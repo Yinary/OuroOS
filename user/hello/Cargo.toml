@@ -1,0 +1,20 @@
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2021"
+description = "OuroOS 最小用户程序（hello / check），双架构静态 ELF，由内核内嵌运行"
+
+# 独立于内核 workspace：由顶层 Makefile 先构建，再嵌入内核镜像
+[workspace]
+
+[lib]
+name = "hello"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hello"
+path = "src/bin/hello.rs"
+
+[[bin]]
+name = "check"
+path = "src/bin/check.rs"

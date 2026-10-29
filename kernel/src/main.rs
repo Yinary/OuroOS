@@ -14,14 +14,24 @@
 //! clear_bss → 解析 DTB → polyhal ctor 链（trap/timer/logger 初始化）
 //!   → 主核通过 SBI-HSM(riscv) / IPI邮箱(la) 拉起副核 → rust_main / secondary_main
 //! ```
+//!
+//! 最小用户态链路：启动自检通过后，主核依次运行内嵌的 hello 与
+//! check 用户程序（见 `user/hello/`），程序经用户态 ecall / syscall
+//! 执行 write 与 exit，exit 或致命异常后回到启动主流程、报告结果
+//! 并关机。
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod allocator;
 mod config;
+mod elf;
 mod lang_items;
 mod mm;
+mod syscall;
 mod trap;
+mod user;
 
 use core::{
     hint::spin_loop,
@@ -37,6 +47,11 @@ use polyhal::{
     timer::{current_time, set_next_timer},
 };
 use polyhal_boot::define_entry;
+
+/// 构建时由 build.rs 生成的内嵌用户 ELF 镜像（user/hello 构建产物）
+mod user_images {
+    include!(concat!(env!("OUT_DIR"), "/user_images.rs"));
+}
 
 /// 时钟 tick 计数（trap.rs 中累加），用于启动自检
 pub static TIMER_TICKS: AtomicUsize = AtomicUsize::new(0);
@@ -57,7 +72,7 @@ fn rust_main(hartid: usize) {
         spin_loop();
     }
 
-    // 自检（heap/帧分配/trap/时钟/多核）全部通过，打印启动成功信息后关机
+    // 自检（heap/帧分配/trap/时钟/多核）全部通过，打印启动成功信息
     println!(
         "{} v{} · {} · boot hart {} · {} cpus · boot ok",
         config::KERNEL_NAME,
@@ -66,6 +81,14 @@ fn rust_main(hartid: usize) {
         hartid,
         get_cpu_num()
     );
+
+    // 依次运行内嵌的用户程序，结束后统一关机
+    // hello：write 固定消息 → 校验返回字节数 → exit(0)
+    user::run_user_elf("hello", user_images::HELLO_ELF);
+    // check：系统调用错误路径检查（EFAULT/EBADF/ENOSYS 等），
+    // 最后故意触发一次用户态非法访存，由内核报告并终止
+    user::run_user_elf("check", user_images::CHECK_ELF);
+
     shutdown();
 }
 
