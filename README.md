@@ -16,19 +16,40 @@ OuroOS 是一个用 Rust 编写的宏内核，支持 RISC-V64 和 LoongArch64，
 常用命令：
 
 ```bash
-make all      # 构建双架构内核，产出仓库根目录下的 kernel-rv 与 kernel-la
+make all      # 构建双架构内核与内嵌用户程序，产出 kernel-rv 与 kernel-la
 make run-rv   # QEMU 启动 riscv64 内核（OpenSBI 交接，物理 0x80200000）
 make run-la   # QEMU 启动 loongarch64 内核（直启 ELF）
+make clippy   # 双架构 clippy（含用户程序构建）
+make fmt      # 格式化内核与用户程序代码
 ```
 
 启动自检（堆、帧分配器、trap、时钟、多核）全部通过后，内核会打印下面这一行
-并调用 QEMU 关机退出（boot hart 编号以实际启动核为准）：
+（boot hart 编号以实际启动核为准）：
 
 ```text
 OuroOS v0.1.0 · riscv64 · boot hart 2 · 4 cpus · boot ok
 ```
 
+随后内核进入最小用户态链路：依次运行内嵌的用户程序 `hello` 与 `check`
+（源码在 `user/hello/`，构建时嵌入内核镜像，不经磁盘），用户程序真实
+运行在用户权限级，通过 ecall / syscall 执行 write 与 exit：
+
+```text
+hello, OuroOS user world (riscv64)
+[user] hello: exited with status 0
+check: write ok
+check: all syscall paths ok, faulting now
+[user] check: killed by LoadPageFault @ 0x5000, pc 0x100e8
+```
+
+`check` 覆盖：write 成功路径与返回字节数、跨页用户缓冲区、未映射地址与
+内核高地址缓冲区（EFAULT）、错误 fd（EBADF）、未实现系统调用（ENOSYS），
+以及用户态非法访存被内核报告并终止。两个程序运行结束后内核统一关机。
+
 ## 测试情况
+
+- 2026-10 本仓库尚在起步阶段，未接入官方测例；上述用户程序验证为本地
+  `make run-rv` / `make run-la`（QEMU 9.2.1 / 10.0.2）实测结果。
 
 ## 文档
 
