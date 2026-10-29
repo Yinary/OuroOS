@@ -6,9 +6,10 @@
 //!
 //! 内核侧只需通过 `#[polyhal::arch_interrupt]` 挂接统一回调。
 //!
-//! 本轮新增：用户态来源的异常与系统调用不在这里完成处理，只做“来源
-//! 判定 + 事件登记”，由用户任务运行循环（user.rs）消费——TrapType 携带
-//! 完整的异常信息（缺页地址等），而 EscapeReason 是有损的（只剩 NoReason）。
+//! 本模块新增的职责：用户态来源的异常与系统调用不在这里完成处理，
+//! 只做来源判定与事件登记，由用户任务运行循环（user.rs）消费：
+//! TrapType 携带完整的异常信息（缺页地址等），EscapeReason 则是有损
+//! 的（只剩 NoReason）。
 
 use core::{
     sync::atomic::{AtomicBool, Ordering},
@@ -22,7 +23,7 @@ use spin::Mutex;
 
 use crate::{config, TIMER_TICKS};
 
-/// 用户异常的种类（对应本轮关心的 TrapType 子集）
+/// 用户异常的种类（对应用户程序可能触发的 TrapType 子集）
 #[derive(Debug, Clone, Copy)]
 pub enum UserFaultKind {
     StorePageFault,
@@ -67,7 +68,7 @@ fn is_from_user(ctx: &TrapFrame) -> bool {
     }
 }
 
-/// 登记用户异常（后到的覆盖先到的：本轮任务在首个致命异常后即被终止，
+/// 登记用户异常（后到的覆盖先到的：任务在首个致命异常后即被终止，
 /// 不会积累多个）。
 fn record_user_fault(kind: UserFaultKind, info: usize, pc: usize) {
     *PENDING_USER_FAULT.lock() = Some(UserFault { kind, info, pc });

@@ -44,7 +44,7 @@ pub const GUARD_BOTTOM: usize = 0x7fff_b000;
 pub enum MapError {
     /// 目标页不在用户地址范围内
     OutOfUserRange,
-    /// 目标页已存在映射（本轮加载器不支持页级重叠，拒绝而不是覆盖）
+    /// 目标页已存在映射（加载器不支持页级重叠，拒绝而不是覆盖）
     Overlap,
     /// ELF 段侵入栈或栈保护页
     HitsStack,
@@ -90,7 +90,7 @@ impl UserAddressSpace {
             return Err(MapError::OutOfUserRange);
         }
         if !self.mapped.insert(vaddr / PAGE_SIZE) {
-            // 页级重叠：本轮加载器拒绝而不是覆盖已有映射
+            // 页级重叠：拒绝而不是覆盖已有映射
             return Err(MapError::Overlap);
         }
         let paddr = frame::frame_alloc(1);
@@ -115,7 +115,7 @@ impl UserAddressSpace {
         Ok(())
     }
 
-    /// 映射用户栈区间 [`USER_STACK_BOTTOM`, [`USER_STACK_TOP`]）。
+    /// 映射用户栈区间 [USER_STACK_BOTTOM, USER_STACK_TOP)。
     pub fn map_stack(&mut self) -> Result<(), MapError> {
         // 栈权限：用户可读写、不可执行（loongarch64 侧 NX 无法表达，见模块注释）
         self.map_alloc_range(

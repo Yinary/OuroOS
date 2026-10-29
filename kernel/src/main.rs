@@ -15,10 +15,10 @@
 //!   → 主核通过 SBI-HSM(riscv) / IPI邮箱(la) 拉起副核 → rust_main / secondary_main
 //! ```
 //!
-//! 本轮新增最小用户态链路：启动自检通过后，主核依次运行内嵌的
-//! hello 与 check 用户程序（见 `user/hello/`），通过真实的用户态
-//! 系统调用执行 write / exit，exit 或致命异常后回到启动主流程、
-//! 报告结果并关机。
+//! 最小用户态链路：启动自检通过后，主核依次运行内嵌的 hello 与
+//! check 用户程序（见 `user/hello/`），程序经用户态 ecall / syscall
+//! 执行 write 与 exit，exit 或致命异常后回到启动主流程、报告结果
+//! 并关机。
 #![no_std]
 #![no_main]
 
@@ -82,7 +82,7 @@ fn rust_main(hartid: usize) {
         get_cpu_num()
     );
 
-    // —— 最小用户态链路：依次运行内嵌的用户程序，结束后统一关机 ——
+    // 依次运行内嵌的用户程序，结束后统一关机
     // hello：write 固定消息 → 校验返回字节数 → exit(0)
     user::run_user_elf("hello", user_images::HELLO_ELF);
     // check：系统调用错误路径检查（EFAULT/EBADF/ENOSYS 等），

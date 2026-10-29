@@ -8,7 +8,7 @@
 //! 对齐的文件字节 unsafe 转换成结构体引用。
 //!
 //! Linux 语义说明：真实内核还处理对齐、ELF 注释段、AT_ 辅助向量等，
-//! 本轮均不支持；程序头表之外的 ELF 内容（节表、符号表）不参与加载。
+//! 这里均不支持；程序头表之外的 ELF 内容（节表、符号表）不参与加载。
 
 use polyhal::pagetable::{MappingFlags, PAGE_SIZE};
 

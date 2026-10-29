@@ -5,7 +5,7 @@
 //! syscall(2) 及 riscv64 / loongarch64 的通用（generic）UAPI：两者都用
 //! a7 传调用号、a0..a5 传参数、a0 返回结果，write=64、exit=93。
 //!
-//! 本轮支持范围（未支持部分在此明确，不假装完整 Linux 语义）：
+//! 支持范围（未支持的部分在此明确列出，不冒充完整 Linux 语义）：
 //! - write：仅 fd=1/2，内容直接送内核控制台；不维护文件偏移、不做
 //!   部分写（出错时不输出任何字节，Linux 允许先写部分再返回 EFAULT）；
 //!   len=0 时只检查 fd，不检查缓冲区，返回 0（与 Linux 一致）；
@@ -20,7 +20,7 @@ use crate::mm::{
     user_access::{self, AccessError},
 };
 
-/// Linux errno（仅本轮用到的子集）
+/// Linux errno（仅当前用到的子集）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Errno {
     /// EBADF: fd 不在支持范围

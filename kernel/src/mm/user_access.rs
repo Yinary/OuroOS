@@ -1,6 +1,6 @@
 //! 用户内存访问：把用户缓冲区内容分块复制进内核固定缓冲区。
 //!
-//! 安全前提（本轮成立，须随并发功能引入时重新审视）：全局只有一个用户
+//! 安全前提（当前成立，须随并发功能引入时重新审视）：全局只有一个用户
 //! 任务，且系统调用处理期间没有 munmap、没有其他 CPU 触发地址空间变化，
 //! 因此“逐页检查 → 复制”期间映射保持稳定。
 //!
@@ -14,8 +14,8 @@ use polyhal::pagetable::{MappingFlags, PAGE_SIZE};
 
 use super::address_space::{phys_to_kernel_vaddr, UserAddressSpace, USER_BASE, USER_TOP};
 
-/// 复制到内核缓冲区的分块大小。按用户长度直接申请同样大的堆缓冲既浪费
-/// 又可能被用户以超大长度勒索内核，故固定为小分块。
+/// 复制到内核缓冲区的分块大小。不按用户长度申请同样大的堆缓冲：
+/// 用户传超大长度即可把内核堆耗尽，因此固定为小分块。
 const KERNEL_CHUNK: usize = 256;
 
 /// 用户缓冲区访问失败原因
@@ -28,7 +28,7 @@ pub enum AccessError {
 /// 检查 `[vaddr, vaddr+len)` 中一页的用户映射是否可读。
 ///
 /// riscv64：要求 U|R。loongarch64：PTE 无独立的 R 位（映射即可读，
-/// polyhal 未暴露 NR），只能检查 U 位——权限表达限制见地址空间模块注释。
+/// polyhal 未暴露 NR），只能检查 U 位，权限表达限制见地址空间模块注释。
 fn page_readable(flags: MappingFlags) -> bool {
     if !flags.contains(MappingFlags::U) {
         return false;
@@ -47,7 +47,7 @@ fn page_readable(flags: MappingFlags) -> bool {
 /// 把用户缓冲区 `[vaddr, vaddr+len)` 的内容分块交给 `consume`。
 ///
 /// 先对整段做映射检查，全部通过后才真正复制输出：出错时不产生部分写出
-/// （Linux 的 write 允许先写成功部分再返回 EFAULT，本轮未实现该语义）。
+/// （Linux 的 write 允许先写成功部分再返回 EFAULT，当前未实现该语义）。
 /// 每个分块最长 [`KERNEL_CHUNK`] 字节，且不跨物理页边界。
 pub fn read_user_bytes<F>(
     space: &UserAddressSpace,

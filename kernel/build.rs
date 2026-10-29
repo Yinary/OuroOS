@@ -6,7 +6,7 @@
 //!
 //! 用户镜像由 Makefile 先构建（`make build-user-rv` / `build-user-la`），
 //! 再通过环境变量 OUROOS_HELLO_ELF / OUROOS_CHECK_ELF 传入路径，复制到
-//! OUT_DIR 后以 include_bytes! 引用——rustc 的 dep-info 会跟踪被包含
+//! OUT_DIR 后以 include_bytes! 引用；rustc 的 dep-info 会跟踪被包含
 //! 文件的变化，ELF 更新后内核会自动重编。
 //!
 //! 参考来源：PolyHAL https://github.com/Byte-OS/polyhal example 目录

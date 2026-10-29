@@ -63,7 +63,7 @@ pub fn sys_exit(status: isize) -> ! {
     }
 }
 
-/// panic 时以 134（128+SIGABRT 风格）退出，便于与正常路径区分
+/// panic 时以 134 退出（128+SIGABRT，shell 惯例），与正常退出码区分
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     sys_exit(134)

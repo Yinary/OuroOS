@@ -31,8 +31,8 @@ OuroOS v0.1.0 · riscv64 · boot hart 2 · 4 cpus · boot ok
 ```
 
 随后内核进入最小用户态链路：依次运行内嵌的用户程序 `hello` 与 `check`
-（源码在 `user/hello/`，构建时嵌入内核镜像，不经磁盘），用户程序真实
-运行在用户权限级，通过 ecall / syscall 执行 write 与 exit：
+（源码在 `user/hello/`，构建时嵌入内核镜像，不经磁盘），用户程序
+运行在用户权限级，经 ecall / syscall 执行 write 与 exit：
 
 ```text
 hello, OuroOS user world (riscv64)

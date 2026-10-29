@@ -1,6 +1,6 @@
 //! 用户现场与运行循环：加载、进入用户态、消费 trap 事件、退出与清理。
 //!
-//! 本轮只有一个用户任务，在启动主核上同步运行；副核继续原地驻留。
+//! 当前只有一个用户任务，在启动主核上同步运行；副核继续原地驻留。
 //! 不引入调度队列、全局进程管理器。
 
 use polyhal::println;
@@ -30,7 +30,7 @@ pub enum TaskOutcome {
 /// 清理 → 返回结果。调用前提：当前 CPU 处于内核页表（riscv64 侧
 /// `UserAddressSpace::new` 要从当前 satp 复制内核高位条目）。
 pub fn run_user_elf(name: &str, elf: &[u8]) -> TaskOutcome {
-    // —— 构建地址空间与加载 ——
+    // 构建地址空间并加载 ELF
     let mut space = UserAddressSpace::new();
     let entry = match elf::load_elf(&mut space, elf) {
         Ok(entry) => entry,
@@ -47,7 +47,7 @@ pub fn run_user_elf(name: &str, elf: &[u8]) -> TaskOutcome {
         return outcome;
     }
 
-    // —— 用户现场：入口与栈 ——
+    // 用户现场：入口与栈
     let mut cx = TrapFrame::new();
     cx[TrapFrameArgs::SEPC] = entry;
     cx[TrapFrameArgs::SP] = USER_STACK_TOP;
@@ -61,7 +61,7 @@ pub fn run_user_elf(name: &str, elf: &[u8]) -> TaskOutcome {
         "user TrapFrame must re-enter U-mode (check sstatus SPP/SPIE)"
     );
 
-    // —— 运行循环 ——
+    // 运行循环
     space.activate();
     let mut exit_code = None;
     let mut fault: Option<UserFault> = None;
@@ -97,8 +97,8 @@ pub fn run_user_elf(name: &str, elf: &[u8]) -> TaskOutcome {
         }
     }
 
-    // —— 清理：先切回内核页表（内含全量 TLB flush，此后 TLB 不再引用
-    // 用户页表内容），再 drop 地址空间（释放用户数据页与页表页）——
+    // 清理：先切回内核页表（change 内含全量 TLB flush，此后 TLB 不再
+    // 引用用户页表内容），再 drop 地址空间释放用户数据页与页表页
     space.deactivate();
     drop(space);
 
