@@ -1,0 +1,13 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition = "2021"
+description = "OuroOS kernel, dual-arch (riscv64 / loongarch64), built on PolyHAL"
+
+[dependencies]
+polyhal = { version = "0.4.0", features = ["trap", "logger"] }
+polyhal-boot = "0.4.0"
+polyhal-trap = "0.4.0"
+log = "0.4"
+spin = { version = "0.10", features = ["mutex"] }
+buddy_system_allocator = "0.11"
