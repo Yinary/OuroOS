@@ -9,7 +9,9 @@ OuroOS 是一个用 Rust 编写的宏内核，支持 RISC-V64 和 LoongArch64，
 依赖：
 
 - Rust 工具链：按 `rust-toolchain.toml` 自动安装（nightly-2025-02-18，含 rust-src 等组件）。
-- QEMU 10.0.2（`qemu-system-riscv64`、`qemu-system-loongarch64`）。
+- QEMU 10.0.2（`qemu-system-riscv64`、`qemu-system-loongarch64`）：需在 PATH 中，
+  否则运行时用 `QEMU_RV` / `QEMU_LA` 变量指定路径，如
+  `make run-la QEMU_LA=/path/to/qemu-system-loongarch64`。
 
 常用命令：
 

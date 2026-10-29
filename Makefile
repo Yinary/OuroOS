@@ -30,11 +30,10 @@ MEM ?= 1G
 SMP ?= 4
 LOG ?= warn         # 编译期日志级别: error|warn|info|debug|trace（boot 报告块由 polyhal 固定打印，不受此控）
 
-# 本地 QEMU：优先使用 10.x，否则回退 PATH
-QEMU_PREFIX ?= $(shell [ -x "$(HOME)/oscontest/qemu-10.0.2/bin/qemu-system-riscv64" ] \
-                    && echo "$(HOME)/oscontest/qemu-10.0.2/bin/")
-QEMU_RV ?= $(QEMU_PREFIX)qemu-system-riscv64
-QEMU_LA ?= $(QEMU_PREFIX)qemu-system-loongarch64
+# QEMU：默认取 PATH 中的可执行文件；不在 PATH 时用变量覆盖，例如：
+#   make run-la QEMU_LA=/path/to/qemu-system-loongarch64
+QEMU_RV ?= qemu-system-riscv64
+QEMU_LA ?= qemu-system-loongarch64
 
 .PHONY: all kernel-rv kernel-la build build-rv build-la run run-rv run-la clean help
 
