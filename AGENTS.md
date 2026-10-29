@@ -13,8 +13,10 @@
 - OuroOS：用 Rust 编写的宏内核，支持 riscv64 和 loongarch64，兼容 Linux 系统调用接口。
 - 硬件抽象层使用 PolyHAL，内核其余部分从零编写。
 - 本项目重视文档和注释：代码不仅要能跑，还要能被人读懂、讲清楚。
-- 仓库结构：<待定，结构确定后补充>
-- 常用命令：<待定，补充构建、运行、测试命令>
+- 仓库结构：`kernel/` 内核 crate（入口、堆、物理页帧分配、trap 处理，基于 PolyHAL）；
+  `Makefile` 双架构构建与 QEMU 运行；根目录的 `kernel-rv` / `kernel-la` 为构建产物，不入库。
+- 常用命令：`make all` 构建 riscv64 / loongarch64 双架构内核；
+  `make run-rv` / `make run-la` 用 QEMU 启动；`cargo fmt`、`cargo clippy`。
 
 ## 2. 任务范围
 

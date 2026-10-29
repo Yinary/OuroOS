@@ -180,7 +180,7 @@ scope 列表会随项目结构调整。新增 scope 需要修改本文件。
   ```bash
   cargo fmt --check
   cargo clippy          # 不新增 warning
-  # <待定：riscv64 与 loongarch64 构建命令>
+  make all              # riscv64 与 loongarch64 双架构构建
   # <待定：回归测试命令>
   ```
 
