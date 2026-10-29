@@ -1,0 +1,26 @@
+# 构建检查：代码格式 + 双架构（riscv64 / loongarch64）内核编译。
+# 不在 CI 中跑 QEMU，启动验证通过本地 make run-rv / make run-la 完成。
+name: 构建
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      # 不带参数，按 rust-toolchain.toml 安装指定工具链（含组件与目标）
+      - name: 安装 Rust 工具链
+        run: rustup toolchain install
+      - name: 检查代码格式
+        run: cargo fmt --all -- --check
+      - name: 构建双架构内核
+        run: make all
