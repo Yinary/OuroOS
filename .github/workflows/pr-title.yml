@@ -1,0 +1,42 @@
+# 检查 PR 标题格式，规则见 CONTRIBUTING.md 第 4、6 节。
+# 合入方式是 squash，PR 标题会成为 main 上的 commit 标题，所以在这里把关。
+name: PR 标题检查
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检查标题
+        env:
+          # 标题通过环境变量传入，不直接拼进脚本，防止标题里的特殊字符被当成命令执行
+          TITLE: ${{ github.event.pull_request.title }}
+          LC_ALL: C.UTF-8
+        run: |
+          types='feat|fix|perf|refactor|docs|test|build|ci|chore|style|revert'
+          # 与 CONTRIBUTING.md 第 6 节的 scope 列表保持一致，新增 scope 时两处一起改
+          scopes='arch|hal|mm|task|sched|syscall|signal|fs|vfs|net|ipc|drivers|sync|boot|build|test|docs'
+
+          if [[ ! "$TITLE" =~ ^($types)\(($scopes)\):\ (.+)$ ]]; then
+            echo "::error::标题格式应为 <type>(<scope>): <简述>，当前为：$TITLE"
+            echo "type 可选：${types//|/ }"
+            echo "scope 可选：${scopes//|/ }"
+            exit 1
+          fi
+
+          summary="${BASH_REMATCH[3]}"
+          if (( ${#summary} > 50 )); then
+            echo "::error::简述不超过 50 字，当前 ${#summary} 字"
+            exit 1
+          fi
+          if [[ "$summary" =~ [。.]$ ]]; then
+            echo "::error::简述末尾不加句号"
+            exit 1
+          fi
+          echo "标题格式正确"
