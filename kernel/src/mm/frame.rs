@@ -7,21 +7,28 @@
 //! 修改说明：修正了登记区域与内核镜像末尾求交时的起点计算，并补充注释。
 
 use buddy_system_allocator::FrameAllocator;
-use polyhal::{pagetable::PAGE_SIZE, PhysAddr};
+use polyhal::{consts::VIRT_ADDR_START, pagetable::PAGE_SIZE, PhysAddr};
 use spin::Mutex;
 
 static LOCK_FRAME_ALLOCATOR: Mutex<FrameAllocator<32>> = Mutex::new(FrameAllocator::new());
 
 /// 把一段物理内存 [`mm_start`, `mm_end`) 按页登记进分配器。
 ///
-/// 起点取 `max(mm_start, 内核镜像末尾 _end)` 向上对齐到页（防止把内核
+/// 起点取 `max(mm_start, 内核镜像物理末尾)` 向上对齐到页（防止把内核
 /// 占用的区域登记进来），终点向下对齐到页；对齐后起点不小于终点时跳过
 /// 这段区域（空区间或不足一页）。
+///
+/// 注意：链接脚本符号 `_end` 位于内核**虚拟**高半地址（rv 为
+/// 0xffffffc0_xxxxxxxx，la 为 0x9000_0000_xxxxxxxx），必须先减去架构的
+/// 内核虚拟基址换算回物理地址再与物理区域比较；直接比较会导致所有
+/// 区域被跳过、分配器登记不到任何页帧。
 pub fn add_frame_range(mm_start: usize, mm_end: usize) {
     extern "C" {
         fn _end();
     }
-    let start_ppn = mm_start.max(_end as usize).div_ceil(PAGE_SIZE);
+    // 内核虚拟基址 = pa | VIRT_ADDR_START，故物理地址 = vaddr - VIRT_ADDR_START
+    let kernel_end_phys = _end as usize - VIRT_ADDR_START;
+    let start_ppn = mm_start.max(kernel_end_phys).div_ceil(PAGE_SIZE);
     let end_ppn = mm_end / PAGE_SIZE;
     if start_ppn >= end_ppn {
         return;
