@@ -12,6 +12,7 @@
 //! 的（只剩 NoReason）。
 
 use core::{
+    cell::Cell,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
@@ -19,7 +20,6 @@ use core::{
 use polyhal::timer::{current_time, set_next_timer};
 use polyhal_trap::trap::TrapType;
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
-use spin::Mutex;
 
 use crate::{config, TIMER_TICKS};
 
@@ -46,10 +46,13 @@ pub struct UserFault {
 /// 回调登记的“来自用户的系统调用”事件。
 /// riscv64 上内核自身的 SBI ecall 同样表现为 TrapType::SysCall，
 /// 因此不能用 EscapeReason 单独区分，必须带来源判定。
+#[polyhal::percpu]
 static PENDING_USER_SYSCALL: AtomicBool = AtomicBool::new(false);
 
-/// 回调登记的用户异常（None 表示当前没有未消费的异常）
-static PENDING_USER_FAULT: Mutex<Option<UserFault>> = Mutex::new(None);
+/// 当前核回调登记的用户异常（None 表示没有未消费的异常）。
+/// 用户任务同步运行，时钟中断不访问此槽；Cell 避免持有跨中断的可变引用。
+#[polyhal::percpu]
+static PENDING_USER_FAULT: Cell<Option<UserFault>> = Cell::new(None);
 
 /// 判断异常是否来自用户权限级。
 ///
@@ -71,17 +74,19 @@ fn is_from_user(ctx: &TrapFrame) -> bool {
 /// 登记用户异常（后到的覆盖先到的：任务在首个致命异常后即被终止，
 /// 不会积累多个）。
 fn record_user_fault(kind: UserFaultKind, info: usize, pc: usize) {
-    *PENDING_USER_FAULT.lock() = Some(UserFault { kind, info, pc });
+    PENDING_USER_FAULT.set(Some(UserFault { kind, info, pc }));
 }
 
-/// 取走“来自用户的系统调用”事件（有则清除并返回 true）
+/// 取走当前核“来自用户的系统调用”事件（有则清除并返回 true）。
+/// 与用户任务同步返回到同一核的约定配套；跨核迁移或内核抢占时需重新审视。
 pub fn take_user_syscall() -> bool {
     PENDING_USER_SYSCALL.swap(false, Ordering::SeqCst)
 }
 
-/// 取走登记的用户异常（如果有）
+/// 仅取走当前核登记的用户异常（如果有），不影响其他核。
+/// 事件消费前不得迁移用户任务；将来引入跨核迁移或内核抢占时需重新审视。
 pub fn take_user_fault() -> Option<UserFault> {
-    PENDING_USER_FAULT.lock().take()
+    PENDING_USER_FAULT.take()
 }
 
 /// 缺页异常的分发：来自用户则登记异常信息，来自内核则维持现有 panic 策略

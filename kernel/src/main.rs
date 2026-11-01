@@ -53,7 +53,9 @@ mod user_images {
     include!(concat!(env!("OUT_DIR"), "/user_images.rs"));
 }
 
-/// 时钟 tick 计数（trap.rs 中累加），用于启动自检
+/// 当前核的时钟 tick 计数（trap.rs 中累加），启动自检只等待本核时钟。
+/// 保留原子访问，避免主流程读取与时钟中断更新之间的普通内存访问冲突。
+#[polyhal::percpu]
 pub static TIMER_TICKS: AtomicUsize = AtomicUsize::new(0);
 
 /// 主核入口（polyhal-boot 完成架构早期初始化并拉起副核后调用）
