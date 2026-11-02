@@ -30,6 +30,7 @@ mod elf;
 mod lang_items;
 mod mm;
 mod syscall;
+mod task;
 mod trap;
 mod user;
 
@@ -83,6 +84,7 @@ fn rust_main(hartid: usize) {
         hartid,
         get_cpu_num()
     );
+    task::run_demo();
 
     // 依次运行内嵌的用户程序，结束后统一关机
     // hello：write 固定消息 → 校验返回字节数 → exit(0)
