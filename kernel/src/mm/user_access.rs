@@ -1,39 +1,36 @@
-//! 用户内存访问：把用户缓冲区内容分块复制进内核固定缓冲区。
+//! 用户内存访问：在内核缓冲区与用户地址空间之间复制数据。
 //!
-//! 安全前提（当前成立，须随并发功能引入时重新审视）：全局只有一个用户
-//! 任务，且系统调用处理期间没有 munmap、没有其他 CPU 触发地址空间变化，
-//! 因此“逐页检查 → 复制”期间映射保持稳定。
+//! 前提：全局只有一个用户任务，复制期间无 munmap 与其他核的地址空间变更。
 //!
-//! 不把用户指针直接当作 Rust 切片引用，而是：
-//! 1. 检查地址 + 长度是否溢出、是否在用户地址范围内；
-//! 2. 逐页走用户页表翻译，检查映射存在、属于用户（U 位）且可读；
-//! 3. 经物理页的内核直接映射窗口复制到固定大小的内核栈缓冲区；
-//! 4. 由调用方分块消费原始字节，不把任意字节当 UTF-8。
+//! 流程：地址范围校验 → 逐页翻译与权限校验 → 经内核直接映射窗口复制。
+//! 不将用户指针构造为 Rust 引用。
 
 use polyhal::pagetable::{MappingFlags, PAGE_SIZE};
 
 use super::address_space::{phys_to_kernel_vaddr, UserAddressSpace, USER_BASE, USER_TOP};
 
-/// 复制到内核缓冲区的分块大小。不按用户长度申请同样大的堆缓冲：
-/// 用户传超大长度即可把内核堆耗尽，因此固定为小分块。
+/// 复制到内核缓冲区的分块大小上限。
 const KERNEL_CHUNK: usize = 256;
 
 /// 用户缓冲区访问失败原因
 #[derive(Debug)]
 pub enum AccessError {
-    /// 地址溢出、越出用户范围、未映射、非用户页或不可读 → EFAULT
+    /// 地址溢出、越界、未映射、非用户页或权限不符 → EFAULT
     Fault,
 }
 
-/// 两架构统一检查用户位与读权限，PROT_NONE 的硬件叶项不可翻译。
+/// 两架构统一检查用户位与读权限。
 fn page_readable(flags: MappingFlags) -> bool {
     flags.contains(MappingFlags::U | MappingFlags::R)
 }
+/// 两架构统一检查用户位与写权限。
+fn page_writable(flags: MappingFlags) -> bool {
+    flags.contains(MappingFlags::U | MappingFlags::W)
+}
 /// 把用户缓冲区 `[vaddr, vaddr+len)` 的内容分块交给 `consume`。
 ///
-/// 先对整段做映射检查，全部通过后才真正复制输出：出错时不产生部分写出
-/// （Linux 的 write 允许先写成功部分再返回 EFAULT，当前未实现该语义）。
-/// 每个分块最长 [`KERNEL_CHUNK`] 字节，且不跨物理页边界。
+/// 先对整段做权限检查，全部通过后才复制；失败时不产生部分输出。
+/// 每个分块不跨页边界，长度不超过 [`KERNEL_CHUNK`]。
 pub fn read_user_bytes<F>(
     space: &UserAddressSpace,
     vaddr: usize,
@@ -43,14 +40,7 @@ pub fn read_user_bytes<F>(
 where
     F: FnMut(&[u8]),
 {
-    let Some(end) = vaddr.checked_add(len) else {
-        return Err(AccessError::Fault);
-    };
-    // 用户指针必须落在用户地址范围内：栈区是合法映射的用户内存，允许；
-    // 内核高位地址（rv 经复制的高半区条目、la 经 DMW）在此被拒绝
-    if vaddr < USER_BASE || end > USER_TOP {
-        return Err(AccessError::Fault);
-    }
+    let end = check_span(vaddr, len)?;
     // 第一遍：整段映射与权限检查
     let mut va = vaddr;
     while va < end {
@@ -65,12 +55,12 @@ where
     let mut pos = vaddr;
     while pos < end {
         let page_end = ((pos / PAGE_SIZE + 1) * PAGE_SIZE).min(end);
-        // translate 返回的物理地址已含页内偏移
+        // translate 返回的物理地址含页内偏移
         let (paddr, _) = space.translate(pos).ok_or(AccessError::Fault)?;
         let mut copied = 0usize;
         while copied < page_end - pos {
-            // SAFETY: 前一循环已确认本页映射存在且可读；src 为该页经内核
-            // 直接映射窗口的地址，n 不超过本页剩余长度，读取不会越页。
+            // SAFETY: 上一循环已确认本页映射存在且可读；src 为本页的
+            // 内核直接映射地址，n 不超过页内剩余长度。
             let src = phys_to_kernel_vaddr(paddr) + copied;
             let n = (page_end - pos - copied).min(KERNEL_CHUNK);
             let chunk = unsafe { core::slice::from_raw_parts(src as *const u8, n) };
@@ -81,4 +71,84 @@ where
         pos = page_end;
     }
     Ok(())
+}
+
+/// 把 `src` 写入用户地址 `[vaddr, vaddr+src.len())`。
+///
+/// 先对整段做可写检查，全部通过后才写入；失败时不产生部分写入。
+/// 按页切分，每页单独翻译；用户虚拟地址连续不要求物理连续。
+pub fn copy_to_user(space: &UserAddressSpace, vaddr: usize, src: &[u8]) -> Result<(), AccessError> {
+    let end = check_span(vaddr, src.len())?;
+    let mut va = vaddr;
+    while va < end {
+        let (_, flags) = space.translate(va).ok_or(AccessError::Fault)?;
+        if !page_writable(flags) {
+            return Err(AccessError::Fault);
+        }
+        va = (va / PAGE_SIZE + 1) * PAGE_SIZE;
+    }
+    let mut pos = vaddr;
+    let mut done = 0usize;
+    while pos < end {
+        let (paddr, _) = space.translate(pos).ok_or(AccessError::Fault)?;
+        let n = ((pos / PAGE_SIZE + 1) * PAGE_SIZE).min(end) - pos;
+        // SAFETY: 上一循环已确认本页属于用户且可写；dst 为本页的内核
+        // 直接映射地址，n 不越过页尾，src 与 dst 不重叠。
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src.as_ptr().add(done),
+                phys_to_kernel_vaddr(paddr) as *mut u8,
+                n,
+            );
+        }
+        done += n;
+        pos += n;
+    }
+    Ok(())
+}
+
+/// 从用户地址 `[vaddr, vaddr+dst.len())` 读出到 `dst`。
+///
+/// 先对整段做可读检查，全部通过后才复制：失败时 `dst` 不被修改。
+pub fn copy_from_user(
+    space: &UserAddressSpace,
+    vaddr: usize,
+    dst: &mut [u8],
+) -> Result<(), AccessError> {
+    let end = check_span(vaddr, dst.len())?;
+    let mut va = vaddr;
+    while va < end {
+        let (_, flags) = space.translate(va).ok_or(AccessError::Fault)?;
+        if !page_readable(flags) {
+            return Err(AccessError::Fault);
+        }
+        va = (va / PAGE_SIZE + 1) * PAGE_SIZE;
+    }
+    let mut pos = vaddr;
+    let mut done = 0usize;
+    while pos < end {
+        let (paddr, _) = space.translate(pos).ok_or(AccessError::Fault)?;
+        let n = ((pos / PAGE_SIZE + 1) * PAGE_SIZE).min(end) - pos;
+        // SAFETY: 上一循环已确认本页属于用户且可读；src 为本页的内核
+        // 直接映射地址，n 不越过页尾，src 与 dst 不重叠。
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                phys_to_kernel_vaddr(paddr) as *const u8,
+                dst.as_mut_ptr().add(done),
+                n,
+            );
+        }
+        done += n;
+        pos += n;
+    }
+    Ok(())
+}
+
+/// 检查 `[vaddr, vaddr+len)` 的溢出与用户地址范围，返回结束地址。
+fn check_span(vaddr: usize, len: usize) -> Result<usize, AccessError> {
+    let end = vaddr.checked_add(len).ok_or(AccessError::Fault)?;
+    if vaddr < USER_BASE || end > USER_TOP {
+        return Err(AccessError::Fault);
+    }
+    Ok(end)
 }
