@@ -3,6 +3,7 @@
 use super::{
     address_space::{phys_to_kernel_vaddr, AreaKind, MapError, UserAddressSpace, USER_TOP},
     frame,
+    user_access::{copy_from_user, copy_to_user},
 };
 use polyhal::pagetable::{MappingFlags as F, PAGE_SIZE};
 
@@ -140,8 +141,63 @@ pub(super) fn run() {
         }
     }
     assert_eq!(frame::stats(), baseline);
+    user_copy_tests();
     log::info!("mm self-test: independent address spaces passed");
     log::info!("mm self-test: map/protect/unmap/zeroing/reclaim passed");
+    log::info!("mm self-test: user copy read/write passed");
     #[cfg(debug_assertions)]
     log::info!("mm self-test: allocation failure rollback passed");
+}
+
+/// 用户内存复制自检：成写、越界、权限、跨页、零长、溢出、内核地址。
+fn user_copy_tests() {
+    let baseline = frame::stats();
+    {
+        let mut space = UserAddressSpace::new().expect("copy test space");
+        // 前三页连续映射，第三页设为只读；第四页不映射
+        space
+            .map_region(0x40_0000, 3, F::URW, AreaKind::Heap)
+            .expect("rw region");
+        space.protect(0x40_2000, 1, F::URX).expect("ro page");
+
+        // 页内写入后读回
+        let mut src = [0u8; 16];
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = i as u8 + 1;
+        }
+        assert!(copy_to_user(&space, 0x40_0010, &src).is_ok());
+        let mut got = [0u8; 16];
+        assert!(copy_from_user(&space, 0x40_0010, &mut got).is_ok());
+        assert_eq!(got, src);
+
+        // 起始不对齐且跨页写入
+        let cross = [0xA5u8; 32];
+        assert!(copy_to_user(&space, 0x40_0ff0, &cross).is_ok());
+        let mut tail = [0u8; 32];
+        assert!(copy_from_user(&space, 0x40_0ff0, &mut tail).is_ok());
+        assert_eq!(tail, cross);
+
+        // 只读页写失败、只读页读成功、未映射页读写失败
+        assert!(copy_to_user(&space, 0x40_2000, &src).is_err());
+        assert!(copy_to_user(&space, 0x40_3000, &src).is_err());
+        assert!(copy_from_user(&space, 0x40_2000, &mut got).is_ok());
+        assert!(copy_from_user(&space, 0x40_3000, &mut got).is_err());
+
+        // 零长度、溢出、内核地址
+        assert!(copy_to_user(&space, 0x40_0000, &[]).is_ok());
+        assert!(copy_to_user(&space, usize::MAX, &src).is_err());
+        assert!(copy_to_user(&space, 0xffff_ffc0_8020_0000, &src).is_err());
+        assert!(copy_from_user(&space, 0xffff_ffc0_8020_0000, &mut got).is_err());
+
+        // 原子性：跨入只读页的写入失败后，之前页内容不变
+        let mut edge = [0u8; 8];
+        assert!(copy_from_user(&space, 0x40_0ffe, &mut edge).is_ok());
+        let mut wide = [0u8; 0x1004];
+        assert!(copy_from_user(&space, 0x40_0ffe, &mut wide).is_ok());
+        assert!(copy_to_user(&space, 0x40_0ffe, &[0xFFu8; 0x1004]).is_err());
+        let mut after = [0u8; 0x1004];
+        assert!(copy_from_user(&space, 0x40_0ffe, &mut after).is_ok());
+        assert_eq!(after, wide);
+    }
+    assert_eq!(frame::stats(), baseline);
 }
