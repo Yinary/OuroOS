@@ -20,6 +20,8 @@ use crate::mm::{
 /// 加载失败原因
 #[derive(Debug)]
 pub enum ElfError {
+    /// 用户数据页、页表页或管理元数据不足。
+    OutOfMemory,
     /// 文件比 ELF 头还短
     Truncated,
     /// 魔数 / class / 数据序 / 版本不符合 ELF64 小端
@@ -63,8 +65,7 @@ const PT_INTERP: u32 = 3;
 const PHENTSIZE: u16 = 56;
 
 /// 程序头 p_flags 到页权限的映射。统一叠加 U 位（用户可访问）。
-/// 注意 loongarch64 经 polyhal 无法表达 R/X 撤销（映射即隐含可读可执行），
-/// 只有 W/U 受控；riscv64 完整表达 RWX。
+/// 记录 ELF 请求权限；两架构均不提供 NX，实际可访问页允许执行。
 fn segment_flags(p_flags: u32) -> MappingFlags {
     let mut flags = MappingFlags::U;
     if p_flags & 0x4 != 0 {
@@ -84,11 +85,20 @@ fn read_u16(buf: &[u8], off: usize) -> u16 {
 }
 
 fn read_u32(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
 }
 
 fn read_u64(buf: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+    u64::from_le_bytes([
+        buf[off],
+        buf[off + 1],
+        buf[off + 2],
+        buf[off + 3],
+        buf[off + 4],
+        buf[off + 5],
+        buf[off + 6],
+        buf[off + 7],
+    ])
 }
 
 /// 解析并把 ELF 加载进 `space`，返回入口虚拟地址。
@@ -148,27 +158,18 @@ pub fn load_elf(space: &mut UserAddressSpace, elf: &[u8]) -> Result<usize, ElfEr
     let Some((_, flags)) = space.translate(e_entry) else {
         return Err(ElfError::EntryInvalid);
     };
-    if !flags.contains(MappingFlags::U) || !entry_executable(flags) {
+    if !flags.contains(MappingFlags::U)
+        || !space
+            .areas()
+            .iter()
+            .any(|a| a.start <= e_entry && e_entry < a.end && a.flags.contains(MappingFlags::X))
+    {
         return Err(ElfError::EntryInvalid);
     }
 
     // 代码页经内核别名写入、用户在用户地址取指，需同步指令缓存
     fence_icache();
     Ok(e_entry)
-}
-
-/// 入口映射是否可执行。riscv64 查 X 位；loongarch64 的 X 无法通过
-/// polyhal 的权限转换撤回（映射即隐含可执行），只能确认映射属于用户。
-fn entry_executable(flags: MappingFlags) -> bool {
-    #[cfg(target_arch = "riscv64")]
-    {
-        flags.contains(MappingFlags::X)
-    }
-    #[cfg(target_arch = "loongarch64")]
-    {
-        let _ = flags;
-        true
-    }
 }
 
 /// 加载单个 PT_LOAD 段（`ph` 为该程序头在文件内的偏移）。
@@ -206,9 +207,11 @@ fn load_segment(space: &mut UserAddressSpace, elf: &[u8], ph: usize) -> Result<(
     for i in 0..pages {
         let vaddr = p_vaddr + i * PAGE_SIZE;
         // 页级重叠拒绝：map_alloc 检查目标页是否已有映射
-        let paddr = space
-            .map_alloc(vaddr, flags)
-            .map_err(|_| ElfError::SegmentOverlap)?;
+        let paddr = space.map_alloc(vaddr, flags).map_err(|e| match e {
+            crate::mm::address_space::MapError::OutOfMemory => ElfError::OutOfMemory,
+            crate::mm::address_space::MapError::Overlap => ElfError::SegmentOverlap,
+            _ => ElfError::MapFailed,
+        })?;
         // 复制文件内容（BSS 部分依赖新页已清零）
         let file_off = p_offset + i * PAGE_SIZE;
         let copy_len = p_filesz.saturating_sub(i * PAGE_SIZE).min(PAGE_SIZE);

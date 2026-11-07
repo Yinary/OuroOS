@@ -25,25 +25,10 @@ pub enum AccessError {
     Fault,
 }
 
-/// 检查 `[vaddr, vaddr+len)` 中一页的用户映射是否可读。
-///
-/// riscv64：要求 U|R。loongarch64：PTE 无独立的 R 位（映射即可读，
-/// polyhal 未暴露 NR），只能检查 U 位，权限表达限制见地址空间模块注释。
+/// 两架构统一检查用户位与读权限，PROT_NONE 的硬件叶项不可翻译。
 fn page_readable(flags: MappingFlags) -> bool {
-    if !flags.contains(MappingFlags::U) {
-        return false;
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        flags.contains(MappingFlags::R)
-    }
-    // loongarch64：polyhal 的 MappingFlags 转换不产生 R 位（见上方说明）
-    #[cfg(target_arch = "loongarch64")]
-    {
-        true
-    }
+    flags.contains(MappingFlags::U | MappingFlags::R)
 }
-
 /// 把用户缓冲区 `[vaddr, vaddr+len)` 的内容分块交给 `consume`。
 ///
 /// 先对整段做映射检查，全部通过后才真正复制输出：出错时不产生部分写出

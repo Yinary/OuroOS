@@ -12,7 +12,21 @@ use polyhal::println;
 
 /// 运行 A/B 两个内核任务的启动自检。
 pub fn run_demo() {
-    sched::run([thread_a, thread_b]);
+    let before = crate::mm::frame::stats();
+    #[cfg(debug_assertions)]
+    for budget in 0..2 {
+        crate::mm::frame::set_test_budget(Some(budget));
+        let result = sched::run([thread_a, thread_b]);
+        crate::mm::frame::set_test_budget(None);
+        assert_eq!(result, Err(crate::mm::frame::FrameError::OutOfMemory));
+        assert_eq!(crate::mm::frame::stats(), before);
+    }
+    if let Err(error) = sched::run([thread_a, thread_b]) {
+        log::error!("kernel task initialization failed: {:?}", error);
+        return;
+    }
+    assert_eq!(crate::mm::frame::stats(), before);
+    log::info!("kernel task stacks: all pages reclaimed");
     println!("[kthread] all done");
 }
 

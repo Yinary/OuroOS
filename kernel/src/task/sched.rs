@@ -19,15 +19,15 @@ struct Scheduler {
 }
 
 impl Scheduler {
-    fn new(entries: [TaskEntry; TASK_COUNT]) -> Self {
-        Self {
+    fn new(entries: [TaskEntry; TASK_COUNT]) -> Result<Self, crate::mm::frame::FrameError> {
+        Ok(Self {
             boot_context: KContext::blank(),
             tasks: [
-                Some(Task::new(entries[0], task_trampoline)),
-                Some(Task::new(entries[1], task_trampoline)),
+                Some(Task::new(entries[0], task_trampoline)?),
+                Some(Task::new(entries[1], task_trampoline)?),
             ],
             current: None,
-        }
+        })
     }
 
     fn next_ready(&self, current: usize) -> Option<usize> {
@@ -44,12 +44,12 @@ impl Scheduler {
 static SCHEDULER: Mutex<Option<Scheduler>> = Mutex::new(None);
 
 /// 创建两个内核任务，并运行到它们全部退出。
-pub fn run(entries: [TaskEntry; TASK_COUNT]) {
+pub fn run(entries: [TaskEntry; TASK_COUNT]) -> Result<(), crate::mm::frame::FrameError> {
     let (from, to) = {
         let mut slot = SCHEDULER.lock();
         assert!(slot.is_none(), "kernel task scheduler initialized twice");
 
-        *slot = Some(Scheduler::new(entries));
+        *slot = Some(Scheduler::new(entries)?);
         let scheduler = slot.as_mut().expect("scheduler was just initialized");
         let first = scheduler.tasks[0]
             .as_mut()
@@ -65,7 +65,7 @@ pub fn run(entries: [TaskEntry; TASK_COUNT]) {
 
     switch_context(from, to);
 
-    let slot = SCHEDULER.lock();
+    let mut slot = SCHEDULER.lock();
     let scheduler = slot.as_ref().expect("scheduler disappeared while running");
     assert!(
         scheduler.current.is_none()
@@ -75,6 +75,11 @@ pub fn run(entries: [TaskEntry; TASK_COUNT]) {
             }),
         "kernel task scheduler returned before all tasks exited"
     );
+    // 已恢复启动栈，且两个任务均不再调度，此时才可释放任务栈。
+    let finished = slot.take();
+    drop(slot);
+    drop(finished);
+    Ok(())
 }
 
 /// 当前任务主动让出 CPU，切换到下一个就绪任务。
