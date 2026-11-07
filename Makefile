@@ -36,7 +36,8 @@ RUSTFLAGS_LA := RUSTFLAGS="-Zunstable-options -C target-feature=-lsx,-lasx"
 # 注意：loongarch virt 的 0x80000000 物理地址仅在内存 > 256M 时存在（lowmem [0,256M) +
 # highmem [0x80000000,...)），因此 la 侧内存必须 > 256M，这里统一默认 1G。
 MEM ?= 1G
-SMP ?= 4
+# 仅面向单核，默认 -smp 1
+SMP ?= 1
 LOG ?= warn         # 编译期日志级别: error|warn|info|debug|trace（boot 报告块由 polyhal 固定打印，不受此控）
 
 # QEMU：默认取 PATH 中的可执行文件；不在 PATH 时用变量覆盖，例如：
@@ -118,4 +119,4 @@ help:
 	@echo "make clippy     - 双架构 clippy（含用户程序构建）"
 	@echo "make fmt        - 格式化内核与用户程序代码"
 	@echo "make clean"
-	@echo "变量: MEM=1G SMP=4 LOG=info QEMU_RV=... QEMU_LA=..."
+	@echo "变量: MEM=1G SMP=1 LOG=info QEMU_RV=... QEMU_LA=..."

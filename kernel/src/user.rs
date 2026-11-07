@@ -1,6 +1,6 @@
 //! 用户现场与运行循环：加载、进入用户态、消费 trap 事件、退出与清理。
 //!
-//! 当前只有一个用户任务，在启动主核上同步运行；副核继续原地驻留。
+//! 当前只有一个用户任务，在启动核上同步运行。
 //! 不引入调度队列、全局进程管理器。
 
 use polyhal::println;
@@ -28,10 +28,17 @@ pub enum TaskOutcome {
 
 /// 运行一个内嵌的用户 ELF：创建地址空间 → 加载 → 进入用户态循环 →
 /// 清理 → 返回结果。调用前提：当前 CPU 处于内核页表（riscv64 侧
-/// `UserAddressSpace::new` 要从当前 satp 复制内核高位条目）。
+/// 新空间使用 mm 初始化时记录的内核根，避免继承另一个用户空间）。
 pub fn run_user_elf(name: &str, elf: &[u8]) -> TaskOutcome {
     // 构建地址空间并加载 ELF
-    let mut space = UserAddressSpace::new();
+    let mut space = match UserAddressSpace::new() {
+        Ok(space) => space,
+        Err(_) => {
+            let outcome = TaskOutcome::LoadFailed(ElfError::OutOfMemory);
+            report(name, &outcome);
+            return outcome;
+        }
+    };
     let entry = match elf::load_elf(&mut space, elf) {
         Ok(entry) => entry,
         Err(e) => {
@@ -41,7 +48,10 @@ pub fn run_user_elf(name: &str, elf: &[u8]) -> TaskOutcome {
         }
     };
     if let Err(e) = space.map_stack() {
-        let outcome = TaskOutcome::LoadFailed(ElfError::MapFailed);
+        let outcome = TaskOutcome::LoadFailed(match e {
+            crate::mm::address_space::MapError::OutOfMemory => ElfError::OutOfMemory,
+            _ => ElfError::MapFailed,
+        });
         log::error!("map user stack failed: {:?}", e);
         report(name, &outcome);
         return outcome;

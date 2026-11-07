@@ -47,9 +47,12 @@ impl Task {
     ///
     /// `trampoline` 必须是一个永不返回的入口：它调用 `entry`，并在入口
     /// 返回后将任务标记为退出并切换到其他上下文。
-    pub fn new(entry: TaskEntry, trampoline: extern "C" fn() -> !) -> Self {
+    pub fn new(
+        entry: TaskEntry,
+        trampoline: extern "C" fn() -> !,
+    ) -> Result<Self, frame::FrameError> {
         // HACK(qzquan): 暂用物理页作为内核栈，待 mm 提供 kstack 后替换。
-        let stack_start = frame::frame_alloc(KSTACK_PAGES);
+        let stack_start = frame::frame_alloc(KSTACK_PAGES)?;
         stack_start.clear_len(KSTACK_PAGES * PAGE_SIZE);
 
         let stack_bottom = stack_start.get_mut_ptr::<u8>() as usize;
@@ -60,12 +63,12 @@ impl Task {
         context[KContextArgs::KTP] = read_current_tp();
         context[KContextArgs::KPC] = trampoline as usize;
 
-        Self {
+        Ok(Self {
             context,
             entry,
             state: TaskState::Ready,
             _stack_start: stack_start,
-        }
+        })
     }
 }
 
@@ -92,4 +95,16 @@ fn read_current_tp() -> usize {
         asm!("move {}, $tp", out(reg) tp);
     }
     tp
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        for page in 0..KSTACK_PAGES {
+            // SAFETY: 任务不可复制，仅初始化失败或恢复启动栈后销毁；
+            // exit_current 不释放当前栈，每个独占物理页只归还一次。
+            unsafe {
+                frame::frame_dealloc(PhysAddr::new(self._stack_start.raw() + page * PAGE_SIZE));
+            }
+        }
+    }
 }
