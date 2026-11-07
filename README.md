@@ -4,6 +4,8 @@ OuroOS 是一个用 Rust 编写的宏内核，支持 RISC-V64 和 LoongArch64，
 
 本文只描述已经实现的内容。
 
+OuroOS 目前仅面向单核：QEMU 以 `-smp 1` 运行，内核不含多核机制。
+
 ## 构建与运行
 
 依赖：
@@ -23,11 +25,10 @@ make clippy   # 双架构 clippy（含用户程序构建）
 make fmt      # 格式化内核与用户程序代码
 ```
 
-启动自检（堆、帧分配器、trap、时钟、多核）全部通过后，内核会打印下面这一行
-（boot hart 编号以实际启动核为准）：
+启动自检（堆、帧分配器、trap、时钟）全部通过后，内核会打印下面这一行：
 
 ```text
-OuroOS v0.1.0 · riscv64 · boot hart 2 · 4 cpus · boot ok
+OuroOS v0.1.0 · riscv64 · boot hart 0 · 1 cpus · boot ok
 ```
 
 随后内核进入最小用户态链路：依次运行内嵌的用户程序 `hello` 与 `check`
@@ -59,7 +60,7 @@ check: all syscall paths ok, faulting now
 |---|---|---|---|
 | PolyHAL 0.4.0 | https://github.com/Byte-OS/polyhal | MIT | 硬件抽象层 |
 | PolyHAL example | https://github.com/Byte-OS/polyhal example 目录 | MIT | 改编了 `kernel/build.rs`、`kernel/linker.lds`、`kernel/src/mm/frame.rs` |
-| polyhal-boot 0.4.0 | https://crates.io/crates/polyhal-boot | MIT | 双架构早期汇编入口与拉起副核 |
+| polyhal-boot 0.4.0 | https://crates.io/crates/polyhal-boot | MIT | 双架构早期汇编入口与早期初始化（多核拉起路径本项目不使用） |
 | polyhal-trap 0.4.0 | https://crates.io/crates/polyhal-trap | MIT | 双架构中断/异常初始化与分发 |
 | log 0.4.34 | https://crates.io/crates/log | MIT OR Apache-2.0 | 分级日志 |
 | spin 0.10.1 | https://crates.io/crates/spin | MIT | 自旋锁（帧分配器） |

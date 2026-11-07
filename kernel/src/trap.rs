@@ -21,7 +21,7 @@ use polyhal::timer::{current_time, set_next_timer};
 use polyhal_trap::trap::TrapType;
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 
-use crate::{config, TIMER_TICKS};
+use crate::{config, BREAK_TICKS, TIMER_TICKS};
 
 /// 用户异常的种类（对应用户程序可能触发的 TrapType 子集）
 #[derive(Debug, Clone, Copy)]
@@ -108,6 +108,9 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                 // 用户态断点视为异常终止（内核侧 ebreak 仍是启动自检）
                 record_user_fault(UserFaultKind::Breakpoint, 0, ctx[TrapFrameArgs::SEPC]);
             } else {
+                // 内核态断点来自启动自检（main.rs 的 ebreak 自检），
+                // 计数后由自检断言确认异常确实送达并返回
+                BREAK_TICKS.fetch_add(1, Ordering::Relaxed);
                 log::debug!("breakpoint @ {:#x}", ctx[TrapFrameArgs::SEPC]);
             }
         }

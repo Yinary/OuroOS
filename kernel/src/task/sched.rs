@@ -188,7 +188,7 @@ fn switch_context(from: *mut KContext, to: *const KContext) {
     // SAFETY:
     // - `from` 和 `to` 都指向静态 SCHEDULER 内部、调度期间不会移动的 KContext；
     // - 两个指针指向不同上下文，且目标任务拥有有效、对齐的内核栈；
-    // - 只有启动核调用本调度器，副核仍停留在 secondary_main；
+    // - 本项目仅面向单核，只有启动核调用本调度器，无并发进入；
     // - 调度器锁已在调用前释放，切入的任务可以再次进入调度器。
     unsafe {
         context_switch(from, to);

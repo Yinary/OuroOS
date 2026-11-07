@@ -1,24 +1,4 @@
-//! OuroOS 内核入口：基于 PolyHAL 的双架构（riscv64 / loongarch64）启动骨架。
-//!
-//! 两个架构共用同一份 Rust 代码，架构差异全部由 PolyHAL / polyhal-boot 吸收：
-//!
-//! ```text
-//! riscv64:    QEMU(-bios default=OpenSBI) -kernel kernel-rv(ELF)
-//!             → OpenSBI 以 S 态交接 a0=hartid, a1=dtb，PC=0x80200000
-//!             → polyhal-boot 汇编入口：建恒等+高位映射页表，开 MMU，跳入高位
-//! loongarch64: QEMU -kernel kernel-la(ELF)
-//!             → 所有核从 ELF 入口(0x9000000080000000)启动（DA 模式下高位被截断，
-//!               实际取指于物理 0x80000000）
-//!             → polyhal-boot 汇编入口：设 DMW 窗口，开 PG，跳入 DMW 映射地址
-//!     ↓ 两者汇聚
-//! clear_bss → 解析 DTB → polyhal ctor 链（trap/timer/logger 初始化）
-//!   → 主核通过 SBI-HSM(riscv) / IPI邮箱(la) 拉起副核 → rust_main / secondary_main
-//! ```
-//!
-//! 最小用户态链路：启动自检通过后，主核依次运行内嵌的 hello 与
-//! check 用户程序（见 `user/hello/`），程序经用户态 ecall / syscall
-//! 执行 write 与 exit，exit 或致命异常后回到启动主流程、报告结果
-//! 并关机。
+// OuroOS 内核入口
 #![no_std]
 #![no_main]
 
@@ -59,13 +39,24 @@ mod user_images {
 #[polyhal::percpu]
 pub static TIMER_TICKS: AtomicUsize = AtomicUsize::new(0);
 
-/// 主核入口（polyhal-boot 完成架构早期初始化并拉起副核后调用）
+/// 当前核在内核态触发断点的次数（trap.rs 中累加）。
+///
+/// 启动自检在 `rust_main` 开头主动执行一条断点指令，用这个计数确认 trap
+/// 入口已安装、且异常返回路径能正常恢复执行。它比“等时钟中断”更早暴露
+/// trap 初始化问题：入口没装好会当场卡住，而不是卡在等 tick 的循环里。
+#[polyhal::percpu]
+pub static BREAK_TICKS: AtomicUsize = AtomicUsize::new(0);
+
+/// 内核入口（polyhal-boot 完成架构早期初始化后调用；单核运行，无副核拉起）
 fn rust_main(hartid: usize) {
     allocator::init();
     mm::init();
-
-    // 触发一次断点异常，验证当前架构的 trap 路径已就绪
     ebreak();
+    assert_eq!(
+        BREAK_TICKS.load(Ordering::Relaxed),
+        1,
+        "trap self-check failed: breakpoint not delivered"
+    );
 
     // 打开中断并启动第一个 tick
     IRQ::int_enable();
@@ -75,7 +66,7 @@ fn rust_main(hartid: usize) {
         spin_loop();
     }
 
-    // 自检（heap/帧分配/trap/时钟/多核）全部通过，打印启动成功信息
+    // 自检（heap/帧分配/trap/时钟）全部通过，打印启动成功信息
     println!(
         "{} v{} · {} · boot hart {} · {} cpus · boot ok",
         config::KERNEL_NAME,
@@ -96,10 +87,9 @@ fn rust_main(hartid: usize) {
     shutdown();
 }
 
-/// 副核入口（riscv64 经 OpenSBI HSM 唤醒，loongarch64 经 IPI 邮箱唤醒）
+// 副核入口
 fn secondary_main(hartid: usize) {
     log::debug!("hart {} (secondary) up, parked.", hartid);
-    // 启动骨架阶段副核只驻留；后续调度器就位后在此进入 idle/调度循环
     loop {
         spin_loop();
     }
