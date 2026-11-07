@@ -1,4 +1,4 @@
-// OuroOS 内核入口
+//! OuroOS 内核入口
 #![no_std]
 #![no_main]
 
@@ -39,18 +39,15 @@ mod user_images {
 #[polyhal::percpu]
 pub static TIMER_TICKS: AtomicUsize = AtomicUsize::new(0);
 
-/// 当前核在内核态触发断点的次数（trap.rs 中累加）。
-///
-/// 启动自检在 `rust_main` 开头主动执行一条断点指令，用这个计数确认 trap
-/// 入口已安装、且异常返回路径能正常恢复执行。它比“等时钟中断”更早暴露
-/// trap 初始化问题：入口没装好会当场卡住，而不是卡在等 tick 的循环里。
+/// 当前核在内核态触发断点的次数（trap.rs 中累加），供启动自检断言。
 #[polyhal::percpu]
 pub static BREAK_TICKS: AtomicUsize = AtomicUsize::new(0);
 
-/// 内核入口（polyhal-boot 完成架构早期初始化后调用；单核运行，无副核拉起）
+/// 内核入口（polyhal-boot 完成架构早期初始化后调用）
 fn rust_main(hartid: usize) {
     allocator::init();
     mm::init();
+    // trap 路径自检
     ebreak();
     assert_eq!(
         BREAK_TICKS.load(Ordering::Relaxed),
@@ -66,7 +63,7 @@ fn rust_main(hartid: usize) {
         spin_loop();
     }
 
-    // 自检（heap/帧分配/trap/时钟）全部通过，打印启动成功信息
+    // 自检（heap/帧分配/trap/时钟）全部通过
     println!(
         "{} v{} · {} · boot hart {} · {} cpus · boot ok",
         config::KERNEL_NAME,
@@ -87,7 +84,7 @@ fn rust_main(hartid: usize) {
     shutdown();
 }
 
-// 副核入口
+// 副核入口，正常运行不会到达；保留以满足 define_entry! 两入口签名
 fn secondary_main(hartid: usize) {
     log::debug!("hart {} (secondary) up, parked.", hartid);
     loop {

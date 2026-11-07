@@ -108,8 +108,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
                 // 用户态断点视为异常终止（内核侧 ebreak 仍是启动自检）
                 record_user_fault(UserFaultKind::Breakpoint, 0, ctx[TrapFrameArgs::SEPC]);
             } else {
-                // 内核态断点来自启动自检（main.rs 的 ebreak 自检），
-                // 计数后由自检断言确认异常确实送达并返回
+                // 来自 main.rs 启动自检
                 BREAK_TICKS.fetch_add(1, Ordering::Relaxed);
                 log::debug!("breakpoint @ {:#x}", ctx[TrapFrameArgs::SEPC]);
             }

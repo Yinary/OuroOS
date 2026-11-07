@@ -35,6 +35,7 @@
 pub mod address_space;
 mod arch;
 pub mod frame;
+pub mod kernel_pt;
 mod page_table;
 pub mod region;
 mod self_test;
@@ -45,7 +46,6 @@ static KERNEL_ROOT: AtomicUsize = AtomicUsize::new(0);
 /// 初始化一次，先完成物理记账，再运行启动期内存自检。
 /// 引导数据不可用或元数据分配失败是启动失败，不属于用户系统调用路径。
 pub fn init() {
-    KERNEL_ROOT.store(arch::current(), Ordering::Relaxed);
     region::init().expect("physical memory initialization failed");
     let (total, free) = frame::stats();
     assert!(total > 0, "no usable physical memory");
@@ -60,6 +60,9 @@ pub fn init() {
     );
     assert_eq!(frame::stats(), (total, free));
     log::info!("frame allocator oversized allocation: rejected without changing free pages");
+    // 顺序约束：kernel_pt::init 先于 KERNEL_ROOT 读取
+    kernel_pt::init();
+    KERNEL_ROOT.store(arch::current(), Ordering::Relaxed);
     self_test::run();
 }
 /// 经内核别名写入用户代码后同步指令缓存。PolyHAL 未提供对应封装。

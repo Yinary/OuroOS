@@ -36,7 +36,7 @@ RUSTFLAGS_LA := RUSTFLAGS="-Zunstable-options -C target-feature=-lsx,-lasx"
 # 注意：loongarch virt 的 0x80000000 物理地址仅在内存 > 256M 时存在（lowmem [0,256M) +
 # highmem [0x80000000,...)），因此 la 侧内存必须 > 256M，这里统一默认 1G。
 MEM ?= 1G
-# 本项目仅面向单核，QEMU 默认以单核形态运行（-smp 1）。
+# 仅面向单核，默认 -smp 1
 SMP ?= 1
 LOG ?= warn         # 编译期日志级别: error|warn|info|debug|trace（boot 报告块由 polyhal 固定打印，不受此控）
 
