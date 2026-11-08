@@ -7,6 +7,8 @@ extern crate alloc;
 mod allocator;
 mod config;
 mod elf;
+mod framework;
+mod fs;
 mod lang_items;
 mod mm;
 mod syscall;
@@ -47,6 +49,7 @@ pub static BREAK_TICKS: AtomicUsize = AtomicUsize::new(0);
 fn rust_main(hartid: usize) {
     allocator::init();
     mm::init();
+    fs::self_check();
     // trap 路径自检
     ebreak();
     assert_eq!(

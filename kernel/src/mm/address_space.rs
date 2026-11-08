@@ -157,6 +157,32 @@ impl UserAddressSpace {
         self.map_region(va, 1, flags, AreaKind::Elf)?;
         Ok(self.pages[self.pages.len() - 1].frame.addr())
     }
+
+    /// 映射一张新页，将 `data` 写入页首，其余字节保持为零。
+    /// 数据超过一页、映射冲突或分配失败时返回错误。
+    pub fn map_initialized_page(
+        &mut self,
+        va: usize,
+        flags: MappingFlags,
+        data: &[u8],
+    ) -> Result<(), MapError> {
+        if data.len() > PAGE_SIZE {
+            return Err(MapError::OutOfUserRange);
+        }
+        let pa = self.map_alloc(va, flags)?;
+        if !data.is_empty() {
+            // SAFETY: map_alloc 返回本次独占的新页，和输入切片不重叠。
+            // 直接映射覆盖整页，且上面已限制复制长度。
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    phys_to_kernel_vaddr(pa) as *mut u8,
+                    data.len(),
+                );
+            }
+        }
+        Ok(())
+    }
     /// 初始栈请求 RW；当前不支持 NX，实际为 RWX，保护页不分配。
     pub fn map_stack(&mut self) -> Result<(), MapError> {
         self.map_region(USER_STACK_BOTTOM, 4, MappingFlags::URW, AreaKind::Stack)

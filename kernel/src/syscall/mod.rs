@@ -15,10 +15,7 @@
 use polyhal::debug_console::DebugConsole;
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 
-use crate::mm::{
-    address_space::UserAddressSpace,
-    user_access::{self, AccessError},
-};
+use crate::framework::user_access::{self, AccessError, UserAddressSpace};
 
 /// Linux errno（仅当前用到的子集）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
