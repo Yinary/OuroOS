@@ -24,3 +24,7 @@ pub const TICK_MS: u64 = 100;
 
 /// 启动自检需要收到的 tick 数
 pub const BOOT_TICKS: usize = 3;
+
+/// 每个任务的内核栈页数（4 页 = 16 KiB）。
+/// 无保护页：见 mm/kstack.rs 头部的欠账说明。
+pub const KSTACK_PAGES: usize = 4;

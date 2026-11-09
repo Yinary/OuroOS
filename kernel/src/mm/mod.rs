@@ -36,6 +36,7 @@ pub mod address_space;
 mod arch;
 pub mod frame;
 pub mod kernel_pt;
+pub mod kstack;
 mod page_table;
 pub mod region;
 mod self_test;

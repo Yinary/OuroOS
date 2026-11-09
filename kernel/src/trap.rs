@@ -7,9 +7,10 @@
 //! 内核侧只需通过 `#[polyhal::arch_interrupt]` 挂接统一回调。
 //!
 //! 本模块新增的职责：用户态来源的异常与系统调用不在这里完成处理，
-//! 只做来源判定与事件登记，由用户任务运行循环（user.rs）消费：
-//! TrapType 携带完整的异常信息（缺页地址等），EscapeReason 则是有损
-//! 的（只剩 NoReason）。
+//! 只做来源判定与事件登记，由用户任务运行循环（task/user_task.rs）
+//! 消费：TrapType 携带完整的异常信息（缺页地址等），EscapeReason 则
+//! 是有损的（只剩 NoReason）——侧信道是 polyhal 缺陷 5 的临时补丁，
+//! patch polyhal 立项后移除（见 doc/ostd-contracts.md）。
 
 use core::{
     cell::Cell,
