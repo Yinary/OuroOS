@@ -55,6 +55,7 @@ pub fn init() {
         free,
         total
     );
+    // 自检：帧账本守恒——超量申请被拒且不改变空闲数（每次启动）
     assert_eq!(
         frame::frame_alloc(free + 1),
         Err(frame::FrameError::OutOfMemory)

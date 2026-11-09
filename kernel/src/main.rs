@@ -48,7 +48,7 @@ pub static BREAK_TICKS: AtomicUsize = AtomicUsize::new(0);
 fn rust_main(hartid: usize) {
     allocator::init();
     mm::init();
-    // trap 路径自检
+    // 自检：trap 回调链路——断点必须恰好送达一次（每次启动）
     ebreak();
     assert_eq!(
         BREAK_TICKS.load(Ordering::Relaxed),
@@ -62,6 +62,7 @@ fn rust_main(hartid: usize) {
     IRQ::int_enable();
     set_next_timer(current_time() + Duration::from_millis(config::TICK_MS));
 
+    // 自检：时钟中断持续到达——等待 BOOT_TICKS 个 tick（每次启动）
     while TIMER_TICKS.load(Ordering::Relaxed) < config::BOOT_TICKS {
         spin_loop();
     }

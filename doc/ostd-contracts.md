@@ -71,7 +71,7 @@ PolyHAL（0.4.0，三 crate：polyhal / polyhal-trap / polyhal-boot）承担
 或 fork 分支。**不得直接编辑 ~/.cargo/registry**（不进版本控制、会被
 缓存事件静默还原）。立项前上述 OS 层补丁保留，属记录在案的妥协。
 
-## 3. task 契约（全文见 `kernel/src/task/mod.rs` 头部）
+## 3. task 契约（本节为权威文本；`kernel/src/task/mod.rs` 头部只留摘要）
 
 执行模型：用户态唯一入口 run_user_task，续体暂存于每核槽（rv
 sscratch / la SAVE0）。两不变量：进用户态的内核栈在整个用户态期间
@@ -109,6 +109,11 @@ Flow（Continue/Yield/Exited）是调用对执行流的全部影响——阻塞�
 内核中 try_lock 失败即 bug（持锁跨调度），立即报告；切换入口断言
 持锁深度为零（might_sleep 内核版）；锁序 SCHED → REGISTRY → FRAME。
 
+已知妥协：polyhal 未打补丁（见 §2 缺陷表）——EscapeReason 有损导致
+trap.rs 事件侧信道暂留；la 用户非法指令等未分类异常在 polyhal 层
+直接 panic。事件消费约定：逃逸回来必须先查异常槽再回用户态，
+迁移/抢占引入前事件不得跨任务滞留。
+
 ### task 欠账
 
 - 内核栈虚拟窗口 + 底部保护页：需 rv 内核共享页表窗口条目 + la PGDL
@@ -121,11 +126,31 @@ Flow（Continue/Yield/Exited）是调用对执行流的全部影响——阻塞�
   锁协议全面重审）。
 - polyhal patch（见上节）；la idle 指令封装（当前 idle 自旋等钟）。
 
-## 4. 验证入口
+## 4. 自检清单与验证入口
+
+### 自检注释规范
+
+所有自检代码的注释以 `自检：` 开头，写明两件事：**验证的不变量**、
+**运行时机**（每次启动 / 仅 selftest 档）。自检测的是不变量而不是
+功能清单；新增自检时同步登记本表。
+
+### 自检清单
+
+| 位置 | 不变量 | 运行时机 |
+|---|---|---|
+| main.rs（ebreak/BREAK_TICKS） | trap 回调链路：断点恰好送达一次 | 每次启动 |
+| main.rs（BOOT_TICKS 等待） | 时钟中断持续到达 | 每次启动 |
+| mm/mod.rs::init | 帧账本：超量申请被拒且不改变空闲数 | 每次启动 |
+| mm/self_test.rs | 页所有权/区间分裂/权限/边界/释放守恒 | 每次启动 |
+| task/mod.rs::run（帧守恒断言） | 全部任务退出后帧统计回到基线（覆盖 kstack 与用户空间回收） | 每次启动 |
+| task/mod.rs::spawn_oom_probe | 孵化 OOM 无副作用：失败不改帧数、不登记 | 仅 selftest 档 |
+| mm/frame.rs（cfg(debug_assertions) 预算注入） | 逐点 OOM 失败路径不变量 | 仅 selftest 档 |
+
+### 验证入口
 
 - `make run-rv` / `make run-la`：release，六任务验收（kthread A/B
   交错、hello、sched×2 交错+抢占、check 正常+被杀路径），末尾帧守恒
   断言与逐进程汇总。
 - `make selftest-rv` / `make selftest-la`：selftest 档（debug 断言 +
-  lock_debug + LOG=info），额外启用 OOM 注入自检（孵化失败无副作用）
-  与调试锁检查。
+  lock_debug + LOG=info），额外启用 OOM 注入自检与调试锁检查。
+  注意：polyhal 缺陷 #8 使本档需 `-Zub-checks=no`（Makefile 已内置）。
