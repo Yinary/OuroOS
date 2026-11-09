@@ -266,8 +266,6 @@ dependencies = [
 [[package]]
 name = "polyhal-trap"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "630a11f92fa9968490c5680475612f39c7079af9a1ee292d9c9074c040ccf261"
 dependencies = [
  "aarch64-cpu",
  "bitflags 2.13.2",

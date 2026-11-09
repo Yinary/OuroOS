@@ -58,18 +58,22 @@ PolyHAL（0.4.0，三 crate：polyhal / polyhal-trap / polyhal-boot）承担
 | 2 | translate 叶子级不查 PTE 有效性 | 弃用，自建 translate |
 | 3 | SysCall 不推进 PC | 运行循环恰好一次 syscall_ok |
 | 4 | 内核 SBI ecall 也表现为 SysCall | 来源判定（from_user）+ 事件标志 |
-| 5 | EscapeReason 有损（用户异常只剩 NoReason） | trap.rs percpu 事件槽（临时补丁） |
+| 5 | EscapeReason 有损（用户异常只剩 NoReason） | **已修复**（vendor 补丁：run_user_task 返回完整 TrapType，事件侧信道已移除） |
 | 6 | la 无法表达撤 X（无 NX） | 团队决策不实现 NX；translate 报实际权限 |
-| 7 | la 未分类异常在 HAL 层直接 panic | **未解决**：la 用户非法指令会 panic 内核；patch 立项时一并处理 |
-| 8 | 启动期（rust_main 之前）存在一处 ptr::add 地址计算回绕 | **预存缺陷，本轮发现**：release 下静默回绕不触发；debug 断言的 ub-check 会 panic。selftest 档以 -Zub-checks=no 定向规避（Makefile UB_CHECKS_OFF），定位修复归入 patch 立项。已验证非本仓回归（main 的 dev 构建同样触发） |
+| 7 | la 未分类异常在 HAL 层直接 panic | **已修复**（vendor 补丁：新增 TrapType::Unhandled 转交 OS；验收：ill 程序 la 侧 ADEF 被终止任务而非 panic 内核） |
+| 8 | 启动期（rust_main 之前）一处 ptr::add 越界 | **已定位**：polyhal 本体 percpu `set_local_thread_pointer`（rv，percpu/mod.rs:88）把 VIRT_ADDR_START 作 ptr::add 字节偏移，超出 isize 范围（数学结果正确，技术 UB）。不在 polyhal-trap vendor 范围内，selftest 档继续以 -Zub-checks=no 规避（Makefile UB_CHECKS_OFF）；vendor polyhal 本体时顺手修复 |
 | — | la 缺 TrapFrame::from_user 封装 | trap.rs 内联读 prmd（带 cfg 注释） |
 
-### patch 立项（本轮明确未做）
+### vendor 补丁（已实施，polyhal-patch 分支）
 
-修复 5/7/la from_user 的正确位置是 polyhal-trap（约 1500 行小 crate）。
-载体待团队决策：vendor 进仓库 + `[patch.crates-io]`（贴合环境冻结现状）
-或 fork 分支。**不得直接编辑 ~/.cargo/registry**（不进版本控制、会被
-缓存事件静默还原）。立项前上述 OS 层补丁保留，属记录在案的妥协。
+polyhal-trap 0.4.0 整 crate vendor 至 `third_party/polyhal-trap`，
+根 Cargo.toml `[patch.crates-io]` 指向本地副本；polyhal 本体与
+polyhal-boot 仍走 crates.io。补丁清单与升级回归说明见其 README.md，
+登记于 docs/third-party.md。修复项：#5（TrapType 直达）、#7
+（Unhandled 转交）、la from_user 补齐；另将 la 非对齐模拟成功改报
+新增的 Absorbed（与未分类异常区分）。**不得直接编辑
+~/.cargo/registry**（不进版本控制、会被缓存事件静默还原）。
+上游 PR（Byte-OS/polyhal，MIT）待提——补丁已写好，成本近零。
 
 ## 3. task 契约（本节为权威文本；`kernel/src/task/mod.rs` 头部只留摘要）
 
@@ -109,10 +113,11 @@ Flow（Continue/Yield/Exited）是调用对执行流的全部影响——阻塞�
 内核中 try_lock 失败即 bug（持锁跨调度），立即报告；切换入口断言
 持锁深度为零（might_sleep 内核版）；锁序 SCHED → REGISTRY → FRAME。
 
-已知妥协：polyhal 未打补丁（见 §2 缺陷表）——EscapeReason 有损导致
-trap.rs 事件侧信道暂留；la 用户非法指令等未分类异常在 polyhal 层
-直接 panic。事件消费约定：逃逸回来必须先查异常槽再回用户态，
-迁移/抢占引入前事件不得跨任务滞留。
+已知妥协：缺陷 #5/#7 已由 vendor 补丁修复，事件侧信道（percpu 槽）
+已移除——运行循环直接按 run_user_task 返回的完整 TrapType 处置：
+SysCall 经 cx.from_user() 判来源；Absorbed（la 非对齐模拟成功）继续
+执行；Unhandled 与各异常类来自用户则终止任务。残留：#8（polyhal
+本体 percpu，见 §2）与 la idle 指令未封装。
 
 ### task 欠账
 
@@ -122,9 +127,17 @@ trap.rs 事件侧信道暂留；la 用户非法指令等未分类异常在 polyh
   idle 的"队列空即全部退出"判定需重写。
 - fork/exec/wait/僵尸语义、退出码 wait status 编码。
 - exec 栈内容构造（argv/envp/auxv）。
-- 锁序图（lockdep 式环检测）；SMP（TLB shootdown、percpu 队列、
-  锁协议全面重审）。
-- polyhal patch（见上节）；la idle 指令封装（当前 idle 自旋等钟）。
+- 锁序图（lockdep 式环检测）。
+- polyhal 本体 vendor（#8 修复）；la idle 指令封装（当前 idle 自旋等钟）。
+
+### 非目标（团队决定不做，区别于"欠账"）
+
+**SMP/多核不做。** 与之相关的不变量在单核下各有职责、全部保留：
+!Send/LocalSpace（所有权边界与静态容器约束）、percpu（访问形态）、
+全量 TLB flush（正确性优先）。若将来重开多核，以下设计须重新审视：
+TLB shootdown 协议、调度器与注册表的单核假设、锁序与 irq-off 模型、
+页表全量刷新策略。不为想象中的 SMP 预留任何参数化或间接层——
+可扩展性的证明是重构成本低（不变量清晰），不是预留钩子。
 
 ## 4. 自检清单与验证入口
 
@@ -148,8 +161,9 @@ trap.rs 事件侧信道暂留；la 用户非法指令等未分类异常在 polyh
 
 ### 验证入口
 
-- `make run-rv` / `make run-la`：release，六任务验收（kthread A/B
-  交错、hello、sched×2 交错+抢占、check 正常+被杀路径），末尾帧守恒
+- `make run-rv` / `make run-la`：release，七任务验收（kthread A/B
+  交错、hello、sched×2 交错+抢占、check 正常+被杀路径、ill 异常类
+  终止——rv IllegalInstruction / la Unhandled(ADEF)），末尾帧守恒
   断言与逐进程汇总。
 - `make selftest-rv` / `make selftest-la`：selftest 档（debug 断言 +
   lock_debug + LOG=info），额外启用 OOM 注入自检与调试锁检查。

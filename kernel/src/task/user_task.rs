@@ -6,8 +6,9 @@
 //!
 //! 运行循环（user_task_entry）：运行在任务自己的内核栈上——这是
 //! run_user_task 续体机制的落点，也是"每任务一栈"不变性的消费者：
-//! 进用户态前激活本任务页表，逃逸回来消费 syscall/异常事件，
-//! 在逃逸点做时间片判定，exit/fault 走统一的退出路径。
+//! 进用户态前激活本任务页表，逃逸回来按完整 TrapType 消费
+//! syscall/异常事件（vendor 补丁后信息不再降维），在逃逸点做时间片
+//! 判定，exit/fault 走统一的退出路径。
 //!
 //! rv 侧构造初始 TrapFrame 的时机约束：TrapFrame::new 拷贝当前
 //! sstatus，回用户态依赖 SPP=0/SPIE=1（用户态开中断）稳态；因此
@@ -17,7 +18,7 @@
 use alloc::boxed::Box;
 
 use polyhal_trap::{
-    trap::{run_user_task, EscapeReason},
+    trap::{run_user_task, TrapType},
     trapframe::{TrapFrame, TrapFrameArgs},
 };
 
@@ -25,7 +26,7 @@ use crate::{
     elf::{self, ElfError},
     mm::address_space::{UserAddressSpace, USER_STACK_TOP},
     syscall::{self, Flow},
-    trap,
+    trap::{self, UserFault},
 };
 
 use super::{
@@ -130,12 +131,12 @@ pub fn user_task_entry() -> ! {
                         .as_space()
                         .activate();
                 }
-                let reason = run_user_task(frame);
-                match reason {
-                    EscapeReason::SysCall => {
+                let trap_type = run_user_task(frame);
+                match trap_type {
+                    TrapType::SysCall => {
                         // 只处理来自用户的系统调用；riscv64 内核自身 SBI
-                        // ecall 同样产生 SysCall 逃逸，不是用户请求
-                        if trap::take_user_syscall() {
+                        // ecall 理论上不会逃逸到此处，防御性忽略
+                        if frame.from_user() {
                             let flow = {
                                 let reg = REGISTRY.lock();
                                 let rec = reg
@@ -161,17 +162,27 @@ pub fn user_task_entry() -> ! {
                             Action::Continue
                         }
                     }
-                    EscapeReason::Timer | EscapeReason::IRQ | EscapeReason::NoReason => {
-                        // NoReason 可能是用户致命异常（事件在 trap.rs 登记）
-                        // 或 loongarch64 非对齐访问模拟成功，先查异常
-                        if let Some(fault) = trap::take_user_fault() {
-                            Action::Exit(ExitInfo {
-                                code: FAULT_EXIT_CODE,
-                                fault: Some(fault),
-                            })
-                        } else {
-                            Action::Continue
+                    TrapType::Timer
+                    | TrapType::Irq(_)
+                    | TrapType::SupervisorExternal
+                    | TrapType::Absorbed  // la 非对齐模拟成功，恢复执行
+                    | TrapType::Unknown => Action::Continue,
+                    fatal => {
+                        // 用户态致命异常（含 vendor 补丁后的 Unhandled）：
+                        // 终止任务而不是带走内核
+                        if !frame.from_user() {
+                            panic!("kernel-origin trap escaped to user loop: {:?}", fatal);
                         }
+                        let (kind, info) =
+                            trap::fatal_fault(fatal).expect("fatal_fault covers fatal traps");
+                        Action::Exit(ExitInfo {
+                            code: FAULT_EXIT_CODE,
+                            fault: Some(UserFault {
+                                kind,
+                                info,
+                                pc: frame[TrapFrameArgs::SEPC],
+                            }),
+                        })
                     }
                 }
             }

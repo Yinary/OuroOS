@@ -89,6 +89,7 @@ fn rust_main(hartid: usize) {
         ("sched", user_images::SCHED_ELF),
         ("sched", user_images::SCHED_ELF),
         ("check", user_images::CHECK_ELF),
+        ("ill", user_images::ILL_ELF),
     ] {
         match task::spawn_user(name, elf) {
             Ok(pid) => println!("[task] spawned {} as pid {}", name, pid),
