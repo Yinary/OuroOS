@@ -88,7 +88,7 @@ build-la:
 #
 # UB_CHECKS_OFF：polyhal 启动期（rust_main 之前）存在一处 ptr::add
 # 地址计算回绕，debug 断言的 ub-check 会在此 panic（release 静默回绕，
-# 预存缺陷，见 doc/ostd-contracts.md 已知缺陷表 #8）。定位修复归入
+# 预存缺陷，见 docs/ostd-contracts.md 已知缺陷表 #8）。定位修复归入
 # polyhal patch 立项；selftest 档定向关闭 ub-check 保留其余断言。
 UB_CHECKS_OFF := RUSTFLAGS="-Zunstable-options -Zub-checks=no"
 # la 侧需同时保留 LSX/LASX 禁用，单独组合避免两个 RUSTFLAGS 赋值相杀

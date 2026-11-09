@@ -1,9 +1,5 @@
-//! 用户虚拟地址空间：区域描述、页所有权、事务映射与生命周期。
-//!
-//! 区域描述用户期望权限，页表负责硬件实现；两者不能相互代替。
-//! 当前采用立即分配、不共享物理数据页；未来 fork 用深拷贝，exec 先构造
-//! 新空间再切换。地址空间 !Send/!Sync，禁止跨核共享直到实现 TLB shootdown。
-//! 所有可失败的元数据预留均在修改原空间前进行，解除映射先刷新 TLB 再释放。
+//! 用户虚拟地址空间：区域（期望权限/用途）+ 页清单（页所有权）+ 页表，
+//! 事务性映射与生命周期管理。契约见 docs/ostd-contracts.md §1。
 use super::{
     frame::{FrameError, OwnedFrame},
     page_table::UserPageTable,
@@ -304,7 +300,7 @@ pub fn phys_to_kernel_vaddr(pa: PhysAddr) -> usize {
 /// SAFETY（unsafe impl Send 的全部依据）：内核当前单核（-smp 1，构建
 /// 与运行均不含多核机制），地址空间只在创建核被创建/激活/销毁，
 /// 不存在跨核移动。SMP 化时本类型必须先于 TLB shootdown 实现移除
-/// 或重构（见 doc/ostd-contracts.md mm 欠账）。不变量的归属在 mm，
+/// 或重构（见 docs/ostd-contracts.md mm 欠账）。不变量的归属在 mm，
 /// 因此 unsafe 断言写在这里而不在使用方。
 pub struct LocalSpace(pub(crate) UserAddressSpace);
 // SAFETY: 见类型文档；单核内不存在跨线程移动。

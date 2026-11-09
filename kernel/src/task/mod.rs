@@ -1,18 +1,5 @@
-//! 任务与调度子系统：统一任务抽象、进程注册表、协作+时间片调度。
-//!
-//! 关键约束一览（完整契约、背景与欠账清单见 doc/ostd-contracts.md §3，
-//! 本处只列代码阅读时必须先知道的事实）：
-//!
-//! - 执行模型两不变量：进用户态的内核栈在整个用户态期间存活；
-//!   每核同时至多一个用户态会话（续体槽唯一指向当前任务）。
-//! - 内核态一律关中断；抢占只发生在用户态逃逸点；内核任务协作让出。
-//! - Task（调度单元）与 ProcessRecord（资源容器，静态注册表）分离；
-//!   地址空间只住注册表不进 Task（!Send，经 mm 的 LocalSpace 单核凭证）。
-//! - 本轮无 fork ⇒ 无父子 ⇒ 无 wait/僵尸：退出即全回收。
-//! - rv 孵化时机约束：spawn 必须在 task::run 关中断之前
-//!   （初始 TrapFrame 的 sstatus 稳态，spawn 内有断言兜底）。
-//! - 自检：帧守恒断言（每次启动）与孵化 OOM 无副作用自检
-//!   （仅 selftest 档），见 doc/ostd-contracts.md 自检清单。
+//! 任务与调度子系统：统一任务抽象（内核/用户任务）、进程注册表、
+//! 协作 + 时间片调度。完整契约见 docs/ostd-contracts.md §3。
 
 pub mod sched;
 // Issue 指定的 `task/mod.rs` + `task/task.rs` 布局会自然形成同名子模块。
@@ -156,8 +143,7 @@ pub fn init() {
     sched::init();
 }
 
-/// 孵化两个协作内核任务，延续旧 run_demo 的行为自检覆盖
-/// （独立内核栈、主动让出、正常退出、栈回收）。
+/// 孵化两个协作内核任务（独立内核栈、主动让出、正常退出）。
 pub fn spawn_demo_kthreads() {
     for (name, body) in [("kthread-a", thread_a as fn()), ("kthread-b", thread_b)] {
         match spawn_kernel(name, body) {

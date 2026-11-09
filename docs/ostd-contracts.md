@@ -3,7 +3,11 @@
 本文档是三个子系统（mm / polyhal 边界 / task）的框架级契约与欠账清单，
 配合各模块源码头部的模块契约阅读。定位：框内核（frame kernel）思想的
 落地——HAL 提供原语，框架层（mm、task、syscall）提供带不变量的安全
-服务，上层模块只经安全接口使用资源。准则：**能编译期管的不写注释，
+服务，上层模块只经安全接口使用资源。
+
+**本文档是设计决策、语义规范、路线计划、已知缺陷与欠账的唯一权威
+文本**：代码注释只做介绍（"这是什么"、不易懂代码在做什么），不承载
+上述内容（AGENTS.md §6）。准则：**能编译期管的不写注释，
 能断言管的不写文档，其余全部记录在案。**
 
 维护约定：契约条目变更须与代码同 PR；"欠账"条目解决时移入对应
@@ -11,7 +15,7 @@
 
 ---
 
-## 1. mm 契约（摘要，全文见 `kernel/src/mm/mod.rs` 头部）
+## 1. mm 契约（权威全文；mm 各模块头只留职责摘要）
 
 mm 把物理内存变成失败可预期、责任可追溯的虚拟内存服务，五层链：
 region（物理账本，唯一入口）→ frame（OwnedFrame 唯一释放凭证）→
@@ -19,10 +23,29 @@ page_table/arch（硬件机制，PTE 差异收敛于 arch.rs）→ address_space
 （区域期望权限 + 页清单真实所有权）→ user_access（两遍式验证后复制）。
 
 十律：物理内存唯一入口；唯一释放凭证；分配即清零；期望权限 ≠ 实际
-权限（无 NX，撤 X 请求明确拒绝）；PROT_NONE 占坑保留页；事务性
-（失败与未调用不可区分）；两遍式用户访问（无部分写、用户指针永不成
-引用）；地址空间 !Send（单核绑定）；TLB 全量刷保守策略；关键路径
-零堆依赖零 panic。
+权限（无 NX，团队决策，撤 X 请求明确拒绝）；PROT_NONE 占坑保留页；
+事务性（失败与未调用不可区分）；两遍式用户访问（无部分写、用户指针
+永不成引用）；地址空间 !Send（单核绑定）；TLB 全量刷保守策略；
+关键路径零堆依赖零 panic。
+
+补充语义（自各模块注释收编）：
+- 帧分配器选位图而非 buddy：buddy 空闲链表依赖堆，堆耗尽会 panic
+  内核；位图 + try_reserve 元数据使运行期分配路径零堆依赖、失败
+  可恢复。连续多页分配无所有权封装，仅限底层适配（kernel_pt 启动
+  期与 kstack），普通调用方一律走 OwnedFrame。
+- 零页（物理 <0x1000）永久保留：空 PTE 与指向物理 0 的有效 PTE
+  无法区分，保留后"表项为零"可安全表示"从未映射"。
+- region 保留区语义：FDT 显式保留、内核镜像、固件、对齐碎片各有
+  类型化来源；HAL 启动占用且无法经公开 API 追溯的空洞统一记
+  HalBoot，不伪造来源。原始 FDT RAM 不得绕过账本直接交给分配器。
+- 内核堆固定 8 MiB 不扩容（TODO 已在 allocator.rs 挂锚点）；MM
+  元数据全部 try_reserve 返回 OOM，帧分配/归还不依赖运行期堆。
+- user_access 并发前提：当前全局单任务、复制期间无并发 munmap；
+  并发化时需持空间锁或固定被访问页。
+- kstack：连续物理页 + 直映访问，无保护页（直映上无法用"不映射"
+  表达，伪造保护被明文禁止）；虚拟窗口欠账见下。
+- ELF 加载器仅支持 ET_EXEC 静态小端 ELF64；与 Linux 的差异
+  （对齐、note 段、auxv 等）见 §4。
 
 已定的未来语义：brk 字节级记账；mmap 匿名找空洞、MAP_FIXED 先备
 齐再原子替换；fork 深拷贝、建成才发布、无 COW；exec 先建新空间
@@ -49,6 +72,8 @@ PolyHAL（0.4.0，三 crate：polyhal / polyhal-trap / polyhal-boot）承担
   （mm::arch::switch 控制 flush 时序），不用 context_switch_pt。
 - LA TLB refill 向量被本仓自写实现替换（QEMU 10.0.2 LDPTE 丢
   NR/NX 位），SAVE3 暂存 t1（PolyHAL 占用 SAVE0..2）。
+- HAL 未封装、由内核自补的接口：fence_icache（fence.i/ibar）、
+  read_current_tp、la idle 指令（当前自旋等钟）。
 
 ### 已知缺陷清单（详录见 notes/log/2026-10-29-polyhal-0.4.0-已知缺陷.md）
 
@@ -139,7 +164,36 @@ TLB shootdown 协议、调度器与注册表的单核假设、锁序与 irq-off 
 页表全量刷新策略。不为想象中的 SMP 预留任何参数化或间接层——
 可扩展性的证明是重构成本低（不变量清晰），不是预留钩子。
 
-## 4. 自检清单与验证入口
+## 4. syscall 与用户 ABI 语义偏差
+
+语义基线是 man 2（调用号与寄存器约定按 riscv64/loongarch64 通用
+UAPI：a7=调用号、a0..a5=参数、a0=返回）。框架协议：内核内部一律
+`Result<_, Errno>`、ABI 边界统一转负 errno；`Flow`
+（Continue/Yield/Exited）是调用对执行流的全部影响——阻塞类调用向
+运行循环声明让出意图而非内核自旋，是"阻塞即让出"协议的最小实例。
+
+与 Linux 的已登记偏差：
+- write：仅 fd=1/2 直通控制台；不做部分写（Linux 允许先写部分再
+  EFAULT）；len=0 只查 fd 返回 0（与 Linux 一致）；无文件偏移。
+- exit：本轮无 wait/僵尸，退出即全回收，退出码仅记录于注册表；
+  被致命异常杀死以 128+11 占位（Linux 编码进 wait status 位域，
+  wait 实现时统一）。
+- sched_yield：单核轮转，让出后可能立即被再次调度（语义兼容）。
+- getpid：总成功。
+- 其余调用号一律 ENOSYS；fd 表、文件框架、信号均不存在。
+- ELF 加载：仅 ET_EXEC 静态；段页级重叠/越界/侵入栈保护区拒绝；
+  不处理对齐差异、note 段、auxv。
+
+## 5. sync 锁模型（DebugMutex，feature `lock_debug`）
+
+前提：内核态一律关中断（见 §3），单核上不存在"另一执行流持锁"的
+合法状态——try_lock 失败即 bug（持锁跨 context_switch），立即报告，
+不做超时等待。提供的检查：持锁者与获取点（#[track_caller]）、
+percpu 持锁深度、调度切换入口断言深度为零（might_sleep 内核版）。
+锁序 SCHED → REGISTRY → FRAME，任何路径不得反向持有。release 构建
+零开销。欠账：锁序图（lockdep 式环检测）、SMP 化时全面重审。
+
+## 6. 自检清单与验证入口
 
 ### 自检注释规范
 

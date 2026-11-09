@@ -1,19 +1,6 @@
-//! 用户任务的孵化与运行循环：原 user.rs 的全部职责迁入此处。
-//!
-//! 孵化（spawn_user）：建地址空间 → 加载 ELF → 建栈 → 初始 TrapFrame
-//! → 建任务 → 登记注册表 → 入队。所有可失败步骤在提交（登记+入队）
-//! 之前完成，失败不留下半成品（pid 允许出现空洞，见注册表说明）。
-//!
-//! 运行循环（user_task_entry）：运行在任务自己的内核栈上——这是
-//! run_user_task 续体机制的落点，也是"每任务一栈"不变性的消费者：
-//! 进用户态前激活本任务页表，逃逸回来按完整 TrapType 消费
-//! syscall/异常事件（vendor 补丁后信息不再降维），在逃逸点做时间片
-//! 判定，exit/fault 走统一的退出路径。
-//!
-//! rv 侧构造初始 TrapFrame 的时机约束：TrapFrame::new 拷贝当前
-//! sstatus，回用户态依赖 SPP=0/SPIE=1（用户态开中断）稳态；因此
-//! spawn 必须发生在进入任务时代（关中断）之前的开中断阶段，
-//! 见 doc/ostd-contracts.md task 契约"孵化时机"。
+//! 用户任务的孵化（ELF → 地址空间 → 初始现场 → 入队）与运行循环
+//! （run_user_task + TrapType 消费 + 时间片判定）。契约与孵化时机
+//! 约束见 docs/ostd-contracts.md §3。
 
 use alloc::boxed::Box;
 
@@ -37,7 +24,7 @@ use super::{
 
 /// 被用户态致命异常杀死时的退出码。Linux 将死亡原因编码进 wait
 /// status 位域；当前以 128+11（SIGSEGV 的 shell 惯例值）作简化占位，
-/// 偏差记录在 doc/ostd-contracts.md，wait 语义实现时统一编码。
+/// 偏差记录在 docs/ostd-contracts.md，wait 语义实现时统一编码。
 pub const FAULT_EXIT_CODE: i32 = 128 + 11;
 
 /// 孵化失败原因。
@@ -134,8 +121,7 @@ pub fn user_task_entry() -> ! {
                 let trap_type = run_user_task(frame);
                 match trap_type {
                     TrapType::SysCall => {
-                        // 只处理来自用户的系统调用；riscv64 内核自身 SBI
-                        // ecall 理论上不会逃逸到此处，防御性忽略
+                        // 只处理来自用户的系统调用，其余防御性忽略
                         if frame.from_user() {
                             let flow = {
                                 let reg = REGISTRY.lock();

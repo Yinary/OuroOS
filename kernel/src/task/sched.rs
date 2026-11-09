@@ -1,17 +1,5 @@
-//! 调度器核心：就绪队列、当前任务、上下文切换、idle 与任务回收。
-//!
-//! 模型（契约全文见 doc/ostd-contracts.md 与 task/mod.rs 头部）：
-//! - 单核；内核态一律关中断，中断只在用户态执行与 idle 等待时开启；
-//! - 抢占只发生在用户态逃逸点（run_user_task 返回后），内核路径
-//!   不可抢占；内核任务靠协作 yield；
-//! - 时间片为固定 tick 数轮转，无优先级；
-//! - idle 运行在 boot 栈（bstack），无保护页（静态 .bss 数组，无页粒度
-//!   邻居，见 mm 契约），队列空时等中断；
-//! - CURRENT（percpu）唯一指向当前任务，也是 trap 续体槽（sscratch/
-//!   SAVE0）之外的"我是谁"事实来源；切入/切出只经 context_switch。
-//!
-//! 生命周期约束：任务退出后其 Task 进入 dead 表，内核栈已无执行流，
-//! 由 idle 在持调度器锁时统一回收（reap），保证帧守恒可断言。
+//! 调度器核心：就绪队列、当前任务（percpu）、上下文切换、idle 与任务回收。
+//! 模型与生命周期约束见 docs/ostd-contracts.md §3。
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -209,17 +197,14 @@ fn wait_for_interrupt() {
     IRQ::int_enable();
     #[cfg(target_arch = "riscv64")]
     hlt();
-    // polyhal 未封装 loongarch64 的 idle 指令；自旋等钟在 QEMU 下
-    // 足够（此处无性能要求），真机低功耗再补 idle 0 封装。
+    // la 侧自旋等钟（HAL 未封装 idle，见 docs/ostd-contracts.md §2）
     #[cfg(target_arch = "loongarch64")]
     core::hint::spin_loop();
     IRQ::int_disable();
 }
 
-/// 调度器主循环，运行在 boot 栈（idle）。返回 = 全部任务已退出。
-///
-/// 本轮没有阻塞语义，"就绪队列为空且无当前任务"即全部退出。
-/// 引入阻塞任务后，此判定需要改为"无就绪且无被定时器唤醒的可能"。
+/// 调度器主循环，运行在 boot 栈（idle）；返回 = 全部任务已退出
+/// （判定前提：本轮无阻塞语义，见 docs/ostd-contracts.md §3 欠账）。
 pub(super) fn run_loop() {
     loop {
         let next = {
