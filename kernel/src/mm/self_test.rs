@@ -7,6 +7,8 @@ use super::{
 };
 use polyhal::pagetable::{MappingFlags as F, PAGE_SIZE};
 
+/// 自检：页所有权、区间分裂、权限、边界与释放守恒（每次启动；
+/// debug 构建额外逐点注入 OOM，见模块头）。
 pub(super) fn run() {
     let baseline = frame::stats();
     assert!(matches!(

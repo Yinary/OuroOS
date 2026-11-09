@@ -11,3 +11,9 @@ polyhal-trap = "0.4.0"
 log = "0.4"
 spin = { version = "0.10", features = ["mutex"] }
 buddy_system_allocator = "0.11"
+
+[features]
+# 调试锁（sync.rs）：持锁深度、切换点断言、等待即报告。
+# 挂 feature 而非 debug_assertions：本项目默认只编 release，
+# feature 可叠加在 release/selftest 构建上（见 Makefile selftest 目标）。
+lock_debug = []

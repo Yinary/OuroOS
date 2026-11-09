@@ -297,3 +297,22 @@ impl Drop for UserAddressSpace {
 pub fn phys_to_kernel_vaddr(pa: PhysAddr) -> usize {
     pa.raw() | VIRT_ADDR_START
 }
+
+/// 地址空间的单核使用凭证：让 !Send 的 [`UserAddressSpace`] 能进入
+/// 静态容器（进程注册表）。
+///
+/// SAFETY（unsafe impl Send 的全部依据）：内核当前单核（-smp 1，构建
+/// 与运行均不含多核机制），地址空间只在创建核被创建/激活/销毁，
+/// 不存在跨核移动。SMP 化时本类型必须先于 TLB shootdown 实现移除
+/// 或重构（见 doc/ostd-contracts.md mm 欠账）。不变量的归属在 mm，
+/// 因此 unsafe 断言写在这里而不在使用方。
+pub struct LocalSpace(pub(crate) UserAddressSpace);
+// SAFETY: 见类型文档；单核内不存在跨线程移动。
+unsafe impl Send for LocalSpace {}
+
+impl LocalSpace {
+    /// 借用内部地址空间。
+    pub fn as_space(&self) -> &UserAddressSpace {
+        &self.0
+    }
+}

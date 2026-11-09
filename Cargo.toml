@@ -1,3 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["kernel"]
+
+# selftest 专用构建档：release 优化 + debug 断言，
+# 让 cfg(debug_assertions) 的 OOM 注入等自检进入验证流程。
+# profile 必须写在 workspace 根（cargo 限制）。
+[profile.selftest]
+inherits = "release"
+debug-assertions = true

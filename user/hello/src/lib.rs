@@ -63,6 +63,16 @@ pub fn sys_exit(status: isize) -> ! {
     }
 }
 
+/// sched_yield(2)：让出 CPU。内核单核轮转，返回 0（成功）。
+pub fn sys_sched_yield() -> isize {
+    syscall3(124, 0, 0, 0)
+}
+
+/// getpid(2)：返回调用者 pid。
+pub fn sys_getpid() -> isize {
+    syscall3(172, 0, 0, 0)
+}
+
 /// panic 时以 134 退出（128+SIGABRT，shell 惯例），与正常退出码区分
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
