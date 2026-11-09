@@ -71,6 +71,7 @@ build-rv:
 	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/hello \
 	OUROOS_CHECK_ELF=target/$(TARGET_RV)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_RV)/$(USER_REL)/sched \
+	OUROOS_ILL_ELF=target/$(TARGET_RV)/$(USER_REL)/ill \
 	LOG=$(LOG) cargo build $(BUILD_STD) --release --target $(TARGET_RV)
 
 build-la:
@@ -78,6 +79,7 @@ build-la:
 	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/hello \
 	OUROOS_CHECK_ELF=target/$(TARGET_LA)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_LA)/$(USER_REL)/sched \
+	OUROOS_ILL_ELF=target/$(TARGET_LA)/$(USER_REL)/ill \
 	LOG=$(LOG) cargo build $(BUILD_STD) --release --target $(TARGET_LA)
 
 # selftest：selftest 档（release 优化 + debug 断言）+ 调试锁，
@@ -96,6 +98,7 @@ selftest-rv: build-user-rv
 	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/hello \
 	OUROOS_CHECK_ELF=target/$(TARGET_RV)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_RV)/$(USER_REL)/sched \
+	OUROOS_ILL_ELF=target/$(TARGET_RV)/$(USER_REL)/ill \
 	LOG=info cargo build $(BUILD_STD) --profile selftest -p kernel --features lock_debug --target $(TARGET_RV)
 
 selftest-la: build-user-la
@@ -103,6 +106,7 @@ selftest-la: build-user-la
 	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/hello \
 	OUROOS_CHECK_ELF=target/$(TARGET_LA)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_LA)/$(USER_REL)/sched \
+	OUROOS_ILL_ELF=target/$(TARGET_LA)/$(USER_REL)/ill \
 	LOG=info cargo build $(BUILD_STD) --profile selftest -p kernel --features lock_debug --target $(TARGET_LA)
 
 # ---------- 静态检查 ----------
@@ -110,6 +114,7 @@ clippy-rv: build-user-rv
 	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/hello \
 	OUROOS_CHECK_ELF=target/$(TARGET_RV)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_RV)/$(USER_REL)/sched \
+	OUROOS_ILL_ELF=target/$(TARGET_RV)/$(USER_REL)/ill \
 	LOG=$(LOG) cargo clippy $(BUILD_STD) --release --target $(TARGET_RV)
 
 clippy-la: build-user-la
@@ -117,6 +122,7 @@ clippy-la: build-user-la
 	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/hello \
 	OUROOS_CHECK_ELF=target/$(TARGET_LA)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_LA)/$(USER_REL)/sched \
+	OUROOS_ILL_ELF=target/$(TARGET_LA)/$(USER_REL)/ill \
 	LOG=$(LOG) cargo clippy $(BUILD_STD) --release --target $(TARGET_LA)
 
 clippy: clippy-rv clippy-la
