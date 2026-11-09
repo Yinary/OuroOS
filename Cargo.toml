@@ -4,7 +4,7 @@ members = ["kernel"]
 
 # 本地 vendor 的 polyhal-trap（修复 EscapeReason 有损、la 未分类异常 panic、
 # la 缺 from_user；修改清单见 third_party/polyhal-trap/README.md 与
-# doc/ostd-contracts.md 缺陷表）。不得直接编辑 ~/.cargo/registry 的源码。
+# docs/ostd-contracts.md 缺陷表）。不得直接编辑 ~/.cargo/registry 的源码。
 [patch.crates-io]
 polyhal-trap = { path = "third_party/polyhal-trap" }
 

@@ -1,12 +1,7 @@
-//! 内核页表：替换启动粗页表，细化内核镜像权限。
-//!
-//! rv 布局：镜像区间用 4 KiB 叶子（text RX / rodata R / data 及之后 RW），
-//! 镜像所在 GiB 的其余部分与后续 RAM 用 2 MiB / 1 GiB 大页 RWX，
-//! 低半区、MMIO 与 RAM 之外不映射。
-//! la 内核映射由 DMW 承担，本模块为空实现。
-//!
-//! 以下 unsafe 函数的共享前提：仅在启动单线程阶段、旧页表活跃时调用；
-//! 表页由帧分配器返回且已清零，经 pa|VIRT 别名窗口访问。
+//! rv 内核页表：启动期一次性细化镜像权限（text RX / rodata R / data RW），
+//! 其余 RAM 以大页直映；la 内核映射由 DMW 承担，本模块为空实现。
+// SAFETY（本模块全部 unsafe 函数共享）：仅启动单线程阶段、旧页表
+// 活跃时调用；表页由帧分配器返回且已清零，经 pa|VIRT 别名窗口访问。
 
 #[cfg(target_arch = "riscv64")]
 use polyhal::{consts::VIRT_ADDR_START, mem::get_mem_areas, PhysAddr};

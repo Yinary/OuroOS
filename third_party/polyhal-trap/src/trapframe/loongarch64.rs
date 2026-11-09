@@ -1,3 +1,5 @@
+//! 参考来源：PolyHAL https://github.com/Byte-OS/polyhal polyhal-trap 0.4.0（MIT）。
+//! 修改说明：OuroOS vendor 补丁，见本目录 README.md。
 use core::ops::{Index, IndexMut};
 
 use super::TrapFrameArgs;
@@ -16,9 +18,7 @@ pub struct TrapFrame {
 }
 
 impl TrapFrame {
-    /// OuroOS 补丁：与 riscv64 侧对齐的来源判定。
-    /// PRMD.PPLV（bit 1:0）记录 trap 前的特权级，PLV0（内核）为 0，
-    /// PLV3（用户）非 0；PIE 在 bit 2，被掩码排除。
+    /// 来源判定：PRMD.PPLV（bit 1:0）非 0 即来自用户（OuroOS 补丁）。
     pub fn from_user(&self) -> bool {
         self.prmd & 0x3 != 0
     }

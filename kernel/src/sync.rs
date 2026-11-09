@@ -1,22 +1,5 @@
-//! 调试锁：在单核关中断内核里把锁误用变成可断言的不变量。
-//!
-//! 前提模型（见 doc/ostd-contracts.md 的 task 契约）：内核态一律关中断，
-//! 中断只在用户态执行与 idle 等待两处开启。因此单核上不存在"另一个
-//! 执行流持锁"的合法状态——`try_lock` 失败本身即为 bug（持锁跨越了
-//! context_switch），不做超时等待，立即报告。
-//!
-//! 提供的检查（`lock_debug` feature，默认关闭，release 零开销）：
-//! - 持锁者与获取点：每把锁记录持有者 id（任务时代前为 0）与调用位置；
-//! - 持锁深度：percpu 计数，调度切换入口断言为 0（"睡在锁上"检测，
-//!   即 Linux might_sleep 检查的内核版）；
-//! - 等待即报告：try_lock 失败时输出锁名、持有者、获取点后 panic。
-//!
-//! 锁序约定（单核下当前不会真正嵌套竞争，但按序编写避免将来返工）：
-//! SCHED → REGISTRY → FRAME；任何路径不得反向持有。
-//!
-//! 本轮只服务 task 子系统（调度器与进程注册表）；mm 内部锁仍为
-//! 裸 spin::Mutex，后续统一迁移。锁序图（lockdep 式环检测）为
-//! 记录在案的推迟项，SMP 化前再立项。
+//! 调试锁（feature `lock_debug`）：持锁者/获取点跟踪、percpu 持锁深度、
+//! 调度切换点断言。模型与锁序见 docs/ostd-contracts.md §5。
 
 use core::{
     cell::Cell,
@@ -99,7 +82,7 @@ impl<T> DebugMutex<T> {
                 // 不存在其他执行流——唯一解释是持锁跨越了调度。
                 panic!(
                     "lock-debug: 等待 '{}'——单核关中断内核中不存在合法等待，\
-                     疑似持锁跨调度（cf. doc/ostd-contracts.md task 契约）",
+                     疑似持锁跨调度（cf. docs/ostd-contracts.md task 契约）",
                     self.name
                 );
             };

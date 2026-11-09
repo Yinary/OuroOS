@@ -1,3 +1,5 @@
+//! 参考来源：PolyHAL https://github.com/Byte-OS/polyhal polyhal-trap 0.4.0（MIT）。
+//! 修改说明：OuroOS vendor 补丁，见本目录 README.md。
 #[macro_use]
 mod macros;
 mod unaligned;
@@ -88,7 +90,7 @@ pub fn disable_irq() {
     prmd::set_pie(false);
 }
 
-/// OuroOS 补丁（缺陷 #5）：返回完整 TrapType，不再降维成 EscapeReason。
+/// 进用户态至下一陷阱，返回完整 TrapType（OuroOS 补丁 #5）。
 pub fn run_user_task(cx: &mut TrapFrame) -> TrapType {
     user_restore(cx);
     loongarch64_trap_handler(cx)
@@ -197,7 +199,7 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
             TrapType::Breakpoint
         }
         Trap::Exception(Exception::AddressNotAligned) => {
-            // OuroOS 补丁：模拟成功属于"已消化事件"，与未分类异常区分
+            // OuroOS 补丁：模拟成功 = 已消化事件（Absorbed）。
             unsafe { emulate_load_store_insn(tf) }
             TrapType::Absorbed
         }
@@ -226,14 +228,12 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
         | Trap::Exception(Exception::PageNonReadableFault) => {
             TrapType::LoadPageFault(badv::read().vaddr())
         }
+        // OuroOS 补丁：机器错误/未分类不再 panic，改报 Unhandled。
         Trap::MachineError(_) | Trap::Unknown => {
-            // OuroOS 补丁：机器错误不再 todo!() panic
             TrapType::Unhandled((estat.ecode() << 16) | estat.esubcode())
         }
         _ => {
-            // OuroOS 补丁（缺陷 #7）：未分类异常交由 OS 回调决策——
-            // 来自用户态应终止任务而非带走整个内核；来自内核态由
-            // OS 判定为内核 bug。
+            // OuroOS 补丁（#7）：未分类异常交由 OS 回调决策。
             log::error!(
                 "unclassified trap {:?} @ {:#x} BADV: {:#x}",
                 estat.cause(),

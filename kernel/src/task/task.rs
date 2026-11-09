@@ -1,14 +1,5 @@
-//! 任务描述符：调度单元的全部静态资源与初始内核现场。
-//!
-//! Task 是调度器搬运的对象；资源容器（地址空间、退出信息）在进程
-//! 注册表（见 mod.rs），Task 只持 pid 引用——UserAddressSpace 为 !Send
-//! （TLB shootdown 未实现），不能进入静态就绪队列，这是"注册表持有
-//! 空间"设计的直接原因。
-//!
-//! 内核任务与用户任务统一为同一结构，差异收敛在 [`TaskBody`]：
-//! 内核身体是普通函数，用户身体是 TrapFrame（用户现场）+ pid（经
-//! 注册表取地址空间）。两者的内核侧执行流同构：各自内核栈 + KContext，
-//! 从各自的 trampoline 起步。
+//! 任务描述符：内核栈、KContext、身体（内核入口 / 用户现场+pid）与调度状态。
+//! 内核/用户任务差异收敛在 [`TaskBody`]。契约见 docs/ostd-contracts.md §3。
 
 use polyhal::kcontext::{KContext, KContextArgs};
 use polyhal_trap::trapframe::TrapFrame;

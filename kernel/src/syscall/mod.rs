@@ -1,27 +1,7 @@
-//! 最小系统调用分发：write / exit / sched_yield / getpid。
-//!
-//! 错误在内核内部用 `Result<_, Errno>` 表达，在 ABI 边界转换成 Linux
-//! 负 errno 返回值（a0）。系统调用号与寄存器约定依据 Linux man-pages
-//! syscall(2) 及 riscv64 / loongarch64 的通用（generic）UAPI：两者都用
-//! a7 传调用号、a0..a5 传参数、a0 返回结果；write=64、exit=93、
-//! sched_yield=124、getpid=172。
-//!
-//! 框架协议（见 doc/ostd-contracts.md syscall 一节）：
-//! - 分发只借当前任务的 TrapFrame 与其地址空间（经进程注册表解析）；
-//! - `Flow` 是系统调用对执行流的全部影响：继续 / 让出 / 退出。
-//!   sched_yield 不在内核层自旋等待，而是向运行循环声明让出意图，
-//!   由调度器在逃逸点执行——这是"阻塞即让出"协议的最小实例；
-//! - PC 推进由运行循环统一处理（syscall_ok 恰好一次）。
-//!
-//! 支持范围（未支持的部分在此明确列出，不冒充完整 Linux 语义）：
-//! - write：仅 fd=1/2，内容直接送内核控制台；不维护文件偏移、不做
-//!   部分写（出错时不输出任何字节，Linux 允许先写部分再返回 EFAULT）；
-//!   len=0 时只检查 fd，不检查缓冲区，返回 0（与 Linux 一致）；
-//! - exit：记录退出状态并结束当前任务（本轮无 wait/僵尸，退出即回收）；
-//! - sched_yield：按 man 2 sched_yield 成功返回 0；本内核单核且轮转，
-//!   让出后仍可能被立即再次调度（语义兼容）；
-//! - getpid：返回调用者 pid；
-//! - 其余系统调用一律 ENOSYS。fd 表、文件框架、信号均不存在。
+//! 最小系统调用分发：write / exit / sched_yield / getpid，其余 ENOSYS。
+//! 调用号与寄存器约定按 riscv64/loongarch64 通用 UAPI（a7=调用号、
+//! a0..a5=参数、a0=返回负 errno 或结果）。支持范围与 Linux 语义偏差
+//! 见 docs/ostd-contracts.md §4；PC 推进由运行循环统一处理。
 
 use polyhal::debug_console::DebugConsole;
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};

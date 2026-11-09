@@ -1,3 +1,5 @@
+//! 参考来源：PolyHAL https://github.com/Byte-OS/polyhal polyhal-trap 0.4.0（MIT）。
+//! 修改说明：OuroOS vendor 补丁，见本目录 README.md。
 #[macro_use]
 mod macros;
 
@@ -55,8 +57,7 @@ fn kernel_callback(context: &mut TrapFrame) -> TrapType {
         Trap::Exception(Exception::LoadPageFault) => TrapType::LoadPageFault(stval),
         Trap::Interrupt(Interrupt::SupervisorExternal) => TrapType::SupervisorExternal,
         _ => {
-            // OuroOS 补丁：未分类陷阱不 panic，交由 OS 回调决策
-            // （来自用户态应终止任务而非带走内核）。
+            // OuroOS 补丁：未分类陷阱不 panic，交由 OS 回调决策。
             log::error!(
                 "unclassified trap: {:#x} {:?}  stval {:#x}  sepc: {:#x}",
                 scause.bits(),
@@ -191,10 +192,7 @@ pub unsafe extern "C" fn uservec() {
     );
 }
 
-/// Run user task until the next trap; returns the full [`TrapType`].
-///
-/// OuroOS 补丁（缺陷 #5）：直接返回 kernel_callback 的 TrapType，
-/// 不再降维成 EscapeReason——缺页地址、非法指令编码等完整信息得以保留。
+/// 进用户态至下一陷阱，返回完整 TrapType（OuroOS 补丁 #5）。
 pub fn run_user_task(context: &mut TrapFrame) -> TrapType {
     user_restore(context);
     kernel_callback(context)

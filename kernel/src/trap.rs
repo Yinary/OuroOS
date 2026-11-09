@@ -1,21 +1,6 @@
-//! 中断/异常处理（HAL 回调）。
-//!
-//! polyhal-trap 在 ctor（Cpu 阶段）自动完成架构初始化：
-//! - riscv64:     设 stvec、sie、timer
-//! - loongarch64: 设 eentry、ecfg、tlb 填充回调、timer
-//!
-//! vendor 补丁（third_party/polyhal-trap）之后，`run_user_task` 返回
-//! 完整 `TrapType`，用户态陷阱的全部信息直达任务运行循环
-//! （task/user_task.rs）——本模块不再需要事件侧信道（原 polyhal
-//! 缺陷 #5 的临时补丁已移除）。
-//!
-//! 回调现存职责（对全部 trap 来源调用，含内核态）：
-//! - Timer：tick 计账 + 续设下一次时钟（idle 与用户态时钟都依赖）；
-//! - Breakpoint（内核来源）：启动自检计数；
-//! - 异常类（内核来源）：内核 bug，panic 不容忍；
-//! - 异常类（用户来源）：运行循环按 TrapType 处置，此处不重复处理；
-//! - SysCall：用户调用由运行循环分发；内核态 ecall（如 rv SBI）由
-//!   其自身路径处理，此处忽略。
+//! 中断/异常回调：时钟记账与续设、启动自检、内核态异常执法；
+//! 用户态陷阱由任务运行循环按完整 TrapType 处置。
+//! 职责划分依据见 docs/ostd-contracts.md §2/§3。
 
 use core::{sync::atomic::Ordering, time::Duration};
 

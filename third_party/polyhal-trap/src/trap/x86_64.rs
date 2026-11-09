@@ -1,3 +1,5 @@
+//! 参考来源：PolyHAL https://github.com/Byte-OS/polyhal polyhal-trap 0.4.0（MIT）。
+//! 修改说明：OuroOS vendor 补丁，见本目录 README.md。
 #[macro_use]
 mod macros;
 
@@ -48,7 +50,7 @@ static KERNEL_SP: usize = 0;
 
 // 内核中断回调
 #[no_mangle]
-/// OuroOS 补丁：返回分类结果，供 run_user_task 透传（缺陷 #5）。
+/// 返回分类结果，供 run_user_task 透传（OuroOS 补丁）。
 fn kernel_callback(context: &mut TrapFrame) -> TrapType {
     let trap_type = match context.vector as u8 {
         PAGE_FAULT_VECTOR => {
@@ -348,7 +350,7 @@ unsafe extern "C" fn syscall_entry() {
 }
 
 /// Return Some(()) if it was interrupt by syscall, otherwise None.
-/// OuroOS 补丁（缺陷 #5）：返回完整 TrapType，不再降维成 EscapeReason。
+/// 进用户态至下一陷阱，返回完整 TrapType（OuroOS 补丁 #5）。
 pub fn run_user_task(context: &mut TrapFrame) -> TrapType {
     // TODO: set tss kernel sp just once, before task run.
     let cx_general_top =

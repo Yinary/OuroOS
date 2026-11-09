@@ -56,9 +56,8 @@ fn rust_main(hartid: usize) {
         "trap self-check failed: breakpoint not delivered"
     );
 
-    // 打开中断并启动第一个 tick。启动自检阶段保持开中断稳态；
-    // 之后的孵化阶段依赖此稳态（rv 初始 TrapFrame 的 sstatus 拷贝，
-    // 见 task 契约"孵化时机"），任务时代才关中断。
+    // 打开中断并启动第一个 tick；孵化阶段须保持此稳态
+    // （rv TrapFrame sstatus 前提，见 docs/ostd-contracts.md §3）
     IRQ::int_enable();
     set_next_timer(current_time() + Duration::from_millis(config::TICK_MS));
 
@@ -80,8 +79,7 @@ fn rust_main(hartid: usize) {
     // 任务时代基线：全部任务退出后帧统计必须回到这里（帧守恒断言）
     let baseline = mm::frame::stats();
 
-    // 调度器就绪后孵化全部任务（见 task 契约"孵化时机"：
-    // 必须在 task::run 关中断之前）。
+    // 孵化须在 task::run 关中断之前（契约"孵化时机"）
     task::init();
     task::spawn_demo_kthreads();
     for (name, elf) in [

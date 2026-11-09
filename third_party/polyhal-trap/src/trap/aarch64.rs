@@ -1,3 +1,5 @@
+//! 参考来源：PolyHAL https://github.com/Byte-OS/polyhal polyhal-trap 0.4.0（MIT）。
+//! 修改说明：OuroOS vendor 补丁，见本目录 README.md。
 use core::arch::{global_asm, naked_asm};
 
 use aarch64_cpu::registers::{Writeable, ESR_EL1, FAR_EL1, VBAR_EL1};
@@ -146,7 +148,7 @@ extern "C" fn user_restore(context: *mut TrapFrame) -> TrapKind {
     }
 }
 
-/// OuroOS 补丁（缺陷 #5）：返回完整 TrapType，不再降维成 EscapeReason。
+/// 进用户态至下一陷阱，返回完整 TrapType（OuroOS 补丁 #5）。
 pub fn run_user_task(cx: &mut TrapFrame) -> TrapType {
     let trap_kind = user_restore(cx);
     handle_exception(cx, trap_kind, TrapSource::LowerAArch64)
