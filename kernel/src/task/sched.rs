@@ -54,7 +54,8 @@ struct Scheduler {
     ready: VecDeque<Box<Task>>,
     current: Option<Box<Task>>,
     /// 已退出任务；内核栈已无执行流，等 idle 回收。
-    dead: Vec<Task>,
+    #[allow(clippy::vec_box)] // 已退出任务的上下文仍须地址稳定直到切走。
+    dead: Vec<Box<Task>>,
     /// idle（boot 栈）的内核上下文；最后一个任务退出时切回这里。
     idle_ctx: KContext,
 }
@@ -100,6 +101,19 @@ pub(super) fn init() {
     });
 }
 
+/// 孵化提交前预留就绪及退出队列容量；切换/退出本身不再分配。
+pub(super) fn reserve_task() -> Result<(), crate::mm::frame::FrameError> {
+    let mut slot = SCHED.lock();
+    let s = slot.as_mut().expect("scheduler not initialized");
+    s.ready
+        .try_reserve(2)
+        .map_err(|_| crate::mm::frame::FrameError::OutOfMemory)?;
+    let live = s.ready.len() + usize::from(s.current.is_some()) + 1;
+    s.dead
+        .try_reserve(live)
+        .map_err(|_| crate::mm::frame::FrameError::OutOfMemory)?;
+    Ok(())
+}
 /// 任务入就绪队列队尾。
 pub(super) fn enqueue(task: Box<Task>) {
     let mut slot = SCHED.lock();
@@ -158,7 +172,7 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
         let from = unsafe { addr_of_mut!((*cur_ptr).context) };
         debug_assert_eq!(cur_ptr, &mut *cur as *mut Task);
         cur.state = TaskState::Exited;
-        s.dead.push(*cur);
+        s.dead.push(cur);
         match s.ready.pop_front() {
             Some(next) => {
                 let to = s.promote(next);

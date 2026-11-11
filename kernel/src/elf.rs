@@ -5,7 +5,7 @@
 use polyhal::pagetable::{MappingFlags, PAGE_SIZE};
 
 use crate::mm::{
-    address_space::{phys_to_kernel_vaddr, UserAddressSpace, USER_BASE},
+    address_space::{phys_to_kernel_vaddr, UserAddressSpace},
     fence_icache,
 };
 
@@ -182,9 +182,6 @@ fn load_segment(space: &mut UserAddressSpace, elf: &[u8], ph: usize) -> Result<(
     }
     // 用户范围与栈保护检查（含溢出）
     UserAddressSpace::check_user_span(p_vaddr, p_memsz).map_err(|_| ElfError::BadSegment)?;
-    if p_vaddr < USER_BASE {
-        return Err(ElfError::BadSegment);
-    }
     // 我们按 4KiB 页映射：虚拟地址必须页对齐；文件偏移只在段含文件
     // 内容时要求页对齐（纯 BSS 段 filesz=0，无偏移约束）
     if p_vaddr % PAGE_SIZE != 0 || (p_filesz > 0 && p_offset % PAGE_SIZE != 0) {

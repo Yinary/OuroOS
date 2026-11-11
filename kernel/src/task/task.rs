@@ -48,6 +48,8 @@ pub struct Task {
     /// 本时间片起点的 tick；由调度器在切入（promote）时刷新，
     /// 用户任务在逃逸点比较 [`crate::TIMER_TICKS`] 与它决定让出。
     pub slice_tick: usize,
+    /// nanosleep 等待的绝对截止时间。
+    pub sleep_deadline: Option<core::time::Duration>,
     /// 内核栈（纯所有权字段，仅 Drop 生效，无读取方；下划线豁免
     /// dead_code 检查）。任务回收（idle 的 reap）时最终释放。
     _kstack: KernelStack,
@@ -68,6 +70,7 @@ impl Task {
             pid,
             name,
             slice_tick: 0,
+            sleep_deadline: None,
             _kstack: kstack,
         })
     }
@@ -87,6 +90,7 @@ impl Task {
             pid,
             name,
             slice_tick: 0,
+            sleep_deadline: None,
             _kstack: kstack,
         })
     }

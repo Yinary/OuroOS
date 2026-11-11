@@ -35,6 +35,11 @@ impl ExitInfo {
 
 /// 进程注册表条目：Task 之外的全部资源与终态。
 pub struct ProcessRecord {
+    user_ns: u64,
+    system_ns: u64,
+    child_user_ns: u64,
+    child_system_ns: u64,
+    fs: Option<crate::fs::context::Context>,
     pub pid: Pid,
     pub name: &'static str,
     /// 用户任务的地址空间（单核凭证包装，见 mm::address_space::
@@ -42,6 +47,8 @@ pub struct ProcessRecord {
     /// 放注册表不放 Task 的原因见模块契约"数据模型"。
     pub space: Option<LocalSpace>,
     pub exit: Option<ExitInfo>,
+    pub parent: Pid,
+    pub waited: bool,
 }
 
 /// 注册表本体。pid 0 保留（"无任务"标识）。
@@ -70,6 +77,14 @@ mod registry {
         pid
     }
 
+    /// 登记前预留容量，错误不会留下半注册的任务。
+    pub fn reserve() -> Result<(), SpawnError> {
+        REGISTRY
+            .lock()
+            .records
+            .try_reserve(1)
+            .map_err(|_| SpawnError::OutOfMemory)
+    }
     /// 登记一个进程记录（孵化提交段）。
     pub fn register(pid: Pid, name: &'static str, space: Option<LocalSpace>) {
         let mut reg = REGISTRY.lock();
@@ -78,6 +93,13 @@ mod registry {
             name,
             space,
             exit: None,
+            parent: 0,
+            waited: false,
+            user_ns: 0,
+            system_ns: 0,
+            child_user_ns: 0,
+            child_system_ns: 0,
+            fs: None,
         });
     }
 
@@ -97,6 +119,11 @@ mod registry {
         }
         // take+drop 在锁内完成：空间释放不可再失败
         rec.space = None;
+        rec.fs = None;
+        let init = INIT_PID.load(core::sync::atomic::Ordering::Relaxed);
+        for child in reg.records.iter_mut().filter(|r| r.parent == pid) {
+            child.parent = init;
+        }
     }
 
     /// 注册表条目数（自检用，仅 debug 构建调用）。
@@ -133,14 +160,34 @@ mod registry {
 pub fn spawn_kernel(name: &'static str, entry: fn()) -> Result<Pid, SpawnError> {
     let pid = registry::alloc_pid();
     let task = task::Task::new_kernel(pid, name, entry).map_err(|_| SpawnError::OutOfMemory)?;
+    let task = alloc::boxed::Box::try_new(task).map_err(|_| SpawnError::OutOfMemory)?;
+    registry::reserve()?;
+    sched::reserve_task().map_err(|_| SpawnError::OutOfMemory)?;
     registry::register(pid, name, None);
-    sched::enqueue(alloc::boxed::Box::new(task));
+    sched::enqueue(task);
     Ok(pid)
 }
 
 /// 初始化调度器；必须在任何 spawn 之前调用（spawn 会入队）。
 pub fn init() {
     sched::init();
+    let pid = spawn_kernel("init", init_task).expect("init allocation failed");
+    INIT_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
+}
+static INIT_PID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+fn init_task() {
+    loop {
+        let done = {
+            let reg = REGISTRY.lock();
+            reg.records.iter().all(|r| {
+                r.pid == INIT_PID.load(core::sync::atomic::Ordering::Relaxed) || r.exit.is_some()
+            })
+        };
+        if done {
+            return;
+        }
+        yield_now();
+    }
 }
 
 /// 孵化两个协作内核任务（独立内核栈、主动让出、正常退出）。
@@ -222,3 +269,5 @@ pub fn run(baseline: (usize, usize)) {
     registry::report_all();
     println!("[task] all tasks done");
 }
+
+mod exec;
