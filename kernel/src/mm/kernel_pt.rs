@@ -98,6 +98,16 @@ unsafe fn init_rv() {
     write_table(&root, 256 + (gi_base >> 30), img_l1.raw());
     fill_root_tail(&root, gi_base + GIB, ram_top);
 
+    // QEMU virt 的 UART 与 VirtIO MMIO，只有内核可读写。
+    let io_l1 = frame::frame_alloc(1).expect("kernel MMIO table: OOM");
+    write_leaf(
+        &io_l1,
+        0x1000_0000 >> 21,
+        0x1000_0000,
+        V | R | W | A | D | G,
+    );
+    write_table(&root, 256, io_l1.raw());
+
     // 切换前软件走表自检
     let va = |pa: usize| pa | VIRT_ADDR_START;
     let check = |pa: usize, want_flags: u64| {
@@ -117,7 +127,7 @@ unsafe fn init_rv() {
     }
     // 大页区与无效区
     check(ram_top - PAGE_SIZE, V | R | W | X | A | D | G);
-    assert_eq!(leaf_at(root, va(0x1000_0000)), None); // MMIO
+    check(0x1000_0000, V | R | W | A | D | G); // MMIO
     assert_eq!(leaf_at(root, text), None); // 无恒等窗口
 
     BOOT_PT.store(arch::current(), core::sync::atomic::Ordering::Relaxed);
