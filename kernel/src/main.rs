@@ -1,12 +1,15 @@
 //! OuroOS 内核入口
 #![no_std]
+#![feature(allocator_api)]
 #![no_main]
 
 extern crate alloc;
 
 mod allocator;
 mod config;
+mod drivers;
 mod elf;
+mod fs;
 mod lang_items;
 mod mm;
 mod sync;
@@ -48,6 +51,8 @@ pub static BREAK_TICKS: AtomicUsize = AtomicUsize::new(0);
 fn rust_main(hartid: usize) {
     allocator::init();
     mm::init();
+    drivers::init().expect("block device initialization failed");
+    fs::init().expect("root filesystem initialization failed");
     // 自检：trap 回调链路——断点必须恰好送达一次（每次启动）
     ebreak();
     assert_eq!(
@@ -81,14 +86,28 @@ fn rust_main(hartid: usize) {
 
     // 孵化须在 task::run 关中断之前（契约"孵化时机"）
     task::init();
-    task::spawn_demo_kthreads();
-    for (name, elf) in [
-        ("hello", user_images::HELLO_ELF),
-        ("sched", user_images::SCHED_ELF),
-        ("sched", user_images::SCHED_ELF),
-        ("check", user_images::CHECK_ELF),
-        ("ill", user_images::ILL_ELF),
-    ] {
+    let disk_init = if user_images::TEST_ELF.is_empty() {
+        fs::context::Context::new()
+            .ok()
+            .and_then(|ctx| fs::context::executable(&ctx, "/init").ok())
+    } else {
+        None
+    };
+    let images: &[(&str, &[u8])] = if !user_images::TEST_ELF.is_empty() {
+        &[("test", user_images::TEST_ELF)]
+    } else if let Some(image) = disk_init.as_ref() {
+        &[("basic-init", image.as_slice())]
+    } else {
+        task::spawn_demo_kthreads();
+        &[
+            ("hello", user_images::HELLO_ELF),
+            ("sched", user_images::SCHED_ELF),
+            ("sched", user_images::SCHED_ELF),
+            ("check", user_images::CHECK_ELF),
+            ("ill", user_images::ILL_ELF),
+        ]
+    };
+    for &(name, elf) in images {
         match task::spawn_user(name, elf) {
             Ok(pid) => println!("[task] spawned {} as pid {}", name, pid),
             // 空镜像（脱离 Makefile 构建时）或加载失败：报告后继续
