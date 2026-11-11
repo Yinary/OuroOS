@@ -1,5 +1,6 @@
-//! EXT4 卷与块设备适配，对上层提供 inode 读写。
-//! 使用 ext4_rs 1.3.3（MIT），来源见 docs/third-party.md。
+//! EXT4 卷适配与路径→inode 查找（先 FAT 挂载后 EXT4 根，见 §6 契约），
+//! 对上层提供 inode 级读写/创建/截断/回收。
+//! 使用 ext4_rs 1.3.3（MIT，含本地补丁，见 docs/third-party.md）。
 use crate::{drivers, syscall::Errno};
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};

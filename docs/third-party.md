@@ -7,5 +7,5 @@
 | [PolyHAL](https://github.com/Byte-OS/polyhal) polyhal / polyhal-boot / polyhal-trap 0.4.0 | MIT | crates.io 依赖（polyhal、polyhal-boot）；polyhal-trap 整 crate vendor 至 `third_party/polyhal-trap` 并打本地补丁（清单见其 README.md） | polyhal-patch 分支 |
 
 | [virtio-drivers](https://github.com/rcore-os/virtio-drivers) 0.7.5 | MIT | 精确版本 crates.io 依赖；自写 DMA 与 MMIO/PCI 适配，未修改上游 | 2026-11-10 |
-| [ext4_rs](https://github.com/yuoo655/ext4_rs) 1.3.3 | MIT | 固定 1.3.3，源码 vendor 至 third_party/ext4_rs；file.rs 分配起点从写死块组 1 改为 inode 所属组，避免小卷访问不存在的块组；保留 MIT 协议 | 2026-11-10 |
+| [ext4_rs](https://github.com/yuoo655/ext4_rs) 1.3.3 | MIT | 固定 1.3.3，源码 vendor 至 third_party/ext4_rs。补丁：① file.rs 块分配起点从写死块组 1 改为 inode 所属组（小卷支持）；② panic 审计——磁盘数据可达的 unwrap/panic 改为错误传播或降级（direntry 非法 UTF-8 名、block.rs 越界写、extent 节点解析、remove 路径 index/extent 缺失共 9 处），find_extent Ok 构造保证非空的 4 处 unwrap 经审计标记保留；③ lib.rs core::error feature 开关移除。均以 "OuroOS patch" 行内标记。保留 MIT 协议 | 2026-11-10/11 |
 | [rust-fatfs](https://github.com/rafalh/rust-fatfs) 38b3a7950bf0e765e34286d1dfe76c519ee347e2 | MIT | 锁定 Git revision，no_std + alloc + lfn，FAT 支持（接入中） | 2026-11-10 |

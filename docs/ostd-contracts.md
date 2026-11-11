@@ -119,20 +119,35 @@ LocalSpace 单核凭证（unsafe impl Send 断言集中在不变量归属地 mm�
 SMP 化时欠账集中于此）。pid 递增不复用，孵化失败允许空洞。
 CURRENT（percpu，以整数存址绕开裸指针 !Send）是身份唯一来源。
 
-生命周期：本轮无 fork ⇒ 无父子 ⇒ 无 wait/僵尸，**退出即全回收**。
-exit(n) 码为 n；被致命异常杀死以 128+11 占位（Linux 编码进 wait
-status 位域，此为记录在案的偏差，wait 实现时统一）。
+生命周期：wait 收割即删（注册表只存活跃进程与未收割僵尸）；孤儿过继
+内核 init，已退出的孤儿即收（运行时间累归丢弃）；终态行积攒到任务
+时代结束统一输出（不混入用户程序的测试输出块）。pid 递增不复用。
+exit(n) 码为 n；被致命异常杀死以 128+11 占位（wait status 位域编码
+见 §4）。
 
-时间片：固定 1 tick 轮转（TICK_MS=100），无优先级；切入刷新
-slice_tick，逃逸点比较判定。
+等待与唤醒（阻塞即让出协议的运行形态）：Flow 的 Wait 变体携带
+WaitReason（Deadline/Children/Pipe），运行循环 park 进调度器等待表
+并切走（syscall PC 保留）；唤醒是宽松匹配 + Mesa 风格重执行——醒来
+后从 syscall 指令重新执行重查条件，不精确订阅。唤醒路径：Deadline
+由调度边界按硬件时钟扫描；Children/Pipe 由事件方置无锁原子标志
+（request_children_wake/request_pipe_wake），在调度边界统一消费，
+避免 fs 层在 REGISTRY 锁内反向取 SCHED。等待表容量耗尽时 park 退化
+为就绪让出（条件重查仍正确）。就绪空而等待非空时 idle 等时钟。
+进程互等无解时表现为永久等待（与 Linux 死锁一致，QEMU 超时兑底）。
+CURRENT（percpu，以整数存址绕开裸指针 !Send）是身份唯一来源。
 
 孵化时机：rv 初始 TrapFrame 依赖开中断稳态（SPP=0/SPIE=1），
 spawn 必须发生在 task::run 关中断之前；spawn 内有断言兜底。
 
+时间片：固定 1 tick 轮转（TICK_MS=100），无优先级；切入刷新
+slice_tick，逃逸点比较判定；等待中任务不占就绪队列与时间片。
+
 syscall 框架协议：内部一律 Result<_, Errno>，边界统一转负值；
-Flow（Continue/Yield/Exited）是调用对执行流的全部影响——阻塞类
-调用向运行循环声明让出意图而非内核自旋，是"阻塞即让出"协议的
-最小实例。现支持 write/exit/sched_yield/getpid，其余 ENOSYS。
+Flow（Continue/Yield/Wait(WaitReason)/Process/Exited）是调用对执行
+流的全部影响——Wait 保留 syscall PC 挂起、醒来重执行重查，是
+“阻塞即让出”协议的运行形态；Process 表示需在 REGISTRY 借用解除后
+由运行循环处理（fork/exec/wait4/nanosleep/times 等，它们会再取
+REGISTRY，非重入锁禁止在 dispatch 锁内调用）。
 
 锁调试（sync.rs，feature `lock_debug`，selftest 档启用）：单核关中断
 内核中 try_lock 失败即 bug（持锁跨调度），立即报告；切换入口断言
@@ -148,12 +163,12 @@ SysCall 经 cx.from_user() 判来源；Absorbed（la 非对齐模拟成功）继
 
 - 内核栈虚拟窗口 + 底部保护页：需 rv 内核共享页表窗口条目 + la PGDL
   映射 + 既有用户页表的同步协议；当前直映无保护（mm/kstack.rs）。
-- 阻塞/唤醒原语：sleep/wakeup，pipe 与未来 fs 的地基；引入后
-  idle 的"队列空即全部退出"判定需重写。
-- fork/exec/wait/僵尸语义、退出码 wait status 编码。
-- exec 栈内容构造（argv/envp/auxv）。
+- pipe/子进程唤醒的精确订阅：当前宽松匹配 + Mesa 重执行（单核惊群
+  可忽略）；新增 pipe 状态变化处必须补 request_pipe_wake，遗漏会导致
+  等待者永久挂起（就绪空、等待非空时 idle 等时钟不退出）。
 - 锁序图（lockdep 式环检测）。
-- polyhal 本体 vendor（#8 修复）；la idle 指令封装（当前 idle 自旋等钟）。
+- polyhal 本体 vendor（#8 修复）；la idle 指令封装（当前 idle 自旋
+  等钟，但 Deadline 唤醒依赖硬件时钟读数而非中断，自旋不阻塞正确性）。
 
 ### 非目标（团队决定不做，区别于"欠账"）
 
@@ -167,22 +182,54 @@ TLB shootdown 协议、调度器与注册表的单核假设、锁序与 irq-off 
 ## 4. syscall 与用户 ABI 语义偏差
 
 语义基线是 man 2（调用号与寄存器约定按 riscv64/loongarch64 通用
-UAPI：a7=调用号、a0..a5=参数、a0=返回）。框架协议：内核内部一律
-`Result<_, Errno>`、ABI 边界统一转负 errno；`Flow`
-（Continue/Yield/Exited）是调用对执行流的全部影响——阻塞类调用向
-运行循环声明让出意图而非内核自旋，是"阻塞即让出"协议的最小实例。
+UAPI：a7=调用号、a0..a5=参数、a0=返回负 errno 或结果）。框架协议：
+内核内部一律 `Result<_, Errno>`、ABI 边界统一转负 errno；`Flow`
+（Continue/Yield/Wait/Process/Exited）是调用对执行流的全部影响
+（见 §3 等待与唤醒）。已实现调用分三组：文件（getcwd/dup/dup3/
+mkdirat/unlinkat/mount/vfat/umount2/chdir/openat/close/pipe2/
+getdents64/lseek/read/write/fstat/statx，实现于 fs::context）；
+进程（exit/nanosleep/sched_yield/times/getpid/getppid/clone/
+execve/wait4，实现于 task 侧 process_call）；内存（brk/mmap/munmap/
+mprotect）；另有 uname/gettimeofday。其余调用号一律 ENOSYS。
 
 与 Linux 的已登记偏差：
-- write：仅 fd=1/2 直通控制台；不做部分写（Linux 允许先写部分再
-  EFAULT）；len=0 只查 fd 返回 0（与 Linux 一致）；无文件偏移。
-- exit：本轮无 wait/僵尸，退出即全回收，退出码仅记录于注册表；
-  被致命异常杀死以 128+11 占位（Linux 编码进 wait status 位域，
-  wait 实现时统一）。
+- read/write：循环分块至缓冲区填满/写尽或 EOF（4KiB 内核栈缓冲分块，
+  无单次截断）；部分成功后出错返回已完成量（短读/短写）。
+- pipe：容量 64KiB（同 Linux 默认）；读空/写满阻塞等待（真挂起，
+  醒来重执行），O_NONBLOCK 返回 EAGAIN；写满不做部分写。
+- wait4：wanted<=0 等任意孩子（无进程组概念，0 与 -1 等价），>0 指定
+  pid，<-1 EINVAL；无可收割孩子阻塞，无孩子 ECHILD；status 编码
+  WEXITSTATUS=(code&255)<<8，被异常杀死 status=11（WIFSIGNALED 位域）；
+  WNOHANG 支持；收割即从注册表删除，重复 wait 同一 pid 得 ECHILD。
+- clone：仅 flags 低字节为 SIGCHLD(17) 的进程 fork；非零 stack 参数
+  会设置子 SP（glibc 无此用法，仅为兼容传入栈顶的调用方）。
+- execve：argv/envp 各限 256 项、总长 32KiB；auxv 仅 AT_PAGESZ +
+  AT_NULL（静态 musl 够用，glibc 静态需要 AT_PHDR/AT_RANDOM——
+  busybox 里程碑前置项）；可执行文件整体读入内核堆后加载。
+- nanosleep：到期返回 0；rem（剩余时间）不回写；相对 now 计算。
+- uname：sysname=OuroOS、nodename=ouro、release=内核版本、
+  version=OuroOS、machine=架构名、domainname=local（合成的
+  身份信息，dev/serial 同理为伪造值）。
+- statx/fstat：dev=0x307、blksize=4096 等字段合成；FAT 权限硬编码
+  0777；atime/ctime/mtime 不维护。
+- mount：仅接受 vfat，且源设备仅识别 /dev/vd[a-d][1-4]。
+- mmap：匿名仅 PRIVATE；文件映射仅 PRIVATE（写时复制到私有页）与
+  SHARED（共享页缓存，最后映射释放时写回）；超出文件 EOF 的整页
+  范围拒绝（ENOTSUP，Linux 为零页+SIGBUS）；MAP_FIXED 匿名走
+  replace_region 事务替换。
+- ELF 加载：仅 ET_EXEC 静态（ET_DYN/PT_INTERP 拒绝——busybox/
+  动态链接里程碑前置项）；段起点要求严格页对齐（p_vaddr 与
+  p_offset 同时 4K 对齐；Linux 只要求 vaddr-offset 同相位——busybox
+  的常规段布局会被拒绝，待修）；USER_BASE=0 允许 ELF 头段占零地址
+  （官方 basic 布局需要；运行时 mmap 分配起点 0x1000_0000，用户
+  主动映射低址仍不可达）。
+- unlink：EXT4 支持 unlink 后句柄存活（最后关闭回收）；FAT 在有
+  打开句柄时返回 EBUSY（两文件系统语义不一致，登记）。
+- getdents64：syscall 层直接解析 EXT4 盘上 dirent 格式（分层欠账，
+  见 fs 欠账）；单次最多填充 4KiB，多次调用推进 offset。
+- write：fd=1/2 直通控制台；stdin 读恒 EOF（返回 0）。
 - sched_yield：单核轮转，让出后可能立即被再次调度（语义兼容）。
-- getpid：总成功。
-- 其余调用号一律 ENOSYS；fd 表、文件框架、信号均不存在。
-- ELF 加载：仅 ET_EXEC 静态；段页级重叠/越界/侵入栈保护区拒绝；
-  不处理对齐差异、note 段、auxv。
+- getpid 总成功；getppid 返回注册表 parent（孤儿过继内核 init）。
 
 ## 5. sync 锁模型（DebugMutex，feature `lock_debug`）
 
@@ -190,10 +237,45 @@ UAPI：a7=调用号、a0..a5=参数、a0=返回）。框架协议：内核内部
 合法状态——try_lock 失败即 bug（持锁跨 context_switch），立即报告，
 不做超时等待。提供的检查：持锁者与获取点（#[track_caller]）、
 percpu 持锁深度、调度切换入口断言深度为零（might_sleep 内核版）。
-锁序 SCHED → REGISTRY → FRAME，任何路径不得反向持有。release 构建
-零开销。欠账：锁序图（lockdep 式环检测）、SMP 化时全面重审。
+release 构建零开销。欠账：锁序图（lockdep 式环检测）、SMP 化时
+全面重审。
 
-## 6. 自检清单与验证入口
+锁序总图：SCHED → REGISTRY → {FRAME, EXIT_REPORTS, fs 层 spin
+锁（ROOT/PAGES/MOUNTS/DISKS/打开文件 Handle）}，任何路径不得反向
+持有。fs/drivers 层的 spin::Mutex 不在 lock_debug 检查范围（登记为
+已知缺口）；事件方（fs 层、退出路径）不得直接取 SCHED 唤醒等待者，
+一律经无锁原子标志（request_children_wake/request_pipe_wake）在
+调度边界消费。syscall dispatch 持 REGISTRY 期间内嵌 fs 锁与磁盘
+I/O（单核关中断下无死锁，但锁持有时长覆盖完整磁盘操作——重构为
+space/fs 出注册表是结构欠账）。进程退出的 space/fs Drop 在 REGISTRY
+锁外完成。
+## 6. fs 与块设备契约
+
+结构：fs::context（每进程 cwd + fd 表 + 文件调用 dispatch，Handle=
+Arc<Mutex<OpenFile>> 使 dup/fork 共享偏移）；fs::mod（EXT4 卷适配
+ext4_rs，lookup 语义 = 先查 FAT 挂载再查 EXT4 根）；fs::fat（挂载的
+FAT 卷，rust-fatfs，路径即身份、虚拟 inode 从 0x8000_0000 递增）；
+fs::cache（MAP_SHARED 文件页，映射持强引用、索引持弱引用，最后
+映射释放时写回）；drivers（virtio-blk 同步 IO + 字节层 RMW + MBR
+分区解析，riscv MMIO 固定槽 / la PCI ECAM 枚举）。
+
+已登记的妥协与欠账：
+- 文件系统身份偷位：inode 号最高位区分 FAT（置位）/EXT4，FAT inode
+  为 (mount, path) 的登记序号非磁盘身份。重构方向：显式挂载表 +
+  全局 inode 命名空间（欠账）。
+- FAT 无目录列举（getdents 仅支持 EXT4）；FAT 每次 read/write/stat
+  全路径重开（无句柄缓存）；FAT unlink 语义 = EBUSY（EXT4 为延迟
+  回收）。busybox 里程碑前应统一。
+- getdents64 在 syscall 层解析 EXT4 盘上 dirent（分层欠账，应下沉
+  为 fs 层 readdir 抽象）。
+- EXT4 超级块几何校验限定：4KiB 数据块、64 描述符、128/256 inode；
+  非 4K 块卷直接拒绝（ext4_rs 硬编码 BLOCK_SIZE）。
+- 块层同步轮询（无中断驱动、无请求队列）；DMA 页用 frame_alloc 裸
+  接口（OwnedFrame 例外清单的第三处，登记于此）；dma_alloc 失败
+  返回物理 0（virtio-drivers Dma::new 的错误约定，仅初始化期发生）。
+- exec/read 大文件整体经内核堆（8MiB）；分块直填页为欠账。
+
+## 7. 自检清单与验证入口
 
 ### 自检注释规范
 

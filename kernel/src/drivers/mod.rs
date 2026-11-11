@@ -27,6 +27,9 @@ pub enum Error {
 struct Dma;
 // SAFETY: DMA 页来自连续物理帧；share 仅接收驱动持有的内核直映缓冲区；
 // 同步请求完成前缓冲区保持存活，QEMU virt 平台 DMA 与 CPU 缓存一致。
+// 失败约定：dma_alloc 返回物理地址 0 时 virtio-drivers 的 Dma::new
+// 返回 Err（上游约定，hal.rs:32），dangling 指针不会被解引用；分配仅
+// 发生在设备初始化（Queue::new），运行期 read/write 走调用方缓冲区。
 unsafe impl Hal for Dma {
     fn dma_alloc(pages: usize, _: BufferDirection) -> (usize, NonNull<u8>) {
         match frame::frame_alloc(pages) {
