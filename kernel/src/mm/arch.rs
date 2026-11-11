@@ -1,7 +1,6 @@
-//! 页表硬件适配：只在此处区分 Sv39 与 LoongArch 三层 4 KiB 页表。
-//! 团队决定两架构均不实现 NX：可访问页均允许执行，PROT_NONE 仍不可访问。
-//! PTE 位编码按硬件语义独立实现；LoongArch 64 位 NR/NX 为 61/62，
-//! 核对依据：Linux arch/loongarch/include/asm/pgtable-bits.h（仅核对数值，未复制代码）。
+//! 页表硬件适配：Sv39 与 LoongArch 三层 4 KiB 页表的 PTE 编码、切换
+//! 与 TLB refill 集中于此。LoongArch NR/NX 位值（61/62）经 Linux
+//! pgtable-bits.h 核对。NX 决策与 refill 实现依据见 docs/ostd-contracts.md §1/§2。
 use polyhal::{
     pagetable::{MappingFlags as F, PageTable, TLB},
     PhysAddr,

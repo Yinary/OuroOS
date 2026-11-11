@@ -50,9 +50,12 @@ fn gen_linker_script() -> io::Result<()> {
 }
 
 /// 内嵌镜像描述：(环境变量, 文件名, 生成的静态符号名)
-const IMAGES: [(&str, &str, &str); 2] = [
+const IMAGES: [(&str, &str, &str); 5] = [
+    ("OUROOS_TEST_ELF", "test", "TEST_ELF"),
     ("OUROOS_HELLO_ELF", "hello", "HELLO_ELF"),
     ("OUROOS_CHECK_ELF", "check", "CHECK_ELF"),
+    ("OUROOS_SCHED_ELF", "sched", "SCHED_ELF"),
+    ("OUROOS_ILL_ELF", "ill", "ILL_ELF"),
 ];
 
 /// 复制用户 ELF 到 OUT_DIR 并生成 user_images.rs。
@@ -72,6 +75,7 @@ fn embed_user_images() -> io::Result<()> {
         "// 由 build.rs 生成：内嵌的用户程序 ELF（构建见 Makefile 与 user/hello）。\n",
     );
     for (var, name, symbol) in IMAGES {
+        println!("cargo:rerun-if-env-changed={var}");
         match env::var(var) {
             Ok(path) => {
                 let src = PathBuf::from(&path);
@@ -92,9 +96,11 @@ fn embed_user_images() -> io::Result<()> {
                 ));
             }
             Err(_) => {
-                println!(
+                if var != "OUROOS_TEST_ELF" {
+                    println!(
                     "cargo:warning={var} 未设置：嵌入空镜像（请通过 make all 构建以嵌入用户程序）"
                 );
+                }
                 code.push_str(&format!(
                     "/// {name} 用户程序：构建时未提供（空镜像，运行时会报告加载失败）\n\
                      pub static {symbol}: &[u8] = &[];\n"

@@ -7,6 +7,8 @@ use super::{
 };
 use polyhal::pagetable::{MappingFlags as F, PAGE_SIZE};
 
+/// 自检：页所有权、区间分裂、权限、边界与释放守恒（每次启动；
+/// debug 构建额外逐点注入 OOM，见模块头）。
 pub(super) fn run() {
     let baseline = frame::stats();
     assert!(matches!(
@@ -141,6 +143,47 @@ pub(super) fn run() {
         }
     }
     assert_eq!(frame::stats(), baseline);
+    #[cfg(debug_assertions)]
+    {
+        let mut space = UserAddressSpace::new().expect("fixed test root");
+        let pa = space.map_alloc(0x20_0000, F::URW).expect("fixed original");
+        // SAFETY: 测试持有数据页，尚无用户并发访问，字节访问在页内。
+        unsafe {
+            (phys_to_kernel_vaddr(pa) as *mut u8).write_volatile(93);
+        }
+        let before = frame::stats();
+        space.activate();
+        // 两个新数据页、根页和两级中间表，共五次帧分配；逐次失败都须回滚。
+        for budget in 0..5 {
+            frame::set_test_budget(Some(budget));
+            assert_eq!(
+                space.replace_region(0x20_0000, 2, F::URW),
+                Err(MapError::OutOfMemory)
+            );
+            frame::set_test_budget(None);
+            assert_eq!(frame::stats(), before);
+            assert_eq!(space.translate(0x20_0000).unwrap().0.raw(), pa.raw());
+            // SAFETY: 失败后原页仍归该测试空间所有。
+            unsafe {
+                assert_eq!((phys_to_kernel_vaddr(pa) as *const u8).read_volatile(), 93);
+            }
+        }
+        space
+            .replace_region(0x20_0000, 2, F::URW)
+            .expect("fixed commit");
+        let fresh = space.translate(0x20_0000).unwrap().0;
+        assert_ne!(fresh.raw(), pa.raw());
+        // SAFETY: 新匿名页在当前空间内，成功替换后仍持有其所有权。
+        unsafe {
+            assert_eq!(
+                (phys_to_kernel_vaddr(fresh) as *const u8).read_volatile(),
+                0
+            );
+        }
+        drop(space);
+        assert_eq!(frame::stats(), baseline);
+        log::info!("mm self-test: fixed replacement rollback passed");
+    }
     user_copy_tests();
     log::info!("mm self-test: independent address spaces passed");
     log::info!("mm self-test: map/protect/unmap/zeroing/reclaim passed");

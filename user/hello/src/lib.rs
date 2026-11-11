@@ -44,6 +44,75 @@ pub fn syscall3(nr: usize, a0: usize, a1: usize, a2: usize) -> isize {
     unsafe { __syscall3(nr, a0, a1, a2) }
 }
 
+// 六参数桩保留 syscall3，mmap 直接使用完整通用 ABI。
+#[cfg(target_arch = "riscv64")]
+core::arch::global_asm!(
+    ".globl __syscall6",
+    "__syscall6:",
+    "mv a7, a0",
+    "mv a0, a1",
+    "mv a1, a2",
+    "mv a2, a3",
+    "mv a3, a4",
+    "mv a4, a5",
+    "mv a5, a6",
+    "ecall",
+    "ret"
+);
+#[cfg(target_arch = "loongarch64")]
+core::arch::global_asm!(
+    ".globl __syscall6",
+    "__syscall6:",
+    "move $a7, $a0",
+    "move $a0, $a1",
+    "move $a1, $a2",
+    "move $a2, $a3",
+    "move $a3, $a4",
+    "move $a4, $a5",
+    "move $a5, $a6",
+    "syscall 0",
+    "jirl $zero, $ra, 0"
+);
+extern "C" {
+    fn __syscall6(
+        nr: usize,
+        a0: usize,
+        a1: usize,
+        a2: usize,
+        a3: usize,
+        a4: usize,
+        a5: usize,
+    ) -> isize;
+}
+/// 六参数系统调用；不创建用户指针引用，原样返回 ABI 结果。
+pub fn syscall6(nr: usize, args: [usize; 6]) -> isize {
+    // SAFETY: 汇编桩依照 C ABI 按值搬运参数，并保留被调用者保存寄存器。
+    unsafe { __syscall6(nr, args[0], args[1], args[2], args[3], args[4], args[5]) }
+}
+/// 原始 brk ABI，失败时返回旧地址；传零查询。
+pub fn sys_brk(addr: usize) -> usize {
+    syscall3(214, addr, 0, 0) as usize
+}
+/// mmap 的原始六参数包装，成功返回地址，失败返回负 errno。
+pub fn sys_mmap(
+    addr: usize,
+    len: usize,
+    prot: usize,
+    flags: usize,
+    fd: usize,
+    offset: usize,
+) -> isize {
+    syscall6(222, [addr, len, prot, flags, fd, offset])
+}
+/// 解除映射，返回零或负 errno。
+pub fn sys_munmap(addr: usize, len: usize) -> isize {
+    syscall3(215, addr, len, 0)
+}
+/// 修改权限；本内核不支持 NX。
+pub fn sys_mprotect(addr: usize, len: usize, prot: usize) -> isize {
+    syscall3(226, addr, len, prot)
+}
+
 /// write(2)：把缓冲区写到 fd（内核当前只支持 1/2）
 pub fn sys_write(fd: usize, buf: &[u8]) -> isize {
     syscall3(64, fd, buf.as_ptr() as usize, buf.len())
@@ -61,6 +130,16 @@ pub fn sys_exit(status: isize) -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// sched_yield(2)：让出 CPU。内核单核轮转，返回 0（成功）。
+pub fn sys_sched_yield() -> isize {
+    syscall3(124, 0, 0, 0)
+}
+
+/// getpid(2)：返回调用者 pid。
+pub fn sys_getpid() -> isize {
+    syscall3(172, 0, 0, 0)
 }
 
 /// panic 时以 134 退出（128+SIGABRT，shell 惯例），与正常退出码区分

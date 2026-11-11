@@ -1,25 +1,43 @@
-//! 最小系统调用分发：write 与 exit。
-//!
-//! 错误在内核内部用 `Result<_, Errno>` 表达，在 ABI 边界转换成 Linux
-//! 负 errno 返回值（a0）。系统调用号与寄存器约定依据 Linux man-pages
-//! syscall(2) 及 riscv64 / loongarch64 的通用（generic）UAPI：两者都用
-//! a7 传调用号、a0..a5 传参数、a0 返回结果，write=64、exit=93。
-//!
-//! 支持范围（未支持的部分在此明确列出，不冒充完整 Linux 语义）：
-//! - write：仅 fd=1/2，内容直接送内核控制台；不维护文件偏移、不做
-//!   部分写（出错时不输出任何字节，Linux 允许先写部分再返回 EFAULT）；
-//!   len=0 时只检查 fd，不检查缓冲区，返回 0（与 Linux 一致）；
-//! - exit：记录退出状态并结束唯一用户任务，由启动主流程统一关机；
-//! - 其余系统调用一律 ENOSYS。fd 表、文件框架、信号均不存在。
+//! 最小系统调用分发：write / exit / sched_yield / getpid，其余 ENOSYS。
+//! 调用号与寄存器约定按 riscv64/loongarch64 通用 UAPI（a7=调用号、
+//! a0..a5=参数、a0=返回负 errno 或结果）。支持范围与 Linux 语义偏差
+//! 见 docs/ostd-contracts.md §4；PC 推进由运行循环统一处理。
 
-use polyhal::debug_console::DebugConsole;
+mod memory;
+
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 
-use crate::framework::user_access::{self, AccessError, UserAddressSpace};
+use crate::mm::{address_space::UserAddressSpace, user_access};
 
 /// Linux errno（仅当前用到的子集）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Errno {
+    Access,
+    NoChild,
+    NoProcess,
+    SeekPipe,
+    Busy,
+    TooBig,
+    ExecFormat,
+    Again,
+    WouldBlock,
+    Pipe,
+    Io,
+    NoEntry,
+    NoSpace,
+    Exists,
+    NotDir,
+    IsDir,
+    NoDevice,
+    TooManyFiles,
+    Range,
+    NameTooLong,
+    /// 内存不足。
+    NoMem,
+    /// 参数无效。
+    Invalid,
+    /// 不支持的能力。
+    NotSupported,
     /// EBADF: fd 不在支持范围
     BadF,
     /// EFAULT: 用户缓冲区地址非法
@@ -32,6 +50,28 @@ impl Errno {
     /// Linux errno 数值（asm-generic/errno-base.h）
     pub fn as_errno(self) -> isize {
         match self {
+            Self::Access => 13,
+            Self::NoChild => 10,
+            Self::NoProcess => 3,
+            Self::SeekPipe => 29,
+            Self::Busy => 16,
+            Self::TooBig => 7,
+            Self::ExecFormat => 8,
+            Self::Again | Self::WouldBlock => 11,
+            Self::Pipe => 32,
+            Self::Io => 5,
+            Self::NoEntry => 2,
+            Self::NoSpace => 28,
+            Self::Exists => 17,
+            Self::NotDir => 20,
+            Self::IsDir => 21,
+            Self::NoDevice => 19,
+            Self::TooManyFiles => 24,
+            Self::Range => 34,
+            Self::NameTooLong => 36,
+            Self::NoMem => 12,
+            Self::Invalid => 22,
+            Self::NotSupported => 95,
             Errno::BadF => 9,
             Errno::Fault => 14,
             Errno::NoSys => 38,
@@ -39,50 +79,111 @@ impl Errno {
     }
 }
 
-/// exit 之后的流向：告知用户任务运行循环结束
+/// 一次系统调用之后的执行流去向：继续、让出还是退出。
 pub enum Flow {
-    /// 系统调用完成，返回用户态继续
+    /// 等待 I/O，保留参数和 PC 后让出。
+    Retry,
+    /// 系统调用完成，返回用户态继续。
     Continue,
-    /// 用户任务已退出，携带退出状态
+    /// 系统调用完成，返回用户态前让出 CPU（sched_yield 等）。
+    Yield,
+    /// 在解除注册表借用后处理进程操作。
+    Process,
+    /// 任务已退出，携带退出状态。
     Exited(i32),
 }
 
-/// syscall(64) write：把用户缓冲区内容写到控制台。
-///
-/// fd 只接受 1（stdout）/ 2（stderr）；缓冲区逐页检查用户映射与
-/// 所有权后经内核直接映射分块复制，不把用户指针当作内核切片。
-fn sys_write(space: &UserAddressSpace, fd: usize, buf: usize, len: usize) -> Result<usize, Errno> {
-    if fd != 1 && fd != 2 {
-        return Err(Errno::BadF);
-    }
-    if len == 0 {
-        // Linux 语义：count=0 时成功返回 0，不校验缓冲区
-        return Ok(0);
-    }
-    // 分块输出原始字节，不把任意字节强制当 UTF-8
-    user_access::read_user_bytes(space, buf, len, |chunk| {
-        for &b in chunk {
-            DebugConsole::putchar(b);
-        }
-    })
-    .map_err(|AccessError::Fault| Errno::Fault)?;
-    Ok(len)
-}
-
 /// 系统调用分发。寄存器现场由调用方（用户任务运行循环）持有，
-/// 返回值写回 a0，PC 推进（syscall_ok）也由调用方统一处理。
-pub fn dispatch(cx: &mut TrapFrame, space: &UserAddressSpace) -> Flow {
+/// 返回值写回 a0，PC 推进（syscall_ok）与执行流决策也由调用方统一处理。
+/// `pid` 为调用者标识（getpid 返回它）。
+pub fn dispatch(
+    cx: &mut TrapFrame,
+    pid: usize,
+    space: &mut UserAddressSpace,
+    fs: &mut crate::fs::context::Context,
+) -> Flow {
     // 调用号在 a7（TrapFrameArgs::SYSCALL），参数在 a0..；返回值写回 a0
     let nr = cx[TrapFrameArgs::SYSCALL];
     let args = cx.args();
     let (a0, a1, a2) = (args[0], args[1], args[2]);
     match nr {
-        64 => {
-            let ret = sys_write(space, a0, a1, a2);
+        17 | 23 | 24 | 34 | 35 | 39 | 40 | 49 | 56 | 57 | 59 | 61 | 62 | 63 | 64 | 80 | 291 => {
+            let ret = crate::fs::context::dispatch(
+                nr,
+                [args[0], args[1], args[2], args[3], args[4], args[5]],
+                space,
+                fs,
+            );
+            if ret == Err(Errno::WouldBlock) {
+                return Flow::Retry;
+            }
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
         93 => Flow::Exited(a0 as i32),
+        214 => {
+            cx[TrapFrameArgs::RET] = space.brk(a0);
+            Flow::Continue
+        }
+        215 | 222 | 226 => {
+            let ret = match nr {
+                215 => memory::munmap(space, a0, a1),
+                226 => memory::mprotect(space, a0, a1, a2),
+                _ => memory::mmap(
+                    space,
+                    [args[0], args[1], args[2], args[3], args[4], args[5]],
+                    fs,
+                ),
+            };
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        124 => {
+            // sched_yield(2)：成功返回 0；让出意图交给运行循环
+            cx[TrapFrameArgs::RET] = 0;
+            Flow::Yield
+        }
+        101 | 153 | 173 | 220 | 221 | 260 => Flow::Process,
+        160 | 169 => {
+            let ret = if nr == 160 {
+                let mut data = [0u8; 390];
+                for (i, text) in [
+                    "OuroOS",
+                    "ouro",
+                    "0.1.0",
+                    "basic",
+                    crate::config::ARCH_NAME,
+                    "local",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    data[i * 65..i * 65 + text.len()].copy_from_slice(text.as_bytes());
+                }
+                user_access::copy_to_user(space, a0, &data)
+                    .map(|_| 0)
+                    .map_err(|_| Errno::Fault)
+            } else {
+                let now = polyhal::timer::current_time();
+                let mut data = [0u8; 16];
+                data[..8].copy_from_slice(&now.as_secs().to_ne_bytes());
+                data[8..].copy_from_slice(&(now.subsec_micros() as u64).to_ne_bytes());
+                if a0 == 0 {
+                    Ok(0)
+                } else {
+                    user_access::copy_to_user(space, a0, &data)
+                        .map(|_| 0)
+                        .map_err(|_| Errno::Fault)
+                }
+            };
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        172 => {
+            // getpid(2)：总成功；pid 由进程注册表分配，见 task 契约
+            cx[TrapFrameArgs::RET] = pid;
+            Flow::Continue
+        }
         _ => {
             cx[TrapFrameArgs::RET] = to_abi(Err(Errno::NoSys));
             Flow::Continue
@@ -91,7 +192,7 @@ pub fn dispatch(cx: &mut TrapFrame, space: &UserAddressSpace) -> Flow {
 }
 
 /// Result → Linux ABI 返回值：Ok(n) → n；Err(e) → -errno
-fn to_abi(ret: Result<usize, Errno>) -> usize {
+pub(crate) fn to_abi(ret: Result<usize, Errno>) -> usize {
     match ret {
         Ok(n) => n,
         Err(e) => (-e.as_errno()) as usize,

@@ -39,6 +39,7 @@ MEM ?= 1G
 # 仅面向单核，默认 -smp 1
 SMP ?= 1
 LOG ?= warn         # 编译期日志级别: error|warn|info|debug|trace（boot 报告块由 polyhal 固定打印，不受此控）
+FEATURES ?=         # 附加 cargo feature，例如 make selftest-rv 无需手改
 
 # QEMU：默认取 PATH 中的可执行文件；不在 PATH 时用变量覆盖，例如：
 #   make run-la QEMU_LA=/path/to/qemu-system-loongarch64
@@ -46,7 +47,7 @@ QEMU_RV ?= qemu-system-riscv64
 QEMU_LA ?= qemu-system-loongarch64
 
 .PHONY: all kernel-rv kernel-la build build-rv build-la \
-	build-user-rv build-user-la clippy clippy-rv clippy-la fmt \
+	build-user-rv build-user-la selftest-rv selftest-la clippy clippy-rv clippy-la fmt \
 	run run-rv run-la clean help
 
 all: kernel-rv kernel-la
@@ -69,24 +70,59 @@ build-user-la:
 build-rv:
 	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/hello \
 	OUROOS_CHECK_ELF=target/$(TARGET_RV)/$(USER_REL)/check \
+	OUROOS_SCHED_ELF=target/$(TARGET_RV)/$(USER_REL)/sched \
+	OUROOS_ILL_ELF=target/$(TARGET_RV)/$(USER_REL)/ill \
 	LOG=$(LOG) cargo build $(BUILD_STD) --release --target $(TARGET_RV)
 
 build-la:
 	$(RUSTFLAGS_LA) \
 	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/hello \
 	OUROOS_CHECK_ELF=target/$(TARGET_LA)/$(USER_REL)/check \
+	OUROOS_SCHED_ELF=target/$(TARGET_LA)/$(USER_REL)/sched \
+	OUROOS_ILL_ELF=target/$(TARGET_LA)/$(USER_REL)/ill \
 	LOG=$(LOG) cargo build $(BUILD_STD) --release --target $(TARGET_LA)
+
+# selftest：selftest 档（release 优化 + debug 断言）+ 调试锁，
+# 让 OOM 注入/帧守恒/持锁跨切换检测进入验证流程；产物在
+# target/<target>/selftest/kernel，不覆盖 release 产物。
+#
+# UB_CHECKS_OFF：polyhal 启动期（rust_main 之前）存在一处 ptr::add
+# 地址计算回绕，debug 断言的 ub-check 会在此 panic（release 静默回绕，
+# 预存缺陷，见 docs/ostd-contracts.md 已知缺陷表 #8）。定位修复归入
+# polyhal patch 立项；selftest 档定向关闭 ub-check 保留其余断言。
+UB_CHECKS_OFF := RUSTFLAGS="-Zunstable-options -Zub-checks=no"
+# la 侧需同时保留 LSX/LASX 禁用，单独组合避免两个 RUSTFLAGS 赋值相杀
+UB_CHECKS_OFF_LA := RUSTFLAGS="-Zunstable-options -C target-feature=-lsx,-lasx -Zub-checks=no"
+selftest-rv: build-user-rv
+	$(UB_CHECKS_OFF) \
+	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/hello \
+	OUROOS_CHECK_ELF=target/$(TARGET_RV)/$(USER_REL)/check \
+	OUROOS_SCHED_ELF=target/$(TARGET_RV)/$(USER_REL)/sched \
+	OUROOS_ILL_ELF=target/$(TARGET_RV)/$(USER_REL)/ill \
+	LOG=info cargo build $(BUILD_STD) --profile selftest -p kernel --features lock_debug --target $(TARGET_RV)
+
+selftest-la: build-user-la
+	$(UB_CHECKS_OFF_LA) \
+	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/hello \
+	OUROOS_CHECK_ELF=target/$(TARGET_LA)/$(USER_REL)/check \
+	OUROOS_SCHED_ELF=target/$(TARGET_LA)/$(USER_REL)/sched \
+	OUROOS_ILL_ELF=target/$(TARGET_LA)/$(USER_REL)/ill \
+	LOG=info cargo build $(BUILD_STD) --profile selftest -p kernel --features lock_debug --target $(TARGET_LA)
 
 # ---------- 静态检查 ----------
 clippy-rv: build-user-rv
 	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/hello \
 	OUROOS_CHECK_ELF=target/$(TARGET_RV)/$(USER_REL)/check \
+	OUROOS_SCHED_ELF=target/$(TARGET_RV)/$(USER_REL)/sched \
+	OUROOS_ILL_ELF=target/$(TARGET_RV)/$(USER_REL)/ill \
 	LOG=$(LOG) cargo clippy $(BUILD_STD) --release --target $(TARGET_RV)
 
 clippy-la: build-user-la
 	$(RUSTFLAGS_LA) \
 	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/hello \
 	OUROOS_CHECK_ELF=target/$(TARGET_LA)/$(USER_REL)/check \
+	OUROOS_SCHED_ELF=target/$(TARGET_LA)/$(USER_REL)/sched \
+	OUROOS_ILL_ELF=target/$(TARGET_LA)/$(USER_REL)/ill \
 	LOG=$(LOG) cargo clippy $(BUILD_STD) --release --target $(TARGET_LA)
 
 clippy: clippy-rv clippy-la
@@ -117,6 +153,7 @@ help:
 	@echo "make run-la     - QEMU 启动 loongarch64 内核"
 	@echo "make run        - 两个架构依次启动"
 	@echo "make clippy     - 双架构 clippy（含用户程序构建）"
+	@echo "make selftest-rv/la - selftest 档构建（debug 断言 + 调试锁 + LOG=info）"
 	@echo "make fmt        - 格式化内核与用户程序代码"
 	@echo "make clean"
 	@echo "变量: MEM=1G SMP=1 LOG=info QEMU_RV=... QEMU_LA=..."

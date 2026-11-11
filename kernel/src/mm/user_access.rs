@@ -1,13 +1,9 @@
-//! 用户内存访问：在内核缓冲区与用户地址空间之间复制数据。
-//!
-//! 前提：全局只有一个用户任务，复制期间无 munmap 与其他核的地址空间变更。
-//!
-//! 流程：地址范围校验 → 逐页翻译与权限校验 → 经内核直接映射窗口复制。
-//! 不将用户指针构造为 Rust 引用。
+//! 用户内存访问：内核与用户地址空间之间的数据复制——地址范围校验、
+//! 逐页翻译与权限校验、经内核直映窗口复制；用户指针不构造为 Rust 引用。
 
 use polyhal::pagetable::{MappingFlags, PAGE_SIZE};
 
-use super::address_space::{phys_to_kernel_vaddr, UserAddressSpace, USER_BASE, USER_TOP};
+use super::address_space::{phys_to_kernel_vaddr, UserAddressSpace, USER_TOP};
 
 /// 复制到内核缓冲区的分块大小上限。
 const KERNEL_CHUNK: usize = 256;
@@ -147,7 +143,7 @@ pub fn copy_from_user(
 /// 检查 `[vaddr, vaddr+len)` 的溢出与用户地址范围，返回结束地址。
 fn check_span(vaddr: usize, len: usize) -> Result<usize, AccessError> {
     let end = vaddr.checked_add(len).ok_or(AccessError::Fault)?;
-    if vaddr < USER_BASE || end > USER_TOP {
+    if end > USER_TOP {
         return Err(AccessError::Fault);
     }
     Ok(end)

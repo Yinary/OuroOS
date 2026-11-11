@@ -1,29 +1,18 @@
-//! 中断/异常处理。
-//!
-//! polyhal-trap 在 ctor（Cpu 阶段）自动完成架构初始化：
-//! - riscv64:     设 stvec、sie、timer
-//! - loongarch64: 设 eentry、ecfg、tlb 填充回调、timer
-//!
-//! 内核侧只需通过 `#[polyhal::arch_interrupt]` 挂接统一回调。
-//!
-//! 本模块新增的职责：用户态来源的异常与系统调用不在这里完成处理，
-//! 只做来源判定与事件登记，由用户任务运行循环（user.rs）消费：
-//! TrapType 携带完整的异常信息（缺页地址等），EscapeReason 则是有损
-//! 的（只剩 NoReason）。
+//! 中断/异常回调：时钟记账与续设、启动自检、内核态异常执法；
+//! 用户态陷阱由任务运行循环按完整 TrapType 处置。
+//! 职责划分依据见 docs/ostd-contracts.md §2/§3。
 
-use core::{
-    cell::Cell,
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
-};
+use core::{sync::atomic::Ordering, time::Duration};
 
 use polyhal::timer::{current_time, set_next_timer};
-use polyhal_trap::trap::TrapType;
-use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
+use polyhal_trap::{
+    trap::TrapType,
+    trapframe::{TrapFrame, TrapFrameArgs},
+};
 
 use crate::{config, BREAK_TICKS, TIMER_TICKS};
 
-/// 用户异常的种类（对应用户程序可能触发的 TrapType 子集）
+/// 用户异常的种类（对应用户程序可能触发的 TrapType 子集）。
 #[derive(Debug, Clone, Copy)]
 pub enum UserFaultKind {
     StorePageFault,
@@ -31,121 +20,68 @@ pub enum UserFaultKind {
     InstructionPageFault,
     IllegalInstruction,
     Breakpoint,
+    /// HAL 无法分类的异常（polyhal-trap 补丁新增，见其 README；
+    /// la 上如取指地址错误 ADEF）。
+    Unhandled,
 }
 
-/// 一次用户态异常的信息
+/// 一次用户态异常的信息。
 #[derive(Debug, Clone, Copy)]
 pub struct UserFault {
     pub kind: UserFaultKind,
-    /// 出错地址（非法指令时为指令编码）
+    /// 出错地址 / 指令编码 / 架构异常码（Unhandled 时）。
     pub info: usize,
-    /// 异常发生时的用户 PC
+    /// 异常发生时的用户 PC。
     pub pc: usize,
 }
 
-/// 回调登记的“来自用户的系统调用”事件。
-/// riscv64 上内核自身的 SBI ecall 同样表现为 TrapType::SysCall，
-/// 因此不能用 EscapeReason 单独区分，必须带来源判定。
-#[polyhal::percpu]
-static PENDING_USER_SYSCALL: AtomicBool = AtomicBool::new(false);
-
-/// 当前核回调登记的用户异常（None 表示没有未消费的异常）。
-/// 用户任务同步运行，时钟中断不访问此槽；Cell 避免持有跨中断的可变引用。
-#[polyhal::percpu]
-static PENDING_USER_FAULT: Cell<Option<UserFault>> = Cell::new(None);
-
-/// 判断异常是否来自用户权限级。
-///
-/// riscv64：trap 时硬件把先前特权级写入 sstatus.SPP，polyhal-trap 已把
-/// sstatus 存入 TrapFrame（TrapFrame::from_user）。loongarch64：prmd.PPLV
-/// 字段（bit 1:0）记录先前特权级。polyhal-trap 未提供 loongarch64 侧的
-/// 封装，这里出现 `#[cfg(target_arch)]`（CSR 语义无法通用表达）。
-fn is_from_user(ctx: &TrapFrame) -> bool {
-    #[cfg(target_arch = "riscv64")]
-    {
-        ctx.from_user()
-    }
-    #[cfg(target_arch = "loongarch64")]
-    {
-        ctx.prmd & 0x3 != 0
-    }
-}
-
-/// 登记用户异常（后到的覆盖先到的：任务在首个致命异常后即被终止，
-/// 不会积累多个）。
-fn record_user_fault(kind: UserFaultKind, info: usize, pc: usize) {
-    PENDING_USER_FAULT.set(Some(UserFault { kind, info, pc }));
-}
-
-/// 取走当前核“来自用户的系统调用”事件（有则清除并返回 true）。
-/// 与用户任务同步返回到同一核的约定配套；跨核迁移或内核抢占时需重新审视。
-pub fn take_user_syscall() -> bool {
-    PENDING_USER_SYSCALL.swap(false, Ordering::SeqCst)
-}
-
-/// 仅取走当前核登记的用户异常（如果有），不影响其他核。
-/// 事件消费前不得迁移用户任务；将来引入跨核迁移或内核抢占时需重新审视。
-pub fn take_user_fault() -> Option<UserFault> {
-    PENDING_USER_FAULT.take()
-}
-
-/// 缺页异常的分发：来自用户则登记异常信息，来自内核则维持现有 panic 策略
-fn handle_page_fault(ctx: &TrapFrame, from_user: bool, kind: UserFaultKind, addr: usize) {
-    if from_user {
-        record_user_fault(kind, addr, ctx[TrapFrameArgs::SEPC]);
-    } else {
-        panic!("page fault @ {:#x}", addr);
+/// 把用户态来源的陷阱分类为致命异常；非致命（时钟/中断/已消化等）
+/// 返回 None，由运行循环继续执行。
+pub fn fatal_fault(trap_type: TrapType) -> Option<(UserFaultKind, usize)> {
+    match trap_type {
+        TrapType::Breakpoint => Some((UserFaultKind::Breakpoint, 0)),
+        TrapType::StorePageFault(addr) => Some((UserFaultKind::StorePageFault, addr)),
+        TrapType::LoadPageFault(addr) => Some((UserFaultKind::LoadPageFault, addr)),
+        TrapType::InstructionPageFault(addr) => Some((UserFaultKind::InstructionPageFault, addr)),
+        TrapType::IllegalInstruction(ins) => Some((UserFaultKind::IllegalInstruction, ins)),
+        TrapType::Unhandled(code) => Some((UserFaultKind::Unhandled, code)),
+        // Timer / Irq / SysCall / Absorbed（la 非对齐模拟成功）/ Unknown：
+        // 非致命
+        _ => None,
     }
 }
 
 /// 统一的中断/异常入口（两种架构共用），由 polyhal-trap 分发调用。
 #[polyhal::arch_interrupt]
 fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
-    let from_user = is_from_user(ctx);
     match trap_type {
-        TrapType::Breakpoint => {
-            if from_user {
-                // 用户态断点视为异常终止（内核侧 ebreak 仍是启动自检）
-                record_user_fault(UserFaultKind::Breakpoint, 0, ctx[TrapFrameArgs::SEPC]);
-            } else {
-                // 来自 main.rs 启动自检
-                BREAK_TICKS.fetch_add(1, Ordering::Relaxed);
-                log::debug!("breakpoint @ {:#x}", ctx[TrapFrameArgs::SEPC]);
-            }
-        }
-        TrapType::SysCall => {
-            // 只登记来自用户态的系统调用；内核态 ecall（如 riscv64 SBI）
-            // 不是用户请求，交由 polyhal/SBI 自身路径处理
-            if from_user {
-                PENDING_USER_SYSCALL.store(true, Ordering::SeqCst);
-            }
-        }
         TrapType::Timer => {
             TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
             set_next_timer(current_time() + Duration::from_millis(config::TICK_MS));
         }
-        TrapType::StorePageFault(p) => {
-            handle_page_fault(ctx, from_user, UserFaultKind::StorePageFault, p)
-        }
-        TrapType::LoadPageFault(p) => {
-            handle_page_fault(ctx, from_user, UserFaultKind::LoadPageFault, p)
-        }
-        TrapType::InstructionPageFault(p) => {
-            handle_page_fault(ctx, from_user, UserFaultKind::InstructionPageFault, p)
-        }
-        TrapType::IllegalInstruction(ins) => {
-            if from_user {
-                record_user_fault(
-                    UserFaultKind::IllegalInstruction,
-                    ins,
-                    ctx[TrapFrameArgs::SEPC],
-                );
-            } else {
-                panic!("illegal instruction {:#x}", ins);
+        TrapType::Breakpoint => {
+            // 用户态断点由运行循环按致命异常处置；内核态断点是启动自检
+            if !ctx.from_user() {
+                BREAK_TICKS.fetch_add(1, Ordering::Relaxed);
             }
         }
-        other => {
-            log::warn!("unhandled trap: {:?}", other);
+        TrapType::SysCall | TrapType::Absorbed | TrapType::Unknown => {}
+        TrapType::Irq(_) | TrapType::SupervisorExternal => {
+            log::warn!("unhandled irq: {:?}", trap_type);
+        }
+        TrapType::StorePageFault(_)
+        | TrapType::LoadPageFault(_)
+        | TrapType::InstructionPageFault(_)
+        | TrapType::IllegalInstruction(_)
+        | TrapType::Unhandled(_) => {
+            // 用户来源由运行循环处置；内核来源是内核 bug，不容忍
+            if !ctx.from_user() {
+                panic!(
+                    "kernel-origin trap {:?} @ pc {:#x}",
+                    trap_type,
+                    ctx[TrapFrameArgs::SEPC]
+                );
+            }
         }
     }
 }

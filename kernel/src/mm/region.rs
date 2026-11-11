@@ -1,8 +1,4 @@
-//! 启动物理内存账本：FDT RAM 与 HAL 剩余区求交，再扣除显式保留区。
-//!
-//! HAL 剩余区已经扣除了 DTB、per-CPU 与副核启动栈；不能把原始 RAM 直接
-//! 交给分配器。无法由公开 API 追溯的空洞统一记为 HalBoot，不伪造具体来源。
-//! 内核区间包含堆、bstack、ph_init；percpu 的动态副本则由 HAL 保留。
+//! 启动物理内存账本：FDT RAM 与 HAL 剩余区求交、扣除保留区后登记给帧分配器。
 use super::frame::{self, FrameError};
 use alloc::vec::Vec;
 use polyhal::{

@@ -1,12 +1,7 @@
-//! 内核页表：替换启动粗页表，细化内核镜像权限。
-//!
-//! rv 布局：镜像区间用 4 KiB 叶子（text RX / rodata R / data 及之后 RW），
-//! 镜像所在 GiB 的其余部分与后续 RAM 用 2 MiB / 1 GiB 大页 RWX，
-//! 低半区、MMIO 与 RAM 之外不映射。
-//! la 内核映射由 DMW 承担，本模块为空实现。
-//!
-//! 以下 unsafe 函数的共享前提：仅在启动单线程阶段、旧页表活跃时调用；
-//! 表页由帧分配器返回且已清零，经 pa|VIRT 别名窗口访问。
+//! rv 内核页表：启动期一次性细化镜像权限（text RX / rodata R / data RW），
+//! 其余 RAM 以大页直映；la 内核映射由 DMW 承担，本模块为空实现。
+// SAFETY（本模块全部 unsafe 函数共享）：仅启动单线程阶段、旧页表
+// 活跃时调用；表页由帧分配器返回且已清零，经 pa|VIRT 别名窗口访问。
 
 #[cfg(target_arch = "riscv64")]
 use polyhal::{consts::VIRT_ADDR_START, mem::get_mem_areas, PhysAddr};
@@ -103,6 +98,16 @@ unsafe fn init_rv() {
     write_table(&root, 256 + (gi_base >> 30), img_l1.raw());
     fill_root_tail(&root, gi_base + GIB, ram_top);
 
+    // QEMU virt 的 UART 与 VirtIO MMIO，只有内核可读写。
+    let io_l1 = frame::frame_alloc(1).expect("kernel MMIO table: OOM");
+    write_leaf(
+        &io_l1,
+        0x1000_0000 >> 21,
+        0x1000_0000,
+        V | R | W | A | D | G,
+    );
+    write_table(&root, 256, io_l1.raw());
+
     // 切换前软件走表自检
     let va = |pa: usize| pa | VIRT_ADDR_START;
     let check = |pa: usize, want_flags: u64| {
@@ -122,7 +127,7 @@ unsafe fn init_rv() {
     }
     // 大页区与无效区
     check(ram_top - PAGE_SIZE, V | R | W | X | A | D | G);
-    assert_eq!(leaf_at(root, va(0x1000_0000)), None); // MMIO
+    check(0x1000_0000, V | R | W | A | D | G); // MMIO
     assert_eq!(leaf_at(root, text), None); // 无恒等窗口
 
     BOOT_PT.store(arch::current(), core::sync::atomic::Ordering::Relaxed);

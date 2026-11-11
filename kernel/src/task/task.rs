@@ -1,73 +1,97 @@
-//! 内核任务描述符与初始上下文构造。
-//!
-//! 每个任务拥有独立内核栈和 PolyHAL `KContext`。本模块只负责任务的
-//! 静态资源与初始寄存器状态，调度策略由 `sched` 模块负责。
+//! 任务描述符：内核栈、KContext、身体（内核入口 / 用户现场+pid）与调度状态。
+//! 内核/用户任务差异收敛在 [`TaskBody`]。契约见 docs/ostd-contracts.md §3。
 
-use core::arch::asm;
+use polyhal::kcontext::{KContext, KContextArgs};
+use polyhal_trap::trapframe::TrapFrame;
 
-use polyhal::{
-    kcontext::{KContext, KContextArgs},
-    pagetable::PAGE_SIZE,
-    PhysAddr,
+use crate::{
+    config,
+    mm::{frame::FrameError, kstack::KernelStack},
 };
 
-use crate::mm::frame;
+use super::{sched, user_task};
 
-/// 每个内核任务占用的页数（4 页 = 16 KiB）。
-const KSTACK_PAGES: usize = 4;
+/// 进程标识；由注册表分配，递增不复用（复用推迟到 wait 语义出现）。
+pub type Pid = usize;
 
-/// 内核任务入口函数类型。
-pub type TaskEntry = fn();
+/// 任务的执行身体。
+///
+/// 用户身体携带完整 TrapFrame，与内核身体大小差异大；不用 Box 包裹
+/// 是为了避免引入分配失败路径（spawn 的 OOM 语义要求全部可失败步骤
+/// 显式返回错误），Task 本身已由调度器装箱，差异可接受。
+#[allow(clippy::large_enum_variant)]
+pub enum TaskBody {
+    /// 内核任务：入口函数运行在自己的内核栈上，返回即退出（码 0）。
+    Kernel(fn()),
+    /// 用户任务：TrapFrame 是全部用户现场；pid 经注册表解析地址空间。
+    User { frame: TrapFrame, pid: Pid },
+}
 
-/// 内核任务的调度状态。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 调度状态。本轮没有阻塞语义（阻塞原语是下一阶段工作），
+/// Exited 任务进入调度器的待回收表，由 idle 回收内核栈。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskState {
-    /// 可以被调度。
     Ready,
-    /// 正在启动核上执行。
     Running,
-    /// 入口函数已返回，不得再次调度。
     Exited,
 }
 
-/// 单个内核任务。
+/// 单个任务。
 pub struct Task {
-    /// PolyHAL 保存的内核上下文。
+    /// 内核上下文：切换的唯一载体。地址稳定性由 Box<Task> 保证。
     pub context: KContext,
-    /// trampoline 最终调用的 Rust 入口函数。
-    pub entry: TaskEntry,
-    /// 当前调度状态。
+    pub body: TaskBody,
     pub state: TaskState,
-    /// 保留栈的物理起始地址，表示任务对这块内存的占用。
-    _stack_start: PhysAddr,
+    pub pid: Pid,
+    /// 调试与日志用名。
+    pub name: &'static str,
+    /// 本时间片起点的 tick；由调度器在切入（promote）时刷新，
+    /// 用户任务在逃逸点比较 [`crate::TIMER_TICKS`] 与它决定让出。
+    pub slice_tick: usize,
+    /// nanosleep 等待的绝对截止时间。
+    pub sleep_deadline: Option<core::time::Duration>,
+    /// 内核栈（纯所有权字段，仅 Drop 生效，无读取方；下划线豁免
+    /// dead_code 检查）。任务回收（idle 的 reap）时最终释放。
+    _kstack: KernelStack,
 }
 
 impl Task {
-    /// 创建一个尚未运行的内核任务。
-    ///
-    /// `trampoline` 必须是一个永不返回的入口：它调用 `entry`，并在入口
-    /// 返回后将任务标记为退出并切换到其他上下文。
-    pub fn new(
-        entry: TaskEntry,
-        trampoline: extern "C" fn() -> !,
-    ) -> Result<Self, frame::FrameError> {
-        // HACK(qzquan): 暂用物理页作为内核栈，待 mm 提供 kstack 后替换。
-        let stack_start = frame::frame_alloc(KSTACK_PAGES)?;
-        stack_start.clear_len(KSTACK_PAGES * PAGE_SIZE);
-
-        let stack_bottom = stack_start.get_mut_ptr::<u8>() as usize;
-        let stack_top = (stack_bottom + KSTACK_PAGES * PAGE_SIZE) & !0xf;
-
+    /// 创建内核任务。trampoline 从调度器读取 current 任务后调用入口。
+    pub fn new_kernel(pid: Pid, name: &'static str, entry: fn()) -> Result<Self, FrameError> {
+        let kstack = KernelStack::new(config::KSTACK_PAGES)?;
         let mut context = KContext::blank();
-        context[KContextArgs::KSP] = stack_top;
+        context[KContextArgs::KSP] = kstack.top();
         context[KContextArgs::KTP] = read_current_tp();
-        context[KContextArgs::KPC] = trampoline as usize;
-
+        context[KContextArgs::KPC] = sched::kernel_trampoline as usize;
         Ok(Self {
             context,
-            entry,
+            body: TaskBody::Kernel(entry),
             state: TaskState::Ready,
-            _stack_start: stack_start,
+            pid,
+            name,
+            slice_tick: 0,
+            sleep_deadline: None,
+            _kstack: kstack,
+        })
+    }
+
+    /// 创建用户任务。`frame` 必须已设置好入口 PC 与用户栈顶
+    /// （构造时机受 rv sstatus 稳态约束，见 [`super::user_task`]）。
+    pub fn new_user(pid: Pid, name: &'static str, frame: TrapFrame) -> Result<Self, FrameError> {
+        let kstack = KernelStack::new(config::KSTACK_PAGES)?;
+        let mut context = KContext::blank();
+        context[KContextArgs::KSP] = kstack.top();
+        context[KContextArgs::KTP] = read_current_tp();
+        context[KContextArgs::KPC] = user_task::user_task_entry as usize;
+        Ok(Self {
+            context,
+            body: TaskBody::User { frame, pid },
+            state: TaskState::Ready,
+            pid,
+            name,
+            slice_tick: 0,
+            sleep_deadline: None,
+            _kstack: kstack,
         })
     }
 }
@@ -81,30 +105,18 @@ fn read_current_tp() -> usize {
     let tp;
     // SAFETY: 只读取当前 CPU 的 `tp`，不修改寄存器、内存或控制流。
     unsafe {
-        asm!("mv {}, tp", out(reg) tp);
+        core::arch::asm!("mv {}, tp", out(reg) tp);
     }
     tp
 }
 
-/// 读取 PolyHAL `context_switch` 实际保存的 `tp` 寄存器。
+/// 读取 PolyHAL `context_switch` 实际保存的 `tp` 寄存器（loongarch64）。
 #[cfg(target_arch = "loongarch64")]
 fn read_current_tp() -> usize {
     let tp;
     // SAFETY: 只读取当前 CPU 的 `$tp`，不修改寄存器、内存或控制流。
     unsafe {
-        asm!("move {}, $tp", out(reg) tp);
+        core::arch::asm!("move {}, $tp", out(reg) tp);
     }
     tp
-}
-
-impl Drop for Task {
-    fn drop(&mut self) {
-        for page in 0..KSTACK_PAGES {
-            // SAFETY: 任务不可复制，仅初始化失败或恢复启动栈后销毁；
-            // exit_current 不释放当前栈，每个独占物理页只归还一次。
-            unsafe {
-                frame::frame_dealloc(PhysAddr::new(self._stack_start.raw() + page * PAGE_SIZE));
-            }
-        }
-    }
 }

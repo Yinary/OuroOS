@@ -1,19 +1,11 @@
-//! 受限的 ELF64 加载器。
-//!
-//! 只支持：ELF64 / 小端 / 目标架构匹配 / ET_EXEC 固定地址静态可执行文件。
-//! 拒绝：动态解释器（PT_INTERP）、ET_DYN 等动态格式、页级重叠、越出
-//! 用户范围的段、侵入栈保护页的段。
-//!
-//! 解析时全部用边界检查后的字段读取（小端字节序逐字段拼装），不把未
-//! 对齐的文件字节 unsafe 转换成结构体引用。
-//!
-//! Linux 语义说明：真实内核还处理对齐、ELF 注释段、AT_ 辅助向量等，
-//! 这里均不支持；程序头表之外的 ELF 内容（节表、符号表）不参与加载。
+//! 受限的 ELF64 加载器：仅静态 ET_EXEC（ELF64/小端/架构匹配），
+//! 逐字段边界检查解析，不把文件字节重解释为结构体引用。
+//! 支持范围与 Linux 差异见 docs/ostd-contracts.md §4。
 
 use polyhal::pagetable::{MappingFlags, PAGE_SIZE};
 
 use crate::mm::{
-    address_space::{UserAddressSpace, USER_BASE},
+    address_space::{phys_to_kernel_vaddr, UserAddressSpace},
     fence_icache,
 };
 
@@ -103,7 +95,7 @@ fn read_u64(buf: &[u8], off: usize) -> u64 {
 
 /// 解析并把 ELF 加载进 `space`，返回入口虚拟地址。
 ///
-/// BSS（memsz > filesz 的部分）依赖 [`UserAddressSpace::map_initialized_page`]
+/// BSS（memsz > filesz 的部分）依赖 [`UserAddressSpace::map_alloc`]
 /// 返回已清零的页，无需显式清零。加载完成后执行指令缓存同步。
 pub fn load_elf(space: &mut UserAddressSpace, elf: &[u8]) -> Result<usize, ElfError> {
     if elf.len() < 64 {
@@ -190,9 +182,6 @@ fn load_segment(space: &mut UserAddressSpace, elf: &[u8], ph: usize) -> Result<(
     }
     // 用户范围与栈保护检查（含溢出）
     UserAddressSpace::check_user_span(p_vaddr, p_memsz).map_err(|_| ElfError::BadSegment)?;
-    if p_vaddr < USER_BASE {
-        return Err(ElfError::BadSegment);
-    }
     // 我们按 4KiB 页映射：虚拟地址必须页对齐；文件偏移只在段含文件
     // 内容时要求页对齐（纯 BSS 段 filesz=0，无偏移约束）
     if p_vaddr % PAGE_SIZE != 0 || (p_filesz > 0 && p_offset % PAGE_SIZE != 0) {
@@ -206,15 +195,27 @@ fn load_segment(space: &mut UserAddressSpace, elf: &[u8], ph: usize) -> Result<(
     let pages = p_memsz.div_ceil(PAGE_SIZE);
     for i in 0..pages {
         let vaddr = p_vaddr + i * PAGE_SIZE;
-        let start = p_offset + (i * PAGE_SIZE).min(p_filesz);
-        let end = start + (file_end - start).min(PAGE_SIZE);
-        space
-            .map_initialized_page(vaddr, flags, &elf[start..end])
-            .map_err(|e| match e {
-                crate::mm::address_space::MapError::OutOfMemory => ElfError::OutOfMemory,
-                crate::mm::address_space::MapError::Overlap => ElfError::SegmentOverlap,
-                _ => ElfError::MapFailed,
-            })?;
+        // 页级重叠拒绝：map_alloc 检查目标页是否已有映射
+        let paddr = space.map_alloc(vaddr, flags).map_err(|e| match e {
+            crate::mm::address_space::MapError::OutOfMemory => ElfError::OutOfMemory,
+            crate::mm::address_space::MapError::Overlap => ElfError::SegmentOverlap,
+            _ => ElfError::MapFailed,
+        })?;
+        // 复制文件内容（BSS 部分依赖新页已清零）
+        let file_off = p_offset + i * PAGE_SIZE;
+        let copy_len = p_filesz.saturating_sub(i * PAGE_SIZE).min(PAGE_SIZE);
+        if copy_len > 0 {
+            let dst = phys_to_kernel_vaddr(paddr);
+            // SAFETY: paddr 是刚为本段分配并清零的物理页；copy_len 由
+            // p_filesz（已做文件边界检查）限定，源与目标都不越界。
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    elf.as_ptr().add(file_off),
+                    dst as *mut u8,
+                    copy_len,
+                );
+            }
+        }
     }
     Ok(())
 }

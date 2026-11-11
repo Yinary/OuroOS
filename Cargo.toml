@@ -1,3 +1,17 @@
 [workspace]
 resolver = "2"
 members = ["kernel"]
+
+# 本地 vendor 的 polyhal-trap（修复 EscapeReason 有损、la 未分类异常 panic、
+# la 缺 from_user；修改清单见 third_party/polyhal-trap/README.md 与
+# docs/ostd-contracts.md 缺陷表）。不得直接编辑 ~/.cargo/registry 的源码。
+[patch.crates-io]
+ext4_rs = { path = "third_party/ext4_rs" }
+polyhal-trap = { path = "third_party/polyhal-trap" }
+
+# selftest 专用构建档：release 优化 + debug 断言，
+# 让 cfg(debug_assertions) 的 OOM 注入等自检进入验证流程。
+# profile 必须写在 workspace 根（cargo 限制）。
+[profile.selftest]
+inherits = "release"
+debug-assertions = true

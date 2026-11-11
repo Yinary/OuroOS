@@ -1,7 +1,4 @@
-//! 物理页所有权与帧分配。启动时建立位图，运行时分配/释放不再申请堆内存。
-//!
-//! 旧 buddy 的空闲链表使用 BTreeSet，分裂/归还也可能因堆不足终止内核。
-//! 本实现采用区域内首次适配；优先保证失败可恢复，暂不做 NUMA/迁移/大页。
+//! 物理页所有权与帧分配：位图、区域内首次适配，运行期零堆依赖。
 use alloc::vec::Vec;
 use polyhal::{pagetable::PAGE_SIZE, PhysAddr};
 use spin::Mutex;

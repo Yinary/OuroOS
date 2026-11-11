@@ -50,15 +50,24 @@ SECTIONS
         egot = .;
     }
 
+    /* 段间距 4K 对齐：AT() 用的是上一段结束符号，若下一段因自身
+       align 被填充（如 .data 需要 16 字节对齐），ld 会修正 LMA 使
+       paddr = vaddr - 8，QEMU 按 paddr 加载后所有 .data 全局变量整体
+       错位，自旋锁等静态状态直接读成非零而永久卡死。这里把下一段的
+       起始 VMA 与 AT 同时对齐到同一地址，保持 paddr == vaddr 不变式。 */
+    . = ALIGN(4K);
+
     /* polyhal ctor 表（CtorType 系统初始化链） */
-    ph_init : AT(egot - VIRT_BASE + PHYS_BASE) {
+    ph_init : AT(ALIGN(egot, 4K) - VIRT_BASE + PHYS_BASE) {
         sph_init = .;
         KEEP(*(ph_init .ph_init))
         . = ALIGN(8);
         eph_init = .;
     }
 
-    .data : AT(eph_init - VIRT_BASE + PHYS_BASE) {
+    . = ALIGN(4K);
+
+    .data : AT(ALIGN(eph_init, 4K) - VIRT_BASE + PHYS_BASE) {
         _sdata = .;
         . = ALIGN(4K);
         *(.data.boot_page_table)
