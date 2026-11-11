@@ -38,6 +38,7 @@ impl Ext4 {
 
             if let Ok(path) = search_path {
                 // get the last path
+                // OuroOS patch audit: find_extent 返回 Ok 时路径必非空（构造保证），unwrap 安全。
                 let path = path.path.last().unwrap();
 
                 // get physical block id
@@ -126,6 +127,7 @@ impl Ext4 {
 
             if let Ok(path) = search_path {
                 // get the last path
+                // OuroOS patch audit: find_extent 返回 Ok 时路径必非空（构造保证），unwrap 安全。
                 let path = path.path.last().unwrap();
 
                 // get physical block id
@@ -358,6 +360,7 @@ impl Ext4 {
 
             if let Ok(path) = search_path {
                 // get the last path
+                // OuroOS patch audit: find_extent 返回 Ok 时路径必非空（构造保证），unwrap 安全。
                 let path = path.path.last().unwrap();
 
                 // get physical block id

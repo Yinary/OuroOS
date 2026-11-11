@@ -77,6 +77,7 @@ impl Ext4 {
         let search_path = self.find_extent(inode_ref, lblock);
         if let Ok(path) = search_path {
             // get the last path
+            // OuroOS patch audit: find_extent 返回 Ok 时路径必非空（构造保证），unwrap 安全。
             let path = path.path.last().unwrap();
 
             // get physical block id
@@ -216,7 +217,10 @@ impl Ext4 {
     }
 
     pub fn correspond_inode_mode(&self, filetype: u8) -> u16 {
-        let file_type = DirEntryType::from_bits(filetype).unwrap();
+        // OuroOS patch: filetype 来自磁盘目录项，未知位组合时归为 UNKNOWN
+        // 而非 unwrap panic。
+        let file_type = DirEntryType::from_bits(filetype)
+            .unwrap_or(DirEntryType::EXT4_DE_UNKNOWN);
         match file_type {
             DirEntryType::EXT4_DE_REG_FILE => InodeFileType::S_IFREG.bits(),
             DirEntryType::EXT4_DE_DIR => InodeFileType::S_IFDIR.bits(),

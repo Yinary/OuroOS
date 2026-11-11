@@ -24,7 +24,8 @@ impl Ext4 {
         // Load the root node
         let root_data: &[u8; 60] =
             unsafe { core::mem::transmute::<&[u32; 15], &[u8; 60]>(&inode_ref.inode.block) };
-        let mut node = ExtentNode::load_from_data(root_data, true).unwrap();
+        // OuroOS patch: 根节点来自磁盘 inode，坏数据时传播 EIO 而非 unwrap panic。
+        let mut node = ExtentNode::load_from_data(root_data, true)?;
 
         let mut depth = node.header.depth;
 
@@ -45,7 +46,12 @@ impl Ext4 {
                     pblock_of_node,
                 });
 
-                let next_block = search_path.path.last().unwrap().index.unwrap().leaf_lo;
+                // OuroOS patch: index 由磁盘 extent 节点解析而来，坏数据时
+                // 传播 EIO 而非 unwrap panic。
+                let next_block = match search_path.path.last().and_then(|p| p.index.as_ref()) {
+                    Some(index) => index.leaf_lo,
+                    None => return_errno_with_message!(Errno::EIO, "corrupt extent index"),
+                };
                 let mut next_data = self
                     .block_device
                     .read_offset(next_block as usize * BLOCK_SIZE);
@@ -201,7 +207,8 @@ impl Ext4 {
         let data = self
             .block_device
             .read_offset(node.pblock as usize * BLOCK_SIZE);
-        let extent_node = ExtentNode::load_from_data(&data, false).unwrap();
+        // OuroOS patch: 磁盘块数据，坏数据时传播 EIO 而非 unwrap panic。
+        let extent_node = ExtentNode::load_from_data(&data, false)?;
 
         match extent_node.get_extent(pos) {
             Some(extent) => Ok(extent),
@@ -214,7 +221,8 @@ impl Ext4 {
         let data = self
             .block_device
             .read_offset(node.pblock as usize * BLOCK_SIZE);
-        let extent_node = ExtentNode::load_from_data(&data, false).unwrap();
+        // OuroOS patch: 同上，磁盘块数据传播错误。
+        let extent_node = ExtentNode::load_from_data(&data, false)?;
 
         extent_node.get_index(pos)
     }
@@ -656,7 +664,11 @@ impl Ext4 {
         let depth = search_path.depth as usize;
 
         /* If we do remove_space inside the range of an extent */
-        let mut ex = search_path.path[depth].extent.unwrap();
+        // OuroOS patch: extent 来自磁盘构造的搜索路径，缺失时传播 EIO。
+        let mut ex = match search_path.path[depth].extent {
+            Some(ex) => ex,
+            None => return_errno_with_message!(Errno::EIO, "missing extent at depth"),
+        };
         if ex.get_first_block() < from
             && to < (ex.get_first_block() + ex.get_actual_len() as u32 - 1)
         {
@@ -1039,7 +1051,11 @@ impl Ext4 {
         let mut header = path.path[i].header;
 
         // Get the index block to delete
-        let leaf_block = path.path[i].index.unwrap().get_pblock();
+        // OuroOS patch: index 缺失时传播 EIO 而非 unwrap panic。
+        let leaf_block = match path.path[i].index {
+            Some(index) => index.get_pblock(),
+            None => return_errno_with_message!(Errno::EIO, "missing index to remove"),
+        };
 
         let node_pblock = path.path[i].pblock_of_node;
         let node_disk_pos = node_pblock * BLOCK_SIZE;
@@ -1088,7 +1104,12 @@ impl Ext4 {
         }
 
         // Free the index block
-        self.ext_remove_index_block(inode_ref, &mut path.path[i].index.unwrap());
+        // OuroOS patch: 同上，index 缺失时传播 EIO。
+        if let Some(mut index) = path.path[i].index.take() {
+            self.ext_remove_index_block(inode_ref, &mut index);
+        } else {
+            return_errno_with_message!(Errno::EIO, "missing index to free")
+        }
 
         // If we're not at the root, check if we need to update the parent node index
         let mut idx = i;
@@ -1098,10 +1119,15 @@ impl Ext4 {
             }
 
             let parent_idx = idx - 1;
-            let parent_index = &mut path.path[parent_idx].index.unwrap();
-            let current_index = &path.path[idx].index.unwrap();
-
-            parent_index.first_block = current_index.first_block;
+            // OuroOS patch: 同上，index 缺失时传播 EIO。
+            let current_first = match path.path[idx].index {
+                Some(index) => index.first_block,
+                None => return_errno_with_message!(Errno::EIO, "missing index in correct"),
+            };
+            match path.path[parent_idx].index.as_mut() {
+                Some(parent_index) => parent_index.first_block = current_first,
+                None => return_errno_with_message!(Errno::EIO, "missing parent index"),
+            }
             self.write_back_inode(inode_ref);
 
             idx -= 1;

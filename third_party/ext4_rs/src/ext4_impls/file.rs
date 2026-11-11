@@ -400,7 +400,7 @@ impl Ext4 {
                 block.data.copy_from_slice(&existing_data);
             }
             
-            block.write_offset(unaligned, &write_buf[..len], len);
+            block.write_offset(unaligned, &write_buf[..len], len)?;
 
             // Verify write
             block.sync_blk_to_disk(&self.block_device);
@@ -443,7 +443,7 @@ impl Ext4 {
                 block.data.copy_from_slice(&existing_data);
             }
             
-            block.write_offset(0, &write_buf[written..written + write_size], write_size);
+            block.write_offset(0, &write_buf[written..written + write_size], write_size)?;
 
             // Verify write
             block.sync_blk_to_disk(&self.block_device);

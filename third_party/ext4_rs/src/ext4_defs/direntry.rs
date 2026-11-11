@@ -148,7 +148,12 @@ impl Ext4DirEntry {
     pub fn get_name(&self) -> String {
         let name_len = self.name_len as usize;
         let name = &self.name[..name_len];
-        let name = core::str::from_utf8(name).unwrap();
+        // OuroOS patch: 磁盘上的文件名是字节串，可能非 UTF-8；
+        // 上游 unwrap 会 panic 内核，无效名以 "?" 读出。
+        let name = match core::str::from_utf8(name) {
+            Ok(s) => s,
+            Err(_) => "?",
+        };
         name.to_string()
     }
 

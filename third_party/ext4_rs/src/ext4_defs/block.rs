@@ -64,13 +64,18 @@ impl Block {
     }
 
     /// Write data to the block starting at a specific offset.
-    pub fn write_offset(&mut self, offset: usize, data: &[u8], len: usize) {
-        let end = offset + len;
+    // OuroOS patch: 上游越界 panic 内核；改为返回 EIO，由调用方传播。
+    pub fn write_offset(&mut self, offset: usize, data: &[u8], len: usize) -> Result<()> {
+        let end = match offset.checked_add(len) {
+            Some(end) => end,
+            None => return Err(Ext4Error::new(Errno::EIO)),
+        };
         if end <= self.data.len() {
             let slice_end = len.min(data.len());
             self.data[offset..end].copy_from_slice(&data[..slice_end]);
+            Ok(())
         } else {
-            panic!("Write would overflow the block buffer");
+            Err(Ext4Error::new(Errno::EIO))
         }
     }
 }
