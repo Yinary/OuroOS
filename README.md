@@ -33,24 +33,37 @@ OuroOS v0.1.0 · riscv64 · boot hart 0 · 1 cpus · boot ok
 
 随后内核进入最小用户态链路：依次运行内嵌的用户程序 `hello` 与 `check`
 （源码在 `user/hello/`，构建时嵌入内核镜像，不经磁盘），用户程序
-运行在用户权限级，经 ecall / syscall 执行 write 与 exit：
+运行在用户权限级，经 ecall / syscall 执行 write、exit 及内存系统调用：
 
 ```text
 hello, OuroOS user world (riscv64)
 [user] hello: exited with status 0
 check: write ok
+check: mm syscall paths ok
 check: all syscall paths ok, faulting now
-[user] check: killed by LoadPageFault @ 0x5000, pc 0x100e8
+[user] check: killed by LoadPageFault @ 0x5000, pc 0x10126
 ```
 
 `check` 覆盖：write 成功路径与返回字节数、跨页用户缓冲区、未映射地址与
 内核高地址缓冲区（EFAULT）、错误 fd（EBADF）、未实现系统调用（ENOSYS），
-以及用户态非法访存被内核报告并终止。两个程序运行结束后内核统一关机。
+以及 brk/mmap/munmap/mprotect 的成功、固定替换、权限与错误路径，
+最后验证用户态非法访存被内核报告并终止。所有任务结束后内核统一关机。
+
+## 内存系统调用范围
+
+| 编号 | 名称 | 已支持与限制 |
+|---|---|---|
+| 214 | brk | 查询、扩展、收缩；失败返回原 break，立即分配物理页 |
+| 222 | mmap | 私有匿名、私有/共享文件映射、MAP_FIXED 事务替换；偏移按页对齐，超出文件 EOF 的整页范围拒绝（尚无 SIGBUS 缺页） |
+| 215 | munmap | 起址必须页对齐，长度向上取整，允许空洞；零长度拒绝 |
+| 226 | mprotect | 修改读写、PROT_NONE；两架构不实现 NX，撤销 PROT_EXEC 返回 EOPNOTSUPP（95） |
+
+可访问页实际允许执行，PROT_WRITE 蕴含 PROT_READ。尚未实现按需分页、COW、SIGBUS 与远端 TLB 同步。
 
 ## 测试情况
 
-- 2026-10 本仓库尚在起步阶段，未接入官方测例；上述用户程序验证为本地
-  `make run-rv` / `make run-la`（QEMU 9.2.1 / 10.0.2）实测结果。
+- 2026-11 双架构 `basic` 组 32 个官方测试点在本地通过（官方 ELF 未修改），`selftest` 档同时运行 mm 自检。
+- 其余官方测例（busybox、lua、libctest 等）尚未接入。
 
 ## 文档
 

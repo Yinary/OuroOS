@@ -68,12 +68,67 @@ extern "C" fn ouro_main() -> ! {
     // 6) 未支持的 syscall
     expect(syscall3(SYS_BOGUS, 0, 0, 0), ENOSYS);
 
+    mm_checks();
+    expect(
+        hello::sys_mmap(0x5000, 4096, 3, 0x32, usize::MAX, 0),
+        0x5000,
+    );
+    expect(hello::sys_munmap(0x5000, 4096), 0);
     // 前置检查全部通过；随后故意访问未映射地址（0x5000），
     // 预期内核报告用户异常并终止本次运行，控制流不应回到这里
     sys_write(1, b"check: all syscall paths ok, faulting now\n");
     let sink = unsafe { core::ptr::read_volatile(0x5000usize as *const u64) };
     // 不应到达：若内核错误地放行，则以 3 退出暴露问题
     sys_exit(sink as _);
+}
+
+/// 覆盖内存 syscall 错误、固定替换和权限；末尾非法访存仍由既有流程检查。
+fn mm_checks() {
+    use hello::{sys_brk, sys_mmap, sys_mprotect, sys_munmap};
+    let base = sys_brk(0);
+    expect(sys_brk(base + 4097) as isize, (base + 4097) as isize);
+    // SAFETY: brk 已成功扩展两页，字节指针仅在映射有效时使用。
+    unsafe {
+        (base as *mut u8).write_volatile(42);
+    }
+    expect(sys_brk(usize::MAX) as isize, (base + 4097) as isize);
+    expect(sys_brk(base) as isize, base as isize);
+    expect(sys_write_raw(1, base, 1), EFAULT);
+    expect(sys_mmap(0, 0, 3, 0x22, usize::MAX, 0), -22);
+    expect(sys_mmap(0, 4096, 3, 0x22, usize::MAX, 1), -22);
+    expect(sys_mmap(0, 4096, 3, 0x21, usize::MAX, 0), -95);
+    let p = sys_mmap(0, 12288, 3, 0x22, usize::MAX, 0);
+    if p < 0 {
+        sys_exit(11);
+    }
+    let p = p as usize;
+    // SAFETY: 三页匿名映射成功，所有访问限定在该映射中。
+    unsafe {
+        (p as *mut u8).write_volatile(17);
+        ((p + 4096) as *mut u8).write_volatile(23);
+        ((p + 8192) as *mut u8).write_volatile(31);
+    }
+    expect(
+        sys_mmap(p + 4096, 4096, 3, 0x32, usize::MAX, 0),
+        (p + 4096) as isize,
+    );
+    // SAFETY: 固定映射替换中间页成功，两侧页面仍属于原映射。
+    unsafe {
+        expect((p as *const u8).read_volatile() as isize, 17);
+        expect(((p + 4096) as *const u8).read_volatile() as isize, 0);
+        expect(((p + 8192) as *const u8).read_volatile() as isize, 31);
+    }
+    expect(sys_mprotect(p, 4096, 3), -95);
+    expect(sys_mprotect(p, 4096, 0), 0);
+    expect(sys_write_raw(1, p, 1), EFAULT);
+    expect(sys_mprotect(p, 4096, 7), 0);
+    expect(sys_munmap(p + 1, 4096), -22);
+    expect(sys_munmap(p, 0), -22);
+    expect(sys_munmap(p, 12288), 0);
+    expect(sys_munmap(p, 4096), 0);
+    expect(sys_mprotect(p, 4096, 7), -12);
+    expect(sys_write_raw(1, p, 1), EFAULT);
+    sys_write(1, b"check: mm syscall paths ok\n");
 }
 
 define_user_entry!(ouro_main);
