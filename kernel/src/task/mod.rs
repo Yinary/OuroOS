@@ -1,5 +1,6 @@
-//! 任务与调度子系统：统一任务抽象（内核/用户任务）、进程注册表、
-//! 协作 + 时间片调度。完整契约见 docs/ostd-contracts.md §3。
+//! 任务与调度子系统：统一任务抽象（内核/用户任务）、进程注册表
+//!（收割即删，见 §3 生命周期）、协作 + 时间片调度与等待/唤醒。
+//! 完整契约见 docs/ostd-contracts.md §3。
 
 pub mod sched;
 // Issue 指定的 `task/mod.rs` + `task/task.rs` 布局会自然形成同名子模块。
@@ -14,7 +15,7 @@ use polyhal::{irq::IRQ, println};
 use crate::{mm, mm::address_space::LocalSpace, sync::DebugMutex, trap::UserFault};
 
 pub use sched::yield_now;
-pub use task::Pid;
+pub use task::{Pid, WaitReason};
 pub use user_task::{spawn_user, SpawnError};
 
 /// 一次任务终止的完整记录。
@@ -34,6 +35,9 @@ impl ExitInfo {
 }
 
 /// 进程注册表条目：Task 之外的全部资源与终态。
+/// 生命周期：wait 成功收割即从表中删除；无人 wait 的孤儿在过继
+/// 内核 init 时即收（exit 已存在则直接删除，运行时间累归丢弃）。
+/// 因此表内只存活跃进程与未被收割的僵尸，终态输出在退出时即时完成。
 pub struct ProcessRecord {
     user_ns: u64,
     system_ns: u64,
@@ -44,11 +48,10 @@ pub struct ProcessRecord {
     pub name: &'static str,
     /// 用户任务的地址空间（单核凭证包装，见 mm::address_space::
     /// LocalSpace）；内核任务与已退出任务为 None。
-    /// 放注册表不放 Task 的原因见模块契约"数据模型"。
+    /// 放注册表不放 Task 的原因见模块契约“数据模型”。
     pub space: Option<LocalSpace>,
     pub exit: Option<ExitInfo>,
     pub parent: Pid,
-    pub waited: bool,
 }
 
 /// 注册表本体。pid 0 保留（"无任务"标识）。
@@ -64,6 +67,11 @@ static REGISTRY: DebugMutex<Registry> = DebugMutex::new(
         records: Vec::new(),
     },
 );
+
+/// 终态行积攒表：收割即删后注册表不留历史，输出推迟到时代结束，
+/// 避免混入用户程序的测试输出块（官方 oracle 按 START/END 判定）。
+static EXIT_REPORTS: DebugMutex<Vec<(Pid, &'static str, ExitInfo)>> =
+    DebugMutex::new("EXIT_REPORTS", Vec::new());
 
 /// 注册表访问（调度器登记退出、用户循环取空间共用）。
 mod registry {
@@ -94,7 +102,6 @@ mod registry {
             space,
             exit: None,
             parent: 0,
-            waited: false,
             user_ns: 0,
             system_ns: 0,
             child_user_ns: 0,
@@ -104,26 +111,70 @@ mod registry {
     }
 
     /// 任务退出的唯一登记点：记录终态并释放地址空间。
-    /// 先显式切回内核页表再置 None 触发释放（Drop 兜底同款逻辑），
-    /// 顺序与旧 user.rs 一致；锁序 REGISTRY → FRAME（见 sync.rs 契约）。
+    /// 终态行积攒到时代末统一输出（不混入用户程序的测试输出块，官方
+    /// oracle 按 START/END 块判定）；孤儿过继内核 init，已退出的孤儿
+    /// 即收（无消费者，运行时间累归丢弃）。space/fs 的 Drop（页释放、
+    /// fd 关闭、可能的磁盘回收）在锁外完成，避免 REGISTRY 锁内嵌套磁盘
+    /// I/O 与反向取锁。
     pub fn record_exit(pid: Pid, exit: ExitInfo) {
+        let taken = {
+            let mut reg = REGISTRY.lock();
+            let rec = reg
+                .records
+                .iter_mut()
+                .find(|r| r.pid == pid)
+                .expect("exiting task is not registered");
+            rec.exit = Some(exit);
+            // 积攒终态行；容量不足时丢弃（打印非关键路径）
+            {
+                let mut reports = EXIT_REPORTS.lock();
+                if reports.try_reserve(1).is_ok() {
+                    reports.push((pid, rec.name, exit));
+                }
+            }
+            if let Some(local) = rec.space.as_ref() {
+                local.as_space().deactivate();
+            }
+            let taken = (rec.space.take(), rec.fs.take());
+            let init = INIT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            // 孤儿即收：过继内核 init 且已退出的孩子无人会 wait，直接回收
+            let reaped: Vec<Pid> = reg
+                .records
+                .iter()
+                .filter(|r| r.parent == pid && r.exit.is_some())
+                .map(|r| r.pid)
+                .collect();
+            for child in reg.records.iter_mut().filter(|r| r.parent == pid) {
+                child.parent = init;
+            }
+            reg.records.retain(|r| !reaped.contains(&r.pid));
+            taken
+        };
+        // 锁外 Drop：页表/页释放、fd 关闭，可能触发磁盘回收写
+        drop(taken);
+    }
+
+    /// wait 成功后收割：从表中删除记录并返回子进程的时间累计归属。
+    /// 返回（pid, user_ns, system_ns）。
+    pub fn reap_child(parent: Pid, target: Pid) -> Option<(u64, u64)> {
         let mut reg = REGISTRY.lock();
-        let rec = reg
+        let i = reg
             .records
-            .iter_mut()
-            .find(|r| r.pid == pid)
-            .expect("exiting task is not registered");
-        rec.exit = Some(exit);
-        if let Some(local) = rec.space.as_ref() {
-            local.as_space().deactivate();
-        }
-        // take+drop 在锁内完成：空间释放不可再失败
-        rec.space = None;
-        rec.fs = None;
-        let init = INIT_PID.load(core::sync::atomic::Ordering::Relaxed);
-        for child in reg.records.iter_mut().filter(|r| r.parent == pid) {
-            child.parent = init;
-        }
+            .iter()
+            .position(|r| r.pid == target && r.parent == parent && r.exit.is_some())?;
+        let rec = reg.records.remove(i);
+        Some((
+            rec.user_ns.saturating_add(rec.child_user_ns),
+            rec.system_ns.saturating_add(rec.child_system_ns),
+        ))
+    }
+
+    /// 注册表是否还有活跃（未退出）进程（init 自身除外）。
+    pub fn any_alive() -> bool {
+        let reg = REGISTRY.lock();
+        reg.records.iter().any(|r| {
+            r.pid != INIT_PID.load(core::sync::atomic::Ordering::Relaxed) && r.exit.is_none()
+        })
     }
 
     /// 注册表条目数（自检用，仅 debug 构建调用）。
@@ -132,24 +183,18 @@ mod registry {
         REGISTRY.lock().records.len()
     }
 
-    /// 启动汇总：逐进程报告终态。运行在 boot 栈（全部任务退出后）。
+    /// 启动自检：注册表内不应再有未退出的任务（每次启动）。
+    /// 终态报告已在退出时即时输出（见 record_exit）。
     pub fn report_all() {
-        let reg = REGISTRY.lock();
-        for rec in reg.records.iter() {
-            match &rec.exit {
-                Some(info) => match &info.fault {
-                    None => println!(
-                        "[task] pid {} ({}): exited with status {}",
-                        rec.pid, rec.name, info.code
-                    ),
-                    Some(f) => println!(
-                        "[task] pid {} ({}): killed by {:?} @ {:#x}, pc {:#x}",
-                        rec.pid, rec.name, f.kind, f.info, f.pc
-                    ),
-                },
+        for (pid, name, exit) in EXIT_REPORTS.lock().iter() {
+            match &exit.fault {
                 None => println!(
-                    "[task] pid {} ({}): still running (scheduler bug)",
-                    rec.pid, rec.name
+                    "[task] pid {} ({}): exited with status {}",
+                    pid, name, exit.code
+                ),
+                Some(f) => println!(
+                    "[task] pid {} ({}): killed by {:?} @ {:#x}, pc {:#x}",
+                    pid, name, f.kind, f.info, f.pc
                 ),
             }
         }
@@ -176,16 +221,9 @@ pub fn init() {
 }
 static INIT_PID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 fn init_task() {
-    loop {
-        let done = {
-            let reg = REGISTRY.lock();
-            reg.records.iter().all(|r| {
-                r.pid == INIT_PID.load(core::sync::atomic::Ordering::Relaxed) || r.exit.is_some()
-            })
-        };
-        if done {
-            return;
-        }
+    // 孤儿已由 record_exit 即收；只要还有活跃进程就继续等它们退出。
+    // waitpid 阻塞由等待表承担，init 自身仅在仍有活跃进程时让出等待。
+    while registry::any_alive() {
         yield_now();
     }
 }

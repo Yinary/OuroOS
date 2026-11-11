@@ -1,11 +1,15 @@
-//! 每进程工作目录和文件描述符；dup/fork 共享打开文件的偏移。
+//! 每进程工作目录、fd 表与文件类系统调用分发；dup/fork 共享打开文件
+//! 的偏移；read/write 循环分块，pipe 阻塞语义见 ostd-contracts §4。
 use crate::{
     fs,
     mm::{address_space::UserAddressSpace, user_access},
-    syscall::Errno,
+    syscall::{sysnr, Errno},
 };
 use alloc::{collections::VecDeque, string::String, sync::Arc, vec::Vec};
 use spin::Mutex;
+
+/// pipe 缓冲容量（对齐 Linux 默认 64KiB）；写满/读空时阻塞等待。
+const PIPE_CAPACITY: usize = 65536;
 
 struct Pipe {
     data: VecDeque<u8>,
@@ -40,6 +44,9 @@ impl Drop for OpenFile {
                 } else {
                     p.writers -= 1;
                 }
+                // 对端计数变化可能使等待者可读（EOF）或写失败（EPIPE），
+                // 请求唤醒；无锁原子标志，可在任意持锁环境下调用。
+                crate::task::sched::request_pipe_wake();
             }
             _ => {}
         }
@@ -195,7 +202,7 @@ pub fn dispatch(
     ctx: &mut Context,
 ) -> Result<usize, Errno> {
     match nr {
-        17 => {
+        sysnr::GETCWD => {
             if a[1] < ctx.cwd.len() + 1 {
                 return Err(Errno::Range);
             }
@@ -208,8 +215,8 @@ pub fn dispatch(
             .map_err(|_| Errno::Fault)?;
             Ok(ctx.cwd.len() + 1)
         }
-        23 => ctx.install(ctx.get(a[0])?, false),
-        24 => {
+        sysnr::DUP => ctx.install(ctx.get(a[0])?, false),
+        sysnr::DUP3 => {
             if a[2] & !0x80000 != 0 || a[0] == a[1] {
                 return Err(Errno::Invalid);
             }
@@ -229,7 +236,7 @@ pub fn dispatch(
             });
             Ok(a[1])
         }
-        34 => {
+        sysnr::MKDIRAT => {
             let path = ctx.path(a[0], &user_path(space, a[1])?)?;
             match fs::lookup(&path) {
                 Ok(_) => Err(Errno::Exists),
@@ -241,7 +248,7 @@ pub fn dispatch(
                 Err(e) => Err(e),
             }
         }
-        40 => {
+        sysnr::MOUNT => {
             if a[3] != 0 {
                 return Err(Errno::NotSupported);
             }
@@ -257,7 +264,7 @@ pub fn dispatch(
             fs::fat::mount(&source, &target)?;
             Ok(0)
         }
-        39 => {
+        sysnr::UMOUNT2 => {
             if a[1] != 0 {
                 return Err(Errno::NotSupported);
             }
@@ -265,7 +272,7 @@ pub fn dispatch(
             fs::fat::unmount(&target)?;
             Ok(0)
         }
-        35 => {
+        sysnr::UNLINKAT => {
             if a[2] != 0 {
                 return Err(Errno::NotSupported);
             }
@@ -275,7 +282,7 @@ pub fn dispatch(
             fs::unlink(p, ino, name)?;
             Ok(0)
         }
-        59 => {
+        sysnr::PIPE2 => {
             if a[1] & !(0x80000 | 0x800) != 0 {
                 return Err(Errno::Invalid);
             }
@@ -320,7 +327,7 @@ pub fn dispatch(
             }
             Ok(0)
         }
-        61 => {
+        sysnr::GETDENTS64 => {
             let handle = ctx.get(a[0])?;
             let mut f = handle.lock();
             let ino = match f.kind {
@@ -382,7 +389,7 @@ pub fn dispatch(
             f.offset = offset;
             Ok(used)
         }
-        49 => {
+        sysnr::CHDIR => {
             let path = ctx.path((-100isize) as usize, &user_path(space, a[0])?)?;
             if fs::stat(fs::lookup(&path)?)?.0 & 0xf000 != 0x4000 {
                 return Err(Errno::NotDir);
@@ -390,7 +397,7 @@ pub fn dispatch(
             ctx.cwd = path;
             Ok(0)
         }
-        56 => {
+        sysnr::OPENAT => {
             if a[2] & 3 == 3 {
                 return Err(Errno::Invalid);
             }
@@ -431,12 +438,12 @@ pub fn dispatch(
                 a[2] & 0x80000 != 0,
             )
         }
-        57 => {
+        sysnr::CLOSE => {
             let slot = ctx.fds.get_mut(a[0]).ok_or(Errno::BadF)?;
             slot.take().ok_or(Errno::BadF)?;
             Ok(0)
         }
-        62 => {
+        sysnr::LSEEK => {
             let handle = ctx.get(a[0])?;
             let mut f = handle.lock();
             let ino = match f.kind {
@@ -456,103 +463,8 @@ pub fn dispatch(
             f.offset = offset as usize;
             Ok(f.offset)
         }
-        63 | 64 => {
-            let handle = ctx.get(a[0])?;
-            let mut f = handle.lock();
-            if (nr == 63 && f.flags & 3 == 1) || (nr == 64 && f.flags & 3 == 0) {
-                return Err(Errno::BadF);
-            }
-            if a[2] == 0 {
-                return Ok(0);
-            }
-            if nr == 64 && matches!(f.kind, Kind::Output) {
-                use polyhal::debug_console::DebugConsole;
-                user_access::read_user_bytes(space, a[1], a[2], |bytes| {
-                    for &b in bytes {
-                        DebugConsole::putchar(b);
-                    }
-                })
-                .map_err(|_| Errno::Fault)?;
-                return Ok(a[2]);
-            }
-            let mut data = [0; 4096];
-            let n = a[2].min(data.len());
-            if nr == 64 {
-                user_access::copy_from_user(space, a[1], &mut data[..n])
-                    .map_err(|_| Errno::Fault)?;
-            }
-            let count = match &f.kind {
-                Kind::Output if nr == 64 => {
-                    use polyhal::debug_console::DebugConsole;
-                    for &b in &data[..n] {
-                        DebugConsole::putchar(b);
-                    }
-                    n
-                }
-                Kind::Input if nr == 63 => 0,
-                Kind::Pipe { pipe, reading } => {
-                    let mut p = pipe.lock();
-                    if *reading {
-                        if p.data.is_empty() {
-                            if p.writers == 0 {
-                                return Ok(0);
-                            }
-                            return Err(if f.flags & 0x800 != 0 {
-                                Errno::Again
-                            } else {
-                                Errno::WouldBlock
-                            });
-                        }
-                        let count = n.min(p.data.len());
-                        for (i, b) in p.data.iter().take(count).enumerate() {
-                            data[i] = *b;
-                        }
-                        user_access::copy_to_user(space, a[1], &data[..count])
-                            .map_err(|_| Errno::Fault)?;
-                        p.data.drain(..count);
-                        count
-                    } else {
-                        if p.readers == 0 {
-                            return Err(Errno::Pipe);
-                        }
-                        if 4096 - p.data.len() < n {
-                            return Err(if f.flags & 0x800 != 0 {
-                                Errno::Again
-                            } else {
-                                Errno::WouldBlock
-                            });
-                        }
-                        p.data.extend(&data[..n]);
-                        n
-                    }
-                }
-                Kind::Inode { ino, .. } => {
-                    let ino = *ino;
-                    if fs::stat(ino)?.0 & 0xf000 == 0x4000 {
-                        return Err(Errno::IsDir);
-                    }
-                    let offset = if nr == 64 && f.flags & 0x400 != 0 {
-                        fs::stat(ino)?.1 as usize
-                    } else {
-                        f.offset
-                    };
-                    let count = if nr == 63 {
-                        fs::read(ino, offset, &mut data[..n])?
-                    } else {
-                        fs::write(ino, offset, &data[..n])?
-                    };
-                    if nr == 63 {
-                        user_access::copy_to_user(space, a[1], &data[..count])
-                            .map_err(|_| Errno::Fault)?;
-                    }
-                    f.offset = offset.checked_add(count).ok_or(Errno::Invalid)?;
-                    return Ok(count);
-                }
-                _ => return Err(Errno::BadF),
-            };
-            Ok(count)
-        }
-        291 => {
+        sysnr::READ | sysnr::WRITE => rw(nr, a, space, ctx),
+        sysnr::STATX => {
             let path = user_path(space, a[1])?;
             if a[2] & !(0x1000 | 0x100 | 0x800 | 0x6000) != 0 {
                 return Err(Errno::Invalid);
@@ -583,7 +495,7 @@ pub fn dispatch(
             user_access::copy_to_user(space, a[4], &data).map_err(|_| Errno::Fault)?;
             Ok(0)
         }
-        80 => {
+        sysnr::FSTAT => {
             let handle = ctx.get(a[0])?;
             let f = handle.lock();
             let (ino, mode, size, links, blocks) = match &f.kind {
@@ -604,6 +516,121 @@ pub fn dispatch(
             Ok(0)
         }
         _ => Err(Errno::NoSys),
+    }
+}
+
+/// read(2)/write(2)：分块循环直至缓冲区填满/写尽或 EOF；单次分块上限
+/// 4KiB（内核栈缓冲）。pipe 读空/写满：O_NONBLOCK 返回 EAGAIN，否则
+/// 返回 EWOULDBLOCK 由分发层转为阻塞等待，醒来后重执行重查。
+/// 状态变化（pipe 读/写、对端关闭）请求唤醒对应等待者。
+fn rw(nr: usize, a: [usize; 6], space: &UserAddressSpace, ctx: &Context) -> Result<usize, Errno> {
+    let reading = nr == sysnr::READ;
+    let handle = ctx.get(a[0])?;
+    let mut f = handle.lock();
+    if (reading && f.flags & 3 == 1) || (!reading && f.flags & 3 == 0) {
+        return Err(Errno::BadF);
+    }
+    let total = a[2];
+    if total == 0 {
+        return Ok(0);
+    }
+    let mut chunk = [0u8; 4096];
+    let mut done = 0;
+    while done < total {
+        let want = (total - done).min(chunk.len());
+        let part: Result<usize, Errno> = (|| {
+            if !reading {
+                user_access::copy_from_user(space, a[1] + done, &mut chunk[..want])
+                    .map_err(|_| Errno::Fault)?;
+            }
+            match &f.kind {
+                Kind::Output if !reading => {
+                    use polyhal::debug_console::DebugConsole;
+                    for &b in &chunk[..want] {
+                        DebugConsole::putchar(b);
+                    }
+                    Ok(want)
+                }
+                Kind::Input if reading => Ok(0),
+                Kind::Pipe { pipe, .. } => {
+                    let mut p = pipe.lock();
+                    if reading {
+                        if p.data.is_empty() {
+                            if p.writers == 0 {
+                                return Ok(0);
+                            }
+                            return Err(nonblock_or_wait(f.flags));
+                        }
+                        let count = want.min(p.data.len());
+                        for (i, b) in p.data.iter().take(count).enumerate() {
+                            chunk[i] = *b;
+                        }
+                        user_access::copy_to_user(space, a[1] + done, &chunk[..count])
+                            .map_err(|_| Errno::Fault)?;
+                        p.data.drain(..count);
+                        // 腾出空间，唤醒写者
+                        crate::task::sched::request_pipe_wake();
+                        Ok(count)
+                    } else {
+                        if p.readers == 0 {
+                            return Err(Errno::Pipe);
+                        }
+                        if PIPE_CAPACITY - p.data.len() < want {
+                            return Err(nonblock_or_wait(f.flags));
+                        }
+                        p.data.extend(&chunk[..want]);
+                        // 有数据可读，唤醒读者
+                        crate::task::sched::request_pipe_wake();
+                        Ok(want)
+                    }
+                }
+                Kind::Inode { ino, .. } => {
+                    let ino = *ino;
+                    if fs::stat(ino)?.0 & 0xf000 == 0x4000 {
+                        return Err(Errno::IsDir);
+                    }
+                    let offset = if !reading && f.flags & 0x400 != 0 {
+                        fs::stat(ino)?.1 as usize
+                    } else {
+                        f.offset
+                    };
+                    let count = if reading {
+                        fs::read(ino, offset, &mut chunk[..want])?
+                    } else {
+                        fs::write(ino, offset, &chunk[..want])?
+                    };
+                    if reading {
+                        user_access::copy_to_user(space, a[1] + done, &chunk[..count])
+                            .map_err(|_| Errno::Fault)?;
+                    }
+                    f.offset = offset.checked_add(count).ok_or(Errno::Invalid)?;
+                    Ok(count)
+                }
+                _ => Err(Errno::BadF),
+            }
+        })();
+        match part {
+            Ok(0) => break, // EOF（或零长请求）
+            Ok(n) => done += n,
+            Err(e) => {
+                // 部分完成后出错：返回已完成量（Linux 短读/短写语义）
+                if done != 0 {
+                    return Ok(done);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(done)
+}
+
+/// pipe 阻塞判定：O_NONBLOCK 返回 EAGAIN，否则 EWOULDBLOCK（分发层
+/// 转为 Flow::Wait 挂起）。
+fn nonblock_or_wait(flags: usize) -> Errno {
+    if flags & 0x800 != 0 {
+        Errno::Again
+    } else {
+        Errno::WouldBlock
     }
 }
 /// 按进程工作目录读取可执行文件，返回独立内核镜像。

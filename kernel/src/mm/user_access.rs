@@ -24,9 +24,9 @@ fn page_writable(flags: MappingFlags) -> bool {
     flags.contains(MappingFlags::U | MappingFlags::W)
 }
 /// 把用户缓冲区 `[vaddr, vaddr+len)` 的内容分块交给 `consume`。
-///
-/// 先对整段做权限检查，全部通过后才复制；失败时不产生部分输出。
-/// 每个分块不跨页边界，长度不超过 [`KERNEL_CHUNK`]。
+/// 两遍式验证的流式接口；当前无调用方，保留供 writev 等散布 I/O
+/// 接入时使用。
+#[allow(dead_code)]
 pub fn read_user_bytes<F>(
     space: &UserAddressSpace,
     vaddr: usize,

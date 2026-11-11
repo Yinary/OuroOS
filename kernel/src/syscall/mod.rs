@@ -1,6 +1,6 @@
-//! 最小系统调用分发：write / exit / sched_yield / getpid，其余 ENOSYS。
+//! 系统调用分发：通用 UAPI 调用号分发表与进程/文件/内存三类实现入口。
 //! 调用号与寄存器约定按 riscv64/loongarch64 通用 UAPI（a7=调用号、
-//! a0..a5=参数、a0=返回负 errno 或结果）。支持范围与 Linux 语义偏差
+//! a0..=a5=参数、a0=返回负 errno 或结果）。支持范围与 Linux 语义偏差
 //! 见 docs/ostd-contracts.md §4；PC 推进由运行循环统一处理。
 
 mod memory;
@@ -8,6 +8,56 @@ mod memory;
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 
 use crate::mm::{address_space::UserAddressSpace, user_access};
+use crate::task::WaitReason;
+
+/// 已实现的通用 UAPI 调用号（asm-generic/unistd.h，rv64/la64 共用）。
+/// 少数未实现项一并列入（目录性质，接入时直接引用）。
+#[allow(dead_code)]
+pub mod sysnr {
+    // 文件
+    pub const GETCWD: usize = 17;
+    pub const DUP: usize = 23;
+    pub const DUP3: usize = 24;
+    pub const IOCTL: usize = 29;
+    pub const MKDIRAT: usize = 34;
+    pub const UNLINKAT: usize = 35;
+    pub const UMOUNT2: usize = 39;
+    pub const MOUNT: usize = 40;
+    pub const CHDIR: usize = 49;
+    pub const OPENAT: usize = 56;
+    pub const CLOSE: usize = 57;
+    pub const PIPE2: usize = 59;
+    pub const GETDENTS64: usize = 61;
+    pub const LSEEK: usize = 62;
+    pub const READ: usize = 63;
+    pub const WRITE: usize = 64;
+    pub const READV: usize = 65;
+    pub const WRITEV: usize = 66;
+    pub const FSTATAT: usize = 79;
+    pub const FSTAT: usize = 80;
+    pub const STATX: usize = 291;
+    // 进程
+    pub const EXIT: usize = 93;
+    pub const EXIT_GROUP: usize = 94;
+    pub const NANOSLEEP: usize = 101;
+    pub const CLOCK_GETTIME: usize = 113;
+    pub const SCHED_YIELD: usize = 124;
+    pub const KILL: usize = 129;
+    pub const TIMES: usize = 153;
+    pub const SET_TID_ADDRESS: usize = 96;
+    pub const UNAME: usize = 160;
+    pub const GETPID: usize = 172;
+    pub const GETPPID: usize = 173;
+    pub const GETTIMEOFDAY: usize = 169;
+    pub const CLONE: usize = 220;
+    pub const EXECVE: usize = 221;
+    pub const WAIT4: usize = 260;
+    // 内存
+    pub const BRK: usize = 214;
+    pub const MUNMAP: usize = 215;
+    pub const MMAP: usize = 222;
+    pub const MPROTECT: usize = 226;
+}
 
 /// Linux errno（仅当前用到的子集）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,10 +129,11 @@ impl Errno {
     }
 }
 
-/// 一次系统调用之后的执行流去向：继续、让出还是退出。
+/// 一次系统调用之后的执行流去向。
 pub enum Flow {
-    /// 等待 I/O，保留参数和 PC 后让出。
-    Retry,
+    /// 阻塞等待：保留 syscall PC 挂起，被唤醒后重执行重查条件
+    /// （“阻塞即让出”协议，等待/唤醒机制见 task 契约）。
+    Wait(WaitReason),
     /// 系统调用完成，返回用户态继续。
     Continue,
     /// 系统调用完成，返回用户态前让出 CPU（sched_yield 等）。
@@ -107,28 +158,45 @@ pub fn dispatch(
     let args = cx.args();
     let (a0, a1, a2) = (args[0], args[1], args[2]);
     match nr {
-        17 | 23 | 24 | 34 | 35 | 39 | 40 | 49 | 56 | 57 | 59 | 61 | 62 | 63 | 64 | 80 | 291 => {
+        sysnr::GETCWD
+        | sysnr::DUP
+        | sysnr::DUP3
+        | sysnr::MKDIRAT
+        | sysnr::UNLINKAT
+        | sysnr::UMOUNT2
+        | sysnr::MOUNT
+        | sysnr::CHDIR
+        | sysnr::OPENAT
+        | sysnr::CLOSE
+        | sysnr::PIPE2
+        | sysnr::GETDENTS64
+        | sysnr::LSEEK
+        | sysnr::READ
+        | sysnr::WRITE
+        | sysnr::FSTAT
+        | sysnr::STATX => {
             let ret = crate::fs::context::dispatch(
                 nr,
                 [args[0], args[1], args[2], args[3], args[4], args[5]],
                 space,
                 fs,
             );
+            // pipe 无数据/无空间且非 O_NONBLOCK：转为阻塞等待
             if ret == Err(Errno::WouldBlock) {
-                return Flow::Retry;
+                return Flow::Wait(WaitReason::Pipe);
             }
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
-        93 => Flow::Exited(a0 as i32),
-        214 => {
+        sysnr::EXIT => Flow::Exited(a0 as i32),
+        sysnr::BRK => {
             cx[TrapFrameArgs::RET] = space.brk(a0);
             Flow::Continue
         }
-        215 | 222 | 226 => {
+        sysnr::MUNMAP | sysnr::MMAP | sysnr::MPROTECT => {
             let ret = match nr {
-                215 => memory::munmap(space, a0, a1),
-                226 => memory::mprotect(space, a0, a1, a2),
+                sysnr::MUNMAP => memory::munmap(space, a0, a1),
+                sysnr::MPROTECT => memory::mprotect(space, a0, a1, a2),
                 _ => memory::mmap(
                     space,
                     [args[0], args[1], args[2], args[3], args[4], args[5]],
@@ -138,20 +206,25 @@ pub fn dispatch(
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
-        124 => {
+        sysnr::SCHED_YIELD => {
             // sched_yield(2)：成功返回 0；让出意图交给运行循环
             cx[TrapFrameArgs::RET] = 0;
             Flow::Yield
         }
-        101 | 153 | 173 | 220 | 221 | 260 => Flow::Process,
-        160 | 169 => {
-            let ret = if nr == 160 {
+        sysnr::NANOSLEEP
+        | sysnr::TIMES
+        | sysnr::GETPPID
+        | sysnr::CLONE
+        | sysnr::EXECVE
+        | sysnr::WAIT4 => Flow::Process,
+        sysnr::UNAME | sysnr::GETTIMEOFDAY => {
+            let ret = if nr == sysnr::UNAME {
                 let mut data = [0u8; 390];
                 for (i, text) in [
-                    "OuroOS",
+                    crate::config::KERNEL_NAME,
                     "ouro",
-                    "0.1.0",
-                    "basic",
+                    crate::config::KERNEL_VERSION,
+                    crate::config::KERNEL_NAME,
                     crate::config::ARCH_NAME,
                     "local",
                 ]
@@ -179,7 +252,7 @@ pub fn dispatch(
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
-        172 => {
+        sysnr::GETPID => {
             // getpid(2)：总成功；pid 由进程注册表分配，见 task 契约
             cx[TrapFrameArgs::RET] = pid;
             Flow::Continue
