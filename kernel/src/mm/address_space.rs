@@ -4,7 +4,7 @@ use super::{
     frame::{FrameError, OwnedFrame},
     page_table::UserPageTable,
 };
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use core::marker::PhantomData;
 use polyhal::{
     consts::VIRT_ADDR_START,
@@ -12,8 +12,8 @@ use polyhal::{
     PhysAddr,
 };
 
-/// 零页保留，不允许用户映射。
-pub const USER_BASE: usize = 0x1000;
+/// 静态 ELF 可以包含零地址的只读头部段。
+pub const USER_BASE: usize = 0;
 /// 当前静态程序布局上界，未来扩大布局须同步 ELF/栈/系统调用检查。
 pub const USER_TOP: usize = 0x8000_0000;
 /// 用户栈顶，16 字节对齐。
@@ -27,6 +27,7 @@ pub const GUARD_BOTTOM: usize = USER_STACK_BOTTOM - PAGE_SIZE;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapError {
     /// 当前不支持执行禁止，要求撤销 X 的保护操作被拒绝。
+    PermissionDenied,
     UnsupportedPermissions,
     OutOfUserRange,
     Overlap,
@@ -47,6 +48,7 @@ pub enum AreaKind {
     Stack,
     Anonymous,
     Heap,
+    File,
 }
 /// 页对齐、不重叠的虚拟区域，不持有物理页。
 #[derive(Debug, Clone, Copy)]
@@ -57,9 +59,22 @@ pub struct VmArea {
     pub flags: MappingFlags,
     pub kind: AreaKind,
 }
+/// 私有页独占，共享文件页使用缓存引用计数。
+pub enum Backing {
+    Private(OwnedFrame),
+    Shared(Arc<crate::fs::cache::SharedPage>, bool),
+}
+impl Backing {
+    fn addr(&self) -> PhysAddr {
+        match self {
+            Self::Private(p) => p.addr(),
+            Self::Shared(p, _) => p.addr(),
+        }
+    }
+}
 struct Page {
     va: usize,
-    frame: OwnedFrame,
+    frame: Backing,
 }
 
 /// 一个用户地址空间，创建/运行/销毁均在同一核；数据页不允许外部释放。
@@ -67,6 +82,8 @@ pub struct UserAddressSpace {
     pt: UserPageTable,
     pages: Vec<Page>,
     areas: Vec<VmArea>,
+    heap_start: usize,
+    program_break: usize,
     local_only: PhantomData<*mut ()>,
 }
 fn reserve<T>(v: &mut Vec<T>, n: usize) -> Result<(), MapError> {
@@ -86,7 +103,7 @@ fn end_of(start: usize, count: usize) -> Result<usize, MapError> {
         .checked_mul(PAGE_SIZE)
         .and_then(|n| start.checked_add(n))
         .ok_or(MapError::OutOfUserRange)?;
-    if count == 0 || start % PAGE_SIZE != 0 || start < USER_BASE || end > USER_TOP {
+    if count == 0 || start % PAGE_SIZE != 0 || end > USER_TOP {
         return Err(MapError::OutOfUserRange);
     }
     Ok(end)
@@ -98,8 +115,228 @@ impl UserAddressSpace {
             pt: UserPageTable::new()?,
             pages: Vec::new(),
             areas: Vec::new(),
+            heap_start: 0,
+            program_break: 0,
             local_only: PhantomData,
         })
+    }
+    /// ELF 加载结束后确定堆起点；只初始化一次。
+    pub fn init_heap(&mut self) {
+        if self.heap_start == 0 {
+            self.heap_start = self
+                .areas
+                .iter()
+                .filter(|a| a.kind == AreaKind::Elf)
+                .map(|a| a.end)
+                .max()
+                .unwrap_or(USER_BASE);
+            self.program_break = self.heap_start;
+        }
+    }
+    /// 原始 Linux brk ABI：失败返回原 break；同页调整不改变映射。
+    pub fn brk(&mut self, requested: usize) -> usize {
+        let old = self.program_break;
+        if requested < self.heap_start || requested >= GUARD_BOTTOM || self.heap_start == 0 {
+            return old;
+        }
+        let old_end = old.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        let new_end = requested.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        let result = match new_end.cmp(&old_end) {
+            core::cmp::Ordering::Greater => self.map_region(
+                old_end,
+                (new_end - old_end) / PAGE_SIZE,
+                MappingFlags::URW,
+                AreaKind::Heap,
+            ),
+            core::cmp::Ordering::Less => self.unmap(new_end, (old_end - new_end) / PAGE_SIZE),
+            core::cmp::Ordering::Equal => Ok(()),
+        };
+        if result.is_ok() {
+            self.program_break = requested;
+        }
+        self.program_break
+    }
+    /// 在用户栈保护区以下寻找页对齐空洞；非固定 hint 冲突时回退搜索。
+    pub fn find_free(&self, hint: usize, count: usize) -> Result<usize, MapError> {
+        let fits = |start| {
+            end_of(start, count)
+                .ok()
+                .filter(|&end| end <= GUARD_BOTTOM)
+                .filter(|&end| !self.areas.iter().any(|a| start < a.end && end > a.start))
+        };
+        let hint = hint / PAGE_SIZE * PAGE_SIZE;
+        if hint != 0 && fits(hint).is_some() {
+            return Ok(hint);
+        }
+        let mut start = 0x1000_0000;
+        for a in &self.areas {
+            if a.end <= start {
+                continue;
+            }
+            if fits(start).is_some() {
+                return Ok(start);
+            }
+            start = a.end;
+        }
+        if fits(start).is_some() {
+            Ok(start)
+        } else {
+            Err(MapError::OutOfMemory)
+        }
+    }
+    /// MAP_FIXED 的事务替换：新页、区域元数据、替代页表全部准备成功后才提交。
+    pub fn replace_region(
+        &mut self,
+        start: usize,
+        count: usize,
+        flags: MappingFlags,
+    ) -> Result<(), MapError> {
+        let end = end_of(start, count)?;
+        check_flags(flags)?;
+        if start < USER_STACK_BOTTOM && end > GUARD_BOTTOM {
+            return Err(MapError::HitsStack);
+        }
+        let mut next_areas = self.split(start, end, None)?;
+        reserve(&mut next_areas, 1)?;
+        next_areas.push(VmArea {
+            start,
+            end,
+            flags,
+            kind: AreaKind::Anonymous,
+        });
+        reserve(&mut self.pages, count)?;
+        let mut fresh = Vec::new();
+        reserve(&mut fresh, count)?;
+        for va in (start..end).step_by(PAGE_SIZE) {
+            fresh.push(Page {
+                va,
+                frame: Backing::Private(OwnedFrame::new()?),
+            });
+        }
+        let mut next_pt = UserPageTable::new()?;
+        for page in &self.pages {
+            if start <= page.va && page.va < end {
+                continue;
+            }
+            let area = self
+                .areas
+                .iter()
+                .find(|a| a.start <= page.va && page.va < a.end)
+                .ok_or(MapError::NotMapped)?;
+            next_pt.map(page.va, page.frame.addr(), area.flags)?;
+        }
+        for page in &fresh {
+            next_pt.map(page.va, page.frame.addr(), flags)?;
+        }
+        let active = self.pt.is_active();
+        core::mem::swap(&mut self.pt, &mut next_pt);
+        if active {
+            self.pt.activate();
+        }
+        drop(next_pt);
+        self.pages.retain(|p| p.va < start || p.va >= end);
+        self.pages.append(&mut fresh);
+        self.areas = next_areas;
+        self.coalesce();
+        Ok(())
+    }
+    /// 深拷贝私有区域与页面；失败时新空间自动回收，原空间不变。
+    pub fn deep_copy(&self) -> Result<Self, MapError> {
+        let mut child = Self::new()?;
+        for area in &self.areas {
+            child.map_region(
+                area.start,
+                (area.end - area.start) / PAGE_SIZE,
+                area.flags,
+                area.kind,
+            )?;
+        }
+        for source in &self.pages {
+            let dest = child
+                .pages
+                .iter_mut()
+                .find(|q| q.va == source.va)
+                .ok_or(MapError::NotMapped)?;
+            if let Backing::Shared(page, writable) = &source.frame {
+                let flags = self
+                    .areas
+                    .iter()
+                    .find(|a| a.start <= source.va && source.va < a.end)
+                    .ok_or(MapError::NotMapped)?
+                    .flags;
+                child.pt.protect(source.va, page.addr(), flags);
+                dest.frame = Backing::Shared(page.clone(), *writable);
+            } else {
+                // SAFETY: 私有源与目标分别拥有独立页，复制整页不重叠。
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        phys_to_kernel_vaddr(source.frame.addr()) as *const u8,
+                        phys_to_kernel_vaddr(dest.frame.addr()) as *mut u8,
+                        PAGE_SIZE,
+                    );
+                }
+            }
+        }
+        child.heap_start = self.heap_start;
+        child.program_break = self.program_break;
+        super::fence_icache();
+        Ok(child)
+    }
+    /// 事务安装文件页；FIXED 只有在全部页表与元数据准备成功后替换。
+    pub fn map_backed(
+        &mut self,
+        start: usize,
+        frames: Vec<Backing>,
+        flags: MappingFlags,
+        fixed: bool,
+    ) -> Result<(), MapError> {
+        let end = end_of(start, frames.len())?;
+        check_flags(flags)?;
+        if end > GUARD_BOTTOM {
+            return Err(MapError::HitsStack);
+        }
+        if !fixed && self.areas.iter().any(|a| start < a.end && a.start < end) {
+            return Err(MapError::Overlap);
+        }
+        let mut areas = self.split(start, end, None)?;
+        reserve(&mut areas, 1)?;
+        areas.push(VmArea {
+            start,
+            end,
+            flags,
+            kind: AreaKind::File,
+        });
+        reserve(&mut self.pages, frames.len())?;
+        let mut fresh = Vec::new();
+        reserve(&mut fresh, frames.len())?;
+        let mut pt = UserPageTable::new()?;
+        for p in &self.pages {
+            if p.va >= start && p.va < end {
+                continue;
+            }
+            let area = self
+                .areas
+                .iter()
+                .find(|a| a.start <= p.va && p.va < a.end)
+                .ok_or(MapError::NotMapped)?;
+            pt.map(p.va, p.frame.addr(), area.flags)?;
+        }
+        for (i, frame) in frames.into_iter().enumerate() {
+            let va = start + i * PAGE_SIZE;
+            pt.map(va, frame.addr(), flags)?;
+            fresh.push(Page { va, frame });
+        }
+        let active = self.pt.is_active();
+        core::mem::swap(&mut self.pt, &mut pt);
+        if active {
+            self.pt.activate();
+        }
+        drop(pt);
+        self.pages.retain(|p| p.va < start || p.va >= end);
+        self.pages.append(&mut fresh);
+        self.areas = areas;
+        self.coalesce();
+        Ok(())
     }
     /// 返回区域视图，不暴露可修改的映射或页所有权。
     pub fn areas(&self) -> &[VmArea] {
@@ -128,7 +365,10 @@ impl UserAddressSpace {
         for va in (start..end).step_by(PAGE_SIZE) {
             let result = OwnedFrame::new().map_err(MapError::from).and_then(|frame| {
                 self.pt.map(va, frame.addr(), flags)?;
-                self.pages.push(Page { va, frame });
+                self.pages.push(Page {
+                    va,
+                    frame: Backing::Private(frame),
+                });
                 Ok(())
             });
             if let Err(e) = result {
@@ -233,6 +473,13 @@ impl UserAddressSpace {
         if cursor != end {
             return Err(MapError::NotMapped);
         }
+        if flags.contains(MappingFlags::W)
+            && self.pages.iter().any(|p| {
+                p.va >= start && p.va < end && matches!(p.frame, Backing::Shared(_, false))
+            })
+        {
+            return Err(MapError::PermissionDenied);
+        }
         let next = self.split(start, end, Some(flags))?;
         for p in &self.pages {
             if start <= p.va && p.va < end {
@@ -266,7 +513,7 @@ impl UserAddressSpace {
     /// ELF 段不能侵入固定栈和保护区。
     pub fn check_user_span(start: usize, len: usize) -> Result<(), MapError> {
         let end = start.checked_add(len).ok_or(MapError::OutOfUserRange)?;
-        if start < USER_BASE || end > GUARD_BOTTOM {
+        if end > GUARD_BOTTOM {
             Err(MapError::HitsStack)
         } else {
             Ok(())

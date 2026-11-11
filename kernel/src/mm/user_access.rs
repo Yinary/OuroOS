@@ -3,7 +3,7 @@
 
 use polyhal::pagetable::{MappingFlags, PAGE_SIZE};
 
-use super::address_space::{phys_to_kernel_vaddr, UserAddressSpace, USER_BASE, USER_TOP};
+use super::address_space::{phys_to_kernel_vaddr, UserAddressSpace, USER_TOP};
 
 /// 复制到内核缓冲区的分块大小上限。
 const KERNEL_CHUNK: usize = 256;
@@ -143,7 +143,7 @@ pub fn copy_from_user(
 /// 检查 `[vaddr, vaddr+len)` 的溢出与用户地址范围，返回结束地址。
 fn check_span(vaddr: usize, len: usize) -> Result<usize, AccessError> {
     let end = vaddr.checked_add(len).ok_or(AccessError::Fault)?;
-    if vaddr < USER_BASE || end > USER_TOP {
+    if end > USER_TOP {
         return Err(AccessError::Fault);
     }
     Ok(end)
