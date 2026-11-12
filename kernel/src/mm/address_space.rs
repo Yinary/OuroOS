@@ -12,7 +12,7 @@ use polyhal::{
     PhysAddr,
 };
 
-/// 静态 ELF 可以包含零地址的只读头部段；未映射的空指针仍会失败。
+/// 静态 ELF 可以包含零地址的只读头部段。
 pub const USER_BASE: usize = 0;
 /// 当前静态程序布局上界，未来扩大布局须同步 ELF/栈/系统调用检查。
 pub const USER_TOP: usize = 0x8000_0000;
@@ -120,7 +120,7 @@ impl UserAddressSpace {
             local_only: PhantomData,
         })
     }
-    /// ELF 加载结束后确定堆起点；只初始化一次，堆与 mmap 共用区域账本。
+    /// ELF 加载结束后确定堆起点；只初始化一次。
     pub fn init_heap(&mut self) {
         if self.heap_start == 0 {
             self.heap_start = self
@@ -185,7 +185,6 @@ impl UserAddressSpace {
         }
     }
     /// MAP_FIXED 的事务替换：新页、区域元数据、替代页表全部准备成功后才提交。
-    /// 不复制保留页的数据；旧空间保持其所有权，直到新页表已激活并刷新 TLB。
     pub fn replace_region(
         &mut self,
         start: usize,

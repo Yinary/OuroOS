@@ -241,7 +241,7 @@ pub fn user_task_entry() -> ! {
     }
 }
 
-/// 进程调用在注册表锁外进入；等待未完成时让出且保留 syscall PC。
+/// 进程级系统调用的处理结果；等待未完成时让出且保留 syscall PC。
 enum ProcessResult {
     Done,
     Retry,

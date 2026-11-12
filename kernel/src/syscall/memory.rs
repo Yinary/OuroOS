@@ -1,6 +1,5 @@
-//! 内存系统调用：立即分配的私有匿名映射，不支持文件映射、共享映射和 NX。
+//! 内存系统调用：mmap/munmap/mprotect 的参数检查与实现。
 //! Linux ABI 依据 man7.org/linux/man-pages/man2/{mmap,mprotect,brk}.2.html。
-//! 不把 MAP_FIXED 当作普通映射：必须完整替换，准备失败保留旧空间。
 use super::Errno;
 use crate::mm::address_space::{AreaKind, MapError, UserAddressSpace};
 use polyhal::pagetable::{MappingFlags as F, PAGE_SIZE};
@@ -39,7 +38,7 @@ fn flags(prot: usize) -> Result<F, Errno> {
     Ok(f)
 }
 /// mmap(2) 子集：PRIVATE|ANONYMOUS，支持 FIXED；其余标志明确拒绝。
-/// 匿名 fd 被忽略；offset 仍必须页对齐。可访问页实际允许执行。
+/// 匿名 fd 被忽略；offset 仍必须页对齐。
 pub(super) fn mmap(
     space: &mut UserAddressSpace,
     a: [usize; 6],
@@ -67,7 +66,7 @@ pub(super) fn mmap(
         let (ino, writable) = crate::fs::context::mapping(ctx, _fd, shared && prot & 2 != 0)?;
         let file_size = crate::fs::stat(ino)?.1 as usize;
         let end = offset.checked_add(len).ok_or(Errno::Invalid)?;
-        // 超过 EOF 的整页尚无 SIGBUS 缺页支持，明确拒绝该范围。
+        // 超出文件 EOF 的整页范围直接拒绝。
         if end > file_size.div_ceil(PAGE_SIZE) * PAGE_SIZE {
             return Err(Errno::NotSupported);
         }
@@ -136,7 +135,7 @@ pub(super) fn munmap(
     Ok(0)
 }
 /// mprotect(2) 子集：完整区间修改；明确拒绝可访问但禁止执行的请求。
-/// 长度为零不改变任何映射；当前没有信号系统，访问违规由用户运行循环终止任务。
+/// 长度为零不改变任何映射。
 pub(super) fn mprotect(
     space: &mut UserAddressSpace,
     addr: usize,

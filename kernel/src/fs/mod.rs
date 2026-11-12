@@ -52,7 +52,7 @@ pub fn init() -> Result<(), Errno> {
         u32at(40),
         u16at(88)
     );
-    // 当前依赖固定使用 4 KiB 数据块；先验证几何，避免无效超级块进入解析器。
+    // 验证超级块几何：固定 4 KiB 数据块。
     if u16at(56) != 0xef53
         || u32at(24) != 2
         || u32at(32) == 0
@@ -212,7 +212,7 @@ fn reclaim(fs: &Ext4, ino: u32) -> Result<(), Errno> {
     if inode.inode.size() != 0 {
         fs.truncate_inode(&mut inode, 0).map_err(error)?;
     }
-    // 尚无 RTC：以卷根目录的时间为基准，避免把小整数误编码成 orphan 链指针。
+    // 无 RTC，以根目录 ctime 加当前秒作 dtime。
     inode.inode.set_dtime(
         fs.get_inode_ref(2)
             .inode
