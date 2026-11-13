@@ -4,7 +4,7 @@
 - 原协议：MIT
 - 引入方式：整 crate 复制进本仓库（`[patch.crates-io]` 指向本目录，
   见根 Cargo.toml），仅 polyhal-trap 一个 crate；polyhal 本体未 vendor。
-- 修改说明（相对上游 0.4.0，逐条对应 doc/ostd-contracts.md 缺陷表）：
+- 修改说明（相对上游 0.4.0，逐条对应 docs/ostd-contracts.md 缺陷表）：
   1. 缺陷 #5（EscapeReason 有损）：四架构 `run_user_task` 改为返回完整
      `TrapType`，不再 `From<TrapType> for EscapeReason` 降维。EscapeReason
      类型与 From 实现保留仅为兼容，不应再使用。

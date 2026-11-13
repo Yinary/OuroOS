@@ -62,10 +62,13 @@ check: all syscall paths ok, faulting now
 
 ## 测试情况
 
-- 2026-11 双架构 `basic` 组 32 个官方测试点在本地通过（官方 ELF 未修改），`selftest` 档同时运行 mm 自检。
+- 2026-11 双架构 `basic` 组 32 个官方测试点在本地通过（官方 ELF 未修改），`basic_edges` 与 `selftest` 档（mm 自检 + 帧守恒）同样通过。
 - 其余官方测例（busybox、lua、libctest 等）尚未接入。
 
 ## 文档
+
+- [ostd 契约与已知缺陷](docs/ostd-contracts.md)
+- [第三方与借鉴代码登记](docs/third-party.md)
 
 ## 第三方代码声明
 
@@ -74,10 +77,13 @@ check: all syscall paths ok, faulting now
 | PolyHAL 0.4.0 | https://github.com/Byte-OS/polyhal | MIT | 硬件抽象层 |
 | PolyHAL example | https://github.com/Byte-OS/polyhal example 目录 | MIT | 改编了 `kernel/build.rs`、`kernel/linker.lds`、`kernel/src/mm/frame.rs` |
 | polyhal-boot 0.4.0 | https://crates.io/crates/polyhal-boot | MIT | 双架构早期汇编入口与早期初始化（多核拉起路径本项目不使用） |
-| polyhal-trap 0.4.0 | https://crates.io/crates/polyhal-trap | MIT | 双架构中断/异常初始化与分发 |
+| polyhal-trap 0.4.0 | https://github.com/Byte-OS/polyhal | MIT | 双架构中断/异常初始化与分发；vendor 至 `third_party/polyhal-trap` 并打本地补丁（清单见其 README） |
+| virtio-drivers 0.7.5 | https://github.com/rcore-os/virtio-drivers | MIT | 块设备驱动；自写 DMA 与 MMIO/PCI 适配 |
+| rsext4 0.8.1 | https://crates.io/crates/rsext4/0.8.1 | Apache-2.0 | Ext4 后端，vendor 于 `third_party/rsext4` |
+| rust-fatfs（锁定 revision） | https://github.com/rafalh/rust-fatfs | MIT | FAT 挂载与文件读写 |
 | log 0.4.34 | https://crates.io/crates/log | MIT OR Apache-2.0 | 分级日志 |
 | spin 0.10.1 | https://crates.io/crates/spin | MIT | 自旋锁（帧分配器） |
-| buddy_system_allocator 0.11.0 | https://crates.io/crates/buddy_system_allocator | MIT | 内核堆与页帧 buddy 分配器 |
+| buddy_system_allocator 0.11.0 | https://crates.io/crates/buddy_system_allocator | MIT | 内核堆分配器（页帧分配器为自建位图） |
 
 ## AI 工具使用说明
 
