@@ -27,13 +27,27 @@ pub enum TaskBody {
     User { frame: TrapFrame, pid: Pid },
 }
 
-/// 调度状态。本轮没有阻塞语义（阻塞原语是下一阶段工作），
+/// 调度状态。Waiting 任务驻留等待表，由事件唤醒或到期扫描搬回就绪表；
 /// Exited 任务进入调度器的待回收表，由 idle 回收内核栈。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskState {
     Ready,
     Running,
+    Waiting,
     Exited,
+}
+
+/// 任务挂起的原因；唤醒采用宽松匹配（醒来重查条件）而非精确订阅。
+/// 任何 pipe 状态变化唤醒全部 Pipe 等待者（单核惊群可忽略），
+/// 子进程退出唤醒全部 Children 等待者。
+#[derive(Clone, Copy, Debug)]
+pub enum WaitReason {
+    /// 绝对截止时间（nanosleep）。
+    Deadline(core::time::Duration),
+    /// 等待子进程退出（waitpid 无可收割孩子）。
+    Children,
+    /// 等待任意 pipe 可读/可写。
+    Pipe,
 }
 
 /// 单个任务。
@@ -48,7 +62,8 @@ pub struct Task {
     /// 本时间片起点的 tick；由调度器在切入（promote）时刷新，
     /// 用户任务在逃逸点比较 [`crate::TIMER_TICKS`] 与它决定让出。
     pub slice_tick: usize,
-    /// nanosleep 等待的绝对截止时间。
+    /// nanosleep 的绝对截止时间；syscall 重执行时用于区分
+    /// “正在睡眠”与“睡眠到期”。
     pub sleep_deadline: Option<core::time::Duration>,
     /// 内核栈（纯所有权字段，仅 Drop 生效，无读取方；下划线豁免
     /// dead_code 检查）。任务回收（idle 的 reap）时最终释放。

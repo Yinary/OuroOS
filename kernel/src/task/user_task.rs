@@ -12,13 +12,13 @@ use polyhal_trap::{
 use crate::{
     elf::{self, ElfError},
     mm::address_space::{UserAddressSpace, USER_STACK_TOP},
-    syscall::{self, Errno, Flow},
+    syscall::{sysnr, Errno, Flow},
     trap::{self, UserFault},
 };
 
 use super::{
     sched::{self, current_ptr},
-    task::{Pid, Task, TaskBody},
+    task::{Pid, Task, TaskBody, WaitReason},
     ExitInfo, REGISTRY,
 };
 
@@ -153,6 +153,9 @@ pub fn user_task_entry() -> ! {
                     TrapType::SysCall => {
                         // 只处理来自用户的系统调用，其余防御性忽略
                         if frame.from_user() {
+                            // dispatch 在 REGISTRY 锁内取空间与 fs 上下文；
+                            // 进程级调用（process_call 会再取 REGISTRY）
+                            // 必须在锁外执行，非重入锁不可重入。
                             let flow = {
                                 let mut reg = REGISTRY.lock();
                                 let rec = reg
@@ -164,19 +167,37 @@ pub fn user_task_entry() -> ! {
                                     .space
                                     .as_mut()
                                     .expect("running user task lost its space");
-                                syscall::dispatch(frame, pid, &mut space.0, rec.fs.as_mut().expect("user fs context"))
+                                crate::syscall::dispatch(
+                                    frame,
+                                    pid,
+                                    &mut space.0,
+                                    rec.fs.as_mut().expect("user fs context"),
+                                )
                             };
                             // 恰好推进一次 syscall PC：polyhal 对 SysCall
-                            // 不推进，重复/遗漏都会破坏用户执行流
-                            let outcome = if matches!(flow, Flow::Process) {
-                                process_call(pid, frame)
-                            } else if matches!(flow, Flow::Retry) { ProcessResult::Retry } else { ProcessResult::Done };
-                            let retry = matches!(outcome, ProcessResult::Retry);
-                            if matches!(outcome, ProcessResult::Done) { frame.syscall_ok(); }
+                            // 不推进，重复/遗漏都会破坏用户执行流。
+                            // 阻塞（Wait）不推 PC，挂起醒来后重执行重查。
+                            let outcome = match flow {
+                                Flow::Process => process_call(pid, frame),
+                                Flow::Wait(reason) => ProcessResult::Wait(reason),
+                                _ => ProcessResult::Done,
+                            };
+                            if matches!(outcome, ProcessResult::Done) {
+                                frame.syscall_ok();
+                            }
+                            // 挂起等待：不持任何借用与锁，切走直到被唤醒；
+                            // 醒来后从 syscall 指令重新执行（Mesa 风格重查）
+                            let wait_reason = match (&flow, &outcome) {
+                                (Flow::Wait(reason), _) => Some(*reason),
+                                (Flow::Process, ProcessResult::Wait(reason)) => Some(*reason),
+                                _ => None,
+                            };
+                            if let Some(reason) = wait_reason {
+                                sched::park(reason);
+                                continue;
+                            }
                             match flow {
-                                Flow::Continue => Action::Continue,
-                                Flow::Retry => Action::Yield,
-                                Flow::Process => if retry { Action::Yield } else { Action::Continue },
+                                Flow::Continue | Flow::Process | Flow::Wait(_) => Action::Continue,
                                 Flow::Yield => Action::Yield,
                                 Flow::Exited(code) => Action::Exit(ExitInfo::exited(code)),
                             }
@@ -241,23 +262,25 @@ pub fn user_task_entry() -> ! {
     }
 }
 
-/// 进程级系统调用的处理结果；等待未完成时让出且保留 syscall PC。
+/// 进程级系统调用的处理结果；等待未完成时挂起并保留 syscall PC。
 enum ProcessResult {
     Done,
-    Retry,
+    Wait(WaitReason),
     Replaced,
 }
 fn process_call(parent: Pid, frame: &mut TrapFrame) -> ProcessResult {
     let args = frame.args();
     let nr = frame[TrapFrameArgs::SYSCALL];
     let result: Result<usize, Errno> = match nr {
-        101 => {
+        sysnr::NANOSLEEP => {
+            // nanosleep(2)：首次设定绝对截止时间并挂起，到期后重执行
+            // 返回 0；剩余时间报告（rem 参数）未支持。
             let task = current_ptr();
-            // SAFETY: 当前任务独占字段，短借用不跨调度；无锁时再由外层 yield。
+            // SAFETY: 当前任务独占字段，短借用不跨调度；挂起前释放。
             let deadline = unsafe { (*task).sleep_deadline };
             if let Some(until) = deadline {
                 if polyhal::timer::current_time() < until {
-                    return ProcessResult::Retry;
+                    return ProcessResult::Wait(WaitReason::Deadline(until));
                 }
                 // SAFETY: 当前任务尚未切换，字段独占。
                 unsafe {
@@ -291,7 +314,7 @@ fn process_call(parent: Pid, frame: &mut TrapFrame) -> ProcessResult {
                             unsafe {
                                 (*task).sleep_deadline = Some(until);
                             }
-                            return ProcessResult::Retry;
+                            return ProcessResult::Wait(WaitReason::Deadline(until));
                         } else {
                             Err(Errno::Invalid)
                         }
@@ -299,7 +322,7 @@ fn process_call(parent: Pid, frame: &mut TrapFrame) -> ProcessResult {
                 }
             }
         }
-        153 => {
+        sysnr::TIMES => {
             let reg = REGISTRY.lock();
             if let Some(rec) = reg.records.iter().find(|r| r.pid == parent) {
                 let mut data = [0; 32];
@@ -327,87 +350,101 @@ fn process_call(parent: Pid, frame: &mut TrapFrame) -> ProcessResult {
                 Err(Errno::NoProcess)
             }
         }
-        173 => Ok(REGISTRY
+        sysnr::GETPPID => Ok(REGISTRY
             .lock()
             .records
             .iter()
             .find(|r| r.pid == parent)
             .map_or(0, |r| r.parent)),
-        221 => match super::exec::exec(parent, [args[0], args[1], args[2]], frame) {
+        sysnr::EXECVE => match super::exec::exec(parent, [args[0], args[1], args[2]], frame) {
             Ok(()) => return ProcessResult::Replaced,
             Err(e) => Err(e),
         },
-        220 => fork_user(parent, frame, args[0], args[1]),
-        260 => {
+        sysnr::CLONE => fork_user(parent, frame, args[0], args[1]),
+        sysnr::WAIT4 => {
+            // wait4(2)：wanted <= 0 等任意孩子（无进程组概念，0 与 -1
+            // 等价）；>0 指定 pid；其余负值 EINVAL。无可收割孩子时挂起，
+            // 无孩子 ECHILD。收割即从注册表删除（生命周期见 mod.rs）。
             if args[2] & !1 != 0 {
                 Err(Errno::Invalid)
             } else {
-                let mut reg = REGISTRY.lock();
                 let wanted = args[0] as isize;
-                let child = reg.records.iter().position(|r| {
-                    r.parent == parent
-                        && !r.waited
-                        && (wanted == -1 || wanted > 0 && r.pid == wanted as usize)
-                        && r.exit.is_some()
-                });
-                if let Some(i) = child {
-                    let info = reg.records[i].exit;
-                    let status = info.map_or(0, |e| {
-                        if e.fault.is_some() {
-                            11u32
-                        } else {
-                            (e.code as u32 & 255) << 8
-                        }
-                    });
-                    let copied = args[1] == 0
-                        || reg
+                if wanted < -1 {
+                    Err(Errno::Invalid)
+                } else {
+                    let matches = |r: &super::ProcessRecord| {
+                        r.parent == parent && (wanted <= 0 || r.pid == wanted as usize)
+                    };
+                    let (ready, has_children, status, reaped_pid) = {
+                        let reg = REGISTRY.lock();
+                        let ready = reg
                             .records
                             .iter()
-                            .find(|r| r.pid == parent)
-                            .and_then(|r| r.space.as_ref())
-                            .is_some_and(|s| {
-                                crate::mm::user_access::copy_to_user(
-                                    s.as_space(),
-                                    args[1],
-                                    &status.to_ne_bytes(),
-                                )
-                                .is_ok()
-                            });
-                    if !copied {
-                        Err(Errno::Fault)
-                    } else {
-                        let pid = reg.records[i].pid;
-                        reg.records[i].waited = true;
-                        let user = reg.records[i]
-                            .user_ns
-                            .saturating_add(reg.records[i].child_user_ns);
-                        let system = reg.records[i]
-                            .system_ns
-                            .saturating_add(reg.records[i].child_system_ns);
-                        if let Some(rec) = reg.records.iter_mut().find(|r| r.pid == parent) {
-                            rec.child_user_ns = rec.child_user_ns.saturating_add(user);
-                            rec.child_system_ns = rec.child_system_ns.saturating_add(system);
+                            .position(|r| matches(r) && r.exit.is_some());
+                        let has_children = reg.records.iter().any(|r| matches(r));
+                        let status = ready.map(|i| {
+                            let info = reg.records[i].exit;
+                            info.map_or(0, |e| {
+                                if e.fault.is_some() {
+                                    11u32
+                                } else {
+                                    (e.code as u32 & 255) << 8
+                                }
+                            })
+                        });
+                        (
+                            ready,
+                            has_children,
+                            status,
+                            ready.map(|i| reg.records[i].pid),
+                        )
+                    };
+                    if ready.is_some() {
+                        let child_pid = reaped_pid.expect("ready implies pid");
+                        let copied = args[1] == 0 || {
+                            let reg = REGISTRY.lock();
+                            reg.records
+                                .iter()
+                                .find(|r| r.pid == parent)
+                                .and_then(|r| r.space.as_ref())
+                                .is_some_and(|s| {
+                                    crate::mm::user_access::copy_to_user(
+                                        s.as_space(),
+                                        args[1],
+                                        &status.expect("ready implies status").to_ne_bytes(),
+                                    )
+                                    .is_ok()
+                                })
+                        };
+                        if !copied {
+                            // 状态指针非法：孩子已收割（Linux 也是收割优先）
+                            Err(Errno::Fault)
+                        } else {
+                            // 收割即删，运行时间累计归父进程
+                            let (user, system) = super::registry::reap_child(parent, child_pid)
+                                .expect("child exists");
+                            let mut reg = REGISTRY.lock();
+                            if let Some(rec) = reg.records.iter_mut().find(|r| r.pid == parent) {
+                                rec.child_user_ns = rec.child_user_ns.saturating_add(user);
+                                rec.child_system_ns = rec.child_system_ns.saturating_add(system);
+                            }
+                            Ok(child_pid)
                         }
-                        Ok(pid)
-                    }
-                } else if reg.records.iter().any(|r| {
-                    r.parent == parent
-                        && !r.waited
-                        && (wanted == -1 || wanted > 0 && r.pid == wanted as usize)
-                }) {
-                    if args[2] & 1 != 0 {
-                        Ok(0)
+                    } else if has_children {
+                        if args[2] & 1 != 0 {
+                            Ok(0)
+                        } else {
+                            return ProcessResult::Wait(WaitReason::Children);
+                        }
                     } else {
-                        return ProcessResult::Retry;
+                        Err(Errno::NoChild)
                     }
-                } else {
-                    Err(Errno::NoChild)
                 }
             }
         }
         _ => Err(Errno::NoSys),
     };
-    frame[TrapFrameArgs::RET] = syscall::to_abi(result);
+    frame[TrapFrameArgs::RET] = crate::syscall::to_abi(result);
     ProcessResult::Done
 }
 /// 创建独立地址空间的子进程，保留父现场，子进程从下一条指令返回零。
