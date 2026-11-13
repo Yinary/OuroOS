@@ -38,6 +38,8 @@ pub enum Errno {
     Invalid,
     /// 不支持的能力。
     NotSupported,
+    /// 只读文件系统。
+    ReadOnly,
     /// EBADF: fd 不在支持范围
     BadF,
     /// EFAULT: 用户缓冲区地址非法
@@ -72,6 +74,7 @@ impl Errno {
             Self::NoMem => 12,
             Self::Invalid => 22,
             Self::NotSupported => 95,
+            Self::ReadOnly => 30,
             Errno::BadF => 9,
             Errno::Fault => 14,
             Errno::NoSys => 38,
@@ -107,7 +110,8 @@ pub fn dispatch(
     let args = cx.args();
     let (a0, a1, a2) = (args[0], args[1], args[2]);
     match nr {
-        17 | 23 | 24 | 34 | 35 | 39 | 40 | 49 | 56 | 57 | 59 | 61 | 62 | 63 | 64 | 80 | 291 => {
+        17 | 23 | 24 | 34 | 35 | 39 | 40 | 49 | 56 | 57 | 59 | 61 | 62 | 63 | 64 | 80 | 82
+        | 291 => {
             let ret = crate::fs::context::dispatch(
                 nr,
                 [args[0], args[1], args[2], args[3], args[4], args[5]],

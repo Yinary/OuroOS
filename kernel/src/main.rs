@@ -122,6 +122,10 @@ fn rust_main(hartid: usize) {
 
     // 进入任务时代：关中断、跑调度器到全部退出、汇总并断言帧守恒
     task::run(baseline);
+    #[cfg(not(feature = "rsext4-readonly"))]
+    if let Err(error) = fs::shutdown() {
+        log::error!("Ext4 shutdown failed: {:?}", error);
+    }
     shutdown();
 }
 

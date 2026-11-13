@@ -43,24 +43,38 @@ impl SharedPage {
             );
         }
     }
+
+    fn write_back(&self) -> Result<(), Errno> {
+        let len = super::stat(self.ino)?.1 as usize;
+        let count = len.saturating_sub(self.offset).min(4096);
+        if count != 0 {
+            let mut data = [0; 4096];
+            self.load(0, &mut data[..count]);
+            if super::write_raw(self.ino, self.offset, &data[..count])? != count {
+                return Err(Errno::Io);
+            }
+        }
+        Ok(())
+    }
 }
 impl Drop for SharedPage {
     fn drop(&mut self) {
-        let result = (|| {
-            let len = super::stat(self.ino)?.1 as usize;
-            let count = len.saturating_sub(self.offset).min(4096);
-            if count != 0 {
-                let mut data = [0; 4096];
-                self.load(0, &mut data[..count]);
-                super::write_raw(self.ino, self.offset, &data[..count])?;
-            }
-            Ok::<(), Errno>(())
-        })();
-        if let Err(e) = result {
+        if let Err(e) = self.write_back() {
             log::error!("shared page writeback failed: {:?}", e);
         }
         super::release(self.ino);
     }
+}
+
+/// 将指定 inode 的驻留共享页写回文件后端。
+#[cfg(not(feature = "rsext4-readonly"))]
+pub(super) fn sync_inode(ino: u32) -> Result<(), Errno> {
+    for (_, _, page) in PAGES.lock().iter().filter(|(id, _, _)| *id == ino) {
+        if let Some(page) = page.upgrade() {
+            page.write_back()?;
+        }
+    }
+    Ok(())
 }
 /// 取得同一 inode/offset 的唯一共享页。
 pub fn page(ino: u32, offset: usize) -> Result<Arc<SharedPage>, Errno> {

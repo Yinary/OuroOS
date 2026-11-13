@@ -39,7 +39,8 @@ MEM ?= 1G
 # 仅面向单核，默认 -smp 1
 SMP ?= 1
 LOG ?= warn         # 编译期日志级别: error|warn|info|debug|trace（boot 报告块由 polyhal 固定打印，不受此控）
-FEATURES ?=         # 附加 cargo feature，例如 make selftest-rv 无需手改
+FEATURES ?=         # 附加内核 feature，例如 rsext4-readonly
+KERNEL_FEATURES = $(if $(strip $(FEATURES)),--features "$(strip $(FEATURES))")
 
 # QEMU：默认取 PATH 中的可执行文件；不在 PATH 时用变量覆盖，例如：
 #   make run-la QEMU_LA=/path/to/qemu-system-loongarch64
@@ -73,7 +74,7 @@ build-rv:
 	OUROOS_CHECK_ELF=target/$(TARGET_RV)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_RV)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_RV)/$(USER_REL)/ill \
-	LOG=$(LOG) cargo build $(BUILD_STD) --release --target $(TARGET_RV)
+	LOG=$(LOG) cargo build $(BUILD_STD) --release --target $(TARGET_RV) $(KERNEL_FEATURES)
 
 build-la:
 	$(RUSTFLAGS_LA) \
@@ -81,7 +82,7 @@ build-la:
 	OUROOS_CHECK_ELF=target/$(TARGET_LA)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_LA)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_LA)/$(USER_REL)/ill \
-	LOG=$(LOG) cargo build $(BUILD_STD) --release --target $(TARGET_LA)
+	LOG=$(LOG) cargo build $(BUILD_STD) --release --target $(TARGET_LA) $(KERNEL_FEATURES)
 
 # selftest：selftest 档（release 优化 + debug 断言）+ 调试锁，
 # 让 OOM 注入/帧守恒/持锁跨切换检测进入验证流程；产物在
@@ -100,7 +101,7 @@ selftest-rv: build-user-rv
 	OUROOS_CHECK_ELF=target/$(TARGET_RV)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_RV)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_RV)/$(USER_REL)/ill \
-	LOG=info cargo build $(BUILD_STD) --profile selftest -p kernel --features lock_debug --target $(TARGET_RV)
+	LOG=info cargo build $(BUILD_STD) --profile selftest -p kernel --features lock_debug --target $(TARGET_RV) $(KERNEL_FEATURES)
 
 selftest-la: build-user-la
 	$(UB_CHECKS_OFF_LA) \
@@ -108,7 +109,7 @@ selftest-la: build-user-la
 	OUROOS_CHECK_ELF=target/$(TARGET_LA)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_LA)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_LA)/$(USER_REL)/ill \
-	LOG=info cargo build $(BUILD_STD) --profile selftest -p kernel --features lock_debug --target $(TARGET_LA)
+	LOG=info cargo build $(BUILD_STD) --profile selftest -p kernel --features lock_debug --target $(TARGET_LA) $(KERNEL_FEATURES)
 
 # ---------- 静态检查 ----------
 clippy-rv: build-user-rv
@@ -116,7 +117,7 @@ clippy-rv: build-user-rv
 	OUROOS_CHECK_ELF=target/$(TARGET_RV)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_RV)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_RV)/$(USER_REL)/ill \
-	LOG=$(LOG) cargo clippy $(BUILD_STD) --release --target $(TARGET_RV)
+	LOG=$(LOG) cargo clippy $(BUILD_STD) --release --target $(TARGET_RV) $(KERNEL_FEATURES)
 
 clippy-la: build-user-la
 	$(RUSTFLAGS_LA) \
@@ -124,7 +125,7 @@ clippy-la: build-user-la
 	OUROOS_CHECK_ELF=target/$(TARGET_LA)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_LA)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_LA)/$(USER_REL)/ill \
-	LOG=$(LOG) cargo clippy $(BUILD_STD) --release --target $(TARGET_LA)
+	LOG=$(LOG) cargo clippy $(BUILD_STD) --release --target $(TARGET_LA) $(KERNEL_FEATURES)
 
 clippy: clippy-rv clippy-la
 
@@ -191,7 +192,7 @@ run-basic: run-basic-rv run-basic-la
 run-case-rv:
 	@test -f "$(BASIC_BIN)/riscv64/$(CASE)" || $(MAKE) --no-print-directory basic-bin
 	OUROOS_TEST_ELF=$(BASIC_BIN)/riscv64/$(CASE) LOG=$(LOG) \
-		cargo build $(BUILD_STD) --release --target $(TARGET_RV)
+		cargo build $(BUILD_STD) --release --target $(TARGET_RV) $(KERNEL_FEATURES)
 	$(QEMU_RV) -machine virt -bios default -kernel $(BIN_RV) -m $(MEM) -nographic -smp $(SMP) \
 		-no-reboot -rtc base=utc \
 		-drive file=$(BASIC_DISK_RV),format=raw,if=none,id=disk,snapshot=on \
@@ -200,7 +201,7 @@ run-case-rv:
 run-case-la:
 	@test -f "$(BASIC_BIN)/loongarch64/$(CASE)" || $(MAKE) --no-print-directory basic-bin
 	$(RUSTFLAGS_LA) OUROOS_TEST_ELF=$(BASIC_BIN)/loongarch64/$(CASE) LOG=$(LOG) \
-		cargo build $(BUILD_STD) --release --target $(TARGET_LA)
+		cargo build $(BUILD_STD) --release --target $(TARGET_LA) $(KERNEL_FEATURES)
 	$(QEMU_LA) -kernel $(BIN_LA) -m $(MEM) -nographic -smp $(SMP) \
 		-no-reboot -rtc base=utc \
 		-drive file=$(BASIC_DISK_LA),format=raw,if=none,id=disk,snapshot=on \

@@ -336,7 +336,7 @@ pub fn dispatch(
             let mut offset = f.offset;
             loop {
                 let mut entry = [0u8; 264];
-                let n = fs::read(ino, offset, &mut entry)?;
+                let n = fs::read_dir_at(ino, offset, &mut entry)?;
                 if n == 0 {
                     break;
                 }
@@ -346,7 +346,11 @@ pub fn dispatch(
                 let inode = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
                 let disk_len = u16::from_le_bytes([entry[4], entry[5]]) as usize;
                 let name_len = entry[6] as usize;
-                if disk_len < 8 || disk_len % 4 != 0 || name_len + 8 > n || name_len + 8 > disk_len
+                if disk_len < 8
+                    || disk_len % 4 != 0
+                    || disk_len > fs::EXT4_BLOCK_SIZE - offset % fs::EXT4_BLOCK_SIZE
+                    || name_len + 8 > n
+                    || name_len + 8 > disk_len
                 {
                     return Err(Errno::Io);
                 }
@@ -430,6 +434,16 @@ pub fn dispatch(
                 }))?,
                 a[2] & 0x80000 != 0,
             )
+        }
+        #[cfg(not(feature = "rsext4-readonly"))]
+        82 => {
+            let handle = ctx.get(a[0])?;
+            let ino = match handle.lock().kind {
+                Kind::Inode { ino, .. } => ino,
+                _ => return Err(Errno::Invalid),
+            };
+            fs::sync_inode(ino)?;
+            Ok(0)
         }
         57 => {
             let slot = ctx.fds.get_mut(a[0]).ok_or(Errno::BadF)?;
