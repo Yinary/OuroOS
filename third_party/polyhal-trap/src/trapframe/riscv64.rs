@@ -1,21 +1,35 @@
+//! riscv64 陷阱现场：整数与完整浮点状态、用户返回特权状态。
+//! 参考来源：PolyHAL https://github.com/Byte-OS/polyhal polyhal-trap/src/trapframe/riscv64.rs
+//! 原协议：MIT
+//! 修改说明：OuroOS 补全浮点现场并显式构造用户返回状态。
+
 use core::{
     fmt::Debug,
     ops::{Index, IndexMut},
 };
 
-use riscv::register::sstatus::{self, Sstatus, SPP};
+use riscv::register::sstatus::{self, Sstatus, FS, SPP};
 
 use super::TrapFrameArgs;
 
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Clone)]
 // 上下文
 pub struct TrapFrame {
     pub x: [usize; 32], // 32 个通用寄存器
     pub sstatus: Sstatus,
     pub sepc: usize,
-    pub fsx: [usize; 2],
+    /// 用户浮点寄存器 f0..f31 的原始位模式。
+    pub fp: [u64; 32],
+    /// 用户 fcsr。
+    pub fcsr: usize,
 }
+
+const _: () = {
+    assert!(core::mem::offset_of!(TrapFrame, fp) == 272);
+    assert!(core::mem::offset_of!(TrapFrame, fcsr) == 528);
+    assert!(core::mem::size_of::<TrapFrame>() == 544);
+};
 
 impl Debug for TrapFrame {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -53,7 +67,7 @@ impl Debug for TrapFrame {
             .field("t6", &self.x[31])
             .field("sstatus", &self.sstatus)
             .field("sepc", &self.sepc)
-            .field("fsx", &self.fsx)
+            .field("fcsr", &self.fcsr)
             .finish()
     }
 }
@@ -62,11 +76,17 @@ impl TrapFrame {
     // 创建上下文信息
     #[inline]
     pub fn new() -> Self {
+        // 只保留硬件报告的 UXL；返回特权级、中断与 FP 状态显式构造。
+        let mut status = Sstatus::from_bits(sstatus::read().bits() & (0b11 << 32));
+        status.set_spp(SPP::User);
+        status.set_spie(true);
+        status.set_fs(FS::Initial);
         TrapFrame {
             x: [0usize; 32],
-            sstatus: sstatus::read(),
+            sstatus: status,
             sepc: 0,
-            fsx: [0; 2],
+            fp: [0; 32],
+            fcsr: 0,
         }
     }
 
@@ -79,6 +99,12 @@ impl TrapFrame {
     #[inline]
     pub fn from_user(&self) -> bool {
         self.sstatus.spp() == SPP::User
+    }
+
+    /// 每次进入用户态前只保留硬件 UXL，明确设置 U 态、中断与 FP。
+    pub(crate) fn prepare_user_return(&mut self) {
+        let uxl = sstatus::read().bits() & (0b11 << 32);
+        self.sstatus = Sstatus::from_bits(uxl | (1 << 5) | (3 << 13));
     }
 
     #[inline]
