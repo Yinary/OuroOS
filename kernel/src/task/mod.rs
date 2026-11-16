@@ -35,9 +35,9 @@ impl ExitInfo {
 }
 
 /// 进程注册表条目：Task 之外的全部资源与终态。
-/// 生命周期：wait 成功收割即从表中删除；无人 wait 的孤儿在过继
-/// 内核 init 时即收（exit 已存在则直接删除，运行时间累归丢弃）。
-/// 因此表内只存活跃进程与未被收割的僵尸，终态输出在退出时即时完成。
+/// 生命周期：wait 成功收割即从表中删除；孤儿过继内核 init，
+/// 已退出者立即删除，活孤儿随后退出时删除，运行时间累归丢弃。
+/// 因此表内只存活跃进程与未被收割的僵尸，终态输出在任务时代结束时完成。
 pub struct ProcessRecord {
     user_ns: u64,
     system_ns: u64,
@@ -135,19 +135,18 @@ mod registry {
             if let Some(local) = rec.space.as_ref() {
                 local.as_space().deactivate();
             }
-            let taken = (rec.space.take(), rec.fs.take());
             let init = INIT_PID.load(core::sync::atomic::Ordering::Relaxed);
-            // 孤儿即收：过继内核 init 且已退出的孩子无人会 wait，直接回收
-            let reaped: Vec<Pid> = reg
-                .records
-                .iter()
-                .filter(|r| r.parent == pid && r.exit.is_some())
-                .map(|r| r.pid)
-                .collect();
+            let orphan = rec.parent == init;
+            let taken = (rec.space.take(), rec.fs.take());
+            // 孤儿即收：清理已退出孩子及退出时已过继 init 的任务。
+            reg.records
+                .retain(|r| !(r.parent == pid && r.exit.is_some() || (r.pid == pid && orphan)));
             for child in reg.records.iter_mut().filter(|r| r.parent == pid) {
                 child.parent = init;
             }
-            reg.records.retain(|r| !reaped.contains(&r.pid));
+            // 自检：父进程退出清理僵尸孩子，孤儿退出清理自身。
+            debug_assert!(reg.records.iter().all(|r| r.parent != pid));
+            debug_assert!(!orphan || reg.records.iter().all(|r| r.pid != pid));
             taken
         };
         // 锁外 Drop：页表/页释放、fd 关闭，可能触发磁盘回收写
@@ -184,7 +183,7 @@ mod registry {
     }
 
     /// 启动自检：注册表内不应再有未退出的任务（每次启动）。
-    /// 终态报告已在退出时即时输出（见 record_exit）。
+    /// 终态报告在退出时积攒，这里统一输出。
     pub fn report_all() {
         for (pid, name, exit) in EXIT_REPORTS.lock().iter() {
             match &exit.fault {
@@ -221,10 +220,9 @@ pub fn init() {
 }
 static INIT_PID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 fn init_task() {
-    // 孤儿已由 record_exit 即收；只要还有活跃进程就继续等它们退出。
-    // waitpid 阻塞由等待表承担，init 自身仅在仍有活跃进程时让出等待。
+    // 孤儿退出时请求唤醒；每次醒来重查是否还有活跃进程。
     while registry::any_alive() {
-        yield_now();
+        sched::park(WaitReason::Children);
     }
 }
 
@@ -295,7 +293,7 @@ pub fn run(baseline: (usize, usize)) {
     IRQ::int_disable();
     spawn_oom_probe();
     sched::run_loop();
-    // 走到这里 = idle 判定全部退出，dead 已由 idle 回收
+    // 走到这里 = idle 判定全部退出，dead 已回收
     // 自检：帧守恒——全部任务退出后帧统计必须回到任务时代前的基线，
     // 覆盖内核栈与用户地址空间的回收（每次启动）
     assert_eq!(
