@@ -111,11 +111,30 @@ pub fn copy_from_user(
     vaddr: usize,
     dst: &mut [u8],
 ) -> Result<(), AccessError> {
+    copy_from_user_with_flags(space, vaddr, dst, MappingFlags::U | MappingFlags::R)
+}
+
+/// 从用户可执行映射读取指令字节；允许仅 X 而不可 R 的代码页。
+#[cfg(target_arch = "loongarch64")]
+pub fn copy_user_instruction(
+    space: &UserAddressSpace,
+    vaddr: usize,
+    dst: &mut [u8],
+) -> Result<(), AccessError> {
+    copy_from_user_with_flags(space, vaddr, dst, MappingFlags::U | MappingFlags::X)
+}
+
+fn copy_from_user_with_flags(
+    space: &UserAddressSpace,
+    vaddr: usize,
+    dst: &mut [u8],
+    required: MappingFlags,
+) -> Result<(), AccessError> {
     let end = check_span(vaddr, dst.len())?;
     let mut va = vaddr;
     while va < end {
         let (_, flags) = space.translate(va).ok_or(AccessError::Fault)?;
-        if !page_readable(flags) {
+        if !flags.contains(required) {
             return Err(AccessError::Fault);
         }
         va = (va / PAGE_SIZE + 1) * PAGE_SIZE;

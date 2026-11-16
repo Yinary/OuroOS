@@ -266,15 +266,12 @@ impl UserAddressSpace {
                     .flags;
                 child.pt.protect(source.va, page.addr(), flags);
                 dest.frame = Backing::Shared(page.clone(), *writable);
+            } else if let (Backing::Private(source), Backing::Private(dest)) =
+                (&source.frame, &dest.frame)
+            {
+                dest.copy_from(source);
             } else {
-                // SAFETY: 私有源与目标分别拥有独立页，复制整页不重叠。
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        phys_to_kernel_vaddr(source.frame.addr()) as *const u8,
-                        phys_to_kernel_vaddr(dest.frame.addr()) as *mut u8,
-                        PAGE_SIZE,
-                    );
-                }
+                return Err(MapError::NotMapped);
             }
         }
         child.heap_start = self.heap_start;
@@ -392,6 +389,28 @@ impl UserAddressSpace {
     pub fn map_alloc(&mut self, va: usize, flags: MappingFlags) -> Result<PhysAddr, MapError> {
         self.map_region(va, 1, flags, AreaKind::Elf)?;
         Ok(self.pages[self.pages.len() - 1].frame.addr())
+    }
+    /// 向已分配的 ELF 私有页写入初始内容；只接受页内区间，不检查用户写权限。
+    pub fn init_elf_page(&mut self, va: usize, data: &[u8]) -> Result<(), MapError> {
+        let page_va = va / PAGE_SIZE * PAGE_SIZE;
+        if !self
+            .areas
+            .iter()
+            .any(|a| a.start <= page_va && page_va < a.end && a.kind == AreaKind::Elf)
+        {
+            return Err(MapError::NotMapped);
+        }
+        let page = self
+            .pages
+            .iter()
+            .find(|p| p.va == page_va)
+            .ok_or(MapError::NotMapped)?;
+        match &page.frame {
+            Backing::Private(frame) => frame
+                .write(va - page_va, data)
+                .map_err(|_| MapError::OutOfUserRange),
+            Backing::Shared(_, _) => Err(MapError::PermissionDenied),
+        }
     }
     /// 初始栈请求 RW；当前不支持 NX，实际为 RWX，保护页不分配。
     pub fn map_stack(&mut self) -> Result<(), MapError> {
