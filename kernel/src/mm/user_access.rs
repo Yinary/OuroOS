@@ -24,9 +24,9 @@ fn page_writable(flags: MappingFlags) -> bool {
     flags.contains(MappingFlags::U | MappingFlags::W)
 }
 /// 把用户缓冲区 `[vaddr, vaddr+len)` 的内容分块交给 `consume`。
-///
-/// 先对整段做权限检查，全部通过后才复制；失败时不产生部分输出。
-/// 每个分块不跨页边界，长度不超过 [`KERNEL_CHUNK`]。
+/// 两遍式验证的流式接口；当前无调用方，保留供 writev 等散布 I/O
+/// 接入时使用。
+#[allow(dead_code)]
 pub fn read_user_bytes<F>(
     space: &UserAddressSpace,
     vaddr: usize,
@@ -111,11 +111,30 @@ pub fn copy_from_user(
     vaddr: usize,
     dst: &mut [u8],
 ) -> Result<(), AccessError> {
+    copy_from_user_with_flags(space, vaddr, dst, MappingFlags::U | MappingFlags::R)
+}
+
+/// 从用户可执行映射读取指令字节；允许仅 X 而不可 R 的代码页。
+#[cfg(target_arch = "loongarch64")]
+pub fn copy_user_instruction(
+    space: &UserAddressSpace,
+    vaddr: usize,
+    dst: &mut [u8],
+) -> Result<(), AccessError> {
+    copy_from_user_with_flags(space, vaddr, dst, MappingFlags::U | MappingFlags::X)
+}
+
+fn copy_from_user_with_flags(
+    space: &UserAddressSpace,
+    vaddr: usize,
+    dst: &mut [u8],
+    required: MappingFlags,
+) -> Result<(), AccessError> {
     let end = check_span(vaddr, dst.len())?;
     let mut va = vaddr;
     while va < end {
         let (_, flags) = space.translate(va).ok_or(AccessError::Fault)?;
-        if !page_readable(flags) {
+        if !flags.contains(required) {
             return Err(AccessError::Fault);
         }
         va = (va / PAGE_SIZE + 1) * PAGE_SIZE;

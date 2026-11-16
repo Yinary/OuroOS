@@ -15,12 +15,30 @@ pub struct TrapFrame {
     pub prmd: usize,
     /// Exception Return Address
     pub era: usize,
+    /// 用户浮点寄存器 f0..f31 的原始位模式。
+    pub fp: [u64; 32],
+    /// 用户浮点条件码 FCC0..FCC7，各占一字节。
+    pub fcc: [u8; 8],
+    /// 用户 FCSR0 的低 32 位。
+    pub fcsr: u32,
 }
+
+const _: () = {
+    assert!(core::mem::offset_of!(TrapFrame, fp) == 272);
+    assert!(core::mem::offset_of!(TrapFrame, fcc) == 528);
+    assert!(core::mem::offset_of!(TrapFrame, fcsr) == 536);
+    assert!(core::mem::size_of::<TrapFrame>() == 544);
+};
 
 impl TrapFrame {
     /// 来源判定：PRMD.PPLV（bit 1:0）非 0 即来自用户（OuroOS 补丁）。
     pub fn from_user(&self) -> bool {
         self.prmd & 0x3 != 0
+    }
+
+    /// 每次进入用户态前显式指定 PLV3 与开中断状态。
+    pub(crate) fn prepare_user_return(&mut self) {
+        self.prmd = 0b0111;
     }
 
     // 创建上下文信息

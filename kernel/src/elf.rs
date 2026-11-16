@@ -1,13 +1,11 @@
 //! 受限的 ELF64 加载器：仅静态 ET_EXEC（ELF64/小端/架构匹配），
 //! 逐字段边界检查解析，不把文件字节重解释为结构体引用。
 //! 支持范围与 Linux 差异见 docs/ostd-contracts.md §4。
+#![deny(unsafe_code)]
 
 use polyhal::pagetable::{MappingFlags, PAGE_SIZE};
 
-use crate::mm::{
-    address_space::{phys_to_kernel_vaddr, UserAddressSpace},
-    fence_icache,
-};
+use crate::mm::{address_space::UserAddressSpace, fence_icache};
 
 /// 加载失败原因
 #[derive(Debug)]
@@ -196,7 +194,7 @@ fn load_segment(space: &mut UserAddressSpace, elf: &[u8], ph: usize) -> Result<(
     for i in 0..pages {
         let vaddr = p_vaddr + i * PAGE_SIZE;
         // 页级重叠拒绝：map_alloc 检查目标页是否已有映射
-        let paddr = space.map_alloc(vaddr, flags).map_err(|e| match e {
+        space.map_alloc(vaddr, flags).map_err(|e| match e {
             crate::mm::address_space::MapError::OutOfMemory => ElfError::OutOfMemory,
             crate::mm::address_space::MapError::Overlap => ElfError::SegmentOverlap,
             _ => ElfError::MapFailed,
@@ -205,16 +203,9 @@ fn load_segment(space: &mut UserAddressSpace, elf: &[u8], ph: usize) -> Result<(
         let file_off = p_offset + i * PAGE_SIZE;
         let copy_len = p_filesz.saturating_sub(i * PAGE_SIZE).min(PAGE_SIZE);
         if copy_len > 0 {
-            let dst = phys_to_kernel_vaddr(paddr);
-            // SAFETY: paddr 是刚为本段分配并清零的物理页；copy_len 由
-            // p_filesz（已做文件边界检查）限定，源与目标都不越界。
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    elf.as_ptr().add(file_off),
-                    dst as *mut u8,
-                    copy_len,
-                );
-            }
+            space
+                .init_elf_page(vaddr, &elf[file_off..file_off + copy_len])
+                .map_err(|_| ElfError::MapFailed)?;
         }
     }
     Ok(())

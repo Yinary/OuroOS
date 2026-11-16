@@ -2,17 +2,15 @@
 //! 修改说明：OuroOS vendor 补丁，见本目录 README.md。
 #[macro_use]
 mod macros;
-mod unaligned;
 
 use super::TrapType;
 use crate::trapframe::TrapFrame;
 use core::arch::naked_asm;
 use loongArch64::register::estat::{self, Exception, Trap};
 use loongArch64::register::{
-    badv, ecfg, eentry, prmd, pwch, pwcl, stlbps, ticlr, tlbidx, tlbrehi, tlbrentry,
+    badv, ecfg, eentry, euen, prmd, pwch, pwcl, stlbps, ticlr, tlbidx, tlbrehi, tlbrentry,
 };
-use polyhal::irq::TIMER_IRQ;
-use unaligned::emulate_load_store_insn;
+use polyhal::irq::{IRQVector, TIMER_IRQ};
 
 #[naked]
 pub unsafe extern "C" fn user_vec() {
@@ -21,8 +19,10 @@ pub unsafe extern "C" fn user_vec() {
         "
             csrrd   $sp,  KSAVE_CTX
             SAVE_REGS
+            SAVE_USER_FP
 
             csrrd   $sp,  KSAVE_KSP
+            LOAD_KERNEL_FP
             ld.d    $ra,  $sp, 0*8
             ld.d    $tp,  $sp, 1*8
             ld.d    $r21, $sp, 2*8
@@ -36,7 +36,7 @@ pub unsafe extern "C" fn user_vec() {
             ld.d    $s6,  $sp, 10*8
             ld.d    $s7,  $sp, 11*8
             ld.d    $s8,  $sp, 12*8
-            addi.d  $sp,  $sp, 13*8
+            addi.d  $sp,  $sp, 48*8
             ret
 
         ",
@@ -45,12 +45,14 @@ pub unsafe extern "C" fn user_vec() {
 
 #[naked]
 #[no_mangle]
-pub extern "C" fn user_restore(context: *mut TrapFrame) {
+extern "C" fn user_restore(context: *mut TrapFrame) {
+    // SAFETY: 仅由关中断的 run_user_task 调用，context 指向存活的用户现场，
+    // 当前内核栈可容纳固定续体与 FP 现场。
     unsafe {
         naked_asm!(
             includes_trap_macros!(),
             r"
-                addi.d  $sp,  $sp, -13*8
+                addi.d  $sp,  $sp, -48*8
                 st.d    $ra,  $sp, 0*8
                 st.d    $tp,  $sp, 1*8
                 st.d    $r21, $sp, 2*8
@@ -64,11 +66,13 @@ pub extern "C" fn user_restore(context: *mut TrapFrame) {
                 st.d    $s6,  $sp, 10*8
                 st.d    $s7,  $sp, 11*8
                 st.d    $s8,  $sp, 12*8
+                SAVE_KERNEL_FP
 
                 csrwr    $sp, KSAVE_KSP   // SAVE kernel_sp to SAVEn(0)
                 move     $sp, $a0         // TIPS: csrwr will write the old value to rd
                 csrwr    $a0, KSAVE_CTX   // SAVE user context addr to SAVEn(1)
 
+                LOAD_USER_FP
                 LOAD_REGS
 
                 ertn
@@ -92,6 +96,11 @@ pub fn disable_irq() {
 
 /// 进用户态至下一陷阱，返回完整 TrapType（OuroOS 补丁 #5）。
 pub fn run_user_task(cx: &mut TrapFrame) -> TrapType {
+    assert!(
+        !polyhal::irq::IRQ::int_enabled(),
+        "run_user_task requires IRQ off"
+    );
+    cx.prepare_user_return();
     user_restore(cx);
     loongarch64_trap_handler(cx)
 }
@@ -114,11 +123,13 @@ pub unsafe extern "C" fn trap_vector_base() {
             // save the registers.
 
             SAVE_REGS
+            SAVE_USER_FP
         
             move    $a0, $sp
             bl      {trap_handler}
         
             // Load registers from sp, include new sp
+            LOAD_USER_FP
             LOAD_REGS
             ertn
         ",
@@ -186,6 +197,8 @@ pub fn tlb_init(tlbrentry: usize) {
 
 #[inline]
 pub fn init() {
+    // OuroOS 补丁：内核与用户均允许基础浮点指令。
+    euen::set_fpe(true);
     tlb_init(tlb_fill as usize);
     ecfg::set_vs(0);
     eentry::set_eentry(trap_vector_base as usize);
@@ -199,9 +212,7 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
             TrapType::Breakpoint
         }
         Trap::Exception(Exception::AddressNotAligned) => {
-            // OuroOS 补丁：模拟成功 = 已消化事件（Absorbed）。
-            unsafe { emulate_load_store_insn(tf) }
-            TrapType::Absorbed
+            TrapType::AddressNotAligned(badv::read().vaddr())
         }
         Trap::Interrupt(_) => {
             let irq_num: usize = estat.is().trailing_zeros() as usize;
@@ -211,7 +222,7 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
                     ticlr::clear_timer_interrupt();
                     TrapType::Timer
                 }
-                _ => panic!("unknown interrupt: {}", irq_num),
+                _ => TrapType::Irq(IRQVector::new(irq_num)),
             }
         }
         Trap::Exception(Exception::Syscall) => TrapType::SysCall,
@@ -244,6 +255,7 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
         }
     };
     // info!("return to addr: {:#x}", tf.era);
+    // SAFETY: tf 是当前陷阱保存的有效 TrapFrame，回调同步使用。
     unsafe { super::_interrupt_for_arch(tf, trap_type, 0) };
     trap_type
 }

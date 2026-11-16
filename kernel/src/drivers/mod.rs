@@ -27,6 +27,9 @@ pub enum Error {
 struct Dma;
 // SAFETY: DMA 页来自连续物理帧；share 仅接收驱动持有的内核直映缓冲区；
 // 同步请求完成前缓冲区保持存活，QEMU virt 平台 DMA 与 CPU 缓存一致。
+// 失败约定：dma_alloc 返回物理地址 0 时 virtio-drivers 的 Dma::new
+// 返回 Err（上游约定，hal.rs:32），dangling 指针不会被解引用；分配仅
+// 发生在设备初始化（Queue::new），运行期 read/write 走调用方缓冲区。
 unsafe impl Hal for Dma {
     fn dma_alloc(pages: usize, _: BufferDirection) -> (usize, NonNull<u8>) {
         match frame::frame_alloc(pages) {
@@ -175,6 +178,16 @@ pub fn write(id: usize, sector: usize, data: &[u8]) -> Result<(), Error> {
     disk.write_blocks(sector, data).map_err(|_| Error::Io)
 }
 
+/// 将块设备已完成的写请求同步到后端。
+pub fn flush(id: usize) -> Result<(), Error> {
+    DISKS
+        .lock()
+        .get_mut(id)
+        .ok_or(Error::NoDevice)?
+        .flush()
+        .map_err(|_| Error::Io)
+}
+
 fn bounds(disk: &Disk, sector: usize, len: usize) -> Result<(), Error> {
     if len % 512 != 0 || sector.checked_add(len / 512).ok_or(Error::Range)? as u64 > disk.capacity()
     {
@@ -182,11 +195,14 @@ fn bounds(disk: &Disk, sector: usize, len: usize) -> Result<(), Error> {
     }
     Ok(())
 }
-/// 按字节读设备，处理跨扇区及非扇区对齐的元数据。
+/// 按字节读设备，完整且对齐的扇区范围一次提交。
 pub fn read_bytes(id: usize, offset: usize, out: &mut [u8]) -> Result<(), Error> {
     let end = offset.checked_add(out.len()).ok_or(Error::Range)?;
     if end as u64 > capacity(id)?.checked_mul(512).ok_or(Error::Range)? {
         return Err(Error::Range);
+    }
+    if offset % 512 == 0 && out.len() % 512 == 0 {
+        return read(id, offset / 512, out);
     }
     let mut done = 0;
     while done < out.len() {
@@ -201,11 +217,15 @@ pub fn read_bytes(id: usize, offset: usize, out: &mut [u8]) -> Result<(), Error>
     Ok(())
 }
 
-/// 按字节写设备；不完整扇区先读后改，调用方须串行化重叠写入。
+/// 按字节写设备，完整且对齐的扇区范围一次提交。
+/// 不完整扇区先读后改，调用方须串行化重叠写入。
 pub fn write_bytes(id: usize, offset: usize, data: &[u8]) -> Result<(), Error> {
     let end = offset.checked_add(data.len()).ok_or(Error::Range)?;
     if end as u64 > capacity(id)?.checked_mul(512).ok_or(Error::Range)? {
         return Err(Error::Range);
+    }
+    if offset % 512 == 0 && data.len() % 512 == 0 {
+        return write(id, offset / 512, data);
     }
     let mut done = 0;
     while done < data.len() {

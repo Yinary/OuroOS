@@ -1,4 +1,5 @@
 //! execve 的参数复制、初始栈构造和地址空间事务切换。
+#![deny(unsafe_code)]
 use super::{Pid, REGISTRY};
 use crate::{
     elf,

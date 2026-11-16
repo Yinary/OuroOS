@@ -1,6 +1,6 @@
 //! 物理页所有权与帧分配：位图、区域内首次适配，运行期零堆依赖。
 use alloc::vec::Vec;
-use polyhal::{pagetable::PAGE_SIZE, PhysAddr};
+use polyhal::{consts::VIRT_ADDR_START, pagetable::PAGE_SIZE, PhysAddr};
 use spin::Mutex;
 
 /// 物理页或管理元数据不足，以及非法申请。
@@ -31,6 +31,10 @@ static ALLOCATOR: Mutex<Allocator> = Mutex::new(Allocator {
     #[cfg(debug_assertions)]
     budget: None,
 });
+
+fn direct_map_addr(pa: PhysAddr) -> usize {
+    pa.raw() | VIRT_ADDR_START
+}
 
 /// 已登记总页数与当前空闲页数；统计与分配在同一把锁内更新。
 pub fn stats() -> (usize, usize) {
@@ -151,6 +155,49 @@ impl OwnedFrame {
     /// 借用物理地址，不转移释放责任。
     pub fn addr(&self) -> PhysAddr {
         self.pa
+    }
+    /// 从所拥有的页复制字节到内核缓冲区；越过页边界返回 InvalidRange。
+    pub fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), FrameError> {
+        if offset > PAGE_SIZE || out.len() > PAGE_SIZE - offset {
+            return Err(FrameError::InvalidRange);
+        }
+        // SAFETY: self 持有一整页已分配物理内存；边界已检查，单核内核操作期间
+        // 用户态停止，且只借用调用方缓冲区，不创建共享页的 Rust 引用。
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (direct_map_addr(self.pa) + offset) as *const u8,
+                out.as_mut_ptr(),
+                out.len(),
+            );
+        }
+        Ok(())
+    }
+    /// 从内核缓冲区写入所拥有的页；越过页边界返回 InvalidRange。
+    pub fn write(&self, offset: usize, data: &[u8]) -> Result<(), FrameError> {
+        if offset > PAGE_SIZE || data.len() > PAGE_SIZE - offset {
+            return Err(FrameError::InvalidRange);
+        }
+        // SAFETY: self 持有一整页已分配物理内存；边界已检查，单核内核操作期间
+        // 用户态停止，且只借用调用方缓冲区，不创建共享页的 Rust 引用。
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                (direct_map_addr(self.pa) + offset) as *mut u8,
+                data.len(),
+            );
+        }
+        Ok(())
+    }
+    /// 将另一拥有页复制到本页；传入自身也合法。
+    pub fn copy_from(&self, source: &OwnedFrame) {
+        // SAFETY: 两个 OwnedFrame 在复制期间均持有已分配页；copy 允许传入同一页。
+        unsafe {
+            core::ptr::copy(
+                direct_map_addr(source.pa) as *const u8,
+                direct_map_addr(self.pa) as *mut u8,
+                PAGE_SIZE,
+            );
+        }
     }
 }
 impl Drop for OwnedFrame {
