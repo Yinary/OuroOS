@@ -1,6 +1,6 @@
 //! 用户任务的孵化（ELF → 地址空间 → 初始现场 → 入队）与运行循环
-//! （run_user_task + TrapType 消费 + 时间片判定）。契约与孵化时机
-//! 约束见 docs/ostd-contracts.md §3。
+//! （run_user_task + TrapType 消费 + 时间片判定）。契约见 docs/ostd-contracts.md §3。
+#![deny(unsafe_code)]
 
 use alloc::boxed::Box;
 
@@ -17,7 +17,7 @@ use crate::{
 };
 
 use super::{
-    sched::{self, current_ptr},
+    sched,
     task::{Pid, Task, TaskBody, WaitReason},
     ExitInfo, REGISTRY,
 };
@@ -39,7 +39,6 @@ pub enum SpawnError {
 /// 孵化一个用户任务并加入就绪队列，返回 pid。
 ///
 /// 调用前提：内核页表活动（rv 侧新空间复制内核半区需要内核根）；
-/// 调用时机见模块头（rv sstatus 稳态约束）。
 pub fn spawn_user(name: &'static str, elf: &[u8]) -> Result<Pid, SpawnError> {
     if elf.is_empty() {
         return Err(SpawnError::Load(ElfError::Truncated));
@@ -59,14 +58,6 @@ pub fn spawn_user(name: &'static str, elf: &[u8]) -> Result<Pid, SpawnError> {
     crate::mm::user_access::copy_to_user(&space, sp, &[0u8; 48])
         .map_err(|_| SpawnError::OutOfMemory)?;
     frame[TrapFrameArgs::SP] = sp;
-    // rv：TrapFrame::new 拷贝当前 sstatus，必须保证回用户态时
-    // SPP=0 + SPIE=1（用户态开中断）；loongarch64 侧 new 显式
-    // 设 prmd=PLV3|PIE，无此约束。
-    #[cfg(target_arch = "riscv64")]
-    assert!(
-        frame.from_user(),
-        "user TrapFrame must re-enter U-mode (check sstatus SPP/SPIE)"
-    );
     let task = Task::new_user(pid, name, frame).map_err(|_| SpawnError::OutOfMemory)?;
 
     let fs = crate::fs::context::Context::new().map_err(|_| SpawnError::OutOfMemory)?;
@@ -92,93 +83,86 @@ enum Action {
     Continue,
     /// 让出 CPU（主动 yield 或时间片用尽）。
     Yield,
+    /// 挂起等待，醒来后重执行当前系统调用。
+    Wait(WaitReason),
     /// 任务终止（exit 或致命异常）。
     Exit(ExitInfo),
 }
 
 /// 用户任务入口：在自己（任务）的内核栈上运行，直到 exit/被杀。
 pub fn user_task_entry() -> ! {
-    let pid = {
-        let task = current_ptr();
-        // SAFETY: 入口只在调度器切入后执行，current 有效且独占。
-        unsafe {
-            match (*task).body {
-                TaskBody::User { pid, .. } => pid,
-                TaskBody::Kernel(_) => panic!("kernel task entered user entry"),
-            }
-        }
+    sched::reap_switched();
+    let (pid, mut frame) = match sched::take_body() {
+        TaskBody::User { frame, pid } => (pid, frame),
+        TaskBody::Kernel(_) => panic!("kernel task entered user entry"),
     };
+    let mut sleep_deadline = None;
 
     loop {
         // 一轮 = 激活页表 → 进用户态 → 消费一次逃逸。
-        // 对当前任务的 &mut 借用不跨 yield/exit（切换会经调度器改任务）。
         let kernel_start;
         let action = {
-            let task = current_ptr();
-            // SAFETY: 本任务是 current，单核关中断下独占；借用止于本块。
-            unsafe {
-                let TaskBody::User { frame, .. } = &mut (*task).body else {
-                    panic!("user task lost its body");
-                };
-                // 每轮激活本任务页表：上次 yield 后其他任务的表可能上过。
-                // REGISTRY 锁不跨 run_user_task（用户态执行期间不持锁）。
-                {
-                    let reg = REGISTRY.lock();
-                    let rec = reg
-                        .records
-                        .iter()
-                        .find(|r| r.pid == pid)
-                        .expect("user task unregistered");
-                    rec.space
-                        .as_ref()
-                        .expect("running user task lost its space")
-                        .as_space()
-                        .activate();
+            // 每轮激活本任务页表：上次 yield 后其他任务的表可能上过。
+            // REGISTRY 锁不跨 run_user_task（用户态执行期间不持锁）。
+            {
+                let reg = REGISTRY.lock();
+                let rec = reg
+                    .records
+                    .iter()
+                    .find(|r| r.pid == pid)
+                    .expect("user task unregistered");
+                rec.space
+                    .as_ref()
+                    .expect("running user task lost its space")
+                    .as_space()
+                    .activate();
+            }
+            let user_start = polyhal::timer::current_time();
+            let trap_type = run_user_task(&mut frame);
+            kernel_start = polyhal::timer::current_time();
+            {
+                let mut reg = REGISTRY.lock();
+                if let Some(rec) = reg.records.iter_mut().find(|r| r.pid == pid) {
+                    rec.user_ns = rec.user_ns.saturating_add(
+                        kernel_start
+                            .saturating_sub(user_start)
+                            .as_nanos()
+                            .min(u64::MAX as u128) as u64,
+                    );
                 }
-                let user_start = polyhal::timer::current_time();
-                let trap_type = run_user_task(frame);
-                kernel_start = polyhal::timer::current_time();
-                {
-                    let mut reg = REGISTRY.lock();
-                    if let Some(rec) = reg.records.iter_mut().find(|r| r.pid == pid) {
-                        rec.user_ns = rec.user_ns.saturating_add(
-                            kernel_start
-                                .saturating_sub(user_start)
-                                .as_nanos()
-                                .min(u64::MAX as u128) as u64,
-                        );
-                    }
-                }
-                match trap_type {
-                    TrapType::SysCall => {
-                        // 只处理来自用户的系统调用，其余防御性忽略
-                        if frame.from_user() {
-                            // dispatch 在 REGISTRY 锁内取空间与 fs 上下文；
-                            // 进程级调用（process_call 会再取 REGISTRY）
-                            // 必须在锁外执行，非重入锁不可重入。
-                            let flow = {
-                                let mut reg = REGISTRY.lock();
-                                let rec = reg
-                                    .records
-                                    .iter_mut()
-                                    .find(|r| r.pid == pid)
-                                    .expect("user task unregistered");
-                                let space = rec
-                                    .space
-                                    .as_mut()
-                                    .expect("running user task lost its space");
-                                crate::syscall::dispatch(
-                                    frame,
-                                    pid,
-                                    &mut space.0,
-                                    rec.fs.as_mut().expect("user fs context"),
-                                )
-                            };
+            }
+            match trap_type {
+                TrapType::SysCall => {
+                    // 只处理来自用户的系统调用，其余防御性忽略
+                    if frame.from_user() {
+                        // dispatch 在 REGISTRY 锁内取空间与 fs 上下文；
+                        // 进程级调用（process_call 会再取 REGISTRY）
+                        // 必须在锁外执行，非重入锁不可重入。
+                        let flow = {
+                            let mut reg = REGISTRY.lock();
+                            let rec = reg
+                                .records
+                                .iter_mut()
+                                .find(|r| r.pid == pid)
+                                .expect("user task unregistered");
+                            let space = rec
+                                .space
+                                .as_mut()
+                                .expect("running user task lost its space");
+                            crate::syscall::dispatch(
+                                &mut frame,
+                                pid,
+                                &mut space.0,
+                                rec.fs.as_mut().expect("user fs context"),
+                            )
+                        };
                             // 恰好推进一次 syscall PC：polyhal 对 SysCall
                             // 不推进，重复/遗漏都会破坏用户执行流。
                             // 阻塞（Wait）不推 PC，挂起醒来后重执行重查。
                             let outcome = match flow {
-                                Flow::Process => process_call(pid, frame),
+                                Flow::Process => {
+                                    process_call(pid, &mut frame, &mut sleep_deadline)
+                                }
                                 Flow::Wait(reason) => ProcessResult::Wait(reason),
                                 _ => ProcessResult::Done,
                             };
@@ -193,13 +177,15 @@ pub fn user_task_entry() -> ! {
                                 _ => None,
                             };
                             if let Some(reason) = wait_reason {
-                                sched::park(reason);
-                                continue;
-                            }
-                            match flow {
-                                Flow::Continue | Flow::Process | Flow::Wait(_) => Action::Continue,
-                                Flow::Yield => Action::Yield,
-                                Flow::Exited(code) => Action::Exit(ExitInfo::exited(code)),
+                                Action::Wait(reason)
+                            } else {
+                                match flow {
+                                    Flow::Continue | Flow::Process | Flow::Wait(_) => {
+                                        Action::Continue
+                                    }
+                                    Flow::Yield => Action::Yield,
+                                    Flow::Exited(code) => Action::Exit(ExitInfo::exited(code)),
+                                }
                             }
                         } else {
                             Action::Continue
@@ -210,6 +196,32 @@ pub fn user_task_entry() -> ! {
                     | TrapType::SupervisorExternal
                     | TrapType::Absorbed  // la 非对齐模拟成功，恢复执行
                     | TrapType::Unknown => Action::Continue,
+                    TrapType::AddressNotAligned(addr) => {
+                        if !frame.from_user() {
+                            panic!("kernel-origin misaligned trap @ {:#x}", addr);
+                        }
+                        let result = {
+                            let reg = REGISTRY.lock();
+                            let space = reg
+                                .records
+                                .iter()
+                                .find(|r| r.pid == pid)
+                                .and_then(|r| r.space.as_ref())
+                                .expect("running user task lost its space");
+                            trap::emulate_unaligned(&mut frame, space.as_space(), addr)
+                        };
+                        match result {
+                            Ok(()) => Action::Continue,
+                            Err(error) => Action::Exit(ExitInfo {
+                                code: FAULT_EXIT_CODE,
+                                fault: Some(UserFault {
+                                    kind: error.fault_kind(),
+                                    info: addr,
+                                    pc: frame[TrapFrameArgs::SEPC],
+                                }),
+                            }),
+                        }
+                    }
                     fatal => {
                         // 用户态致命异常（含 vendor 补丁后的 Unhandled）：
                         // 终止任务而不是带走内核
@@ -228,7 +240,6 @@ pub fn user_task_entry() -> ! {
                         })
                     }
                 }
-            }
         };
 
         {
@@ -245,16 +256,10 @@ pub fn user_task_entry() -> ! {
         match action {
             Action::Exit(info) => sched::exit_current(info),
             Action::Yield => sched::yield_now(),
+            Action::Wait(reason) => sched::park(reason),
             Action::Continue => {
-                // 时间片判定：tick 前进即让出；切入侧 promote 刷新
-                // slice_tick，这里只比较（固定 1 tick 轮转）
-                let now = crate::TIMER_TICKS.load(core::sync::atomic::Ordering::Relaxed);
-                let slice_tick = {
-                    let task = current_ptr();
-                    // SAFETY: 短只读借用，不跨任何切换。
-                    unsafe { (*task).slice_tick }
-                };
-                if now != slice_tick {
+                // 时间片起点由切入侧刷新。
+                if sched::slice_expired() {
                     sched::yield_now();
                 }
             }
@@ -268,24 +273,22 @@ enum ProcessResult {
     Wait(WaitReason),
     Replaced,
 }
-fn process_call(parent: Pid, frame: &mut TrapFrame) -> ProcessResult {
+fn process_call(
+    parent: Pid,
+    frame: &mut TrapFrame,
+    sleep_deadline: &mut Option<core::time::Duration>,
+) -> ProcessResult {
     let args = frame.args();
     let nr = frame[TrapFrameArgs::SYSCALL];
     let result: Result<usize, Errno> = match nr {
         sysnr::NANOSLEEP => {
             // nanosleep(2)：首次设定绝对截止时间并挂起，到期后重执行
             // 返回 0；剩余时间报告（rem 参数）未支持。
-            let task = current_ptr();
-            // SAFETY: 当前任务独占字段，短借用不跨调度；挂起前释放。
-            let deadline = unsafe { (*task).sleep_deadline };
-            if let Some(until) = deadline {
+            if let Some(until) = *sleep_deadline {
                 if polyhal::timer::current_time() < until {
                     return ProcessResult::Wait(WaitReason::Deadline(until));
                 }
-                // SAFETY: 当前任务尚未切换，字段独占。
-                unsafe {
-                    (*task).sleep_deadline = None;
-                }
+                *sleep_deadline = None;
                 Ok(0)
             } else {
                 let reg = REGISTRY.lock();
@@ -310,10 +313,7 @@ fn process_call(parent: Pid, frame: &mut TrapFrame) -> ProcessResult {
                         let until = polyhal::timer::current_time()
                             .checked_add(core::time::Duration::new(sec as u64, ns as u32));
                         if let Some(until) = until {
-                            // SAFETY: 当前任务独占该字段，外层释放所有借用后才切换。
-                            unsafe {
-                                (*task).sleep_deadline = Some(until);
-                            }
+                            *sleep_deadline = Some(until);
                             return ProcessResult::Wait(WaitReason::Deadline(until));
                         } else {
                             Err(Errno::Invalid)
@@ -381,7 +381,7 @@ fn process_call(parent: Pid, frame: &mut TrapFrame) -> ProcessResult {
                             .records
                             .iter()
                             .position(|r| matches(r) && r.exit.is_some());
-                        let has_children = reg.records.iter().any(|r| matches(r));
+                        let has_children = reg.records.iter().any(matches);
                         let status = ready.map(|i| {
                             let info = reg.records[i].exit;
                             info.map_or(0, |e| {

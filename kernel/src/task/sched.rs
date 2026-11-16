@@ -10,15 +10,7 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use polyhal::{
-    irq::IRQ,
-    kcontext::{context_switch, KContext},
-};
-
-// polyhal 只在 riscv64 封装了 wfi（hlt）；la 未提供 idle 指令封装，
-// 差异收敛在 wait_for_interrupt 一处（见其注释）。
-#[cfg(target_arch = "riscv64")]
-use polyhal::instruction::hlt;
+use polyhal::kcontext::KContext;
 
 use crate::{
     sync::{self, DebugMutex},
@@ -54,10 +46,36 @@ pub fn request_pipe_wake() {
 }
 
 /// 读取当前任务指针（调用方保证处于任务上下文）。
-pub(super) fn current_ptr() -> *mut Task {
+fn current_ptr() -> *mut Task {
     let addr = CURRENT.get();
     assert!(addr != 0, "no current task on this cpu");
     addr as *mut Task
+}
+
+/// 首次入口取出任务身体；之后现场由任务自己的内核栈持有。
+pub(super) fn take_body() -> TaskBody {
+    let mut slot = SCHED.lock();
+    slot.as_mut()
+        .expect("scheduler not initialized")
+        .current
+        .as_mut()
+        .expect("task entry without current")
+        .body
+        .take()
+        .expect("task body already taken")
+}
+
+/// 当前任务的时间片是否已用尽。
+pub(super) fn slice_expired() -> bool {
+    let slot = SCHED.lock();
+    let slice_tick = slot
+        .as_ref()
+        .expect("scheduler not initialized")
+        .current
+        .as_ref()
+        .expect("slice check without current")
+        .slice_tick;
+    current_tick() != slice_tick
 }
 
 /// 写入当前任务地址（0 表示 idle）。仅调度器调用。
@@ -70,7 +88,7 @@ struct Scheduler {
     current: Option<Box<Task>>,
     /// 等待表：任务与挂起原因同存；唤醒采用宽松匹配，醒来重查条件。
     waiting: Vec<(Box<Task>, WaitReason)>,
-    /// 已退出任务；内核栈已无执行流，等 idle 回收。
+    /// 已退出任务；切到其他栈后回收。
     #[allow(clippy::vec_box)] // 已退出任务的上下文仍须地址稳定直到切走。
     dead: Vec<Box<Task>>,
     /// idle（boot 栈）的内核上下文；最后一个任务退出时切回这里。
@@ -92,17 +110,33 @@ impl Scheduler {
         task.slice_tick = current_tick();
         let pid = task.pid;
         let ptr: *mut Task = &mut *task;
+        let context = task.context_ptr() as *const KContext;
         self.current = Some(task);
         set_current(ptr);
         sync::set_holder(pid);
-        // SAFETY: ptr 指向刚放入 current 的 Box<Task>，存活由调度器保证。
-        unsafe { addr_of!((*ptr).context) }
+        context
     }
 
     /// 回收已退出的任务：drop Box → 释放内核栈帧。
-    /// 只能在这些任务的内核栈已无执行流时调用（idle 循环内满足）。
+    /// 只能在切换到其他任务或 idle 栈后调用。
     fn reap_dead(&mut self) {
+        // 自检：每次回收时，dead 不含当前栈，释放页数等于退出任务栈页数。
+        #[cfg(debug_assertions)]
+        let (dead_count, free_before) = {
+            let current = self.current.as_deref().map(|task| task as *const Task);
+            assert!(self
+                .dead
+                .iter()
+                .all(|task| Some(&**task as *const Task) != current));
+            (self.dead.len(), crate::mm::frame::stats().1)
+        };
         self.dead.clear();
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            crate::mm::frame::stats().1,
+            free_before + dead_count * crate::config::KSTACK_PAGES,
+            "exited task stacks were not fully reclaimed"
+        );
     }
 
     /// 消费事件唤醒标志，把匹配的等待者搬回就绪表。
@@ -125,6 +159,8 @@ impl Scheduler {
     }
 
     fn move_waiting(&mut self, f: impl Fn(&WaitReason) -> bool) {
+        // 自检：每次集中唤醒前，就绪表足以容纳全部等待任务。
+        debug_assert!(self.ready.capacity() >= self.ready.len() + self.waiting.len());
         let mut i = 0;
         while i < self.waiting.len() {
             if f(&self.waiting[i].1) {
@@ -150,20 +186,22 @@ pub(super) fn init() {
     });
 }
 
-/// 孵化提交前预留就绪/等待/退出队列容量；切换、park 与退出本身不再分配。
+/// 孵化提交前为全部存活任务预留就绪/等待/退出队列容量。
 pub(super) fn reserve_task() -> Result<(), crate::mm::frame::FrameError> {
     let mut slot = SCHED.lock();
     let s = slot.as_mut().expect("scheduler not initialized");
+    let live = s.ready.len() + usize::from(s.current.is_some()) + s.waiting.len() + 1;
     s.ready
-        .try_reserve(2)
+        .try_reserve(live - s.ready.len())
         .map_err(|_| crate::mm::frame::FrameError::OutOfMemory)?;
     s.waiting
-        .try_reserve(1)
+        .try_reserve(live - s.waiting.len())
         .map_err(|_| crate::mm::frame::FrameError::OutOfMemory)?;
-    let live = s.ready.len() + usize::from(s.current.is_some()) + s.waiting.len() + 1;
     s.dead
         .try_reserve(live)
         .map_err(|_| crate::mm::frame::FrameError::OutOfMemory)?;
+    // 自检：每次成功孵化前，两个队列均能容纳全部存活任务。
+    debug_assert!(s.ready.capacity() >= live && s.waiting.capacity() >= live);
     Ok(())
 }
 /// 任务入就绪队列队尾。
@@ -184,9 +222,7 @@ pub fn yield_now() {
         let mut slot = SCHED.lock();
         let s = slot.as_mut().expect("scheduler not initialized");
         let mut cur = s.current.take().expect("yield without current task");
-        // SAFETY: cur_ptr 与 cur 指向同一 Box；此处只借用地址，
-        // Box 移入队列不影响堆上地址稳定性。
-        let from = unsafe { addr_of_mut!((*cur_ptr).context) };
+        let from = cur.context_ptr();
         debug_assert_eq!(cur_ptr, &mut *cur as *mut Task);
         cur.state = TaskState::Ready;
         s.ready.push_back(cur);
@@ -200,6 +236,7 @@ pub fn yield_now() {
         (from, to)
     };
     switch_context(from, to);
+    reap_switched();
 }
 
 /// 当前任务挂起等待：移入等待表并切到下一个就绪任务（或 idle）。
@@ -212,8 +249,7 @@ pub fn park(reason: WaitReason) {
         let mut slot = SCHED.lock();
         let s = slot.as_mut().expect("scheduler not initialized");
         let mut cur = s.current.take().expect("park without current task");
-        // SAFETY: 同 yield_now；Box 随后移入等待表或就绪表，地址不变。
-        let from = unsafe { addr_of_mut!((*cur_ptr).context) };
+        let from = cur.context_ptr();
         debug_assert_eq!(cur_ptr, &mut *cur as *mut Task);
         s.drain_wake_requests();
         s.wake_expired();
@@ -235,6 +271,15 @@ pub fn park(reason: WaitReason) {
         (from, to)
     };
     switch_context(from, to);
+    reap_switched();
+}
+
+/// 切到当前任务的栈后，回收此前退出任务的内核栈。
+pub(super) fn reap_switched() {
+    let mut slot = SCHED.lock();
+    slot.as_mut()
+        .expect("scheduler not initialized")
+        .reap_dead();
 }
 
 /// 当前任务退出：登记退出信息、释放地址空间、移入 dead 表并永久切走。
@@ -243,14 +288,17 @@ pub fn park(reason: WaitReason) {
 pub(super) fn exit_current(exit: ExitInfo) -> ! {
     sync::assert_no_held("exit_current");
     let cur_ptr = current_ptr();
-    // SAFETY: 指针来自调度器切入时设置的合法 Box<Task>；
-    // 单核关中断下该 Box 在此期间不会被移动或释放。
-    let pid = unsafe { (*cur_ptr).pid };
-    log::debug!(
-        "task '{}' (pid {}) exiting",
-        unsafe { (*cur_ptr).name },
-        pid
-    );
+    let (pid, name) = {
+        let slot = SCHED.lock();
+        let task = slot
+            .as_ref()
+            .expect("scheduler not initialized")
+            .current
+            .as_ref()
+            .expect("exit without current task");
+        (task.pid, task.name)
+    };
+    log::debug!("task '{}' (pid {}) exiting", name, pid);
     // 登记退出信息并释放地址空间：UserAddressSpace 的 Drop 会先切回
     // 内核页表（若仍活动）再释放数据页/页表页。此刻仍在自己的内核栈上，
     // 内核栈经直映访问，不受页表切换影响。锁序 REGISTRY → FRAME。
@@ -260,8 +308,7 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
         let mut slot = SCHED.lock();
         let s = slot.as_mut().expect("scheduler not initialized");
         let mut cur = s.current.take().expect("exit without current task");
-        // SAFETY: 同 yield_now；Box 随后移入 dead 表，地址不变。
-        let from = unsafe { addr_of_mut!((*cur_ptr).context) };
+        let from = cur.context_ptr();
         debug_assert_eq!(cur_ptr, &mut *cur as *mut Task);
         cur.state = TaskState::Exited;
         s.dead.push(cur);
@@ -285,30 +332,13 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
 
 /// 内核任务 trampoline：从 current 读取入口，执行完即退出（码 0）。
 pub(super) extern "C" fn kernel_trampoline() -> ! {
-    let entry = {
-        let task = current_ptr();
-        // SAFETY: trampoline 只在调度器切入后执行，current 有效；
-        // 只读取 body 期间不发生任何切换。
-        unsafe {
-            match (*task).body {
-                TaskBody::Kernel(f) => f,
-                TaskBody::User { .. } => panic!("user task entered kernel trampoline"),
-            }
-        }
+    reap_switched();
+    let entry = match take_body() {
+        TaskBody::Kernel(f) => f,
+        TaskBody::User { .. } => panic!("user task entered kernel trampoline"),
     };
     entry();
     exit_current(ExitInfo::exited(0))
-}
-
-/// 等待中断：idle 专属。短暂开中断（此时只有时钟源），醒来立即关回。
-fn wait_for_interrupt() {
-    IRQ::int_enable();
-    #[cfg(target_arch = "riscv64")]
-    hlt();
-    // la 侧自旋等钟（HAL 未封装 idle，见 docs/ostd-contracts.md §2）
-    #[cfg(target_arch = "loongarch64")]
-    core::hint::spin_loop();
-    IRQ::int_disable();
 }
 
 /// 调度器主循环，运行在 boot 栈（idle）；返回 = 全部任务已退出。
@@ -343,7 +373,7 @@ pub(super) fn run_loop() {
                     return;
                 }
                 // 就绪空、等待非空：等时钟（Deadline 到期者依赖时间推进）
-                wait_for_interrupt();
+                crate::hal::wait_for_interrupt();
             }
         }
     }
@@ -356,5 +386,5 @@ fn switch_context(from: *mut KContext, to: *const KContext) {
     // - 两指针可指向同一实例（只有自己可让时），保存后恢复同组寄存器；
     // - 单核、关中断执行，无并发进入；调度器锁已在调用前释放，
     //   切入的任务可以再次取锁。
-    unsafe { context_switch(from, to) }
+    unsafe { crate::hal::context_switch(from, to) }
 }
