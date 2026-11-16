@@ -1,8 +1,8 @@
 # OuroOS ostd 契约与已知缺陷
 
 本文档是 OuroOS 框内核（frame kernel）设计的权威说明：HAL 只提供
-原语，mm/task/syscall 框架层提供带不变量的安全服务，上层模块只经
-安全接口使用资源。
+原语，mm/task/syscall 框架层逐步提供带不变量的安全服务。当前安全
+边界限于已列出的接口；其余上层模块与第三方代码仍需单独审查。
 
 文档只记录三类内容，不记录开发或审查过程：
 
@@ -47,6 +47,7 @@
 | 物理内存唯一入口 | 只有 region → frame 登记；裸 `frame_alloc` 仅 kernel_pt、kstack、DMA 三处受限适配 |
 | 唯一释放凭证 | `OwnedFrame` 不可 Clone；释放前必须撤销映射并刷 TLB |
 | 分配即清零 | `OwnedFrame::new` 清零；kstack/DMA 显式清零 |
+| 拥有页字节访问 | `OwnedFrame::read/write/copy_from` 校验页内范围并封装直映指针；`address_space::init_elf_page` 提供 ELF 初始页写入接口 |
 | 期望权限 ≠ 实际权限 | 两架构无 NX；`mprotect` 撤 X 明确拒绝 |
 | PROT_NONE 占坑 | 保留数据页所有权，硬件叶项清零 |
 | 事务性 | 失败与未调用不可区分；map/replace/map_backed/deep_copy/exec 先备齐后提交 |
@@ -75,6 +76,7 @@
 | mmap 空洞 / MAP_FIXED | `find_free`、`replace_region` 事务替换 |
 | fork 深拷贝 | `deep_copy`，建成才发布，无 COW |
 | exec 先建后切 | 新空间含 argv/envp/auxv，成功才替换 |
+| 页字节访问收口 | 拥有页复制及 ELF 初始页写入由 mm 封装；`elf.rs`、`fs/cache.rs`、`syscall/memory.rs`、`task/user_task.rs`、`task/exec.rs`、`task/task.rs` 拒绝 `unsafe` |
 | MAP_SHARED 文件页缓存 | `fs/cache.rs`；映射持强引用、索引持弱引用、最后释放写回；无脏位，见 §6 |
 
 ### 1.5 欠账
@@ -84,7 +86,7 @@
 | 内核栈虚拟窗口 + 保护页 | 当前直映连续页，无保护页；见 §3 |
 | 数据页/区域线性扫描 | 规模大后换有序结构 |
 | 按需分页 / COW / 通用页缓存 / swap / 远端 TLB | 未做；MAP_SHARED 文件页缓存已实现，不是通用读写页缓存 |
-| 全局堆失败策略 | 8 MiB 固定；pipe 扩容、`record_exit` 的 `collect`、rsext4 的 `alloc::vec!` 不可失败，可耗尽→panic；需要统一 OOM 策略 |
+| 全局堆失败策略 | 8 MiB 固定；pipe 扩容、rsext4 的 `alloc::vec!` 不可失败，可耗尽→panic；需要统一 OOM 策略 |
 
 ## 2. polyhal 边界
 
@@ -93,9 +95,9 @@
 | 能力 | 用法 |
 |---|---|
 | 页表 | 只用 `PAGE_SIZE`、`MappingFlags`、`PageTable::current/root`、`TLB`；页表服务自建（缺陷 1/2） |
-| 上下文切换 | `KContext` + `context_switch`；页表切换自管，不用 `context_switch_pt` |
+| 上下文切换 | `kernel/hal.rs` 在 PolyHAL `KContext` + `context_switch` 外保存内核 FP 现场；页表切换自管，不用 `context_switch_pt` |
 | LA TLB refill | 自写向量（QEMU 10.0.2 LDPTE 丢 NR/NX）；SAVE3 暂存 t1 |
-| 缺失封装 | `fence_icache`、`read_current_tp`、la idle（自旋等钟） |
+| 架构辅助 | `fence_icache` 由框架封装；`read_current_tp` 与单核 idle 等待由 `kernel/hal.rs` 封装（la 自旋等钟） |
 
 ### 2.2 已知缺陷
 
@@ -109,8 +111,10 @@
 | 6 | la 无法表达撤 X（无 NX） | 团队决定不实现；translate 报实际权限 |
 | 7 | la 未分类异常在 HAL 层直接 panic | 分类器已修：新增 `TrapType::Unhandled` 交 OS；模拟器/中断见 #9/#10 |
 | 8 | 启动期一处 ptr::add 越界 | 已定位：polyhal 本体 percpu（rv，`percpu/mod.rs:88`）把 VIRT_ADDR_START 当字节偏移，数学正确但技术 UB；不在 vendor 范围，selftest 用 `-Zub-checks=no` 规避 |
-| 9 | la 非对齐模拟内部仍 panic | 未修：`trap/loongarch64/unaligned.rs` 在模拟地址错误、未支持指令时直接 panic；应改为交 OS 终止任务 |
-| 10 | la 未知中断在 HAL 层 panic | 未修：`trap/loongarch64.rs` 对非 TIMER_IRQ 直接 `panic!`；启用外部中断前必须修 |
+| 9 | la 非对齐模拟内部 panic / 裸用户访存 | 已修：HAL 只报告 BADV；OS 经用户地址空间权限校验后模拟原整数指令范围，失败终止用户任务 |
+| 10 | la 未知中断在 HAL 层 panic | 已修：返回 `TrapType::Irq` 交 OS；实际外设 IRQ 的应答与屏蔽仍待驱动接入 |
+| 11 | rv 未知 cause unwrap 与 LoadFault 地址特判 panic | 已修：未知 cause 报 `Unhandled`；LoadFault 统一作为用户或内核页错误交 OS 判来源 |
+| 12 | 用户 FP 现场不完整 / 内核 FP 跨切换不保留 | 已修：rv/la 陷阱边界保存完整用户 FP、控制状态与内核 FP；框架切换包装器在原 KContext 外保存内核 FP |
 | — | la 缺 `TrapFrame::from_user` | 已修：vendor 补齐，OS 侧统一用 `from_user` |
 
 ### 2.3 vendor 补丁
@@ -118,7 +122,8 @@
 polyhal-trap 0.4.0 整 crate vendor 至 `third_party/polyhal-trap`，
 根 `[patch.crates-io]` 指向本地；polyhal 本体与 polyhal-boot 仍走
 crates.io。补丁：#5 TrapType 直达、#7 Unhandled 转交、la `from_user`
-补齐、la 非对齐成功改报 `Absorbed`。清单与升级回归见该目录
+补齐、la 非对齐事件交 OS 安全模拟、完整 FP 现场与显式用户返回状态。
+清单与升级回归见该目录
 README；不得直接编辑 `~/.cargo/registry`。上游 PR（MIT）待提。
 
 ## 3. task 契约
@@ -135,8 +140,8 @@ README；不得直接编辑 `~/.cargo/registry`。上游 PR（MIT）待提。
   制根项，la 走 DMW）；这些路径不得访问用户低半区。
 - PC 推进归 HAL：断点 +2 由 polyhal 做，syscall 由 `syscall_ok` 恰
   好一次。
-- 孵化时机：rv 初始 TrapFrame 依赖开中断稳态（SPP=0/SPIE=1），spawn
-  必须在 `task::run` 关中断之前；`spawn_user` 内有断言兜底。
+- 首次入口在调度器锁下取出 `TaskBody`；用户 TrapFrame 和 nanosleep
+  截止时间由该任务内核栈上的运行循环局部持有，调度器不借用用户现场。
 
 ### 3.2 中断、抢占、时间片
 
@@ -151,21 +156,25 @@ README；不得直接编辑 `~/.cargo/registry`。上游 PR（MIT）待提。
 
 | 对象 | 内容 | 位置 |
 |---|---|---|
-| Task | 内核栈 + KContext + 身体 + pid | 调度器 Box |
+| Task | 内核栈 + 私有 KContext + 首次入口身体 + pid | 调度器 Box；身体首次取出后为 None |
 | ProcessRecord | 地址空间 + fs + 退出信息 + 父子关系 | 静态 REGISTRY |
 | CURRENT | 当前任务地址（整数存址，绕开裸指针 !Send） | percpu |
 
 Task 与 ProcessRecord 分离是为线程预留；地址空间只住注册表。pid
 递增不复用，孵化失败允许空洞。`LocalSpace` 是 mm 提供的单核凭证，
 `unsafe impl Send` 的依据集中在 mm，SMP 化时欠账也集中于此。
-CURRENT 是当前任务身份的唯一来源。
+CURRENT 记录当前任务地址；调度器的 `current` Box 持有实体，切换时
+核对两者一致。KContext 只向调度器提供裸地址，用户运行循环不得改写。
 
 ### 3.4 生命周期
 
 - wait 收割即删；注册表只存活跃进程与未收割僵尸；重复 wait 得
   ECHILD。
-- 孤儿过继内核 init；已退出的孤儿即收，运行时间丢弃。
-- 终态行积攒到任务时代结束统一输出，不混入用户程序的测试输出。
+- 孤儿过继内核 init；已退出的孤儿即收，活孤儿随后退出时即收，运行时间丢弃。
+- 退出 Task 的内核栈先进入 dead 表，切到其他任务或 idle 栈后立即回收。
+- 终态行积攒到任务时代结束统一输出，不混入用户程序的测试输出；
+  积攒预留失败时静默丢弃该行（终态汇总可能缺项，无日志、无计数）——
+  降级路径：异常退出可能被掩盖，需失败计数与上报。
 - exit(n) 码为 n；致命异常以 128+11 占位；wait status 见 §4。
 
 ### 3.5 等待与唤醒
@@ -174,6 +183,8 @@ CURRENT 是当前任务身份的唯一来源。
   切走，保留 syscall PC；醒来重执行重查条件（Mesa 风格）。
 - Deadline 由调度边界按硬件时钟扫描；Children/Pipe 由事件方置无锁
   原子标志，在调度边界统一消费，避免 fs 在 REGISTRY 内反向取 SCHED。
+- 孵化预留 ready/waiting 各自容纳全部存活任务的容量；集中唤醒不分配。
+- init 在仍有活跃进程时等待 Children 事件，醒后重查条件。
 - 等待表满时 park 退化为就绪让出；就绪空而等待非空时 idle 等时钟；
   互等即永久等待（QEMU 超时兜底）。
 
@@ -186,7 +197,8 @@ nanosleep/times）；非重入锁禁止在 dispatch 锁内调用。
 
 ### 3.7 锁调试
 
-见 §5。切换入口断言持锁深度为零；try_lock 失败即“持锁跨调度”。
+见 §5。切换入口始终断言 DebugMutex 持锁深度为零；lock_debug 下
+try_lock 失败即报告“持锁跨调度”。
 
 ### 3.8 已知妥协、欠账与非目标
 
@@ -266,10 +278,10 @@ nanosleep/times）；非重入锁禁止在 dispatch 锁内调用。
 
 | 项 | 约定 |
 |---|---|
-| 前提 | 任务时代内核态关中断；单核无合法持锁等待；try_lock 失败即 bug（持锁跨调度） |
-| 检查 | 锁名/获取点（`#[track_caller]`）、percpu 持锁深度、切换入口深度为零；release 零开销 |
+| 前提 | 任务时代内核态关中断；单核无合法持锁等待；lock_debug 下 try_lock 失败即报告 bug |
+| 检查 | DebugMutex 的 percpu 持锁深度及切换入口零深度检查始终启用；lock_debug 额外跟踪锁名/获取点（`#[track_caller]`） |
 | 锁序 | SCHED→FRAME；REGISTRY→{FRAME, EXIT_REPORTS, 打开文件 Handle, ROOT/MOUNTS/PAGES}；Handle→{ROOT, MOUNTS, PAGES}；PAGES→{ROOT, MOUNTS}；ROOT/MOUNTS→DISKS |
-| 反向 | 任何路径不得反向持有；fs/drivers 的 `spin::Mutex` 不在 lock_debug 检查范围 |
+| 反向 | 任何路径不得反向持有；fs/drivers 的 `spin::Mutex` 不受 DebugMutex 深度检查保护 |
 | 唤醒 | 事件方不直接取 SCHED；用无锁原子标志，在调度边界消费 |
 | 锁外析构 | 退出路径的 space/fs Drop 在 REGISTRY 锁外完成；exec 目前是例外 |
 | 已知缺口 | 持有者 id 只更新不报告；dispatch 持 REGISTRY 做磁盘 I/O；exec 在 REGISTRY 锁内析构旧空间 |
@@ -309,6 +321,7 @@ nanosleep/times）；非重入锁禁止在 dispatch 锁内调用。
 | 块层 | 同步轮询，无中断驱动/请求队列；DMA 页用裸 `frame_alloc`（OwnedFrame 例外第三处）；`dma_alloc` 失败返回物理 0，仅初始化期 |
 | 大文件堆 | exec 整镜像读入 Vec；rsext4 单次 extent run 最多分配 1 MiB `run_buf`；8 MiB 堆下大镜像可能 OOM；分块直填页为欠账 |
 | 共享页无脏位 | 释放即回写整页（fsync 的回写是有意的）；只读映射/O_RDONLY fd 也会写；rsext4-readonly 每次释放记 EROFS。需要 dirty 标志或区分只读 |
+| 一致性更新降级 | 共享页 `coherent` 的页内读写失败仅记 error 日志并跳过该页更新，后续 read/mmap 可能读到旧数据；无失败计数与恢复策略。需要计数上报与一致性恢复 |
 | 脏卷启动 | `fs::init` 返回错，`main` 用 expect 直接 panic；可写挂载先置 dirty，掉电后卷不可引导，且无日志重放。需要回退策略（只读挂载/内嵌程序/诊断后关机） |
 | rsext4 审计 | vendor 有大量 unwrap/panic，挂载、lookup、read/write、getdents 都会走到；损坏镜像/意外 I/O 下可能从用户路径 panic 内核；原 ext4_rs 的 9 处审计不适用 |
 | FAT unmount | 先 `mounts.remove` 再 `fs.unmount()`；失败时挂载已消失，无法重试。应成功后再移除 |
@@ -325,6 +338,7 @@ nanosleep/times）；非重入锁禁止在 dispatch 锁内调用。
 | mm/mod.rs::init | 帧账本：超量申请被拒且不改变空闲数 | 每次启动 |
 | mm/self_test.rs | 页所有权/区间分裂/权限/边界/释放守恒 | 每次启动 |
 | task/mod.rs::run（帧守恒） | 全部任务退出后帧统计回到基线（覆盖 kstack 与用户空间回收） | 每次启动 |
+| task/sched.rs、task/mod.rs 的 debug 断言 | 切换后 dead 栈释放页数、集中唤醒容量、孤儿记录回收 | selftest 档执行相应路径时 |
 | task/mod.rs::spawn_oom_probe | 孵化 OOM 无副作用：不改帧数、不登记 | 仅 selftest 档 |
 | mm/frame.rs 预算注入 | 逐点 OOM 失败路径不变量 | 仅 selftest 档 |
 
@@ -338,6 +352,7 @@ nanosleep/times）；非重入锁禁止在 dispatch 锁内调用。
 |---|---|
 | `make run-rv` / `make run-la` | release 七任务验收（kthread A/B、hello、sched×2、check、ill），末尾帧守恒与逐进程汇总 |
 | `make selftest-rv` / `make selftest-la` | debug 断言 + lock_debug + LOG=info；额外 OOM 注入与调试锁检查；polyhal #8 需 `-Zub-checks=no` |
+| loongarch64 debug 启动自检（`trap/unaligned.rs`） | 直接验证模拟器 load/store、符号扩展、r0、跨页原子失败与只读拒绝 |
 | `tests/run_group.py` | 双架构 group/edges/selftest 整组验收：QEMU 10.0.2、官方 oracle、`e2fsck -fn` |
 | `tests/mm_validate.py` | MMU/TLB 硬件探针；依赖 musl 交叉工具链与 `~/.config/ouroos/env.sh`，尚未纳入日常门禁 |
 
@@ -346,7 +361,6 @@ nanosleep/times）；非重入锁禁止在 dispatch 锁内调用。
 | 项 | 现状 | 处理 |
 |---|---|---|
 | `make fmt` | `cargo fmt --all` 会连带格式化 `third_party/rsext4`（8 个文件有 rustfmt diff） | 限定 `-p kernel`，vendor 保持上游风格 + 补丁标记 |
-| clippy | `task/user_task.rs` 的 wait4 闭包触发 redundant_closure；lock_debug 下 `sync.rs` 的 needless_return 是 dev 既有 | 修新增 warning |
 | `println!` | main/task/lang_items 用 `println!` 输出验收行，与 AGENTS §6 的 log 规则冲突 | 契约声明例外，或改 log 并在 Makefile 固定 LOG |
 | `report_all` 注释 | 称“退出时即时输出”，实际时代末统一输出 | 修注释 |
 | `allocator.rs` | 模块头不是 `//!` | 改 `//!` |
