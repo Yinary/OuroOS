@@ -1,5 +1,6 @@
 //! 内存系统调用：mmap/munmap/mprotect 的参数检查与实现。
 //! Linux ABI 依据 man7.org/linux/man-pages/man2/{mmap,mprotect,brk}.2.html。
+#![deny(unsafe_code)]
 use super::Errno;
 use crate::mm::address_space::{AreaKind, MapError, UserAddressSpace};
 use polyhal::pagetable::{MappingFlags as F, PAGE_SIZE};
@@ -54,10 +55,7 @@ pub(super) fn mmap(
         return Err(Errno::Invalid);
     }
     if map_flags & 0x20 == 0 {
-        use crate::mm::{
-            address_space::{phys_to_kernel_vaddr, Backing},
-            frame::OwnedFrame,
-        };
+        use crate::mm::{address_space::Backing, frame::OwnedFrame};
         use alloc::vec::Vec;
         if map_flags & !0x13 != 0 {
             return Err(Errno::NotSupported);
@@ -86,14 +84,7 @@ pub(super) fn mmap(
                 let frame = OwnedFrame::new().map_err(|_| Errno::NoMem)?;
                 let mut data = [0u8; PAGE_SIZE];
                 crate::fs::read(ino, pos, &mut data)?;
-                // SAFETY: 新分配的私有页独占，写入不超过一页。
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        data.as_ptr(),
-                        phys_to_kernel_vaddr(frame.addr()) as *mut u8,
-                        PAGE_SIZE,
-                    );
-                }
+                frame.write(0, &data).map_err(|_| Errno::Invalid)?;
                 frames.push(Backing::Private(frame));
             }
         }
