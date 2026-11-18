@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""构造已知 inode 属性，双架构验证文件状态查询；产物只写入 target。"""
+"""构造已知属性与容量的磁盘，双架构验证查询接口；产物只写入 target。"""
 import argparse
 import os
 from pathlib import Path
@@ -30,6 +30,8 @@ def main():
     payload.write_bytes(b"testing")
     empty = out / "empty"
     empty.write_bytes(b"")
+    expected_capacity = out / "expected-capacity"
+    expected_capacity.write_bytes(bytes([0xa5]) * 152)
     for arch, short, target, flags, machine, device in [
         ("riscv64", "rv", "riscv64gc-unknown-none-elf", "",
          ["-machine", "virt", "-bios", "default"], "virtio-blk-device"),
@@ -51,6 +53,7 @@ def main():
                         "cd /meta", "mknod char c 1 3", "cd /",
                         f'write "{out / "user-target" / target / "release/hello"}" /init',
                         f'write "{payload}" /meta/data', f'write "{empty}" /meta/large',
+                        f'write "{expected_capacity}" /fs-expected',
                         "set_inode_field /meta/large size 4294967303",
                         "set_inode_field /meta/data mode 0100640",
                         "set_inode_field /meta/data uid 4464",
@@ -76,6 +79,25 @@ def main():
             script = out / f"{stem}-populate"
             script.write_text("\n".join(commands) + "\n")
             run(["debugfs", "-w", "-f", str(script), str(ext)], out / f"{stem}-populate.log")
+            # 预分配后写入快照，避免保存期望值本身改变空闲计数。
+            run(["debugfs", "-R", "bmap /fs-expected 0", str(ext)], out / f"{stem}-expected-block.log")
+            block = int((out / f"{stem}-expected-block.log").read_text().splitlines()[-1])
+            if block <= 0 or (block + 1) * 4096 > ext.stat().st_size:
+                raise RuntimeError("容量快照文件没有分配有效数据块")
+            with ext.open("r+b") as stream:
+                stream.seek(1024)
+                sb = stream.read(1024)
+                word = lambda offset: struct.unpack_from("<I", sb, offset)[0]
+                blocks = word(4) | word(336) << 32
+                free = word(12) | word(344) << 32
+                reserved = word(8) | word(340) << 32
+                overhead = word(584) << (word(28) - word(24))
+                expected = struct.pack("<15Q", 0xef53, 1024 << word(24), blocks - overhead,
+                                       free, max(0, free - reserved), word(0), word(16),
+                                       int.from_bytes(sb[104:112], "little"), 255,
+                                       1024 << word(24), 0x20, 0, 0, 0, 0)
+                stream.seek(block * 4096)
+                stream.write(expected)
             run(["debugfs", "-R", "stat /meta/data", str(ext)], out / f"{stem}-expected.log")
             run(["e2fsck", "-fn", str(ext)], out / f"{stem}-before-fsck.log")
             image = ext
@@ -85,6 +107,22 @@ def main():
                 with fat.open("wb") as stream:
                     stream.truncate(16 * 1024 * 1024)
                 run(["mkfs.fat", "-F", "16", str(fat)], out / f"{stem}-fat-mkfs.log")
+                with fat.open("rb") as stream:
+                    boot = stream.read(512)
+                    short_word = lambda offset: struct.unpack_from("<H", boot, offset)[0]
+                    sector_size = short_word(11)
+                    cluster_size = sector_size * boot[13]
+                    sectors = short_word(19) or struct.unpack_from("<I", boot, 32)[0]
+                    root_sectors = (short_word(17) * 32 + sector_size - 1) // sector_size
+                    clusters = (sectors - short_word(14) - boot[16] * short_word(22) - root_sectors) // boot[13]
+                    stream.seek(short_word(14) * sector_size)
+                    table = stream.read(short_word(22) * sector_size)
+                    free_clusters = sum(struct.unpack_from("<H", table, i * 2)[0] == 0 for i in range(2, clusters + 2))
+                    fat_expected = struct.pack("<4Q", cluster_size, clusters, free_clusters,
+                                               struct.unpack_from("<I", boot, 39)[0])
+                with ext.open("r+b") as stream:
+                    stream.seek(block * 4096 + 120)
+                    stream.write(fat_expected)
                 start = 2048
                 count = ext.stat().st_size // 512
                 second = start + count
@@ -108,12 +146,16 @@ def main():
                  "-nographic", "-no-reboot", "-drive", f"file={image},format=raw,if=none,id=disk",
                  "-device", f"{device},drive=disk"], out / f"{stem}.log")
             text = (out / f"{stem}.log").read_text(errors="replace")
-            if "STAT PASS:" not in text or "basic-init): exited with status 0" not in text:
+            if ("STAT PASS:" not in text or "READLINK PASS:" not in text or "STATFS PASS:" not in text
+                    or "basic-init): exited with status 0" not in text):
                 raise RuntimeError(f"{stem} failed: {text[-1600:]}")
             if start:
                 with image.open("rb") as stream:
                     stream.seek(start * 512)
                     ext.write_bytes(stream.read(count * 512))
+                    stream.seek(second * 512)
+                    fat.write_bytes(stream.read(fat_count * 512))
+                run(["fsck.fat", "-n", str(fat)], out / f"{stem}-after-fat-fsck.log")
             run(["e2fsck", "-fn", str(ext)], out / f"{stem}-after-fsck.log")
             print(f"{stem}: PASS (status queries and e2fsck)", flush=True)
 

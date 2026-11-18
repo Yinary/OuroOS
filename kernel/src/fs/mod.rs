@@ -12,6 +12,19 @@ mod metadata;
 
 pub(crate) use metadata::{query, Metadata, Timestamp};
 
+/// 已挂载文件系统的容量快照，块数以 block_size 字节为单位。
+pub(crate) struct FileSystemStats {
+    pub kind: u64,
+    pub block_size: u64,
+    pub blocks: u64,
+    pub free_blocks: u64,
+    pub available_blocks: u64,
+    pub files: u64,
+    pub free_files: u64,
+    pub id: u64,
+    pub flags: u64,
+}
+
 const FAT_INODE: u32 = 0x8000_0000;
 
 /// 文件系统返回的目录项类型。
@@ -69,6 +82,24 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
         fat::stat(ino)
     } else {
         ext4::stat(ino)
+    }
+}
+
+/// 查询 inode 所属卷的容量；失败返回对应后端错误。
+pub(crate) fn filesystem_stats(ino: u32) -> Result<FileSystemStats, Errno> {
+    if ino & FAT_INODE != 0 {
+        fat::filesystem_stats(ino)
+    } else {
+        ext4::filesystem_stats()
+    }
+}
+
+/// 读取符号链接的目标文本；非链接返回 EINVAL，FAT 不提供链接。
+pub(crate) fn read_link(ino: u32) -> Result<alloc::string::String, Errno> {
+    if ino & FAT_INODE != 0 {
+        Err(Errno::Invalid)
+    } else {
+        ext4::link_target(ino)
     }
 }
 

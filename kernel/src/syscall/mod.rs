@@ -25,6 +25,8 @@ pub mod sysnr {
     pub const UNLINKAT: usize = 35;
     pub const UMOUNT2: usize = 39;
     pub const MOUNT: usize = 40;
+    pub const STATFS: usize = 43;
+    pub const FSTATFS: usize = 44;
     pub const CHDIR: usize = 49;
     pub const OPENAT: usize = 56;
     pub const CLOSE: usize = 57;
@@ -39,6 +41,7 @@ pub mod sysnr {
     pub const PWRITE64: usize = 68;
     pub const PREADV: usize = 69;
     pub const PWRITEV: usize = 70;
+    pub const READLINKAT: usize = 78;
     pub const FSTATAT: usize = 79;
     pub const FSTAT: usize = 80;
     pub const FSYNC: usize = 82;
@@ -180,6 +183,8 @@ pub fn dispatch(
         | sysnr::UNLINKAT
         | sysnr::UMOUNT2
         | sysnr::MOUNT
+        | sysnr::STATFS
+        | sysnr::FSTATFS
         | sysnr::CHDIR
         | sysnr::OPENAT
         | sysnr::CLOSE
@@ -194,6 +199,7 @@ pub fn dispatch(
         | sysnr::PWRITE64
         | sysnr::PREADV
         | sysnr::PWRITEV
+        | sysnr::READLINKAT
         | sysnr::FSTAT
         | sysnr::FSTATAT
         | sysnr::FSYNC

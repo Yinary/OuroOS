@@ -391,6 +391,14 @@ impl OpenFile {
         }
     }
 
+    /// 查询 inode 所属卷的容量；管道与控制台尚不提供卷统计。
+    pub(crate) fn filesystem_stats(&self) -> Result<fs::FileSystemStats, Errno> {
+        match self.kind {
+            Kind::Inode { ino, .. } => fs::filesystem_stats(ino),
+            _ => Err(Errno::NotSupported),
+        }
+    }
+
     /// 返回打开对象的属性快照；管道与控制台提供合成属性。
     pub(crate) fn metadata(&self) -> Result<fs::Metadata, Errno> {
         match self.kind {

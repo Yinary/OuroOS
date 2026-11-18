@@ -278,6 +278,33 @@ pub(super) fn metadata(ino: u32) -> Result<super::Metadata, Errno> {
     })
 }
 
+/// 查询根卷容量，空闲计数取自后端当前快照。
+pub(super) fn filesystem_stats() -> Result<super::FileSystemStats, Errno> {
+    access(|v| {
+        let stats = v.fs.statfs();
+        let sb = &v.fs.superblock;
+        let overhead = (sb.s_overhead_blocks as u64)
+            .checked_shl(sb.s_log_cluster_size.saturating_sub(sb.s_log_block_size))
+            .ok_or_else(Ext4Error::corrupted)?;
+        let blocks = stats
+            .total_blocks
+            .checked_sub(overhead)
+            .ok_or_else(Ext4Error::corrupted)?;
+        let u = sb.s_uuid;
+        Ok(super::FileSystemStats {
+            kind: 0xef53,
+            block_size: stats.block_size,
+            blocks,
+            free_blocks: stats.free_blocks,
+            available_blocks: stats.free_blocks.saturating_sub(sb.reserved_blocks_count()),
+            files: stats.total_inodes as u64,
+            free_files: stats.free_inodes as u64,
+            id: u64::from_le_bytes([u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7]]),
+            flags: 0x20 | u64::from(!WRITABLE),
+        })
+    })
+}
+
 /// 读取有界的链接目标；不更新访问时间，非 UTF-8 或损坏数据返回 EIO。
 pub(super) fn link_target(ino: u32) -> Result<alloc::string::String, Errno> {
     let mut data = Vec::new();

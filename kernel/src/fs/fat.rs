@@ -216,6 +216,24 @@ pub fn read(ino: u32, offset: usize, out: &mut [u8]) -> Result<usize, Errno> {
         file.read(out).map_err(error)
     })
 }
+
+/// 查询 FAT 卷的实际簇统计；没有固定 inode 池，文件计数返回零。
+pub(super) fn filesystem_stats(ino: u32) -> Result<super::FileSystemStats, Errno> {
+    access(ino, |m, _| {
+        let stats = m.fs.stats().map_err(error)?;
+        Ok(super::FileSystemStats {
+            kind: 0x4d44,
+            block_size: stats.cluster_size() as u64,
+            blocks: stats.total_clusters() as u64,
+            free_blocks: stats.free_clusters() as u64,
+            available_blocks: stats.free_clusters() as u64,
+            files: 0,
+            free_files: 0,
+            id: m.fs.volume_id() as u64,
+            flags: 0x20,
+        })
+    })
+}
 pub fn write(ino: u32, offset: usize, data: &[u8]) -> Result<usize, Errno> {
     access(ino, |m, i| {
         let mut file = m.fs.root_dir().open_file(&m.nodes[i].path).map_err(error)?;

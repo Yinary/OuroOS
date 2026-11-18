@@ -51,6 +51,7 @@ pub fn dispatch(
         }
         sysnr::DUP => ctx.install(ctx.get(a[0])?, false),
         sysnr::FCNTL => fcntl(ctx, a[0] as u32 as usize, a[1] as u32, a[2] as u32),
+        sysnr::STATFS | sysnr::FSTATFS => statfs(nr, ctx, space, a),
         sysnr::DUP3 => {
             if a[2] & !0x80000 != 0 || a[0] == a[1] {
                 return Err(Errno::Invalid);
@@ -224,6 +225,7 @@ pub fn dispatch(
         | sysnr::PWRITE64
         | sysnr::PREADV
         | sysnr::PWRITEV => rw(nr, a, space, ctx),
+        sysnr::READLINKAT => readlinkat(ctx, space, a),
         sysnr::FSTATAT | sysnr::STATX => {
             let extended = nr == sysnr::STATX;
             let flags = if extended { a[2] } else { a[3] };
@@ -257,6 +259,65 @@ pub fn dispatch(
         }
         _ => Err(Errno::NoSys),
     }
+}
+
+/// Linux statfs/fstatfs：查询路径或 FD 所属卷，写回 120 字节的统计结构。
+fn statfs(
+    nr: usize,
+    ctx: &Context,
+    space: &UserAddressSpace,
+    a: [usize; 6],
+) -> Result<usize, Errno> {
+    let stats = if nr == sysnr::STATFS {
+        let path = user_string(space, a[0])?;
+        let info = ctx.query((-100isize) as usize, &path, false, true)?;
+        fs::filesystem_stats(info.ino as u32)?
+    } else {
+        ctx.get(a[0] as u32 as usize)?.lock().filesystem_stats()?
+    };
+    let mut out = [0; 120];
+    for (i, value) in [
+        stats.kind,
+        stats.block_size,
+        stats.blocks,
+        stats.free_blocks,
+        stats.available_blocks,
+        stats.files,
+        stats.free_files,
+        stats.id,
+        255,
+        stats.block_size,
+        stats.flags,
+    ]
+    .iter()
+    .enumerate()
+    {
+        out[i * 8..i * 8 + 8].copy_from_slice(&value.to_ne_bytes());
+    }
+    user_access::copy_to_user(space, a[1], &out).map_err(|_| Errno::Fault)?;
+    Ok(0)
+}
+
+/// Linux readlinkat：读取末项链接，不补 NUL；缓冲区不足时返回截断长度。
+fn readlinkat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
+    let capacity = a[3] as u32 as i32;
+    if capacity <= 0 {
+        return Err(Errno::Invalid);
+    }
+    let path = user_string(space, a[1])?;
+    let dir = a[0] as u32 as i32 as isize as usize;
+    let info = ctx.query(dir, &path, true, false)?;
+    if info.mode & 0xf000 != 0xa000 {
+        return Err(if path.is_empty() {
+            Errno::NoEntry
+        } else {
+            Errno::Invalid
+        });
+    }
+    let target = fs::read_link(info.ino as u32)?;
+    let n = target.len().min(capacity as usize);
+    user_access::copy_to_user(space, a[2], &target.as_bytes()[..n]).map_err(|_| Errno::Fault)?;
+    Ok(n)
 }
 
 /// Linux fcntl 基础 FD 控制；未知命令返回 EINVAL，未实现文件锁及异步 I/O。
