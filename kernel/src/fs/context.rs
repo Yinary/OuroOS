@@ -141,21 +141,25 @@ impl Context {
             }
         };
         out.try_reserve(input.len() + 1).map_err(|_| Errno::NoMem)?;
+        let mut parent_end = None;
         for component in input.split('/') {
-            if !component.is_empty() && fs::stat(fs::lookup(&out)?)?.0 & 0xf000 != 0x4000 {
-                return Err(Errno::NotDir);
-            }
             match component {
-                "" | "." => {}
-                ".." => {
-                    if let Some(i) = out.rfind('/') {
-                        out.truncate(i.max(1));
+                "" => {}
+                "." | ".." => {
+                    directory(&out)?;
+                    parent_end = None;
+                    if component == ".." {
+                        if let Some(i) = out.rfind('/') {
+                            out.truncate(i.max(1));
+                        }
                     }
                 }
                 name => {
                     if name.len() > 255 {
+                        directory(&out)?;
                         return Err(Errno::NameTooLong);
                     }
+                    parent_end = Some(out.len());
                     if out != "/" {
                         out.push('/');
                     }
@@ -163,11 +167,23 @@ impl Context {
                 }
             }
         }
+        // 后端会检查中间目录；只验证末项的父目录，末项允许尚不存在。
+        if let Some(end) = parent_end {
+            directory(&out[..end])?;
+        }
         if out.len() > 4096 {
             return Err(Errno::NameTooLong);
         }
         Ok(out)
     }
+}
+
+/// 确认路径存在且为目录。
+fn directory(path: &str) -> Result<(), Errno> {
+    if fs::stat(fs::lookup(path)?)?.0 & 0xf000 != 0x4000 {
+        return Err(Errno::NotDir);
+    }
+    Ok(())
 }
 
 /// 从用户内存读取 NUL 结尾路径，最长 4096 字节。
