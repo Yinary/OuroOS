@@ -297,43 +297,77 @@ try_lock 失败即报告“持锁跨调度”。
 
 ## 6. fs 与块设备
 
-### 6.1 结构
+### 6.1 分层
 
-| 模块 | 职责 |
+| 层 | 职责 | 代码 |
+|---|---|---|
+| syscall | 用户参数、缓冲区访问、Linux 结果编码；调用语义见 §4 | `syscall/fs.rs` |
+| context | 每进程 cwd、FD 表、打开文件对象与管道 | `fs/context.rs` |
+| fs / metadata | 路径与 inode 分发、统一属性和目录接口、状态查询路径解析 | `fs/mod.rs`、`fs/metadata.rs` |
+| cache | 文件共享页、普通读写与已有映射间的内容同步 | `fs/cache.rs` |
+| 文件系统适配 | Ext4 根卷与 FAT 挂载卷、后端错误转换 | `fs/ext4_rsext4.rs`、`fs/fat.rs` |
+| 第三方后端 | rsext4 0.8.1 的 inode、目录、数据块与日志；rust-fatfs 的 FAT 操作 | `third_party/rsext4/`、`kernel/Cargo.toml` |
+| 块设备 | VirtIO Block 同步 I/O、字节访问与 MBR 分区解析 | `drivers/mod.rs` |
+
+### 6.2 不变量
+
+| 不变量 | 落地方式 |
 |---|---|
-| `fs::context` | 每进程 cwd、fd 表及打开文件操作；`Handle=Arc<Mutex<OpenFile>>`，dup/fork 共享偏移；仅接收内核缓冲区，读结果交付成功后才消费管道数据或推进偏移 |
-| `fs::mod` | Ext4（rsext4）与 FAT 查找；先查 FAT 挂载再查 EXT4 根 |
-| `fs::fat` | rust-fatfs；路径即身份；虚拟 inode 从 0x8000_0000 递增 |
-| `fs::cache` | MAP_SHARED 文件页；映射持强引用、索引持弱引用、最后释放写回 |
-| `drivers` | virtio-blk 同步 IO、字节层 RMW、MBR；rv MMIO 固定槽 / la PCI ECAM |
+| 用户地址访问收口 | syscall 经 `user_access` 复制；FS 接收内核缓冲区或交付回调，不直接解引用用户指针 |
+| FD 与打开文件对象分离 | FD 表持有 `Arc<Mutex<OpenFile>>`；dup/fork 共享文件对象与偏移，CLOEXEC 保留在描述符中 |
+| 打开引用配对释放 | inode 文件对象创建时 retain，最后一个文件对象引用释放时 release；dup/fork 不重复 retain |
+| Ext4 删除不使已打开对象失效 | unlink 移除文件名；链接数和打开引用均为零时才回收 inode；FAT 不提供此保证 |
+| 读位置按实际交付提交 | 只按成功交付的字节数推进文件偏移或消费管道数据；目录输出复制成功后才提交续读位置 |
+| 定位 I/O 不改共享偏移 | `read_at/write_at` 接受独立偏移；普通 I/O 在打开文件锁内更新偏移 |
+| 存活共享页唯一 | `PAGES` 锁下按 `(ino, offset)` 复用；映射持强引用，索引持弱引用 |
+| 共享页初始化后才登记引用 | 分配、读入和填页完成后 retain；未完成登记的页析构时不写回、不 release |
+| 分区访问有界 | Ext4 适配检查块范围，驱动检查扇区对齐、设备容量和地址溢出；同步请求返回后不再访问调用方缓冲区 |
+| 等待交给调度边界 | FS 返回等待错误；系统调用释放锁后挂起重试；管道事件只置唤醒标志，锁序见 §5 |
 
-### 6.2 EXT4 挂载检查
+### 6.3 补充约定
 
-- rsext4 0.8.1，含 JBD2、fsync、卸载同步；内核适配在
-  `fs/ext4_rsext4.rs`。
-- 仅 4 KiB 数据块（`s_log_block_size==2`）；非 4K 卷拒绝。
-- blocks/inodes_per_group 非零；卷块数不超过分区。
-- 可写构建：incompat/ro_compat 白名单、`s_state==EXT4_VALID_FS`、
-  journal inode==8、无外部日志、块数 ≤2^32。
-- rsext4 从超级块读 `s_desc_size`/`s_inode_size`，没有 64 描述符/
-  128–256 inode 的硬限制；4K 限制来自 `rsext4::config::BLOCK_SIZE`。
-- 需要日志重放的卷、外部日志、未知特性一律拒绝。
-
-### 6.3 偏差与欠账
-
-| 项 | 现状 / 影响 |
+| 项 | 约定 |
 |---|---|
-| inode 身份偷位 | 最高位区分 FAT/EXT4；FAT inode 是 (mount,path) 登记序号，非磁盘身份。计划：显式挂载表 + 全局 inode 命名空间 |
-| FAT 能力 | 无目录列举（getdents 仅 EXT4）；每次 read/write/stat 全路径重开；unlink 有句柄时 EBUSY。busybox 前应统一 |
-| 目录遍历 | EXT4 已接入统一目录接口；FAT 尚未接入，返回 ENOTSUP。目录缓冲区每次调用分配一次并跨块复用 |
-| 块层 | 同步轮询，无中断驱动/请求队列；DMA 页用裸 `frame_alloc`（OwnedFrame 例外第三处）；`dma_alloc` 失败返回物理 0，仅初始化期 |
-| 大文件堆 | exec 整镜像读入 Vec；rsext4 单次 extent run 最多分配 1 MiB `run_buf`；8 MiB 堆下大镜像可能 OOM；分块直填页为欠账 |
-| 共享页无脏位 | 释放即回写整页（fsync 的回写是有意的）；只读映射/O_RDONLY fd 也会写；rsext4-readonly 每次释放记 EROFS。需要 dirty 标志或区分只读 |
-| 一致性更新降级 | 共享页 `coherent` 的页内读写失败仅记 error 日志并跳过该页更新，后续 read/mmap 可能读到旧数据；无失败计数与恢复策略。需要计数上报与一致性恢复 |
-| 脏卷启动 | `fs::init` 返回错，`main` 用 expect 直接 panic；可写挂载先置 dirty，掉电后卷不可引导，且无日志重放。需要回退策略（只读挂载/内嵌程序/诊断后关机） |
-| rsext4 审计 | vendor 有大量 unwrap/panic，挂载、lookup、read/write、getdents 都会走到；损坏镜像/意外 I/O 下可能从用户路径 panic 内核；原 ext4_rs 的 9 处审计不适用 |
-| FAT unmount | 先 `mounts.remove` 再 `fs.unmount()`；失败时挂载已消失，无法重试。应成功后再移除 |
-| fs 契约化 | 当前是结构 + 偏差表；inode 引用计数（retain/release）、共享页生命周期、错误映射、Handle 所有权尚未写成带不变量的契约 |
+| 执行前提 | 单核、内核路径不可抢占；FS 与驱动使用 `spin::Mutex`，不受 DebugMutex 持锁深度检查保护 |
+| 根卷选择 | 设备 0 优先取 MBR 第一主分区；分区解析返回 Range 时尝试整盘；无设备允许继续启动 |
+| Ext4 块大小与几何 | 仅 4 KiB 块；校验 magic、卷块数、非零 blocks/inodes_per_group，声明的块范围不得超过分区 |
+| Ext4 可写准入 | incompat/ro_compat 使用适配器白名单，卷状态必须为 `EXT4_VALID_FS`；有日志时还要求日志 inode 为 8、无外部日志、卷块数不超过 2^32 |
+| 只读与恢复 | `rsext4-readonly` 禁止 Ext4 适配层写入；挂载选项关闭日志重放，可写准入条件不作为只读卷的完整特性校验保证 |
+| Ext4 元数据布局 | rsext4 按超级块的 `s_desc_size`、`s_inode_size` 读取布局，不固定为 64 字节描述符或 128 字节 inode；4 KiB 限制来自后端 `BLOCK_SIZE` |
+| inode 标识 | 最高位区分 FAT 与 Ext4；Ext4 拒绝该位已置位的 inode，FAT 从 `0x8000_0000` 分配虚拟编号 |
+| 共享页与普通读写 | read 叠加已有共享页，write 更新后端后同步已有共享页；成功初始化的共享页在最后释放时尝试写回，长度限于当前 EOF 内；失败限制见 §6.5 |
+| 显式同步 | Ext4 fsync 先写回该 inode 的驻留共享页，再同步后端缓存、日志和设备；关机时同步并卸载可写根卷，FAT fsync 返回 ENOTSUP |
+| 字节块访问 | 完整对齐的扇区范围一次提交；不完整扇区先读后改，调用方负责串行化重叠写入 |
+| 错误边界 | FS 对外返回项目 `Errno`，后端错误由适配层转换；不保证任意失败都无磁盘副作用，也不据此保证第三方内部无 panic |
+
+### 6.4 已兑现
+
+| 项 | 说明 |
+|---|---|
+| 文件调用分层 | 用户参数与 Linux ABI 在 syscall，FD 与打开文件操作在 context，磁盘格式在后端 |
+| FD 与 inode 生命周期 | dup/fork 共享偏移，CLOEXEC 按描述符管理；Ext4 打开后 unlink 仍可访问，最后关闭回收 |
+| Ext4 目录遍历 | 后端按块解析，统一返回文件名、类型、inode 与续读位置；缓冲区可失败分配并跨块复用，FAT 尚未接入 |
+| Ext4 属性查询 | 统一 Metadata 提供所有者、大小、块数及可用时间；状态查询区分链接自身与目标，具体标志与限制见 §4 |
+| 定位与向量 I/O | 普通与定位读写共用搬运流程，iovec 先复制到内核；已有进展时返回短传输，支持范围见 §4 |
+| 共享页初始化失败处理 | 分配或填页失败不触发未初始化数据写回，已登记的 inode 引用由页生命周期持有 |
+| Ext4 日志同步 | 接入有日志卷的正常挂载、显式同步与卸载；不包含异常关机后的日志恢复 |
+| 有界块访问 | 对齐请求批量提交，分区与设备分别检查访问范围；rv 使用 MMIO，la 使用 PCI ECAM |
+
+### 6.5 欠账
+
+| 项 | 现状 / 计划 |
+|---|---|
+| inode 与挂载身份 | 最高位分流；FAT 依赖 `(mount, path)` 登记序号，cwd/目录 FD 保存路径字符串。需统一挂载与对象身份 |
+| 路径与文件操作 | 状态查询已有链接与尾斜杠处理，open/exec 尚未统一；rename/link/symlink、目录删除及权限等缺口见 §4 |
+| FAT 接口 | 无目录遍历与时间字段，每次 read/write/stat 按路径重开，打开后 unlink 返回 EBUSY；需补齐统一接口 |
+| 共享页修改跟踪与写回 | 无脏状态，未修改页与只读映射也会尝试写回；只读 Ext4 根卷写回被拒绝并记日志。需 MM 提供修改跟踪，FS 保留失败数据并支持重试 |
+| 共享页一致性失败 | `coherent` 的页内访问失败只记日志并跳过更新；最后释放时写回失败仍释放页。需明确错误传播、数据持有者和恢复策略 |
+| 堆与栈预算 | exec 整镜像读入 Vec，rsext4 单次 extent run 可分配 1 MiB；I/O 和目录临时缓冲区虽可失败分配，仍有分配开销，部分路径保留页大小栈缓冲区。需测量内存与性能成本 |
+| 分配失败覆盖 | 管道扩容及第三方部分分配不可失败；8 MiB 固定堆下可能触发分配失败终止。需与 §1.5 的全局 OOM 策略统一 |
+| 脏卷启动与恢复 | 可写挂载拒绝需恢复的卷，入口对初始化错误使用 expect；无日志重放或降级策略。需确定恢复、只读降级或诊断退出方案 |
+| FAT 卸载失败 | 先移除挂载记录，再调用消费式 unmount；失败时记录已丢失。需确定可重试的同步与卸载流程 |
+| 目录完整性与后端审计 | 目录线性查找的校验和失败仍可能继续解析；第三方有 unwrap/panic 和不可失败分配，用户可达性及错误传播需逐项核对，不能沿用旧 ext4_rs 的审计结论 |
+| 块设备框架边界 | 同步轮询，无中断驱动或请求队列；DMA 页仍走受限的裸 `frame_alloc`，初始化分配失败返回物理 0。需完善失败处理与请求生命周期 |
 
 ## 7. 自检与验证
 
