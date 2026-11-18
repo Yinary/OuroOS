@@ -177,6 +177,45 @@ impl Context {
         }
         Ok(out)
     }
+    /// 状态查询保留原始路径分量，由 FS 处理链接、点分量与尾斜杠。
+    pub(crate) fn query(
+        &self,
+        dir: usize,
+        input: &str,
+        empty: bool,
+        follow: bool,
+    ) -> Result<fs::Metadata, Errno> {
+        if input.is_empty() && empty {
+            if dir as isize == -100 {
+                return fs::query(&self.cwd, true);
+            }
+            return self.get(dir)?.lock().metadata();
+        }
+        if input.is_empty() {
+            return Err(Errno::NoEntry);
+        }
+        if input.starts_with('/') {
+            return fs::query(input, follow);
+        }
+        let base = if dir as isize == -100 {
+            string(&self.cwd)?
+        } else {
+            let file = self.get(dir)?;
+            let file = file.lock();
+            file.directory()?;
+            match &file.kind {
+                Kind::Inode { path, .. } => string(path)?,
+                _ => return Err(Errno::NotDir),
+            }
+        };
+        let mut path = base;
+        path.try_reserve(input.len() + 1)
+            .map_err(|_| Errno::NoMem)?;
+        path.push('/');
+        path.push_str(input);
+        fs::query(&path, follow)
+    }
+
     /// 返回当前工作目录。
     pub(crate) fn cwd(&self) -> &str {
         &self.cwd
@@ -298,14 +337,20 @@ impl OpenFile {
         }
     }
 
-    /// 返回文件编号、模式、大小、链接数和占用块数。
-    pub(crate) fn metadata(&self) -> Result<(u64, u16, u64, u16, u64), Errno> {
+    /// 返回打开对象的属性快照；管道与控制台提供合成属性。
+    pub(crate) fn metadata(&self) -> Result<fs::Metadata, Errno> {
         match self.kind {
-            Kind::Inode { ino, .. } => {
-                let (mode, size, links, blocks) = fs::stat(ino)?;
-                Ok((ino as u64, mode, size, links, blocks))
-            }
-            _ => Ok((0, 0x2000 | 0o666, 0, 1, 0)),
+            Kind::Inode { ino, .. } => fs::metadata::metadata(ino),
+            _ => Ok(fs::Metadata {
+                mode: (if matches!(self.kind, Kind::Pipe { .. }) {
+                    0x1000
+                } else {
+                    0x2000
+                }) | 0o666,
+                links: 1,
+                block_size: 4096,
+                ..Default::default()
+            }),
         }
     }
 

@@ -232,7 +232,7 @@ try_lock 失败即报告“持锁跨调度”。
 
 | 组 | 调用 | 实现 |
 |---|---|---|
-| 文件 | getcwd、dup、dup3、mkdirat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、fstat、fsync、statx | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
+| 文件 | getcwd、dup、dup3、mkdirat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、newfstatat、fstat、fsync、statx | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
 | 进程 | exit、nanosleep、sched_yield、times、getpid、getppid、clone、execve、wait4 | `task::process_call` |
 | 内存 | brk、mmap、munmap、mprotect | `syscall/memory.rs` |
 | 其他 | uname、gettimeofday | `syscall/mod.rs` |
@@ -251,7 +251,9 @@ try_lock 失败即报告“持锁跨调度”。
 | times | tms 四字段来自任务记账；返回启动以来 100Hz tick | 语义兼容 |
 | uname | sysname=OuroOS、nodename=ouro、release=内核版本、version=OuroOS、machine=架构名、domainname=local | 合成身份信息 |
 | gettimeofday | 返回启动以来单调时间；ext4 时间从卷 `s_wtime` 起算 | 不是墙钟，无 RTC；两套时钟 |
-| statx/fstat | statx 写 `stx_mask=0x307`、`stx_blksize=4096`，`st_dev`/`st_rdev` 为 0；FAT 权限 0777；用户可见 atime/ctime/mtime 恒 0 | 0x307 是 mask 不是 dev；ext4 写入路径的 mtime/ctime 由 rsext4 维护，atime 跳过 |
+| newfstatat/fstat/statx | 共用 FS 元数据；Ext4 返回 UID/GID、atime/mtime/ctime（含纪元扩展与纳秒）及可用的 btime；FAT 权限 0777、所有者 0，时间未接通，statx 不置对应有效位；卷设备号为内核分配的合成标识 | rv64/la64 使用 asm-generic stat 布局；旧式 stat 的缺失时间填零；statx 不报告未提供的属性、挂载 ID、DIO 对齐等扩展字段 |
+| 状态查询路径与标志 | 支持绝对路径、cwd/目录 FD 相对路径、AT_EMPTY_PATH（含 NULL）、AT_SYMLINK_NOFOLLOW、AT_NO_AUTOMOUNT；查询时逐级跟随链接，最多 40 次，保留点分量与尾斜杠约束 | 查询专用解析，不代表 open/exec 已支持跟随链接；cwd/目录 FD 仍按保存的路径字符串定位；沿用项目 UTF-8 路径限制，尚无进程身份驱动的目录搜索权限检查 |
+| statx 同步与 mask | 本地卷按当前 inode 缓存查询；接受 AS_STAT/FORCE_SYNC/DONT_SYNC，后两者不触发远端同步或额外文件数据写回；互斥同步标志、未知 flags、保留 mask 位 0x80000000 返回 EINVAL，其余未知 mask 位忽略 | 返回 mask 反映实际提供字段，可以多于请求；缺失时间不标有效，填零；当前 atime 更新策略仍沿用 rsext4 挂载选项 |
 | fsync | EXT4 写回该 inode 的共享页并同步 rsext4 缓存/日志 | FAT 返回 ENOTSUP |
 | mount | fstype 接受 vfat/fat；源设备 `/dev/vd<小写字母>[0-4]`（无后缀或 0 为整盘）；flags 必须 0，data 忽略 | 仅 MBR 主分区；不限于 a-d |
 | mmap | 匿名仅 PRIVATE；文件 PRIVATE/SHARED；EOF 整页拒绝（ENOTSUP）；MAP_FIXED 事务替换 | 共享页无脏位，释放即回写（含 O_RDONLY 映射与 rsext4-readonly 的 EROFS 日志）；O_RDONLY+PROT_WRITE 返回 EBADF（Linux EACCES）；MAP_FIXED 可覆盖用户栈；flags 白名单 |
@@ -263,11 +265,14 @@ try_lock 失败即报告“持锁跨调度”。
 | 路径 | 必须是合法 UTF-8；总长 4096 字节，单分量 255 | 非 UTF-8 文件名不可访问 |
 | 其他 | stdin 读恒 EOF；fd=1/2 直通控制台；sched_yield 轮转后可能立即再次调度；getpid 总成功，getppid 返回注册表 parent | 无信号；孤儿过继 init |
 
+文件状态查询依据：[stat(2)](https://man7.org/linux/man-pages/man2/stat.2.html)、[statx(2)](https://man7.org/linux/man-pages/man2/statx.2.html) 与 [Linux asm-generic stat UAPI](https://github.com/torvalds/linux/blob/v6.12/include/uapi/asm-generic/stat.h)。按公开 ABI 独立编码，未复制 Linux 实现代码。
+
 ### 4.4 下一里程碑缺口
+
 
 | 类别 | 缺口 |
 |---|---|
-| 基础调用 | fstatat(79)、clock_gettime(113)、exit_group(94)、fcntl(25)、ioctl(29)、readv/writev(65/66)、kill(129)、set_tid_address(96) 等仍 ENOSYS |
+| 基础调用 | clock_gettime(113)、exit_group(94)、fcntl(25)、ioctl(29)、readv/writev(65/66)、kill(129)、set_tid_address(96) 等仍 ENOSYS |
 | 信号 | 无投递；EPIPE 不产生 SIGPIPE；SIGSEGV/SIGCHLD 只体现为 wait status |
 | ELF（静态） | busybox 等静态程序的段 vaddr-offset 相位（当前要求 p_vaddr 与 p_offset 都页对齐） |
 | ELF（动态） | ET_DYN/PT_INTERP、动态链接（libc-test/glibc 动态）；与静态 busybox 无关 |

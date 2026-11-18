@@ -84,6 +84,7 @@ pub enum Errno {
     TooManyFiles,
     Range,
     NameTooLong,
+    Loop,
     /// 内存不足。
     NoMem,
     /// 参数无效。
@@ -123,6 +124,7 @@ impl Errno {
             Self::TooManyFiles => 24,
             Self::Range => 34,
             Self::NameTooLong => 36,
+            Self::Loop => 40,
             Self::NoMem => 12,
             Self::Invalid => 22,
             Self::NotSupported => 95,
@@ -179,6 +181,7 @@ pub fn dispatch(
         | sysnr::READ
         | sysnr::WRITE
         | sysnr::FSTAT
+        | sysnr::FSTATAT
         | sysnr::FSYNC
         | sysnr::STATX => {
             let ret = self::fs::dispatch(

@@ -8,6 +8,9 @@ mod ext4;
 pub mod cache;
 pub mod context;
 pub mod fat;
+mod metadata;
+
+pub(crate) use metadata::{query, Metadata, Timestamp};
 
 const FAT_INODE: u32 = 0x8000_0000;
 

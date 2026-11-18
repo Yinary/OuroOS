@@ -216,43 +216,35 @@ pub fn dispatch(
             result
         }
         sysnr::READ | sysnr::WRITE => rw(nr, a, space, ctx),
-        sysnr::STATX => {
-            let path = user_string(space, a[1])?;
-            if a[2] & !(0x1000 | 0x100 | 0x800 | 0x6000) != 0 {
+        sysnr::FSTATAT | sysnr::STATX => {
+            let extended = nr == sysnr::STATX;
+            let flags = if extended { a[2] } else { a[3] };
+            let allowed = 0x1000 | 0x100 | 0x800 | if extended { 0x6000 } else { 0 };
+            if flags & !allowed != 0
+                || (extended && (flags & 0x6000 == 0x6000 || a[3] & 0x8000_0000 != 0))
+            {
                 return Err(Errno::Invalid);
             }
-            let (ino, mode, size, links, blocks) = if path.is_empty() && a[2] & 0x1000 != 0 {
-                let handle = ctx.get(a[0])?;
-                let f = handle.lock();
-                f.metadata()?
+            let path = if a[1] == 0 && flags & 0x1000 != 0 {
+                String::new()
             } else {
-                let ino = fs::lookup(&ctx.path(a[0], &path)?)?;
-                let (m, s, l, b) = fs::stat(ino)?;
-                (ino as u64, m, s, l, b)
+                user_string(space, a[1])?
             };
-            let mut data = [0u8; 256];
-            data[0..4].copy_from_slice(&0x307u32.to_ne_bytes());
-            data[4..8].copy_from_slice(&4096u32.to_ne_bytes());
-            data[16..20].copy_from_slice(&(links as u32).to_ne_bytes());
-            data[28..30].copy_from_slice(&mode.to_ne_bytes());
-            data[32..40].copy_from_slice(&ino.to_ne_bytes());
-            data[40..48].copy_from_slice(&size.to_ne_bytes());
-            data[48..56].copy_from_slice(&blocks.to_ne_bytes());
-            user_access::copy_to_user(space, a[4], &data).map_err(|_| Errno::Fault)?;
+            let info = ctx.query(a[0], &path, flags & 0x1000 != 0, flags & 0x100 == 0)?;
+            if extended {
+                user_access::copy_to_user(space, a[4], &encode_statx(&info))
+                    .map_err(|_| Errno::Fault)?;
+            } else {
+                user_access::copy_to_user(space, a[2], &encode_stat(&info))
+                    .map_err(|_| Errno::Fault)?;
+            }
             Ok(0)
         }
         sysnr::FSTAT => {
             let handle = ctx.get(a[0])?;
-            let f = handle.lock();
-            let (ino, mode, size, links, blocks) = f.metadata()?;
-            let mut data = [0u8; 128];
-            data[8..16].copy_from_slice(&ino.to_ne_bytes());
-            data[16..20].copy_from_slice(&(mode as u32).to_ne_bytes());
-            data[20..24].copy_from_slice(&(links as u32).to_ne_bytes());
-            data[48..56].copy_from_slice(&size.to_ne_bytes());
-            data[56..60].copy_from_slice(&4096u32.to_ne_bytes());
-            data[64..72].copy_from_slice(&blocks.to_ne_bytes());
-            user_access::copy_to_user(space, a[1], &data).map_err(|_| Errno::Fault)?;
+            let info = handle.lock().metadata()?;
+            user_access::copy_to_user(space, a[1], &encode_stat(&info))
+                .map_err(|_| Errno::Fault)?;
             Ok(0)
         }
         _ => Err(Errno::NoSys),
@@ -291,4 +283,62 @@ fn rw(nr: usize, a: [usize; 6], space: &UserAddressSpace, ctx: &Context) -> Resu
         }
     }
     Ok(done)
+}
+
+/// 编码 rv64/la64 共用的 asm-generic 128 字节 stat 布局。
+fn encode_stat(m: &fs::Metadata) -> [u8; 128] {
+    let mut out = [0; 128];
+    out[0..8].copy_from_slice(&m.dev.to_ne_bytes());
+    out[8..16].copy_from_slice(&m.ino.to_ne_bytes());
+    out[16..20].copy_from_slice(&(m.mode as u32).to_ne_bytes());
+    out[20..24].copy_from_slice(&m.links.to_ne_bytes());
+    out[24..28].copy_from_slice(&m.uid.to_ne_bytes());
+    out[28..32].copy_from_slice(&m.gid.to_ne_bytes());
+    out[32..40].copy_from_slice(&m.rdev.to_ne_bytes());
+    out[48..56].copy_from_slice(&m.size.to_ne_bytes());
+    out[56..60].copy_from_slice(&m.block_size.to_ne_bytes());
+    out[64..72].copy_from_slice(&m.blocks.to_ne_bytes());
+    for (offset, time) in [(72, m.atime), (88, m.mtime), (104, m.ctime)] {
+        if let Some(t) = time {
+            out[offset..offset + 8].copy_from_slice(&t.sec.to_ne_bytes());
+            out[offset + 8..offset + 16].copy_from_slice(&(t.nsec as u64).to_ne_bytes());
+        }
+    }
+    out
+}
+
+/// 编码 statx；仅为后端实际提供的时间设置有效位。
+fn encode_statx(m: &fs::Metadata) -> [u8; 256] {
+    let mut out = [0; 256];
+    // 类型、权限、链接数、所有者、inode、长度和块数始终可用。
+    let mut mask = 0x71fu32;
+    out[4..8].copy_from_slice(&m.block_size.to_ne_bytes());
+    out[16..20].copy_from_slice(&m.links.to_ne_bytes());
+    out[20..24].copy_from_slice(&m.uid.to_ne_bytes());
+    out[24..28].copy_from_slice(&m.gid.to_ne_bytes());
+    out[28..30].copy_from_slice(&m.mode.to_ne_bytes());
+    out[32..40].copy_from_slice(&m.ino.to_ne_bytes());
+    out[40..48].copy_from_slice(&m.size.to_ne_bytes());
+    out[48..56].copy_from_slice(&m.blocks.to_ne_bytes());
+    for (offset, bit, time) in [
+        (64, 0x20, m.atime),
+        (80, 0x800, m.btime),
+        (96, 0x80, m.ctime),
+        (112, 0x40, m.mtime),
+    ] {
+        if let Some(t) = time {
+            mask |= bit;
+            out[offset..offset + 8].copy_from_slice(&t.sec.to_ne_bytes());
+            out[offset + 8..offset + 12].copy_from_slice(&t.nsec.to_ne_bytes());
+        }
+    }
+    out[0..4].copy_from_slice(&mask.to_ne_bytes());
+    for (offset, dev) in [(128, m.rdev), (136, m.dev)] {
+        // Linux dev_t 的低 8 位和 12 位以上共同编码次设备号。
+        let major = ((dev >> 8) & 0xfff) as u32;
+        let minor = ((dev & 0xff) | ((dev >> 12) & 0xfffff00)) as u32;
+        out[offset..offset + 4].copy_from_slice(&major.to_ne_bytes());
+        out[offset + 4..offset + 8].copy_from_slice(&minor.to_ne_bytes());
+    }
+    out
 }

@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use fatfs::{FileSystem, FsOptions, IoBase, IoError, Read, Seek, SeekFrom, Write};
 use spin::Mutex;
 static MOUNTS: Mutex<Vec<Mount>> = Mutex::new(Vec::new());
+static NEXT_DEVICE: AtomicU32 = AtomicU32::new(2);
 static NEXT: AtomicU32 = AtomicU32::new(0x8000_0000);
 struct Node {
     ino: u32,
@@ -12,6 +13,7 @@ struct Node {
     opens: usize,
 }
 struct Mount {
+    device: u64,
     path: String,
     fs: FileSystem<Disk>,
     nodes: Vec<Node>,
@@ -119,6 +121,7 @@ pub fn mount(source: &str, target: &str) -> Result<(), Errno> {
     }
     mounts.try_reserve(1).map_err(|_| Errno::NoMem)?;
     mounts.push(Mount {
+        device: NEXT_DEVICE.fetch_add(1, Ordering::Relaxed) as u64,
         path: string(target)?,
         fs,
         nodes: Vec::new(),
@@ -190,6 +193,20 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
         let mut file = m.fs.root_dir().open_file(path).map_err(error)?;
         let len = file.seek(SeekFrom::End(0)).map_err(error)?;
         Ok((0x81ff, len, 1, len.div_ceil(512)))
+    })
+}
+/// 返回 FAT 的合成 POSIX 属性；当前适配层未提供时间字段。
+pub(super) fn metadata(ino: u32) -> Result<super::Metadata, Errno> {
+    let (mode, size, links, blocks) = stat(ino)?;
+    Ok(super::Metadata {
+        ino: ino as u64,
+        dev: access(ino, |m, _| Ok(m.device))?,
+        mode,
+        size,
+        links: links as u32,
+        blocks,
+        block_size: 4096,
+        ..Default::default()
     })
 }
 pub fn read(ino: u32, offset: usize, out: &mut [u8]) -> Result<usize, Errno> {

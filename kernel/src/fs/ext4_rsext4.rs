@@ -232,6 +232,98 @@ pub(super) fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
     })
 }
 
+/// 读取 inode 的所有者、精确时间及基本属性。
+pub(super) fn metadata(ino: u32) -> Result<super::Metadata, Errno> {
+    access(|v| {
+        let inode =
+            v.fs.get_inode_by_num(&mut v.device, InodeNumber::new(ino)?)?;
+        let size = v.fs.superblock.s_inode_size;
+        let time = |t: Ext4Timestamp| super::Timestamp {
+            sec: t.sec,
+            nsec: t.nsec,
+        };
+        let rdev = if matches!(inode.i_mode & 0xf000, 0x2000 | 0x6000) {
+            if inode.i_block[0] != 0 {
+                inode.i_block[0]
+            } else {
+                inode.i_block[1]
+            }
+        } else {
+            0
+        };
+        Ok(super::Metadata {
+            ino: ino as u64,
+            dev: 1,
+            rdev: rdev as u64,
+            mode: inode.i_mode,
+            links: inode.i_links_count as u32,
+            uid: inode.uid(),
+            gid: inode.gid(),
+            size: inode.size(),
+            blocks: inode
+                .blocks_count()
+                // HUGE_FILE 将 i_blocks 的单位从扇区切换为文件系统块。
+                .checked_mul(if inode.i_flags & 0x40000 != 0 {
+                    (BLOCK_SIZE / 512) as u64
+                } else {
+                    1
+                })
+                .ok_or_else(Ext4Error::io)?,
+            block_size: BLOCK_SIZE as u32,
+            atime: Some(time(inode.atime_ts(size))),
+            mtime: Some(time(inode.mtime_ts(size))),
+            ctime: Some(time(inode.ctime_ts(size))),
+            btime: inode.crtime_ts(size).map(time),
+        })
+    })
+}
+
+/// 读取有界的链接目标；不更新访问时间，非 UTF-8 或损坏数据返回 EIO。
+pub(super) fn link_target(ino: u32) -> Result<alloc::string::String, Errno> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(4096).map_err(|_| Errno::NoMem)?;
+    access(|v| {
+        let mut inode =
+            v.fs.get_inode_by_num(&mut v.device, InodeNumber::new(ino)?)?;
+        if !inode.is_symlink() {
+            return Err(Ext4Error::invalid_input());
+        }
+        let size = usize::try_from(inode.size()).map_err(|_| Ext4Error::invalid_input())?;
+        if size >= 4096 {
+            return Err(Ext4Error::new(rsext4::Errno::ENAMETOOLONG));
+        }
+        let xattr_sectors = if inode.file_acl() == 0 {
+            0
+        } else {
+            (BLOCK_SIZE / 512) as u64
+        };
+        if size < 60 && inode.blocks_count() == xattr_sectors {
+            for word in inode.i_block {
+                data.extend_from_slice(&word.to_le_bytes());
+            }
+            data.truncate(size);
+        } else if size != 0 {
+            // 一个链接目标小于一块；非 extent 链接使用首个直接块。
+            let block = if inode.have_extend_header_and_use_extend() {
+                rsext4::loopfile::resolve_inode_block(&mut v.device, &mut inode, 0)?
+                    .ok_or_else(Ext4Error::io)?
+            } else {
+                if inode.i_block[0] == 0 {
+                    return Err(Ext4Error::io());
+                }
+                AbsoluteBN::new(inode.i_block[0] as u64)
+            };
+            v.device.read_block(block)?;
+            data.extend_from_slice(&v.device.buffer()[..size]);
+        }
+        Ok(())
+    })?;
+    if data.contains(&0) {
+        return Err(Errno::Io);
+    }
+    alloc::string::String::from_utf8(data).map_err(|_| Errno::Io)
+}
+
 /// 读取 inode 指定偏移的内容，EOF 返回零。
 pub(super) fn read_raw(ino: u32, offset: usize, data: &mut [u8]) -> Result<usize, Errno> {
     access(|v| {

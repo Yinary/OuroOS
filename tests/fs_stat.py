@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""构造已知 inode 属性，双架构验证文件状态查询；产物只写入 target。"""
+import argparse
+import os
+from pathlib import Path
+import shutil
+import struct
+import subprocess
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def run(args, log, **kwargs):
+    with log.open("wb") as stream:
+        subprocess.run(args, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT,
+                       check=True, timeout=240, **kwargs)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=ROOT / "target/fs-validation/stat")
+    args = parser.parse_args()
+    out = args.output.resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    user = out / "user"
+    shutil.copytree(ROOT / "user/hello", user, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("target"))
+    shutil.copyfile(ROOT / "tests/fs_stat.rs", user / "src/bin/hello.rs")
+    payload = out / "payload"
+    payload.write_bytes(b"testing")
+    empty = out / "empty"
+    empty.write_bytes(b"")
+    for arch, short, target, flags, machine, device in [
+        ("riscv64", "rv", "riscv64gc-unknown-none-elf", "",
+         ["-machine", "virt", "-bios", "default"], "virtio-blk-device"),
+        ("loongarch64", "la", "loongarch64-unknown-none",
+         "-Zunstable-options -C target-feature=-lsx,-lasx", [], "virtio-blk-pci"),
+    ]:
+        env = dict(os.environ, RUSTFLAGS=flags, CARGO_TARGET_DIR=str(out / "user-target"))
+        run(["timeout", "180", "cargo", "build", "--manifest-path", str(user / "Cargo.toml"),
+             "-Z", "build-std=core", "--release", "--target", target, "--bin", "hello"],
+            out / f"{short}-user-build.log", env=env)
+        for inode_size in (256, 128):
+            stem = f"{short}-{inode_size}"
+            ext = out / f"{stem}-ext4.img"
+            with ext.open("wb") as stream:
+                stream.truncate(32 * 1024 * 1024)
+            run(["mkfs.ext4", "-q", "-F", "-b", "4096", "-I", str(inode_size), str(ext)],
+                out / f"{stem}-mkfs.log")
+            commands = ["mkdir /meta", "mkdir /meta/sub", "mkdir /mnt",
+                        "cd /meta", "mknod char c 1 3", "cd /",
+                        f'write "{out / "user-target" / target / "release/hello"}" /init',
+                        f'write "{payload}" /meta/data', f'write "{empty}" /meta/large',
+                        "set_inode_field /meta/large size 4294967303",
+                        "set_inode_field /meta/data mode 0100640",
+                        "set_inode_field /meta/data uid 4464",
+                        "set_inode_field /meta/data uid_hi 1",
+                        "set_inode_field /meta/data gid 8928",
+                        "set_inode_field /meta/data gid_hi 2",
+                        "set_inode_field /meta/data atime 0x80000001",
+                        "set_inode_field /meta/data mtime 0x7ffffffe",
+                        "set_inode_field /meta/data ctime 0xffffffff"]
+            if inode_size == 256:
+                commands += [f"set_inode_field /meta/data atime_extra {(123456789 << 2) | 1}",
+                             f"set_inode_field /meta/data mtime_extra {987654321 << 2}",
+                             f"set_inode_field /meta/data ctime_extra {(999999999 << 2) | 1}",
+                             "set_inode_field /meta/data crtime 1700000000",
+                             "set_inode_field /meta/data crtime_extra 168"]
+            else:
+                commands += [f'write "{empty}" /small-inode']
+            targets = {"abs": "/meta/data", "rel": "data", "chain": "rel",
+                       "dirlink": "/meta", "dangling": "missing", "loop": "loop",
+                       "sub/up": "../data", "sixty": "/" * 50 + "/meta/data",
+                       "long": "/" * 90 + "/meta/data"}
+            commands += [f"symlink /meta/{name} {dest}" for name, dest in targets.items()]
+            script = out / f"{stem}-populate"
+            script.write_text("\n".join(commands) + "\n")
+            run(["debugfs", "-w", "-f", str(script), str(ext)], out / f"{stem}-populate.log")
+            run(["debugfs", "-R", "stat /meta/data", str(ext)], out / f"{stem}-expected.log")
+            run(["e2fsck", "-fn", str(ext)], out / f"{stem}-before-fsck.log")
+            image = ext
+            start = 0
+            if inode_size == 256:
+                fat = out / f"{stem}-fat.img"
+                with fat.open("wb") as stream:
+                    stream.truncate(16 * 1024 * 1024)
+                run(["mkfs.fat", "-F", "16", str(fat)], out / f"{stem}-fat-mkfs.log")
+                start = 2048
+                count = ext.stat().st_size // 512
+                second = start + count
+                fat_count = fat.stat().st_size // 512
+                mbr = bytearray(512)
+                for n, kind, offset, length in [(0, 0x83, start, count), (1, 6, second, fat_count)]:
+                    struct.pack_into("<BBBBBBBBII", mbr, 446 + n * 16,
+                                     0, 0, 0, 0, kind, 0, 0, 0, offset, length)
+                mbr[510:] = b"\x55\xaa"
+                image = out / f"{stem}.img"
+                with image.open("wb") as stream:
+                    stream.truncate((second + fat_count) * 512)
+                    stream.seek(0)
+                    stream.write(mbr)
+                    for part, offset in [(ext, start), (fat, second)]:
+                        stream.seek(offset * 512)
+                        with part.open("rb") as source:
+                            shutil.copyfileobj(source, stream)
+            run(["timeout", "-k", "5", "90", f"qemu-system-{arch}", *machine,
+                 "-kernel", str(ROOT / f"kernel-{short}"), "-m", "1G", "-smp", "1",
+                 "-nographic", "-no-reboot", "-drive", f"file={image},format=raw,if=none,id=disk",
+                 "-device", f"{device},drive=disk"], out / f"{stem}.log")
+            text = (out / f"{stem}.log").read_text(errors="replace")
+            if "STAT PASS:" not in text or "basic-init): exited with status 0" not in text:
+                raise RuntimeError(f"{stem} failed: {text[-1600:]}")
+            if start:
+                with image.open("rb") as stream:
+                    stream.seek(start * 512)
+                    ext.write_bytes(stream.read(count * 512))
+            run(["e2fsck", "-fn", str(ext)], out / f"{stem}-after-fsck.log")
+            print(f"{stem}: PASS (status queries and e2fsck)", flush=True)
+
+
+if __name__ == "__main__":
+    main()
