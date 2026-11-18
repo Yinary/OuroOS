@@ -14,6 +14,7 @@ pub struct SharedPage {
     frame: OwnedFrame,
     ino: u32,
     offset: usize,
+    retained: bool,
 }
 impl SharedPage {
     /// 页表映射使用的物理地址；所有权仍由 Arc 管理。
@@ -42,6 +43,9 @@ impl SharedPage {
 }
 impl Drop for SharedPage {
     fn drop(&mut self) {
+        if !self.retained {
+            return;
+        }
         if let Err(e) = self.write_back() {
             log::error!("shared page writeback failed: {:?}", e);
         }
@@ -74,9 +78,16 @@ pub fn page(ino: u32, offset: usize) -> Result<Arc<SharedPage>, Errno> {
     let frame = OwnedFrame::new().map_err(|_| Errno::NoMem)?;
     let mut data = [0; 4096];
     super::read_raw(ino, offset, &mut data)?;
-    super::retain(ino)?;
-    let p = crate::fs::try_arc(SharedPage { frame, ino, offset })?;
+    let mut p = crate::fs::try_arc(SharedPage {
+        frame,
+        ino,
+        offset,
+        retained: false,
+    })?;
     p.store(0, &data)?;
+    let page = Arc::get_mut(&mut p).ok_or(Errno::Io)?;
+    super::retain(ino)?;
+    page.retained = true;
     pages.push((ino, offset, Arc::downgrade(&p)));
     Ok(p)
 }
