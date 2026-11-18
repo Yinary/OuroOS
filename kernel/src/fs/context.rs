@@ -6,6 +6,8 @@ use spin::Mutex;
 
 /// pipe 缓冲容量（对齐 Linux 默认 64KiB）；写满/读空时阻塞等待。
 const PIPE_CAPACITY: usize = 65536;
+const FD_LIMIT: usize = 1024;
+const OPEN_CREATION_FLAGS: usize = 0x40 | 0x80 | 0x100 | 0x200 | 0x80000;
 
 struct Pipe {
     data: VecDeque<u8>,
@@ -76,9 +78,9 @@ impl Context {
         for kind in [Kind::Input, Kind::Output, Kind::Output] {
             fds.push(Some(Descriptor {
                 handle: crate::fs::try_arc(Mutex::new(OpenFile {
+                    flags: if matches!(kind, Kind::Input) { 0 } else { 1 },
                     kind,
                     offset: 0,
-                    flags: 2,
                 }))?,
                 cloexec: false,
             }));
@@ -107,22 +109,59 @@ impl Context {
     }
     /// 安装打开文件，返回最低可用 FD；容量不足返回错误。
     pub(crate) fn install(&mut self, file: Handle, cloexec: bool) -> Result<usize, Errno> {
-        if let Some(i) = self.fds.iter().position(Option::is_none) {
+        self.install_from(file, 0, cloexec)
+    }
+
+    /// 从指定下界安装到最低空闲 FD；超出上限返回 EINVAL，表满返回 EMFILE。
+    pub(crate) fn install_from(
+        &mut self,
+        file: Handle,
+        minimum: usize,
+        cloexec: bool,
+    ) -> Result<usize, Errno> {
+        if minimum >= FD_LIMIT {
+            return Err(Errno::Invalid);
+        }
+        if let Some(i) = (minimum..self.fds.len()).find(|&i| self.fds[i].is_none()) {
             self.fds[i] = Some(Descriptor {
                 handle: file,
                 cloexec,
             });
             return Ok(i);
         }
-        if self.fds.len() >= 1024 {
+        let i = minimum.max(self.fds.len());
+        if i >= FD_LIMIT {
             return Err(Errno::TooManyFiles);
         }
-        self.fds.try_reserve(1).map_err(|_| Errno::NoMem)?;
+        self.fds
+            .try_reserve(i + 1 - self.fds.len())
+            .map_err(|_| Errno::NoMem)?;
+        self.fds.resize_with(i, || None);
         self.fds.push(Some(Descriptor {
             handle: file,
             cloexec,
         }));
-        Ok(self.fds.len() - 1)
+        Ok(i)
+    }
+
+    /// 查询 FD_CLOEXEC；无效描述符返回 EBADF。
+    pub(crate) fn descriptor_flags(&self, fd: usize) -> Result<usize, Errno> {
+        self.fds
+            .get(fd)
+            .and_then(Option::as_ref)
+            .map(|d| usize::from(d.cloexec))
+            .ok_or(Errno::BadF)
+    }
+
+    /// 设置本描述符的 FD_CLOEXEC，忽略其他位；无效描述符返回 EBADF。
+    pub(crate) fn set_descriptor_flags(&mut self, fd: usize, flags: usize) -> Result<usize, Errno> {
+        let descriptor = self
+            .fds
+            .get_mut(fd)
+            .and_then(Option::as_mut)
+            .ok_or(Errno::BadF)?;
+        descriptor.cloexec = flags & 1 != 0;
+        Ok(0)
     }
     /// 相对工作目录或目录 FD 解析路径，失败返回路径错误。
     pub(crate) fn path(&self, dir: usize, input: &str) -> Result<String, Errno> {
@@ -229,7 +268,7 @@ impl Context {
     /// 将打开文件复制到指定 FD，替换原描述符。
     pub(crate) fn dup_to(&mut self, from: usize, to: usize, cloexec: bool) -> Result<usize, Errno> {
         let file = self.get(from)?;
-        if to >= 1024 {
+        if to >= FD_LIMIT {
             return Err(Errno::BadF);
         }
         if to >= self.fds.len() {
@@ -268,7 +307,7 @@ impl Context {
             fs::try_arc(Mutex::new(OpenFile {
                 kind: Kind::Inode { ino, path },
                 offset: 0,
-                flags,
+                flags: flags & !OPEN_CREATION_FLAGS,
             }))?,
             cloexec,
         )
@@ -289,7 +328,7 @@ impl Context {
                 reading: true,
             },
             offset: 0,
-            flags,
+            flags: flags & 0x800,
         }))?;
         let w = fs::try_arc(Mutex::new(OpenFile {
             kind: Kind::Pipe {
@@ -297,7 +336,7 @@ impl Context {
                 reading: false,
             },
             offset: 0,
-            flags: flags | 1,
+            flags: (flags & 0x800) | 1,
         }))?;
         let rfd = self.install(r, flags & 0x80000 != 0)?;
         let wfd = match self.install(w, flags & 0x80000 != 0) {
@@ -320,6 +359,21 @@ fn directory(path: &str) -> Result<(), Errno> {
 }
 
 impl OpenFile {
+    /// 查询共享的访问模式和文件状态标志。
+    pub(crate) fn status_flags(&self) -> usize {
+        self.flags
+    }
+
+    /// 更新共享的追加、非阻塞标志；未实现的可变标志返回 EOPNOTSUPP。
+    pub(crate) fn set_status_flags(&mut self, flags: usize) -> Result<usize, Errno> {
+        if flags & (0x2000 | 0x4000 | 0x40000) != 0 {
+            return Err(Errno::NotSupported);
+        }
+        let mutable = 0x400 | 0x800;
+        self.flags = (self.flags & !mutable) | (flags & mutable);
+        Ok(0)
+    }
+
     /// 获取 inode，设备和管道返回 EINVAL。
     #[cfg(not(feature = "rsext4-readonly"))]
     pub(crate) fn inode(&self) -> Result<u32, Errno> {

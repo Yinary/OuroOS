@@ -19,6 +19,7 @@ pub mod sysnr {
     pub const GETCWD: usize = 17;
     pub const DUP: usize = 23;
     pub const DUP3: usize = 24;
+    pub const FCNTL: usize = 25;
     pub const IOCTL: usize = 29;
     pub const MKDIRAT: usize = 34;
     pub const UNLINKAT: usize = 35;
@@ -174,6 +175,7 @@ pub fn dispatch(
         sysnr::GETCWD
         | sysnr::DUP
         | sysnr::DUP3
+        | sysnr::FCNTL
         | sysnr::MKDIRAT
         | sysnr::UNLINKAT
         | sysnr::UMOUNT2

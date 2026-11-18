@@ -50,6 +50,7 @@ pub fn dispatch(
             Ok(ctx.cwd().len() + 1)
         }
         sysnr::DUP => ctx.install(ctx.get(a[0])?, false),
+        sysnr::FCNTL => fcntl(ctx, a[0] as u32 as usize, a[1] as u32, a[2] as u32),
         sysnr::DUP3 => {
             if a[2] & !0x80000 != 0 || a[0] == a[1] {
                 return Err(Errno::Invalid);
@@ -255,6 +256,19 @@ pub fn dispatch(
             Ok(0)
         }
         _ => Err(Errno::NoSys),
+    }
+}
+
+/// Linux fcntl 基础 FD 控制；未知命令返回 EINVAL，未实现文件锁及异步 I/O。
+fn fcntl(ctx: &mut Context, fd: usize, command: u32, argument: u32) -> Result<usize, Errno> {
+    let handle = ctx.get(fd)?;
+    match command {
+        0 | 1030 => ctx.install_from(handle, argument as usize, command == 1030),
+        1 => ctx.descriptor_flags(fd),
+        2 => ctx.set_descriptor_flags(fd, argument as usize),
+        3 => Ok(handle.lock().status_flags()),
+        4 => handle.lock().set_status_flags(argument as usize),
+        _ => Err(Errno::Invalid),
     }
 }
 
