@@ -261,17 +261,66 @@ pub(super) fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
     })
 }
 
-/// 读取当前目录块中的原始目录项字节。
-pub(super) fn read_dir_at(ino: u32, offset: usize, data: &mut [u8]) -> Result<usize, Errno> {
-    access(|v| {
-        rsext4::dir::read_dir_at(
-            &mut v.device,
-            &mut v.fs,
-            InodeNumber::new(ino)?,
-            offset,
-            data,
-        )
-    })
+/// 按块读取 Ext4 目录，逐项交付解析结果。
+pub(super) fn read_dir(
+    ino: u32,
+    mut offset: usize,
+    mut visit: impl FnMut(super::DirEntry<'_>) -> bool,
+) -> Result<usize, Errno> {
+    use super::{DirEntry, DirEntryKind};
+
+    let mut block = Vec::new();
+    block
+        .try_reserve_exact(BLOCK_SIZE)
+        .map_err(|_| Errno::NoMem)?;
+    block.resize(BLOCK_SIZE, 0);
+    loop {
+        let n = access(|v| {
+            rsext4::dir::read_dir_at(
+                &mut v.device,
+                &mut v.fs,
+                InodeNumber::new(ino)?,
+                offset,
+                &mut block,
+            )
+        })?;
+        if n == 0 {
+            return Ok(offset);
+        }
+        let mut remaining = &block[..n];
+        while !remaining.is_empty() {
+            let h = remaining.first_chunk::<8>().ok_or(Errno::Io)?;
+            let inode = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
+            let len = u16::from_le_bytes([h[4], h[5]]) as usize;
+            let name_end = 8 + h[6] as usize;
+            if len % 4 != 0 || len < name_end || len > remaining.len() {
+                return Err(Errno::Io);
+            }
+            let next = offset.checked_add(len).ok_or(Errno::Io)?;
+            let kind = match h[7] {
+                1 => DirEntryKind::File,
+                2 => DirEntryKind::Directory,
+                3 => DirEntryKind::Character,
+                4 => DirEntryKind::Block,
+                5 => DirEntryKind::Fifo,
+                6 => DirEntryKind::Socket,
+                7 => DirEntryKind::Symlink,
+                _ => DirEntryKind::Unknown,
+            };
+            if inode != 0
+                && !visit(DirEntry {
+                    inode,
+                    kind,
+                    name: &remaining[8..name_end],
+                    next,
+                })
+            {
+                return Ok(offset);
+            }
+            offset = next;
+            remaining = &remaining[len..];
+        }
+    }
 }
 
 /// 将数据写到普通文件的指定偏移。

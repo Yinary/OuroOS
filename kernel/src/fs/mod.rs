@@ -10,7 +10,26 @@ pub mod context;
 pub mod fat;
 
 const FAT_INODE: u32 = 0x8000_0000;
-const EXT4_BLOCK_SIZE: usize = 4096;
+
+/// 文件系统返回的目录项类型。
+pub(super) enum DirEntryKind {
+    Unknown,
+    File,
+    Directory,
+    Character,
+    Block,
+    Fifo,
+    Socket,
+    Symlink,
+}
+
+/// 目录项及其后端提供的续读位置。
+pub(super) struct DirEntry<'a> {
+    inode: u32,
+    kind: DirEntryKind,
+    name: &'a [u8],
+    next: usize,
+}
 
 /// 初始化 Ext4 根卷；无磁盘时允许继续启动。
 pub fn init() -> Result<(), Errno> {
@@ -68,13 +87,16 @@ pub fn read_raw(ino: u32, offset: usize, data: &mut [u8]) -> Result<usize, Errno
     }
 }
 
-/// 为目录遍历读取当前块中的目录项字节。
-pub(super) fn read_dir_at(ino: u32, offset: usize, data: &mut [u8]) -> Result<usize, Errno> {
+/// 遍历目录项，回调返回 false 时保留该项供下次读取。
+pub(super) fn read_dir(
+    ino: u32,
+    offset: usize,
+    visit: impl FnMut(DirEntry<'_>) -> bool,
+) -> Result<usize, Errno> {
     if ino & FAT_INODE != 0 {
-        fat::read(ino, offset, data)
+        Err(Errno::NotSupported)
     } else {
-        let len = data.len().min(EXT4_BLOCK_SIZE - offset % EXT4_BLOCK_SIZE);
-        ext4::read_dir_at(ino, offset, &mut data[..len])
+        ext4::read_dir(ino, offset, visit)
     }
 }
 

@@ -340,54 +340,35 @@ pub fn dispatch(
             let mut out = [0u8; 4096];
             let cap = a[2].min(out.len());
             let mut used = 0;
-            let mut offset = f.offset;
-            loop {
-                let mut entry = [0u8; 264];
-                let n = fs::read_dir_at(ino, offset, &mut entry)?;
-                if n == 0 {
-                    break;
+            use fs::DirEntryKind;
+
+            let mut full = false;
+            let offset = fs::read_dir(ino, f.offset, |entry| {
+                let len = (19 + entry.name.len() + 1 + 7) & !7;
+                if used + len > cap {
+                    full = true;
+                    return false;
                 }
-                if n < 8 {
-                    return Err(Errno::Io);
-                }
-                let inode = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
-                let disk_len = u16::from_le_bytes([entry[4], entry[5]]) as usize;
-                let name_len = entry[6] as usize;
-                if disk_len < 8
-                    || disk_len % 4 != 0
-                    || disk_len > fs::EXT4_BLOCK_SIZE - offset % fs::EXT4_BLOCK_SIZE
-                    || name_len + 8 > n
-                    || name_len + 8 > disk_len
-                {
-                    return Err(Errno::Io);
-                }
-                let next = offset.checked_add(disk_len).ok_or(Errno::Io)?;
-                if inode != 0 {
-                    let len = (19 + name_len + 1 + 7) & !7;
-                    if used + len > cap {
-                        if used == 0 {
-                            return Err(Errno::Invalid);
-                        }
-                        break;
-                    }
-                    let d = &mut out[used..used + len];
-                    d[..8].copy_from_slice(&(inode as u64).to_ne_bytes());
-                    d[8..16].copy_from_slice(&(next as u64).to_ne_bytes());
-                    d[16..18].copy_from_slice(&(len as u16).to_ne_bytes());
-                    d[18] = match entry[7] {
-                        1 => 8,
-                        2 => 4,
-                        3 => 2,
-                        4 => 6,
-                        5 => 1,
-                        6 => 12,
-                        7 => 10,
-                        _ => 0,
-                    };
-                    d[19..19 + name_len].copy_from_slice(&entry[8..8 + name_len]);
-                    used += len;
-                }
-                offset = next;
+                let d = &mut out[used..used + len];
+                d[..8].copy_from_slice(&(entry.inode as u64).to_ne_bytes());
+                d[8..16].copy_from_slice(&(entry.next as u64).to_ne_bytes());
+                d[16..18].copy_from_slice(&(len as u16).to_ne_bytes());
+                d[18] = match entry.kind {
+                    DirEntryKind::Fifo => 1,
+                    DirEntryKind::Character => 2,
+                    DirEntryKind::Directory => 4,
+                    DirEntryKind::Block => 6,
+                    DirEntryKind::File => 8,
+                    DirEntryKind::Symlink => 10,
+                    DirEntryKind::Socket => 12,
+                    DirEntryKind::Unknown => 0,
+                };
+                d[19..19 + entry.name.len()].copy_from_slice(entry.name);
+                used += len;
+                true
+            })?;
+            if full && used == 0 {
+                return Err(Errno::Invalid);
             }
             user_access::copy_to_user(space, a[1], &out[..used]).map_err(|_| Errno::Fault)?;
             f.offset = offset;

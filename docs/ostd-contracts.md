@@ -259,7 +259,7 @@ try_lock 失败即报告“持锁跨调度”。
 | brk/munmap | brk 失败返回原 break；munmap 起址页对齐、长度向上取整、允许空洞 | 均无按需分页；brk 立即分配/释放物理页 |
 | ELF | 仅 ET_EXEC 静态；p_vaddr 页对齐，p_filesz>0 时 p_offset 也页对齐；零地址允许 | 当前 basic ELF 只用 0x1000（rv 侧核对，两架构同链接脚本）；hint 与 MAP_FIXED 都可落到低址（低址并非不可达） |
 | unlink/unlinkat | EXT4 unlink 后句柄存活、最后关闭回收；FAT 有句柄时 EBUSY；unlinkat flags 仅 0 | AT_REMOVEDIR 返回 ENOTSUP |
-| getdents64 | syscall 层直接解析 EXT4 盘上 dirent；单次最多 4KiB；FAT 不支持 | 分层欠账，见 §6 |
+| getdents64 | fs 层提供目录项与续读位置，EXT4 后端按块解析，syscall 层打包 Linux dirent；单次最多 4KiB；FAT 返回 ENOTSUP | 目录缓冲区使用可失败堆分配，失败不推进文件偏移 |
 | 路径 | 必须是合法 UTF-8；总长 4096 字节，单分量 255 | 非 UTF-8 文件名不可访问 |
 | 其他 | stdin 读恒 EOF；fd=1/2 直通控制台；sched_yield 轮转后可能立即再次调度；getpid 总成功，getppid 返回注册表 parent | 无信号；孤儿过继 init |
 
@@ -317,7 +317,7 @@ try_lock 失败即报告“持锁跨调度”。
 |---|---|
 | inode 身份偷位 | 最高位区分 FAT/EXT4；FAT inode 是 (mount,path) 登记序号，非磁盘身份。计划：显式挂载表 + 全局 inode 命名空间 |
 | FAT 能力 | 无目录列举（getdents 仅 EXT4）；每次 read/write/stat 全路径重开；unlink 有句柄时 EBUSY。busybox 前应统一 |
-| getdents64 分层 | syscall 层解析 EXT4 盘上 dirent；应下沉为 fs 层 readdir |
+| 目录遍历 | EXT4 已接入统一目录接口；FAT 尚未接入，返回 ENOTSUP。目录缓冲区每次调用分配一次并跨块复用 |
 | 块层 | 同步轮询，无中断驱动/请求队列；DMA 页用裸 `frame_alloc`（OwnedFrame 例外第三处）；`dma_alloc` 失败返回物理 0，仅初始化期 |
 | 大文件堆 | exec 整镜像读入 Vec；rsext4 单次 extent run 最多分配 1 MiB `run_buf`；8 MiB 堆下大镜像可能 OOM；分块直填页为欠账 |
 | 共享页无脏位 | 释放即回写整页（fsync 的回写是有意的）；只读映射/O_RDONLY fd 也会写；rsext4-readonly 每次释放记 EROFS。需要 dirty 标志或区分只读 |
