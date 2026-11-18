@@ -198,7 +198,7 @@ fn error(err: Ext4Error) -> Errno {
         Ext4Errno::ENOSPC => Errno::NoSpace,
         Ext4Errno::EEXIST => Errno::Exists,
         Ext4Errno::ENAMETOOLONG => Errno::NameTooLong,
-        Ext4Errno::EFBIG => Errno::TooBig,
+        Ext4Errno::EFBIG => Errno::FileTooBig,
         Ext4Errno::EROFS => Errno::ReadOnly,
         Ext4Errno::EOPNOTSUPP => Errno::NotSupported,
         _ => Errno::Io,

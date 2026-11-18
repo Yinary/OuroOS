@@ -215,7 +215,14 @@ pub fn dispatch(
             let result = handle.lock().seek(a[1] as isize, a[2]);
             result
         }
-        sysnr::READ | sysnr::WRITE => rw(nr, a, space, ctx),
+        sysnr::READ
+        | sysnr::WRITE
+        | sysnr::READV
+        | sysnr::WRITEV
+        | sysnr::PREAD64
+        | sysnr::PWRITE64
+        | sysnr::PREADV
+        | sysnr::PWRITEV => rw(nr, a, space, ctx),
         sysnr::FSTATAT | sysnr::STATX => {
             let extended = nr == sysnr::STATX;
             let flags = if extended { a[2] } else { a[3] };
@@ -251,35 +258,187 @@ pub fn dispatch(
     }
 }
 
-/// read/write 使用 4 KiB 缓冲区；已有进展时返回短读或短写。
+const MAX_IOV: usize = 1024;
+const MAX_RW_COUNT: usize = 0x7fff_f000;
+
+#[derive(Clone, Copy)]
+struct UserBuffer {
+    address: usize,
+    len: usize,
+}
+
+/// 在复制数据前校验数值范围，实际映射和权限由 user_access 逐页检查。
+fn buffer(address: usize, len: usize) -> Result<UserBuffer, Errno> {
+    if len != 0
+        && address.checked_add(len).ok_or(Errno::Fault)? > crate::mm::address_space::USER_TOP
+    {
+        return Err(Errno::Fault);
+    }
+    Ok(UserBuffer { address, len })
+}
+
+/// 先复制全部 iovec 描述符，避免用户缓冲区覆盖尚未导入的描述符。
+fn import_iov(
+    space: &UserAddressSpace,
+    address: usize,
+    count: usize,
+) -> Result<Vec<UserBuffer>, Errno> {
+    if count > MAX_IOV {
+        return Err(Errno::Invalid);
+    }
+    let mut buffers = Vec::new();
+    buffers.try_reserve_exact(count).map_err(|_| Errno::NoMem)?;
+    let mut total = 0usize;
+    for i in 0..count {
+        let mut pair = [0u8; 16];
+        let pointer = address.checked_add(i * 16).ok_or(Errno::Fault)?;
+        user_access::copy_from_user(space, pointer, &mut pair).map_err(|_| Errno::Fault)?;
+        let base = usize::from_ne_bytes(pair[..8].try_into().map_err(|_| Errno::Invalid)?);
+        let len = usize::from_ne_bytes(pair[8..].try_into().map_err(|_| Errno::Invalid)?);
+        total = total
+            .checked_add(len)
+            .filter(|n| *n <= isize::MAX as usize)
+            .ok_or(Errno::Invalid)?;
+        buffers.push(buffer(base, len)?);
+    }
+    Ok(buffers)
+}
+
+struct UserIo<'a> {
+    buffers: &'a [UserBuffer],
+    index: usize,
+    offset: usize,
+}
+impl UserIo<'_> {
+    fn copy(
+        &mut self,
+        len: usize,
+        mut copy: impl FnMut(usize, usize, usize) -> Result<(), Errno>,
+    ) -> Result<usize, Errno> {
+        let mut done = 0;
+        while done < len && self.index < self.buffers.len() {
+            let b = self.buffers[self.index];
+            if self.offset == b.len {
+                self.index += 1;
+                self.offset = 0;
+                continue;
+            }
+            let address = b.address.checked_add(self.offset).ok_or(Errno::Fault)?;
+            let n = (b.len - self.offset)
+                .min(len - done)
+                .min(4096 - address % 4096);
+            if let Err(error) = copy(address, done, n) {
+                return if done != 0 { Ok(done) } else { Err(error) };
+            }
+            self.offset += n;
+            done += n;
+        }
+        Ok(done)
+    }
+}
+
+/// 普通与定位、单缓冲区与向量 I/O 共用搬运流程；定位偏移不写入打开文件对象。
 fn rw(nr: usize, a: [usize; 6], space: &UserAddressSpace, ctx: &Context) -> Result<usize, Errno> {
-    let reading = nr == sysnr::READ;
+    let reading = matches!(
+        nr,
+        sysnr::READ | sysnr::READV | sysnr::PREAD64 | sysnr::PREADV
+    );
+    let vector = matches!(
+        nr,
+        sysnr::READV | sysnr::WRITEV | sysnr::PREADV | sysnr::PWRITEV
+    );
+    let positioned = matches!(
+        nr,
+        sysnr::PREAD64 | sysnr::PWRITE64 | sysnr::PREADV | sysnr::PWRITEV
+    );
+    // rv64/la64 的 pos_l 已容纳完整 64 位偏移，原始 preadv/pwritev 的 pos_h 不参与取值。
+    let offset = if positioned {
+        if (a[3] as isize) < 0 {
+            return Err(Errno::Invalid);
+        }
+        Some(a[3])
+    } else {
+        None
+    };
     let handle = ctx.get(a[0])?;
-    let mut f = handle.lock();
-    f.check_access(reading)?;
-    let total = a[2];
+    let mut file = handle.lock();
+    if positioned {
+        file.check_positioned()?;
+    }
+    file.check_access(reading)?;
+    if vector {
+        let buffers = import_iov(space, a[1], a[2])?;
+        transfer(space, &mut file, &buffers, reading, offset)
+    } else {
+        let b = buffer(a[1], a[2])?;
+        transfer(space, &mut file, &[b], reading, offset)
+    }
+}
+
+/// 复用可失败分配的 4 KiB 缓冲区；发生部分传输后返回已完成长度。
+#[inline(never)]
+fn transfer(
+    space: &UserAddressSpace,
+    file: &mut fs::context::OpenFile,
+    buffers: &[UserBuffer],
+    reading: bool,
+    mut position: Option<usize>,
+) -> Result<usize, Errno> {
+    let total = buffers
+        .iter()
+        .fold(0usize, |sum, b| sum.saturating_add(b.len))
+        .min(MAX_RW_COUNT);
+    let mut user = UserIo {
+        buffers,
+        index: 0,
+        offset: 0,
+    };
     if total == 0 {
         return Ok(0);
     }
-    let mut chunk = [0u8; 4096];
+    let mut chunk = Vec::new();
+    chunk.try_reserve_exact(4096).map_err(|_| Errno::NoMem)?;
+    chunk.resize(4096, 0);
     let mut done = 0;
     while done < total {
         let want = (total - done).min(chunk.len());
         let part: Result<usize, Errno> = (|| {
             if reading {
-                f.read_chunk(&mut chunk[..want], done == 0, |data| {
-                    user_access::copy_to_user(space, a[1] + done, data).map_err(|_| Errno::Fault)
-                })
+                let deliver = |data: &[u8]| {
+                    user.copy(data.len(), |address, start, len| {
+                        user_access::copy_to_user(space, address, &data[start..start + len])
+                            .map_err(|_| Errno::Fault)
+                    })
+                };
+                if let Some(pos) = position {
+                    file.read_at(pos, &mut chunk[..want], done == 0, deliver)
+                } else {
+                    file.read_chunk(&mut chunk[..want], done == 0, deliver)
+                }
             } else {
-                user_access::copy_from_user(space, a[1] + done, &mut chunk[..want])
-                    .map_err(|_| Errno::Fault)?;
-                f.write_chunk(&chunk[..want], done == 0)
+                let copied = user.copy(want, |address, start, len| {
+                    user_access::copy_from_user(space, address, &mut chunk[start..start + len])
+                        .map_err(|_| Errno::Fault)
+                })?;
+                if let Some(pos) = position {
+                    file.write_at(pos, &chunk[..copied], done == 0)
+                } else {
+                    file.write_chunk(&chunk[..copied], done == 0)
+                }
             }
         })();
         match part {
             Ok(0) => break,
-            Ok(n) => done += n,
-            Err(e) => return if done != 0 { Ok(done) } else { Err(e) },
+            Ok(n) => {
+                done += n;
+                if let Some(pos) = &mut position {
+                    *pos = pos.checked_add(n).ok_or(Errno::Invalid)?;
+                }
+                if n < want {
+                    break;
+                }
+            }
+            Err(error) => return if done != 0 { Ok(done) } else { Err(error) },
         }
     }
     Ok(done)

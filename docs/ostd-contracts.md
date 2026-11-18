@@ -232,7 +232,7 @@ try_lock 失败即报告“持锁跨调度”。
 
 | 组 | 调用 | 实现 |
 |---|---|---|
-| 文件 | getcwd、dup、dup3、mkdirat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、newfstatat、fstat、fsync、statx | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
+| 文件 | getcwd、dup、dup3、mkdirat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、newfstatat、fstat、fsync、statx | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
 | 进程 | exit、nanosleep、sched_yield、times、getpid、getppid、clone、execve、wait4 | `task::process_call` |
 | 内存 | brk、mmap、munmap、mprotect | `syscall/memory.rs` |
 | 其他 | uname、gettimeofday | `syscall/mod.rs` |
@@ -242,8 +242,9 @@ try_lock 失败即报告“持锁跨调度”。
 
 | 调用/类别 | 当前实现 | Linux 对照 / 说明 |
 |---|---|---|
-| read/write | 4KiB 内核栈分块循环至填满/写尽/EOF；出错且已有进展时返回短读/短写 | 语义兼容；无单次截断 |
-| pipe | 64KiB；读空或剩余空间不足本次分块时阻塞，O_NONBLOCK 返回 EAGAIN；不做部分写；无读者时写返回 EPIPE | Linux 同容量；但无 SIGPIPE（无信号），部分空间不足也不做部分写 |
+| read/write/readv/writev | 共用 4 KiB 可失败堆缓冲区，单次分配后复用；向量描述符先复制到内核，最多 1024 项，总长度超过 ssize_t 返回 EINVAL；每次最多搬运 0x7ffff000 字节；遇短传输、EOF 或错误停止，已有进展时返回已完成长度 | 用户缓冲区按页交付，读只推进实际交付的偏移；完整调用持有打开文件锁；OOM 返回 ENOMEM，零长度不分配数据缓冲区 |
+| pread64/pwrite64/preadv/pwritev | 指定独立偏移，不修改共享文件偏移；负偏移 EINVAL，流式对象 ESPIPE；rv64/la64 原始向量定位 ABI 使用完整 pos_l，忽略 pos_h；O_APPEND 下定位写仍追加，与 Linux 已知行为一致 | 不支持 preadv2/pwritev2；Ext4 文件超限 EFBIG 独立于参数过长 E2BIG；部分错误仍按已完成字节数返回 |
+| pipe | 容量 64 KiB；读空或空间不足当前分块时等待，O_NONBLOCK 返回 EAGAIN；总长不超过 4 KiB 的 writev 合并后写入，空间不足不写入前缀；更大请求可在分块间返回短写；无读者返回 EPIPE | 无 SIGPIPE；运行期 VecDeque 扩容的不可失败分配仍待处理；复制失败只消费已交付数据 |
 | wait4 | wanted<=0 等任意孩子，>0 指定 pid，<-1 EINVAL；无僵尸则阻塞，无孩子 ECHILD；WNOHANG 支持；status：正常 `(code&255)<<8`，异常 11 | 语义接近；忽略 rusage；无进程组概念 |
 | clone | 仅 flags 恰好为 SIGCHLD(17) 的进程 fork；非零 stack 设置子 SP | 仅为兼容传入栈顶的调用方；不支持线程/共享地址空间 |
 | execve | argv/envp 各 ≤256 项、单串 ≤4095 字节；总受 4 页栈限制（字符串约 12KiB，超出 E2BIG）；auxv 仅 AT_PAGESZ/AT_NULL；整镜像读入内核堆 | 原 32KiB 上限不可达；AT_PHDR/AT_RANDOM 是 glibc 静态需要，静态 musl 不依赖 |
@@ -265,6 +266,8 @@ try_lock 失败即报告“持锁跨调度”。
 | 路径 | 必须是合法 UTF-8；总长 4096 字节，单分量 255 | 非 UTF-8 文件名不可访问 |
 | 其他 | stdin 读恒 EOF；fd=1/2 直通控制台；sched_yield 轮转后可能立即再次调度；getpid 总成功，getppid 返回注册表 parent | 无信号；孤儿过继 init |
 
+文件 I/O 依据：[pread(2)](https://man7.org/linux/man-pages/man2/pread.2.html)、[readv(2)](https://man7.org/linux/man-pages/man2/readv.2.html) 与 [Linux 64 位定位向量 ABI](https://github.com/torvalds/linux/blob/v6.12/fs/read_write.c)。仅核对语义与 ABI，未复制实现代码。
+
 文件状态查询依据：[stat(2)](https://man7.org/linux/man-pages/man2/stat.2.html)、[statx(2)](https://man7.org/linux/man-pages/man2/statx.2.html) 与 [Linux asm-generic stat UAPI](https://github.com/torvalds/linux/blob/v6.12/include/uapi/asm-generic/stat.h)。按公开 ABI 独立编码，未复制 Linux 实现代码。
 
 ### 4.4 下一里程碑缺口
@@ -272,7 +275,7 @@ try_lock 失败即报告“持锁跨调度”。
 
 | 类别 | 缺口 |
 |---|---|
-| 基础调用 | clock_gettime(113)、exit_group(94)、fcntl(25)、ioctl(29)、readv/writev(65/66)、kill(129)、set_tid_address(96) 等仍 ENOSYS |
+| 基础调用 | clock_gettime(113)、exit_group(94)、fcntl(25)、ioctl(29)、kill(129)、set_tid_address(96) 等仍 ENOSYS |
 | 信号 | 无投递；EPIPE 不产生 SIGPIPE；SIGSEGV/SIGCHLD 只体现为 wait status |
 | ELF（静态） | busybox 等静态程序的段 vaddr-offset 相位（当前要求 p_vaddr 与 p_offset 都页对齐） |
 | ELF（动态） | ET_DYN/PT_INTERP、动态链接（libc-test/glibc 动态）；与静态 busybox 无关 |
@@ -359,6 +362,7 @@ try_lock 失败即报告“持锁跨调度”。
 | `make selftest-rv` / `make selftest-la` | debug 断言 + lock_debug + LOG=info；额外 OOM 注入与调试锁检查；polyhal #8 需 `-Zub-checks=no` |
 | loongarch64 debug 启动自检（`trap/unaligned.rs`） | 直接验证模拟器 load/store、符号扩展、r0、跨页原子失败与只读拒绝 |
 | `tests/run_group.py` | 双架构 group/edges/selftest 整组验收：QEMU 10.0.2、官方 oracle、`e2fsck -fn` |
+| `tests/fs_io.py` | `make all` 后执行 `python3 tests/fs_io.py`，构造独立 Ext4 盘验证双架构定位/向量 I/O、用户缓冲区错误、管道与落盘一致性；只读版本先 `make all FEATURES=rsext4-readonly` 再加 `--readonly`，结束后恢复默认构建 |
 | `tests/mm_validate.py` | MMU/TLB 硬件探针；依赖 musl 交叉工具链与 `~/.config/ouroos/env.sh`，尚未纳入日常门禁 |
 
 ## 8. 工程与文档遗留（非 ostd 契约）

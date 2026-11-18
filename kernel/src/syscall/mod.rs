@@ -34,6 +34,10 @@ pub mod sysnr {
     pub const WRITE: usize = 64;
     pub const READV: usize = 65;
     pub const WRITEV: usize = 66;
+    pub const PREAD64: usize = 67;
+    pub const PWRITE64: usize = 68;
+    pub const PREADV: usize = 69;
+    pub const PWRITEV: usize = 70;
     pub const FSTATAT: usize = 79;
     pub const FSTAT: usize = 80;
     pub const FSYNC: usize = 82;
@@ -70,6 +74,7 @@ pub enum Errno {
     SeekPipe,
     Busy,
     TooBig,
+    FileTooBig,
     ExecFormat,
     Again,
     WouldBlock,
@@ -111,6 +116,7 @@ impl Errno {
             Self::SeekPipe => 29,
             Self::Busy => 16,
             Self::TooBig => 7,
+            Self::FileTooBig => 27,
             Self::ExecFormat => 8,
             Self::Again | Self::WouldBlock => 11,
             Self::Pipe => 32,
@@ -180,6 +186,12 @@ pub fn dispatch(
         | sysnr::LSEEK
         | sysnr::READ
         | sysnr::WRITE
+        | sysnr::READV
+        | sysnr::WRITEV
+        | sysnr::PREAD64
+        | sysnr::PWRITE64
+        | sysnr::PREADV
+        | sysnr::PWRITEV
         | sysnr::FSTAT
         | sysnr::FSTATAT
         | sysnr::FSYNC

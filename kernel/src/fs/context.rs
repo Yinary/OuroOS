@@ -404,12 +404,12 @@ impl OpenFile {
     }
 
     /// 读取一块内核缓冲区；交付成功后才消费管道数据或推进偏移。
-    /// first 指示本次读取的首块；交付失败时返回其错误。
+    /// first 指示本次读取的首块；交付函数返回实际写入用户缓冲区的长度。
     pub(crate) fn read_chunk(
         &mut self,
         data: &mut [u8],
         first: bool,
-        deliver: impl FnOnce(&[u8]) -> Result<(), Errno>,
+        deliver: impl FnOnce(&[u8]) -> Result<usize, Errno>,
     ) -> Result<usize, Errno> {
         self.check_type(first)?;
         match &self.kind {
@@ -427,14 +427,16 @@ impl OpenFile {
                 for (i, b) in p.data.iter().take(count).enumerate() {
                     data[i] = *b;
                 }
-                deliver(&data[..count])?;
-                p.data.drain(..count);
+                let delivered = deliver(&data[..count])?;
+                if delivered > count {
+                    return Err(Errno::Invalid);
+                }
+                p.data.drain(..delivered);
                 crate::task::sched::request_pipe_wake();
-                Ok(count)
+                Ok(delivered)
             }
-            Kind::Inode { ino, .. } => {
-                let count = fs::read(*ino, self.offset, data)?;
-                deliver(&data[..count])?;
+            Kind::Inode { .. } => {
+                let count = self.read_at(self.offset, data, false, deliver)?;
                 self.offset = self.offset.checked_add(count).ok_or(Errno::Invalid)?;
                 Ok(count)
             }
@@ -478,6 +480,50 @@ impl OpenFile {
             }
             _ => Err(Errno::BadF),
         }
+    }
+
+    /// 定位 I/O 只接受 inode 对象；流式对象返回 ESPIPE。
+    pub(crate) fn check_positioned(&self) -> Result<(), Errno> {
+        match self.kind {
+            Kind::Inode { .. } => Ok(()),
+            _ => Err(Errno::SeekPipe),
+        }
+    }
+
+    /// 从给定位置读取并交付，返回已交付长度；不改变共享偏移。
+    pub(crate) fn read_at(
+        &self,
+        offset: usize,
+        data: &mut [u8],
+        first: bool,
+        deliver: impl FnOnce(&[u8]) -> Result<usize, Errno>,
+    ) -> Result<usize, Errno> {
+        self.check_type(first)?;
+        let ino = match self.kind {
+            Kind::Inode { ino, .. } => ino,
+            _ => return Err(Errno::SeekPipe),
+        };
+        let count = fs::read(ino, offset, data)?;
+        let delivered = deliver(&data[..count])?;
+        if delivered > count {
+            return Err(Errno::Invalid);
+        }
+        Ok(delivered)
+    }
+
+    /// 写给定位置且不改变共享偏移；O_APPEND 沿用 Linux 的追加行为。
+    pub(crate) fn write_at(&self, offset: usize, data: &[u8], first: bool) -> Result<usize, Errno> {
+        self.check_type(first)?;
+        let ino = match self.kind {
+            Kind::Inode { ino, .. } => ino,
+            _ => return Err(Errno::SeekPipe),
+        };
+        let offset = if self.flags & 0x400 != 0 {
+            fs::stat(ino)?.1 as usize
+        } else {
+            offset
+        };
+        fs::write(ino, offset, data)
     }
 }
 
