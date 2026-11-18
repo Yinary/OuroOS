@@ -232,7 +232,7 @@ try_lock 失败即报告“持锁跨调度”。
 
 | 组 | 调用 | 实现 |
 |---|---|---|
-| 文件 | getcwd、dup、dup3、fcntl、mkdirat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、readlinkat、statfs、fstatfs、newfstatat、fstat、fsync、statx | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
+| 文件 | getcwd、dup、dup3、fcntl、mkdirat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、readlinkat、statfs、fstatfs、newfstatat、fstat、fsync、statx、umask、utimensat | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
 | 进程 | exit、nanosleep、sched_yield、times、getpid、getppid、clone、execve、wait4 | `task::process_call` |
 | 内存 | brk、mmap、munmap、mprotect | `syscall/memory.rs` |
 | 其他 | uname、gettimeofday | `syscall/mod.rs` |
@@ -254,6 +254,8 @@ try_lock 失败即报告“持锁跨调度”。
 | uname | sysname=OuroOS、nodename=ouro、release=内核版本、version=OuroOS、machine=架构名、domainname=local | 合成身份信息 |
 | gettimeofday | 返回启动以来单调时间；ext4 时间从卷 `s_wtime` 起算 | 不是墙钟，无 RTC；两套时钟 |
 | newfstatat/fstat/statx | 共用 FS 元数据；Ext4 返回 UID/GID、atime/mtime/ctime（含纪元扩展与纳秒）及可用的 btime；FAT 权限 0777、所有者 0，时间未接通，statx 不置对应有效位；卷设备号为内核分配的合成标识 | rv64/la64 使用 asm-generic stat 布局；旧式 stat 的缺失时间填零；statx 不报告未提供的属性、挂载 ID、DIO 对齐等扩展字段 |
+| umask | 仅保存 0777 权限位，返回旧值；初始 022；fork 复制且之后独立，exec 保留；openat 新建与 mkdirat 按 mode & ~umask 创建，已有文件不改权限 | 无共享 FS Context 的线程语义、默认 ACL 或特殊权限位支持；FAT 沿用合成 0777，不能表达每文件的 POSIX 创建权限 |
+| utimensat | 支持 NULL times、指定秒/纳秒、UTIME_NOW/UTIME_OMIT、cwd/dirfd 相对路径、中间链接及 AT_SYMLINK_NOFOLLOW；AT_EMPTY_PATH 和 NULL path 的 FD 形式支持仍打开但已删名的 inode；双方 OMIT 不访问路径或写入，参数先经 user_access 复制 | Ext4 更新 atime/mtime 并更新 ctime，不改变 btime 或文件偏移；128 字节 inode 为秒精度，扩展 inode 支持纳秒及纪元位，指定时间越界时限制到可表示范围；FAT、管道和控制台暂 EOPNOTSUPP。尚无 UID/GID/capability 身份检查、目录搜索权限或 immutable/append-only 属性校验；Now 沿用卷 s_wtime 加启动时长，非完整 RTC 墙钟 |
 | statfs/fstatfs | 共用 FS 容量快照，路径跟随链接，FD 查询不修改共享偏移；rv64/la64 均编码 120 字节 asm-generic statfs，保留区清零；返回卷类型、分配单位、总量、空闲量、普通用户可用量、inode 计数、卷标识与只读标志 | Ext4 按当前后端计数并扣除超级块记录的元数据开销，可用量扣除保留块；若卷未记录开销则总量沿用原始块数，尚未补算，可能与 Linux df 有差异。FAT 使用实际簇统计，无固定 inode 池，files/ffree 为零。管道/控制台返回 EOPNOTSUPP；flags 仅报告 ST_VALID/ST_RDONLY，FAT 按现有可写挂载模式报告；无权限搜索及配额限制统计 |
 | readlinkat | 从现有路径查询取得末项链接，读取目标文本并按 bufsiz 截断，不补 NUL；支持绝对路径、cwd/目录 FD 相对路径，绝对路径忽略 dirfd；中间链接跟随，末项不跟随；bufsiz 按 Linux int ABI 解释，非正数 EINVAL | 非空路径指向非链接返回 EINVAL；空路径查询 FD，非链接 ENOENT；坏 FD/用户缓冲区分别 EBADF/EFAULT。复用 Ext4 链接读取，目标仍限 UTF-8 且小于 4 KiB，不更新链接 atime；O_PATH 打开语义及链接 FD 的完整生命周期尚未补齐，不据此宣称完整支持 |
 | 状态查询路径与标志 | 支持绝对路径、cwd/目录 FD 相对路径、AT_EMPTY_PATH（含 NULL）、AT_SYMLINK_NOFOLLOW、AT_NO_AUTOMOUNT；查询时逐级跟随链接，最多 40 次，保留点分量与尾斜杠约束 | 查询专用解析，不代表 open/exec 已支持跟随链接；cwd/目录 FD 仍按保存的路径字符串定位；沿用项目 UTF-8 路径限制，尚无进程身份驱动的目录搜索权限检查 |
@@ -272,6 +274,8 @@ try_lock 失败即报告“持锁跨调度”。
 文件 I/O 依据：[pread(2)](https://man7.org/linux/man-pages/man2/pread.2.html)、[readv(2)](https://man7.org/linux/man-pages/man2/readv.2.html) 与 [Linux 64 位定位向量 ABI](https://github.com/torvalds/linux/blob/v6.12/fs/read_write.c)。仅核对语义与 ABI，未复制实现代码。
 
 FD 控制依据：[F_DUPFD](https://man7.org/linux/man-pages/man2/F_DUPFD.2const.html)、[F_GETFD/F_SETFD](https://man7.org/linux/man-pages/man2/F_GETFD.2const.html) 与 [F_GETFL/F_SETFL](https://man7.org/linux/man-pages/man2/F_GETFL.2const.html)。FD 表扩容使用可失败分配；成功 exec 关闭 cloexec，失败 exec 保留描述符。
+
+创建掩码与时间更新依据：[umask(2)](https://man7.org/linux/man-pages/man2/umask.2.html)、[utimensat(2)](https://man7.org/linux/man-pages/man2/utimensat.2.html) 与 [Linux v6.12 utimes ABI](https://github.com/torvalds/linux/blob/v6.12/fs/utimes.c)。双方 OMIT 的提前成功及 NULL path 的 FD 形式按原始系统调用处理；只核对语义，未复制实现代码。
 
 容量查询依据：[statfs(2)](https://man7.org/linux/man-pages/man2/statfs.2.html) 与 [asm-generic statfs UAPI](https://github.com/torvalds/linux/blob/v6.12/include/uapi/asm-generic/statfs.h)。仅按 ABI 独立编码；Ext4 fsid 取 UUID 前八字节，FAT 取卷序号，均作为不透明标识。
 
@@ -367,7 +371,7 @@ FD 控制依据：[F_DUPFD](https://man7.org/linux/man-pages/man2/F_DUPFD.2const
 | 项 | 现状 / 计划 |
 |---|---|
 | inode 与挂载身份 | 最高位分流；FAT 依赖 `(mount, path)` 登记序号，cwd/目录 FD 保存路径字符串。需统一挂载与对象身份 |
-| 路径与文件操作 | 状态查询已有链接与尾斜杠处理，open/exec 尚未统一；rename/link/symlink、目录删除及权限等缺口见 §4 |
+| 路径与文件操作 | 状态查询已有链接与尾斜杠处理，open/exec 尚未统一；rename/link/symlink、目录删除及完整身份权限检查等缺口见 §4 |
 | FAT 接口 | 无目录遍历与时间字段，每次 read/write/stat 按路径重开，打开后 unlink 返回 EBUSY；需补齐统一接口 |
 | 共享页修改跟踪与写回 | 无脏状态，未修改页与只读映射也会尝试写回；只读 Ext4 根卷写回被拒绝并记日志。需 MM 提供修改跟踪，FS 保留失败数据并支持重试 |
 | 共享页一致性失败 | `coherent` 的页内访问失败只记日志并跳过更新；最后释放时写回失败仍释放页。需明确错误传播、数据持有者和恢复策略 |
@@ -405,6 +409,7 @@ FD 控制依据：[F_DUPFD](https://man7.org/linux/man-pages/man2/F_DUPFD.2const
 | `make selftest-rv` / `make selftest-la` | debug 断言 + lock_debug + LOG=info；额外 OOM 注入与调试锁检查；polyhal #8 需 `-Zub-checks=no` |
 | loongarch64 debug 启动自检（`trap/unaligned.rs`） | 直接验证模拟器 load/store、符号扩展、r0、跨页原子失败与只读拒绝 |
 | `tests/run_group.py` | 双架构 group/edges/selftest 整组验收：QEMU 10.0.2、官方 oracle、`e2fsck -fn` |
+| `tests/fs_stat.py --metadata` | `make all` 后执行 `python3 tests/fs_stat.py --metadata --output target/fs-validation/metadata`，验证双架构 128/256 字节 inode 的创建掩码、fork/exec、NOW/OMIT、FD/链接时间更新与落盘；只读版本先构建相应 feature，添加 --readonly 并指定独立输出目录，结束后恢复默认内核 |
 | `tests/fs_stat.py` | `make all` 后执行 `python3 tests/fs_stat.py`，验证双架构 128/256 字节 inode 的元数据、路径、readlinkat 和 statfs/fstatfs；容量与磁盘快照对照，并验证分配、最后关闭回收及 Ext4/FAT 隔离；镜像运行前后 e2fsck，FAT 卷运行后 fsck.fat。只读版本先构建 rsext4-readonly，同一脚本以 --output 指定独立输出目录 |
 | `tests/fs_io.py` | `make all` 后执行 `python3 tests/fs_io.py`，构造独立 Ext4 盘验证双架构定位/向量 I/O、用户缓冲区错误、管道与落盘一致性；只读版本先 `make all FEATURES=rsext4-readonly` 再加 `--readonly`，结束后恢复默认构建 |
 | `tests/fs_fcntl.py` | `make all` 后执行 `python3 tests/fs_fcntl.py`，验证双架构 FD 分配及耗尽、标志共享、追加写、非阻塞管道、fork 和成功/失败 exec；结束后运行 e2fsck；只读版本同样先构建相应 feature，再加 `--readonly` |

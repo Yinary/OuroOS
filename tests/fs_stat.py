@@ -2,6 +2,7 @@
 """构造已知属性与容量的磁盘，双架构验证查询接口；产物只写入 target。"""
 import argparse
 import os
+import re
 from pathlib import Path
 import shutil
 import struct
@@ -16,16 +17,46 @@ def run(args, log, **kwargs):
                        check=True, timeout=240, **kwargs)
 
 
+def verify_metadata(image, out, stem, small, readonly):
+    log = out / f"{stem}-persisted-times.log"
+    run(["debugfs", "-R", "stat /meta/data", str(image)], log)
+    text = log.read_text()
+    expected = ((-2147483647 if small else 2147483649, 2147483646)
+                if readonly else (1700000001, -10))
+    for field, seconds, nanos in zip(("atime", "mtime"), expected, (123456789, 987654321)):
+        match = re.search(rf"{field}:\s+0x([0-9a-f]+)(?::([0-9a-f]+))?", text)
+        if not match:
+            raise RuntimeError(f"缺少落盘时间 {field}: {text}")
+        base = int(match[1], 16)
+        extra = int(match[2] or "0", 16)
+        actual = (base if base < 1 << 31 else base - (1 << 32)) + ((extra & 3) << 32)
+        if actual != seconds or extra >> 2 != (0 if small else nanos):
+            raise RuntimeError(f"落盘时间不符 {field}: {actual}, {extra >> 2}")
+    if not readonly:
+        for name, mode in (("mask-file", 0o600), ("mask-dir", 0o700),
+                           ("mask-other", 0o640), ("mask-child", 0o700)):
+            log = out / f"{stem}-{name}-mode.log"
+            run(["debugfs", "-R", f"stat /{name}", str(image)], log)
+            match = re.search(r"Mode:\s+([0-7]+)", log.read_text())
+            if not match or int(match[1], 8) != mode:
+                raise RuntimeError(f"落盘权限不符: {name}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "target/fs-validation/stat")
+    parser.add_argument("--metadata", action="store_true", help="验证 umask 和 utimensat")
+    parser.add_argument("--readonly", action="store_true", help="metadata 专项要求只读内核")
     args = parser.parse_args()
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     user = out / "user"
     shutil.copytree(ROOT / "user/hello", user, dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns("target"))
-    shutil.copyfile(ROOT / "tests/fs_stat.rs", user / "src/bin/hello.rs")
+    program = "fs_metadata.rs" if args.metadata else "fs_stat.rs"
+    shutil.copyfile(ROOT / "tests" / program, user / "src/bin/hello.rs")
+    if args.metadata:
+        shutil.copyfile(ROOT / "tests/fs_metadata_exec.rs", user / "src/bin/check.rs")
     payload = out / "payload"
     payload.write_bytes(b"testing")
     empty = out / "empty"
@@ -40,7 +71,7 @@ def main():
     ]:
         env = dict(os.environ, RUSTFLAGS=flags, CARGO_TARGET_DIR=str(out / "user-target"))
         run(["timeout", "180", "cargo", "build", "--manifest-path", str(user / "Cargo.toml"),
-             "-Z", "build-std=core", "--release", "--target", target, "--bin", "hello"],
+             "-Z", "build-std=core", "--release", "--target", target, *(["--bins"] if args.metadata else ["--bin", "hello"])],
             out / f"{short}-user-build.log", env=env)
         for inode_size in (256, 128):
             stem = f"{short}-{inode_size}"
@@ -76,6 +107,8 @@ def main():
                        "sub/up": "../data", "sixty": "/" * 50 + "/meta/data",
                        "long": "/" * 90 + "/meta/data"}
             commands += [f"symlink /meta/{name} {dest}" for name, dest in targets.items()]
+            if args.metadata:
+                commands.append(f'write "{out / "user-target" / target / "release/check"}" /mask-exec')
             script = out / f"{stem}-populate"
             script.write_text("\n".join(commands) + "\n")
             run(["debugfs", "-w", "-f", str(script), str(ext)], out / f"{stem}-populate.log")
@@ -146,9 +179,12 @@ def main():
                  "-nographic", "-no-reboot", "-drive", f"file={image},format=raw,if=none,id=disk",
                  "-device", f"{device},drive=disk"], out / f"{stem}.log")
             text = (out / f"{stem}.log").read_text(errors="replace")
-            if ("STAT PASS:" not in text or "READLINK PASS:" not in text or "STATFS PASS:" not in text
+            markers = ("METADATA PASS:", "MASK EXEC PASS") if args.metadata else ("STAT PASS:", "READLINK PASS:", "STATFS PASS:")
+            if (not all(marker in text for marker in markers)
                     or "basic-init): exited with status 0" not in text):
                 raise RuntimeError(f"{stem} failed: {text[-1600:]}")
+            if args.metadata and args.readonly != ("METADATA READONLY" in text):
+                raise RuntimeError(f"{stem}: 内核只读配置与测试要求不符")
             if start:
                 with image.open("rb") as stream:
                     stream.seek(start * 512)
@@ -156,6 +192,8 @@ def main():
                     stream.seek(second * 512)
                     fat.write_bytes(stream.read(fat_count * 512))
                 run(["fsck.fat", "-n", str(fat)], out / f"{stem}-after-fat-fsck.log")
+            if args.metadata:
+                verify_metadata(ext, out, stem, inode_size == 128, args.readonly)
             run(["e2fsck", "-fn", str(ext)], out / f"{stem}-after-fsck.log")
             print(f"{stem}: PASS (status queries and e2fsck)", flush=True)
 

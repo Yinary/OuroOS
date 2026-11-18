@@ -63,6 +63,7 @@ struct Descriptor {
 pub struct Context {
     cwd: String,
     fds: Vec<Option<Descriptor>>,
+    umask: u16,
 }
 fn string(s: &str) -> Result<String, Errno> {
     let mut result = String::new();
@@ -88,6 +89,7 @@ impl Context {
         Ok(Self {
             cwd: string("/")?,
             fds,
+            umask: 0o022,
         })
     }
     /// fork 复制描述符表，保留共享偏移。
@@ -98,8 +100,21 @@ impl Context {
         Ok(Self {
             cwd: string(&self.cwd)?,
             fds,
+            umask: self.umask,
         })
     }
+    /// 设置创建权限掩码，仅保存权限位并返回旧值。
+    pub(crate) fn set_umask(&mut self, mask: usize) -> usize {
+        let previous = self.umask;
+        self.umask = mask as u16 & 0o777;
+        previous as usize
+    }
+
+    /// 对新建文件和目录的请求权限应用当前进程掩码。
+    pub(crate) fn creation_mode(&self, mode: usize) -> u16 {
+        mode as u16 & 0o777 & !self.umask
+    }
+
     /// 取得打开文件引用，无效 FD 返回 EBADF。
     pub(crate) fn get(&self, fd: usize) -> Result<Handle, Errno> {
         self.fds
@@ -388,6 +403,14 @@ impl OpenFile {
         match self.kind {
             Kind::Inode { ino, .. } if fs::stat(ino)?.0 & 0xf000 == 0x4000 => Ok(ino),
             _ => Err(Errno::NotDir),
+        }
+    }
+
+    /// 更新打开 inode 的访问和修改时间；管道与控制台返回 EOPNOTSUPP。
+    pub(crate) fn update_times(&self, times: [fs::TimeUpdate; 2]) -> Result<(), Errno> {
+        match self.kind {
+            Kind::Inode { ino, .. } => fs::update_times(ino, times),
+            _ => Err(Errno::NotSupported),
         }
     }
 

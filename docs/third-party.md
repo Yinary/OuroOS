@@ -11,3 +11,5 @@
 | [rust-fatfs](https://github.com/rafalh/rust-fatfs) 38b3a7950bf0e765e34286d1dfe76c519ee347e2 | MIT | 锁定 Git revision，no_std + alloc + lfn，FAT 挂载/读写/unlink（无目录列举） | 2026-11-10 |
 
 历史条目：ext4_rs 1.3.3（MIT）曾作为 Ext4 后端 vendor 于 `third_party/ext4_rs`，含块分配起点与 panic 审计 9 处补丁，随 rsext4 接入而移除（fs/rsext4 集成分支）；审计工作待在 rsext4 上重做（见 ostd-contracts §6 欠账）。
+
+rsext4 本地时间接口补丁（2026-11-18）：在 `src/metadata/api.rs` 新增 `utimens_inode`，由 `src/metadata/mod.rs` 导出；路径版接口复用同一实现。沿用 Apache-2.0，未新增依赖或复制其他内核代码。

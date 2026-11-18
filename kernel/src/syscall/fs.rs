@@ -35,6 +35,8 @@ pub fn dispatch(
     ctx: &mut Context,
 ) -> Result<usize, Errno> {
     match nr {
+        sysnr::UMASK => Ok(ctx.set_umask(a[0])),
+        sysnr::UTIMENSAT => utimensat(ctx, space, a),
         sysnr::GETCWD => {
             if a[1] < ctx.cwd().len() + 1 {
                 return Err(Errno::Range);
@@ -64,7 +66,7 @@ pub fn dispatch(
                 Ok(_) => Err(Errno::Exists),
                 Err(Errno::NoEntry) => {
                     let (p, name) = parent(&path)?;
-                    fs::create(p, name, 0x4000 | (a[2] as u16 & 0o777))?;
+                    fs::create(p, name, 0x4000 | ctx.creation_mode(a[2]))?;
                     Ok(0)
                 }
                 Err(e) => Err(e),
@@ -185,7 +187,7 @@ pub fn dispatch(
                 }
                 Err(Errno::NoEntry) if a[2] & 64 != 0 => {
                     let (p, name) = parent(&path)?;
-                    fs::create(p, name, 0x8000 | (a[3] as u16 & 0o777))?
+                    fs::create(p, name, 0x8000 | ctx.creation_mode(a[3]))?
                 }
                 Err(e) => return Err(e),
             };
@@ -259,6 +261,53 @@ pub fn dispatch(
         }
         _ => Err(Errno::NoSys),
     }
+}
+
+/// Linux utimensat：支持路径、FD、NOW/OMIT 和末项不跟随；权限检查沿用现有模型。
+fn utimensat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
+    use fs::{TimeUpdate, Timestamp};
+    let mut raw = [0; 32];
+    if a[2] != 0 {
+        user_access::copy_from_user(space, a[2], &mut raw).map_err(|_| Errno::Fault)?;
+    }
+    let values: [i64; 4] =
+        core::array::from_fn(|i| i64::from_ne_bytes(core::array::from_fn(|j| raw[i * 8 + j])));
+    let omit = (1 << 30) - 2;
+    if a[2] != 0 && values[1] == omit && values[3] == omit {
+        return Ok(0);
+    }
+    let flags = a[3] as u32;
+    if flags & !(0x100 | 0x1000) != 0 {
+        return Err(Errno::Invalid);
+    }
+    let parse = |sec, nsec| match nsec {
+        n if n == omit => Ok(TimeUpdate::Omit),
+        n if n == omit + 1 => Ok(TimeUpdate::Now),
+        0..=999_999_999 => Ok(TimeUpdate::Set(Timestamp {
+            sec,
+            nsec: nsec as u32,
+        })),
+        _ => Err(Errno::Invalid),
+    };
+    let times = if a[2] == 0 {
+        [TimeUpdate::Now; 2]
+    } else {
+        [parse(values[0], values[1])?, parse(values[2], values[3])?]
+    };
+    let dir = a[0] as u32 as i32 as isize as usize;
+    if a[1] == 0 && dir as isize != -100 {
+        if flags != 0 {
+            return Err(Errno::Invalid);
+        }
+        return ctx.get(dir)?.lock().update_times(times).map(|_| 0);
+    }
+    let path = user_string(space, a[1])?;
+    if path.is_empty() && flags & 0x1000 != 0 && dir as isize != -100 {
+        return ctx.get(dir)?.lock().update_times(times).map(|_| 0);
+    }
+    let info = ctx.query(dir, &path, flags & 0x1000 != 0, flags & 0x100 == 0)?;
+    fs::update_times(info.ino as u32, times)?;
+    Ok(0)
 }
 
 /// Linux statfs/fstatfs：查询路径或 FD 所属卷，写回 120 字节的统计结构。

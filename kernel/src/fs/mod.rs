@@ -12,6 +12,23 @@ mod metadata;
 
 pub(crate) use metadata::{query, Metadata, Timestamp};
 
+/// 文件时间的更新方式；Omit 保留对应字段。
+#[derive(Clone, Copy)]
+pub(crate) enum TimeUpdate {
+    Set(Timestamp),
+    Now,
+    Omit,
+}
+
+/// 按 inode 更新访问、修改时间；FAT 时间字段尚未接通。
+pub(crate) fn update_times(ino: u32, times: [TimeUpdate; 2]) -> Result<(), Errno> {
+    if ino & FAT_INODE != 0 {
+        Err(Errno::NotSupported)
+    } else {
+        ext4::update_times(ino, times)
+    }
+}
+
 /// 已挂载文件系统的容量快照，块数以 block_size 字节为单位。
 pub(crate) struct FileSystemStats {
     pub kind: u64,

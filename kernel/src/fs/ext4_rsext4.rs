@@ -278,6 +278,43 @@ pub(super) fn metadata(ino: u32) -> Result<super::Metadata, Errno> {
     })
 }
 
+/// 更新 inode 时间，保留后端的时间编码、校验和与日志写回流程。
+pub(super) fn update_times(ino: u32, times: [super::TimeUpdate; 2]) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        use rsext4::{disknode::Ext4Inode, Ext4TimeSpec};
+        let size = match v.fs.superblock.s_inode_size {
+            0 => Ext4Inode::LARGE_INODE_SIZE,
+            size => size,
+        };
+        let convert = |update, field_end| match update {
+            super::TimeUpdate::Omit => Ext4TimeSpec::Omit,
+            super::TimeUpdate::Now => Ext4TimeSpec::Now,
+            super::TimeUpdate::Set(t) => {
+                let max = if size >= field_end {
+                    0x3_7fff_ffff
+                } else {
+                    i32::MAX as i64
+                };
+                let sec = t.sec.clamp(i32::MIN as i64, max);
+                Ext4TimeSpec::Set(Ext4Timestamp::new(
+                    sec,
+                    if sec == t.sec { t.nsec } else { 0 },
+                ))
+            }
+        };
+        rsext4::metadata::utimens_inode(
+            &mut v.device,
+            &mut v.fs,
+            InodeNumber::new(ino)?,
+            convert(times[0], Ext4Inode::FIELD_END_I_ATIME_EXTRA),
+            convert(times[1], Ext4Inode::FIELD_END_I_MTIME_EXTRA),
+        )
+    })
+}
+
 /// 查询根卷容量，空闲计数取自后端当前快照。
 pub(super) fn filesystem_stats() -> Result<super::FileSystemStats, Errno> {
     access(|v| {

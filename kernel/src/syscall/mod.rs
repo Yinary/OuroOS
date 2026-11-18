@@ -45,6 +45,8 @@ pub mod sysnr {
     pub const FSTATAT: usize = 79;
     pub const FSTAT: usize = 80;
     pub const FSYNC: usize = 82;
+    pub const UTIMENSAT: usize = 88;
+    pub const UMASK: usize = 166;
     pub const STATX: usize = 291;
     // 进程
     pub const EXIT: usize = 93;
@@ -203,6 +205,8 @@ pub fn dispatch(
         | sysnr::FSTAT
         | sysnr::FSTATAT
         | sysnr::FSYNC
+        | sysnr::UTIMENSAT
+        | sysnr::UMASK
         | sysnr::STATX => {
             let ret = self::fs::dispatch(
                 nr,
