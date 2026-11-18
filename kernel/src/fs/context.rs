@@ -581,7 +581,8 @@ fn rw(nr: usize, a: [usize; 6], space: &UserAddressSpace, ctx: &Context) -> Resu
                 }
                 Kind::Inode { ino, .. } => {
                     let ino = *ino;
-                    if fs::stat(ino)?.0 & 0xf000 == 0x4000 {
+                    // 首块检查类型，保留写入时先检查用户缓冲区的顺序。
+                    if done == 0 && fs::stat(ino)?.0 & 0xf000 == 0x4000 {
                         return Err(Errno::IsDir);
                     }
                     let offset = if !reading && f.flags & 0x400 != 0 {
