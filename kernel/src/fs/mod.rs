@@ -12,7 +12,7 @@ pub mod fat;
 const FAT_INODE: u32 = 0x8000_0000;
 
 /// 文件系统返回的目录项类型。
-pub(super) enum DirEntryKind {
+pub(crate) enum DirEntryKind {
     Unknown,
     File,
     Directory,
@@ -24,11 +24,11 @@ pub(super) enum DirEntryKind {
 }
 
 /// 目录项及其后端提供的续读位置。
-pub(super) struct DirEntry<'a> {
-    inode: u32,
-    kind: DirEntryKind,
-    name: &'a [u8],
-    next: usize,
+pub(crate) struct DirEntry<'a> {
+    pub(crate) inode: u32,
+    pub(crate) kind: DirEntryKind,
+    pub(crate) name: &'a [u8],
+    pub(crate) next: usize,
 }
 
 /// 初始化 Ext4 根卷；无磁盘时允许继续启动。
@@ -38,7 +38,7 @@ pub fn init() -> Result<(), Errno> {
 
 /// 写回 inode 的共享页和 Ext4 卷缓存。
 #[cfg(not(feature = "rsext4-readonly"))]
-pub(super) fn sync_inode(ino: u32) -> Result<(), Errno> {
+pub(crate) fn sync_inode(ino: u32) -> Result<(), Errno> {
     if ino & FAT_INODE != 0 {
         return Err(Errno::NotSupported);
     }
@@ -88,7 +88,7 @@ pub fn read_raw(ino: u32, offset: usize, data: &mut [u8]) -> Result<usize, Errno
 }
 
 /// 遍历目录项，回调返回 false 时保留该项供下次读取。
-pub(super) fn read_dir(
+pub(crate) fn read_dir(
     ino: u32,
     offset: usize,
     visit: impl FnMut(DirEntry<'_>) -> bool,

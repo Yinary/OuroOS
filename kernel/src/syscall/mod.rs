@@ -3,6 +3,7 @@
 //! a0..=a5=参数、a0=返回负 errno 或结果）。支持范围与 Linux 语义偏差
 //! 见 docs/ostd-contracts.md §4；PC 推进由运行循环统一处理。
 
+pub(crate) mod fs;
 mod memory;
 
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
@@ -180,7 +181,7 @@ pub fn dispatch(
         | sysnr::FSTAT
         | sysnr::FSYNC
         | sysnr::STATX => {
-            let ret = crate::fs::context::dispatch(
+            let ret = self::fs::dispatch(
                 nr,
                 [args[0], args[1], args[2], args[3], args[4], args[5]],
                 space,

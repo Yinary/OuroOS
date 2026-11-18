@@ -31,7 +31,7 @@ fn strings(space: &UserAddressSpace, ptr: usize) -> Result<Vec<String>, Errno> {
             return Ok(out);
         }
         out.try_reserve(1).map_err(|_| Errno::NoMem)?;
-        out.push(context::user_path(space, address)?);
+        out.push(crate::syscall::fs::user_string(space, address)?);
     }
     Err(Errno::TooBig)
 }
@@ -79,7 +79,7 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
             .find(|r| r.pid == pid)
             .ok_or(Errno::Invalid)?;
         let space = rec.space.as_ref().ok_or(Errno::Invalid)?.as_space();
-        let path = context::user_path(space, args[0])?;
+        let path = crate::syscall::fs::user_string(space, args[0])?;
         let argv = strings(space, args[1])?;
         let envp = strings(space, args[2])?;
         let image = context::executable(rec.fs.as_ref().ok_or(Errno::Invalid)?, &path)?;

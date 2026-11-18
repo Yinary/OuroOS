@@ -24,7 +24,7 @@
 | mm | §1 不变量与失败模型 | `kernel/src/mm/` |
 | polyhal 边界 | §2 可用原语与缺陷 | `third_party/polyhal-trap/` |
 | task | §3 执行、调度、生命周期 | `kernel/src/task/` |
-| syscall | §4 Linux ABI 对照 | `kernel/src/syscall/`、`fs/context.rs` |
+| syscall | §4 Linux ABI 对照 | `kernel/src/syscall/` |
 | sync | §5 锁模型与锁序 | `kernel/src/sync.rs` |
 | fs | §6 结构、挂载、偏差 | `kernel/src/fs/`、`kernel/src/drivers/` |
 
@@ -232,7 +232,7 @@ try_lock 失败即报告“持锁跨调度”。
 
 | 组 | 调用 | 实现 |
 |---|---|---|
-| 文件 | getcwd、dup、dup3、mkdirat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、fstat、fsync、statx | `fs::context` |
+| 文件 | getcwd、dup、dup3、mkdirat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、fstat、fsync、statx | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
 | 进程 | exit、nanosleep、sched_yield、times、getpid、getppid、clone、execve、wait4 | `task::process_call` |
 | 内存 | brk、mmap、munmap、mprotect | `syscall/memory.rs` |
 | 其他 | uname、gettimeofday | `syscall/mod.rs` |
@@ -293,7 +293,7 @@ try_lock 失败即报告“持锁跨调度”。
 
 | 模块 | 职责 |
 |---|---|
-| `fs::context` | 每进程 cwd、fd 表、文件调用 dispatch；`Handle=Arc<Mutex<OpenFile>>`，dup/fork 共享偏移 |
+| `fs::context` | 每进程 cwd、fd 表及打开文件操作；`Handle=Arc<Mutex<OpenFile>>`，dup/fork 共享偏移；仅接收内核缓冲区，读结果交付成功后才消费管道数据或推进偏移 |
 | `fs::mod` | Ext4（rsext4）与 FAT 查找；先查 FAT 挂载再查 EXT4 根 |
 | `fs::fat` | rust-fatfs；路径即身份；虚拟 inode 从 0x8000_0000 递增 |
 | `fs::cache` | MAP_SHARED 文件页；映射持强引用、索引持弱引用、最后释放写回 |
