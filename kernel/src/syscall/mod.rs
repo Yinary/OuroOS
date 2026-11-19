@@ -23,6 +23,7 @@ pub mod sysnr {
     pub const IOCTL: usize = 29;
     pub const MKDIRAT: usize = 34;
     pub const UNLINKAT: usize = 35;
+    pub const RENAMEAT: usize = 38;
     pub const UMOUNT2: usize = 39;
     pub const MOUNT: usize = 40;
     pub const STATFS: usize = 43;
@@ -47,6 +48,7 @@ pub mod sysnr {
     pub const FSYNC: usize = 82;
     pub const UTIMENSAT: usize = 88;
     pub const UMASK: usize = 166;
+    pub const RENAMEAT2: usize = 276;
     pub const STATX: usize = 291;
     // 进程
     pub const EXIT: usize = 93;
@@ -96,6 +98,9 @@ pub enum Errno {
     Range,
     NameTooLong,
     Loop,
+    CrossDevice,
+    NotEmpty,
+    TooManyLinks,
     /// 内存不足。
     NoMem,
     /// 参数无效。
@@ -137,6 +142,9 @@ impl Errno {
             Self::Range => 34,
             Self::NameTooLong => 36,
             Self::Loop => 40,
+            Self::CrossDevice => 18,
+            Self::NotEmpty => 39,
+            Self::TooManyLinks => 31,
             Self::NoMem => 12,
             Self::Invalid => 22,
             Self::NotSupported => 95,
@@ -183,6 +191,8 @@ pub fn dispatch(
         | sysnr::FCNTL
         | sysnr::MKDIRAT
         | sysnr::UNLINKAT
+        | sysnr::RENAMEAT
+        | sysnr::RENAMEAT2
         | sysnr::UMOUNT2
         | sysnr::MOUNT
         | sysnr::STATFS

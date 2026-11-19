@@ -37,6 +37,7 @@ pub fn dispatch(
     match nr {
         sysnr::UMASK => Ok(ctx.set_umask(a[0])),
         sysnr::UTIMENSAT => utimensat(ctx, space, a),
+        sysnr::RENAMEAT | sysnr::RENAMEAT2 => renameat(nr, ctx, space, a),
         sysnr::GETCWD => {
             if a[1] < ctx.cwd().len() + 1 {
                 return Err(Errno::Range);
@@ -121,53 +122,13 @@ pub fn dispatch(
             }
             Ok(0)
         }
-        sysnr::GETDENTS64 => {
-            let handle = ctx.get(a[0])?;
-            let mut f = handle.lock();
-            let ino = f.directory()?;
-            let mut out = [0u8; 4096];
-            let cap = a[2].min(out.len());
-            let mut used = 0;
-            use fs::DirEntryKind;
-
-            let mut full = false;
-            let offset = fs::read_dir(ino, f.offset(), |entry| {
-                let len = (19 + entry.name.len() + 1 + 7) & !7;
-                if used + len > cap {
-                    full = true;
-                    return false;
-                }
-                let d = &mut out[used..used + len];
-                d[..8].copy_from_slice(&(entry.inode as u64).to_ne_bytes());
-                d[8..16].copy_from_slice(&(entry.next as u64).to_ne_bytes());
-                d[16..18].copy_from_slice(&(len as u16).to_ne_bytes());
-                d[18] = match entry.kind {
-                    DirEntryKind::Fifo => 1,
-                    DirEntryKind::Character => 2,
-                    DirEntryKind::Directory => 4,
-                    DirEntryKind::Block => 6,
-                    DirEntryKind::File => 8,
-                    DirEntryKind::Symlink => 10,
-                    DirEntryKind::Socket => 12,
-                    DirEntryKind::Unknown => 0,
-                };
-                d[19..19 + entry.name.len()].copy_from_slice(entry.name);
-                used += len;
-                true
-            })?;
-            if full && used == 0 {
-                return Err(Errno::Invalid);
-            }
-            user_access::copy_to_user(space, a[1], &out[..used]).map_err(|_| Errno::Fault)?;
-            f.set_offset(offset);
-            Ok(used)
-        }
+        sysnr::GETDENTS64 => getdents64(ctx, space, a[0], a[1], a[2]),
         sysnr::CHDIR => {
             let path = ctx.path((-100isize) as usize, &user_string(space, a[0])?)?;
             if fs::stat(fs::lookup(&path)?)?.0 & 0xf000 != 0x4000 {
                 return Err(Errno::NotDir);
             }
-            ctx.set_cwd(path);
+            ctx.set_cwd(path)?;
             Ok(0)
         }
         sysnr::OPENAT => {
@@ -201,7 +162,13 @@ pub fn dispatch(
             if a[2] & 0x200 != 0 && a[2] & 3 != 0 {
                 fs::truncate(ino)?;
             }
-            ctx.open_inode(ino, path, a[2], a[2] & 0x80000 != 0)
+            ctx.open_inode(
+                ino,
+                path,
+                a[2],
+                a[2] & 0x80000 != 0,
+                mode & 0xf000 == 0x4000,
+            )
         }
         #[cfg(not(feature = "rsext4-readonly"))]
         sysnr::FSYNC => {
@@ -261,6 +228,83 @@ pub fn dispatch(
         }
         _ => Err(Errno::NoSys),
     }
+}
+
+/// Linux getdents64：按后端续读位置打包目录项，缓冲区不足时返回 EINVAL。
+#[inline(never)]
+fn getdents64(
+    ctx: &Context,
+    space: &UserAddressSpace,
+    fd: usize,
+    output: usize,
+    count: usize,
+) -> Result<usize, Errno> {
+    let handle = ctx.get(fd)?;
+    let mut f = handle.lock();
+    let ino = f.directory()?;
+    let mut out = [0u8; 4096];
+    let cap = count.min(out.len());
+    let mut used = 0;
+    use fs::DirEntryKind;
+
+    let mut full = false;
+    let offset = fs::read_dir(ino, f.offset(), |entry| {
+        let len = (19 + entry.name.len() + 1 + 7) & !7;
+        if used + len > cap {
+            full = true;
+            return false;
+        }
+        let d = &mut out[used..used + len];
+        d[..8].copy_from_slice(&(entry.inode as u64).to_ne_bytes());
+        d[8..16].copy_from_slice(&(entry.next as u64).to_ne_bytes());
+        d[16..18].copy_from_slice(&(len as u16).to_ne_bytes());
+        d[18] = match entry.kind {
+            DirEntryKind::Fifo => 1,
+            DirEntryKind::Character => 2,
+            DirEntryKind::Directory => 4,
+            DirEntryKind::Block => 6,
+            DirEntryKind::File => 8,
+            DirEntryKind::Symlink => 10,
+            DirEntryKind::Socket => 12,
+            DirEntryKind::Unknown => 0,
+        };
+        d[19..19 + entry.name.len()].copy_from_slice(entry.name);
+        used += len;
+        true
+    })?;
+    if full && used == 0 {
+        return Err(Errno::Invalid);
+    }
+    user_access::copy_to_user(space, output, &out[..used]).map_err(|_| Errno::Fault)?;
+    f.set_offset(offset);
+    Ok(used)
+}
+
+/// Linux renameat/renameat2：支持普通改名及 NOREPLACE；交换和 whiteout 暂不支持。
+fn renameat(
+    nr: usize,
+    ctx: &Context,
+    space: &UserAddressSpace,
+    a: [usize; 6],
+) -> Result<usize, Errno> {
+    let flags = if nr == sysnr::RENAMEAT2 {
+        a[4] as u32
+    } else {
+        0
+    };
+    if flags & !1 != 0 {
+        return Err(Errno::Invalid);
+    }
+    let old = user_string(space, a[1])?;
+    let new = user_string(space, a[3])?;
+    ctx.rename(
+        a[0] as u32 as i32 as isize as usize,
+        &old,
+        a[2] as u32 as i32 as isize as usize,
+        &new,
+        flags & 1 != 0,
+    )?;
+    Ok(0)
 }
 
 /// Linux utimensat：支持路径、FD、NOW/OMIT 和末项不跟随；权限检查沿用现有模型。

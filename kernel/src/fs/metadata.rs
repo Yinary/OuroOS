@@ -48,6 +48,11 @@ fn string(s: &str) -> Result<String, Errno> {
 
 /// 查询绝对路径；follow 只控制末项链接，最多跟随 40 个链接。
 pub(crate) fn query(path: &str, follow: bool) -> Result<Metadata, Errno> {
+    resolve(path, follow).map(|(_, info)| info)
+}
+
+/// 解析绝对路径并返回规范路径及属性；保留与 query 相同的链接规则。
+pub(super) fn resolve(path: &str, follow: bool) -> Result<(String, Metadata), Errno> {
     let mut pending = string(path)?;
     let mut current = string("/")?;
     let mut info = metadata(lookup("/")?)?;
@@ -121,5 +126,5 @@ pub(crate) fn query(path: &str, follow: bool) -> Result<Metadata, Errno> {
         }
         cursor = next;
     }
-    Ok(info)
+    Ok((current, info))
 }

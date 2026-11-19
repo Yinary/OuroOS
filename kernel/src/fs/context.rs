@@ -1,13 +1,47 @@
 //! 进程工作目录、FD 表和打开文件对象；提供内核缓冲区读写与管道操作。
 #![deny(unsafe_code)]
 use crate::{fs, syscall::Errno};
-use alloc::{collections::VecDeque, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    collections::VecDeque,
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use spin::Mutex;
 
 /// pipe 缓冲容量（对齐 Linux 默认 64KiB）；写满/读空时阻塞等待。
 const PIPE_CAPACITY: usize = 65536;
 const FD_LIMIT: usize = 1024;
 const OPEN_CREATION_FLAGS: usize = 0x40 | 0x80 | 0x100 | 0x200 | 0x80000;
+
+static DIRECTORIES: Mutex<Vec<Weak<DirectoryPath>>> = Mutex::new(Vec::new());
+
+struct DirectoryPath(String);
+
+fn directory_path(path: String) -> Result<Arc<DirectoryPath>, Errno> {
+    let mut paths = DIRECTORIES.lock();
+    paths.retain(|p| p.strong_count() != 0);
+    paths.try_reserve(1).map_err(|_| Errno::NoMem)?;
+    let path = fs::try_arc(DirectoryPath(path))?;
+    paths.push(Arc::downgrade(&path));
+    Ok(path)
+}
+
+fn contains(parent: &str, path: &str) -> bool {
+    parent == "/"
+        || path == parent
+        || path
+            .strip_prefix(parent)
+            .is_some_and(|s| s.starts_with('/'))
+}
+
+fn directory_busy(path: &str) -> bool {
+    DIRECTORIES
+        .lock()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .any(|p| contains(path, &p.0))
+}
 
 struct Pipe {
     data: VecDeque<u8>,
@@ -24,6 +58,7 @@ enum Kind {
     Inode {
         ino: u32,
         path: String,
+        _directory: Option<Arc<DirectoryPath>>,
     },
 }
 /// 共享偏移、打开标志和文件资源的持有者。
@@ -61,7 +96,7 @@ struct Descriptor {
 
 /// 进程拥有 fd 表副本，共享打开文件描述，工作目录独立。
 pub struct Context {
-    cwd: String,
+    cwd: Arc<DirectoryPath>,
     fds: Vec<Option<Descriptor>>,
     umask: u16,
 }
@@ -87,7 +122,7 @@ impl Context {
             }));
         }
         Ok(Self {
-            cwd: string("/")?,
+            cwd: directory_path(string("/")?)?,
             fds,
             umask: 0o022,
         })
@@ -98,7 +133,7 @@ impl Context {
         fds.try_reserve(self.fds.len()).map_err(|_| Errno::NoMem)?;
         fds.extend(self.fds.iter().cloned());
         Ok(Self {
-            cwd: string(&self.cwd)?,
+            cwd: self.cwd.clone(),
             fds,
             umask: self.umask,
         })
@@ -186,12 +221,14 @@ impl Context {
         let mut out = if input.starts_with('/') {
             string("/")?
         } else if dir as isize == -100 {
-            string(&self.cwd)?
+            string(self.cwd())?
         } else {
             let f = self.get(dir)?;
             let f = f.lock();
             match &f.kind {
-                Kind::Inode { ino, path } if fs::stat(*ino)?.0 & 0xf000 == 0x4000 => string(path)?,
+                Kind::Inode { ino, path, .. } if fs::stat(*ino)?.0 & 0xf000 == 0x4000 => {
+                    string(path)?
+                }
                 _ => return Err(Errno::NotDir),
             }
         };
@@ -241,7 +278,7 @@ impl Context {
     ) -> Result<fs::Metadata, Errno> {
         if input.is_empty() && empty {
             if dir as isize == -100 {
-                return fs::query(&self.cwd, true);
+                return fs::query(self.cwd(), true);
             }
             return self.get(dir)?.lock().metadata();
         }
@@ -252,7 +289,7 @@ impl Context {
             return fs::query(input, follow);
         }
         let base = if dir as isize == -100 {
-            string(&self.cwd)?
+            string(self.cwd())?
         } else {
             let file = self.get(dir)?;
             let file = file.lock();
@@ -272,12 +309,114 @@ impl Context {
 
     /// 返回当前工作目录。
     pub(crate) fn cwd(&self) -> &str {
-        &self.cwd
+        &self.cwd.0
     }
 
     /// 保存调用方已验证的绝对工作目录。
-    pub(crate) fn set_cwd(&mut self, path: String) {
-        self.cwd = path;
+    pub(crate) fn set_cwd(&mut self, path: String) -> Result<(), Errno> {
+        self.cwd = directory_path(path)?;
+        Ok(())
+    }
+
+    fn rename_path(&self, dir: usize, input: &str) -> Result<(String, u32, String), Errno> {
+        if input.is_empty() {
+            return Err(Errno::NoEntry);
+        }
+        let trimmed = input.trim_end_matches('/');
+        let (parent, name) = match trimmed.rsplit_once('/') {
+            Some(("", name)) => ("/", name),
+            Some(parts) => parts,
+            None => (".", trimmed),
+        };
+        if name.is_empty() || matches!(name, "." | "..") {
+            return Err(Errno::Busy);
+        }
+        if name.len() > 255 {
+            return Err(Errno::NameTooLong);
+        }
+        let mut base = if input.starts_with('/') {
+            string("")?
+        } else if dir as isize == -100 {
+            string(self.cwd())?
+        } else {
+            let handle = self.get(dir)?;
+            let file = handle.lock();
+            file.directory()?;
+            match &file.kind {
+                Kind::Inode { path, .. } => string(path)?,
+                _ => return Err(Errno::NotDir),
+            }
+        };
+        base.try_reserve(parent.len() + 1)
+            .map_err(|_| Errno::NoMem)?;
+        if !base.is_empty() {
+            base.push('/');
+        }
+        base.push_str(parent);
+        let (mut canonical, info) = fs::metadata::resolve(&base, true)?;
+        if info.mode & 0xf000 != 0x4000 {
+            return Err(Errno::NotDir);
+        }
+        canonical
+            .try_reserve(name.len() + 1)
+            .map_err(|_| Errno::NoMem)?;
+        if canonical != "/" {
+            canonical.push('/');
+        }
+        canonical.push_str(name);
+        if canonical.len() >= 4096 {
+            return Err(Errno::NameTooLong);
+        }
+        Ok((canonical, info.ino as u32, string(name)?))
+    }
+
+    /// 重命名文件或目录；拒绝移动仍由 cwd、目录 FD 或挂载引用的目录树。
+    pub(crate) fn rename(
+        &self,
+        old_dir: usize,
+        old: &str,
+        new_dir: usize,
+        new: &str,
+        no_replace: bool,
+    ) -> Result<(), Errno> {
+        let (old_path, old_parent, old_name) = self.rename_path(old_dir, old)?;
+        let (new_path, new_parent, new_name) = self.rename_path(new_dir, new)?;
+        let source = fs::query(&old_path, false)?;
+        let target = match fs::query(&new_path, false) {
+            Ok(info) => Some(info),
+            Err(Errno::NoEntry) => None,
+            Err(error) => return Err(error),
+        };
+        if (old.ends_with('/') || new.ends_with('/')) && source.mode & 0xf000 != 0x4000 {
+            return Err(Errno::NotDir);
+        }
+        if new.ends_with('/') && target.as_ref().is_some_and(|t| t.mode & 0xf000 != 0x4000) {
+            return Err(Errno::NotDir);
+        }
+        if no_replace && target.is_some() {
+            return Err(Errno::Exists);
+        }
+        if source.mode & 0xf000 == 0x4000 && contains(&old_path, &new_path) && old_path != new_path
+        {
+            return Err(Errno::Invalid);
+        }
+        if fs::fat::contains_mount(&old_path) || fs::fat::contains_mount(&new_path) {
+            return Err(Errno::Busy);
+        }
+        if !no_replace
+            && target
+                .as_ref()
+                .is_some_and(|t| t.dev == source.dev && t.ino == source.ino)
+        {
+            return fs::rename(old_parent, &old_name, new_parent, &new_name, false);
+        }
+        if source.mode & 0xf000 == 0x4000 && directory_busy(&old_path)
+            || target.as_ref().is_some_and(|t| t.mode & 0xf000 == 0x4000)
+                && directory_busy(&new_path)
+        {
+            return Err(Errno::Busy);
+        }
+        fs::rename(old_parent, &old_name, new_parent, &new_name, no_replace)
     }
 
     /// 将打开文件复制到指定 FD，替换原描述符。
@@ -316,11 +455,21 @@ impl Context {
         path: String,
         flags: usize,
         cloexec: bool,
+        is_directory: bool,
     ) -> Result<usize, Errno> {
+        let directory = if is_directory {
+            Some(directory_path(string(&path)?)?)
+        } else {
+            None
+        };
         fs::retain(ino)?;
         self.install(
             fs::try_arc(Mutex::new(OpenFile {
-                kind: Kind::Inode { ino, path },
+                kind: Kind::Inode {
+                    ino,
+                    path,
+                    _directory: directory,
+                },
                 offset: 0,
                 flags: flags & !OPEN_CREATION_FLAGS,
             }))?,

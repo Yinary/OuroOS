@@ -129,6 +129,23 @@ pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
     }
 }
 
+/// 在同一挂载内改名；FAT 暂不支持，跨挂载返回 EXDEV。
+pub(crate) fn rename(
+    old: u32,
+    name: &str,
+    new: u32,
+    target: &str,
+    no_replace: bool,
+) -> Result<(), Errno> {
+    if metadata::metadata(old)?.dev != metadata::metadata(new)?.dev {
+        return Err(Errno::CrossDevice);
+    }
+    if old & FAT_INODE != 0 {
+        return Err(Errno::NotSupported);
+    }
+    ext4::rename(old, name, new, target, no_replace)
+}
+
 /// 读取文件指定偏移，EOF 返回零。
 pub fn read_raw(ino: u32, offset: usize, data: &mut [u8]) -> Result<usize, Errno> {
     if ino & FAT_INODE != 0 {

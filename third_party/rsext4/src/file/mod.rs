@@ -46,3 +46,5 @@ pub use io::{
 };
 pub use link::link;
 pub use rename::{mv, rename};
+// OuroOS patch: inode-based rename and deferred target reclamation.
+pub use rename::{rename_entry, reclaim_rename_target};

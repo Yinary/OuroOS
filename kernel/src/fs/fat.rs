@@ -7,6 +7,16 @@ use spin::Mutex;
 static MOUNTS: Mutex<Vec<Mount>> = Mutex::new(Vec::new());
 static NEXT_DEVICE: AtomicU32 = AtomicU32::new(2);
 static NEXT: AtomicU32 = AtomicU32::new(0x8000_0000);
+
+/// 判断路径本身或其子目录是否有挂载点。
+pub(super) fn contains_mount(path: &str) -> bool {
+    MOUNTS.lock().iter().any(|m| {
+        m.path == path
+            || m.path
+                .strip_prefix(path)
+                .is_some_and(|s| s.starts_with('/'))
+    })
+}
 struct Node {
     ino: u32,
     path: String,

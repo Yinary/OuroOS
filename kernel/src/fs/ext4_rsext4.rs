@@ -197,6 +197,8 @@ fn error(err: Ext4Error) -> Errno {
         Ext4Errno::ENOMEM => Errno::NoMem,
         Ext4Errno::ENOSPC => Errno::NoSpace,
         Ext4Errno::EEXIST => Errno::Exists,
+        Ext4Errno::ENOTEMPTY => Errno::NotEmpty,
+        Ext4Errno::EMLINK => Errno::TooManyLinks,
         Ext4Errno::ENAMETOOLONG => Errno::NameTooLong,
         Ext4Errno::EFBIG => Errno::FileTooBig,
         Ext4Errno::EROFS => Errno::ReadOnly,
@@ -558,6 +560,42 @@ pub(super) fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
         })?;
         if links == 0 && !v.opens.iter().any(|&(id, _)| id == ino) {
             reclaim_unlinked(v, ino)?;
+        }
+        Ok(())
+    })
+}
+
+/// 串行更新目录项，旧目标 inode 无链接且无打开引用时才回收。
+pub(super) fn rename(
+    old: u32,
+    name: &str,
+    new: u32,
+    target: &str,
+    no_replace: bool,
+) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        let replaced = rsext4::file::rename_entry(
+            &mut v.fs,
+            &mut v.device,
+            InodeNumber::new(old)?,
+            name,
+            InodeNumber::new(new)?,
+            target,
+            no_replace,
+        )
+        .inspect_err(|e| {
+            if matches!(e.code, rsext4::Errno::EIO | rsext4::Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })?;
+        if let Some(ino) = replaced {
+            if !v.opens.iter().any(|&(id, _)| id == ino.raw()) {
+                rsext4::file::reclaim_rename_target(&mut v.fs, &mut v.device, ino)
+                    .inspect_err(|_| v.failed = true)?;
+            }
         }
         Ok(())
     })
