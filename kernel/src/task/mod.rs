@@ -13,9 +13,12 @@ use alloc::vec::Vec;
 
 use polyhal::{irq::IRQ, println};
 
-use crate::{mm, mm::address_space::LocalSpace, sync::DebugMutex, trap::UserFault};
+use crate::{
+    mm, mm::address_space::LocalSpace, sync::DebugMutex, syscall::signal::SA_NOCLDWAIT,
+    trap::UserFault,
+};
 
-use signal::SignalState;
+use signal::{SigInfoSlot, SignalState, CLD_EXITED, CLD_KILLED, SIGCHLD, SIG_IGN};
 
 pub use sched::yield_now;
 pub use task::{Pid, WaitReason};
@@ -119,9 +122,10 @@ mod registry {
     /// 任务退出的唯一登记点：记录终态并释放地址空间。
     /// 终态行积攒到时代末统一输出（不混入用户程序的测试输出块，官方
     /// oracle 按 START/END 块判定）；孤儿过继内核 init，已退出的孤儿
-    /// 即收（无消费者，运行时间累归丢弃）。space/fs 的 Drop（页释放、
-    /// fd 关闭、可能的磁盘回收）在锁外完成，避免 REGISTRY 锁内嵌套磁盘
-    /// I/O 与反向取锁。
+    /// 即收（无消费者，运行时间累归丢弃）。向活跃父进程产生 SIGCHLD
+    ///（父 IGN/SA_NOCLDWAIT 时自动收割，语义见 docs/ostd-contracts.md）。
+    /// space/fs 的 Drop（页释放、fd 关闭、可能的磁盘回收）在锁外完成，
+    /// 避免 REGISTRY 锁内嵌套磁盘 I/O 与反向取锁。
     pub fn record_exit(pid: Pid, exit: ExitInfo) {
         let taken = {
             let mut reg = REGISTRY.lock();
@@ -143,10 +147,66 @@ mod registry {
             }
             let init = INIT_PID.load(core::sync::atomic::Ordering::Relaxed);
             let orphan = rec.parent == init;
+            // SIGCHLD 挂接要用的字段先复制出来：父记录要在同一锁作用域
+            // 内另行 find（可变借用），不能与 rec 的借用重叠。
+            let parent_pid = rec.parent;
+            let (own_user, own_system, child_user, child_system) = (
+                rec.user_ns,
+                rec.system_ns,
+                rec.child_user_ns,
+                rec.child_system_ns,
+            );
+            let chld_slot = SigInfoSlot {
+                code: match exit {
+                    ExitInfo::Exited(_) => CLD_EXITED,
+                    ExitInfo::Signaled { .. } => CLD_KILLED,
+                },
+                pid: pid as u32,
+                status: match exit {
+                    ExitInfo::Exited(n) => n,
+                    ExitInfo::Signaled { sig, .. } => sig as i32,
+                },
+                ..Default::default()
+            };
             let taken = (rec.space.take(), rec.fs.take());
-            // 孤儿即收：清理已退出孩子及退出时已过继 init 的任务。
-            reg.records
-                .retain(|r| !(r.parent == pid && r.exit.is_some() || (r.pid == pid && orphan)));
+            // SIGCHLD 通知（对应 Linux do_notify_parent/exit_notify）：
+            // 父处置 IGN 或 SA_NOCLDWAIT 时自动收割——不产生僵尸，本次
+            // 退出的记录在下方 retain 一并移除，运行时间累计并入父（与
+            // reap_child 口径一致）；否则向父入队 SIGCHLD。全程持
+            // REGISTRY 锁内联完成，禁止嵌套取锁；孤儿路径不通知（父为
+            // init，已即收）。
+            let auto_reap = if orphan {
+                false
+            } else {
+                match reg
+                    .records
+                    .iter_mut()
+                    .find(|r| r.pid == parent_pid && r.exit.is_none())
+                {
+                    Some(parent) => {
+                        let d = parent.signal.disposition(SIGCHLD);
+                        if d.handler == SIG_IGN || d.flags & SA_NOCLDWAIT != 0 {
+                            parent.child_user_ns = parent
+                                .child_user_ns
+                                .saturating_add(own_user.saturating_add(child_user));
+                            parent.child_system_ns = parent
+                                .child_system_ns
+                                .saturating_add(own_system.saturating_add(child_system));
+                            true
+                        } else {
+                            parent.signal.generate(SIGCHLD, chld_slot);
+                            false
+                        }
+                    }
+                    // 父记录不在表（如内核任务父为 0）：维持现状，不通知。
+                    None => false,
+                }
+            };
+            // 孤儿即收：清理已退出孩子及退出时已过继 init 的任务；
+            // 自动收割的记录在此一并移除。
+            reg.records.retain(|r| {
+                !(r.parent == pid && r.exit.is_some() || (r.pid == pid && (orphan || auto_reap)))
+            });
             for child in reg.records.iter_mut().filter(|r| r.parent == pid) {
                 child.parent = init;
             }

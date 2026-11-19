@@ -4,11 +4,14 @@
 //! 见 docs/ostd-contracts.md §4；PC 推进由运行循环统一处理。
 
 mod memory;
-mod signal;
+// pub(crate)：SA_NOCLDWAIT 由 task 层 record_exit 消费（UAPI 常量
+// 集中在本模块定义）。
+pub(crate) mod signal;
 
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 
 use crate::mm::{address_space::UserAddressSpace, user_access};
+use crate::task::signal::{SigInfoSlot, SIGPIPE};
 use crate::task::WaitReason;
 
 /// 已实现的通用 UAPI 调用号（asm-generic/unistd.h，rv64/la64 共用）。
@@ -203,6 +206,20 @@ pub fn dispatch(
             // pipe 无数据/无空间且非 O_NONBLOCK：转为阻塞等待
             if ret == Err(Errno::WouldBlock) {
                 return Flow::Wait(WaitReason::Pipe);
+            }
+            // 向无读者的管道写入：SIGPIPE 入队与 -EPIPE 返回并行
+            //（对应 Linux pipe_write，二者同时发生；信号是否致命由
+            // 投递阶段决定）。拦截在 dispatch 层：fs 层不持有调用者的
+            // 信号状态，保持文件层与信号机制无关。
+            if ret == Err(Errno::Pipe) && (nr == sysnr::WRITE || nr == sysnr::WRITEV) {
+                signal.generate(
+                    SIGPIPE,
+                    // code=0 即 SI_USER，发送者为调用进程自身。
+                    SigInfoSlot {
+                        pid: pid as u32,
+                        ..Default::default()
+                    },
+                );
             }
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue

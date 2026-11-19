@@ -26,8 +26,12 @@ pub const SIGTRAP: u8 = 5;
 pub const SIGBUS: u8 = 7;
 /// SIGSEGV：无效内存访问。
 pub const SIGSEGV: u8 = 11;
+/// SIGPIPE：向无读者的管道写入。
+pub const SIGPIPE: u8 = 13;
 /// SIGKILL：不可捕获、不可屏蔽的终止信号。
 pub const SIGKILL: u8 = 9;
+/// SIGCHLD：子进程终止。
+pub const SIGCHLD: u8 = 17;
 /// SIGSTOP：不可捕获、不可屏蔽的停止信号。
 pub const SIGSTOP: u8 = 19;
 
@@ -122,28 +126,40 @@ impl SignalSetExt for SignalSet {
 pub struct SignalDisposition {
     /// 处理函数地址或 SIG_DFL/SIG_IGN。
     pub handler: usize,
-    /// sa_flags（sigaction 传入，本步仅存储，消费方：投递阶段）。
-    #[allow(dead_code)]
+    /// sa_flags（sigaction 传入；SA_NOCLDWAIT 由 record_exit 消费，
+    /// 其余位消费方：投递阶段）。
     pub flags: u32,
     /// sa_mask（本步仅存储，消费方：投递阶段）。
     #[allow(dead_code)]
     pub mask: SignalSet,
 }
 
+/// siginfo si_code 子集（来源：Linux include/uapi/asm-generic/siginfo.h）。
+/// CLD_EXITED：子进程正常退出。
+pub const CLD_EXITED: i32 = 1;
+/// siginfo si_code：子进程死于信号。
+pub const CLD_KILLED: i32 = 2;
+
 /// 每信号一个信息槽（信号号由槽位下标隐含）：siginfo 字段子集。
-/// 本步只定义结构（默认全零），语义填充由投递阶段接入。
-#[allow(dead_code)]
+/// 产生侧只填充 code/pid/status 子集，其余字段保持默认；字段在产生
+/// 侧只写不读，读取方（整体取槽）为投递阶段，未读字段以定位
+/// allow 标注。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SigInfoSlot {
     /// si_code。
+    #[allow(dead_code)]
     pub code: i32,
     /// si_errno。
+    #[allow(dead_code)]
     pub errno: i32,
     /// 出错地址（SIGSEGV/SIGBUS 等填充）。
+    #[allow(dead_code)]
     pub addr: usize,
     /// 发送方 pid。
+    #[allow(dead_code)]
     pub pid: u32,
     /// 子进程退出状态（SIGCHLD 用）。
+    #[allow(dead_code)]
     pub status: i32,
 }
 
@@ -204,6 +220,31 @@ impl SignalState {
         self.info[sig as usize] = slot;
     }
 
+    /// 同锁信号产生入口：record_exit 与 syscall 层在已持 REGISTRY 锁
+    /// 时内联调用（锁非重入，禁止再经 send_signal 嵌套取锁）。过滤
+    /// 规则对应 Linux __send_signal/sig_ignored（kernel/signal.c）：
+    /// 屏蔽中的信号照常入队（sig_ignored 对 blocked 恒 false）；处置
+    /// IGN，或 DFL 且默认动作属 IGNORE 集（CHLD/CONT/URG/WINCH，即
+    /// 本表 Ign 与 Cont 两类，对应 include/linux/signal.h 的
+    /// SIG_KERNEL_IGNORE_MASK）的信号静默丢弃；其余入队。本步只入队：
+    /// pending 消费与唤醒属投递阶段 commit。调用方保证 sig 在合法域
+    /// 1..=64；queue 对域外信号不修改状态。
+    pub fn generate(&mut self, sig: u8, slot: SigInfoSlot) {
+        if !self.blocked.has(sig) {
+            let d = self.disposition(sig);
+            let ignored = d.handler == SIG_IGN
+                || (d.handler == SIG_DFL
+                    && matches!(
+                        default_action(sig),
+                        DefaultAction::Ign | DefaultAction::Cont
+                    ));
+            if ignored {
+                return;
+            }
+        }
+        self.queue(sig, slot);
+    }
+
     /// 设置信号 sig 的处置；sig 不在 1..=64 时不修改任何状态。
     pub fn set_disposition(&mut self, sig: u8, d: SignalDisposition) {
         if (1..=64).contains(&sig) {
@@ -258,14 +299,10 @@ impl SignalState {
     }
 }
 
-/// 信号产生的唯一入口：在目标进程的记录上登记一个信号。目标不存在
-/// 或已退出（僵尸）返回 ESRCH。过滤规则对应 Linux __send_signal/
-/// sig_ignored（kernel/signal.c）：屏蔽中的信号照常入队（sig_ignored
-/// 对 blocked 恒 false）；处置 IGN，或 DFL 且默认动作属 IGNORE 集
-///（CHLD/CONT/URG/WINCH，即本表 Ign 与 Cont 两类，对应 include/
-/// linux/signal.h 的 SIG_KERNEL_IGNORE_MASK）的信号静默丢弃并报告
-/// 成功；其余入队。本步只入队：pending 消费与唤醒属投递阶段 commit。
-/// 调用方保证 sig 在合法域 1..=64；queue 对域外信号不修改状态。
+/// 锁外路径的信号产生入口（kill/tgkill）：取 REGISTRY 锁、找活跃
+/// 目标后交 [`SignalState::generate`] 过滤入队。目标不存在或已退出
+///（僵尸）返回 ESRCH。已持 REGISTRY 锁的调用方须改用
+/// [`SignalState::generate`]（锁非重入，不可嵌套取锁）。
 pub fn send_signal(target: Pid, sig: u8, slot: SigInfoSlot) -> Result<(), Errno> {
     let mut reg = REGISTRY.lock();
     let rec = reg
@@ -273,19 +310,7 @@ pub fn send_signal(target: Pid, sig: u8, slot: SigInfoSlot) -> Result<(), Errno>
         .iter_mut()
         .find(|r| r.pid == target && r.exit.is_none())
         .ok_or(Errno::NoProcess)?;
-    if !rec.signal.blocked.has(sig) {
-        let d = rec.signal.disposition(sig);
-        let ignored = d.handler == SIG_IGN
-            || (d.handler == SIG_DFL
-                && matches!(
-                    default_action(sig),
-                    DefaultAction::Ign | DefaultAction::Cont
-                ));
-        if ignored {
-            return Ok(());
-        }
-    }
-    rec.signal.queue(sig, slot);
+    rec.signal.generate(sig, slot);
     Ok(())
 }
 
