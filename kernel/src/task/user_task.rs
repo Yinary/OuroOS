@@ -105,6 +105,11 @@ pub fn user_task_entry() -> ! {
     // sigsuspend 存换入前的旧屏蔽集合；sigtimedwait 存等待集与绝对截止。
     let mut sigsuspend_saved: Option<SignalSet> = None;
     let mut timedwait: Option<(SignalSet, core::time::Duration)> = None;
+    // 最近一次等待的 syscall 是否尚未完成（PC 停在 ecall）。sigsuspend
+    // 存续期间检查点投递 handler 帧前据此补一次 -EINTR 完成（见循环顶
+    // 检查点注释），否则 sigreturn 回到 ecall 会让 sigsuspend 重启而非
+    // 返回。仅在 saved 非空时被消费，不会误伤其他 syscall。
+    let mut wait_uncompleted = false;
 
     loop {
         // 一轮 = 激活页表 + 投递检查点 → 进用户态 → 消费一次逃逸。
@@ -151,6 +156,18 @@ pub fn user_task_entry() -> ! {
                             // blocked_now 相同。仅在建帧时取走 saved，
                             // DFL/IGN 等无帧去向留给 RT_SIGSUSPEND 重入
                             // 分支恢复，避免旧集合过早生效把信号永久屏蔽。
+                            //
+                            // sigsuspend 等待被同批更高号 handler 信号打断且
+                            // syscall 尚未完成（PC 停在 ecall，例如低号
+                            // DFL/Ign 信号刚被快路径丢弃）：按 Linux
+                            // ERESTARTNOHAND 先以 -EINTR 完成再建帧，保证
+                            // handler 返回后用户态见到的是 -EINTR 而非重启。
+                            if sigsuspend_saved.is_some() && wait_uncompleted {
+                                frame.syscall_ok();
+                                frame[TrapFrameArgs::RET] =
+                                    crate::syscall::to_abi(Err(Errno::Interrupted));
+                                wait_uncompleted = false;
+                            }
                             let save_mask = sigsuspend_saved.take().unwrap_or(blocked_now);
                             let space = rec
                                 .space
@@ -362,15 +379,19 @@ pub fn user_task_entry() -> ! {
             // nanosleep/sigsuspend 被打断后静默续等），随后才回循环顶
             // 检查点——彼时已无可投递信号，检查点不会越权消费。
             Action::Wait(reason) => {
-                if park_check_signals(
+                let outcome = park_check_signals(
                     pid,
                     reason,
                     &mut frame,
                     &mut sleep_deadline,
                     &mut timedwait,
                     true,
-                ) {
-                    park_check_signals(
+                );
+                wait_uncompleted = outcome != ParkOutcome::Completed;
+                if outcome == ParkOutcome::Parked {
+                    // 睡醒后的不落睡重查（决策表同上）：睡中到达的信号在
+                    // 唤醒点处理完，随后才回循环顶检查点。
+                    let outcome = park_check_signals(
                         pid,
                         reason,
                         &mut frame,
@@ -378,6 +399,7 @@ pub fn user_task_entry() -> ! {
                         &mut timedwait,
                         false,
                     );
+                    wait_uncompleted = outcome != ParkOutcome::Completed;
                 }
             }
             Action::Continue => {
@@ -407,6 +429,19 @@ fn delivery_verdict(sig: u8, slot: SigInfoSlot, d: SignalDisposition) -> Option<
         }),
         DefaultAction::Ign | DefaultAction::Cont | DefaultAction::Stop => None,
     }
+}
+
+/// park 快路径一次调用后，被等待 syscall 的完成状态（PC 是否仍停在
+/// ecall）。检查点在 sigsuspend 存续期间投递 handler 帧前据此决定是否
+/// 先以 -EINTR 完成（见循环顶注释）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParkOutcome {
+    /// 发生了一次真实挂起，醒来返回（PC 停在 ecall）。
+    Parked,
+    /// 未挂起，syscall 未完成（快路径丢弃/重启臂，PC 停在 ecall）。
+    Incomplete,
+    /// syscall 已完成（EINTR/TwHit 等完成臂，PC 已推进）。
+    Completed,
 }
 
 /// park 快路径对 peek 到的信号的去向。
@@ -444,8 +479,10 @@ enum ParkPeek {
 /// 已被唤醒；第二次 allow_park=false 只决策不落睡，把睡中到达的信号
 /// 在唤醒点处理完（此前这些信号要等循环顶检查点，会把 sigtimedwait
 /// 集合内信号按 DFL 杀掉、令 nanosleep/sigsuspend 被打断后静默续等，
-/// 均为 Linux 语义偏差）。返回是否发生了一次真实挂起：true 时调用方
-/// 补第二次调用（快路径完成臂已推进 PC，二次进入会重复 syscall_ok）。
+/// 均为 Linux 语义偏差）。返回 [`ParkOutcome`]：Parked 时调用方补第二
+/// 次调用（快路径完成臂已推进 PC，二次进入会重复 syscall_ok）；调用方
+/// 另以 Completed/Incomplete 维护"syscall 未完成"标志，供检查点在
+/// sigsuspend 投递前补 -EINTR 完成。
 ///
 /// DFL/IGN 丢弃臂不在此重挂起：返回后由 syscall 重执行的 Mesa 重查
 /// 决定是否继续等。盲目 re-park 会吞掉与本次丢弃同时到达的 children/
@@ -467,7 +504,7 @@ fn park_check_signals(
     sleep_deadline: &mut Option<core::time::Duration>,
     timedwait: &mut Option<(SignalSet, core::time::Duration)>,
     allow_park: bool,
-) -> bool {
+) -> ParkOutcome {
     // sigtimedwait 的等待集；Some 即本次挂起属于 rt_sigtimedwait
     //（与 nanosleep 的 Deadline 归属互斥：同一挂起至多一个 Some）。
     let tw_set = timedwait.map(|(set, _)| set);
@@ -517,9 +554,9 @@ fn park_check_signals(
                 // 无可投递信号：挂起（保留 syscall PC，醒来后由调用方
                 // 补一次不落睡的重查）。
                 sched::park(reason);
-                true
+                ParkOutcome::Parked
             } else {
-                false
+                ParkOutcome::Incomplete
             }
         }
         ParkPeek::TwHit { sig, slot } => {
@@ -533,7 +570,7 @@ fn park_check_signals(
             // Wait 路径原欠一次 syscall_ok，完成恰好补上。
             frame.syscall_ok();
             frame[TrapFrameArgs::RET] = ret;
-            false
+            ParkOutcome::Completed
         }
         ParkPeek::Handler(d) => match reason {
             WaitReason::Deadline(until) => {
@@ -575,17 +612,19 @@ fn park_check_signals(
                     frame.syscall_ok();
                     frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
                 }
-                false
+                ParkOutcome::Completed
             }
             // SA_RESTART：不完成不睡，PC 留在 ecall；信号留在 pending，
             // 循环顶检查点投递 handler，sigreturn 后重执行重查（Linux
             // ERESTARTSYS 重启语义）。
-            WaitReason::Pipe | WaitReason::Children if d.flags & SA_RESTART != 0 => false,
+            WaitReason::Pipe | WaitReason::Children if d.flags & SA_RESTART != 0 => {
+                ParkOutcome::Incomplete
+            }
             // 其余：完成 syscall 返回 -EINTR；信号留给循环顶检查点。
             _ => {
                 frame.syscall_ok();
                 frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
-                false
+                ParkOutcome::Completed
             }
         },
         ParkPeek::Default { sig, slot, d } => {
@@ -595,8 +634,8 @@ fn park_check_signals(
             }
             // Ign/Cont/Stop（含防御 IGN）：丢弃即可，不在此重挂起——
             // 由 syscall 重执行的 Mesa 重查决定是否继续等（理由见函数
-            // 注释）。
-            false
+            // 注释）。syscall 未完成（PC 停在 ecall），据此报 Incomplete。
+            ParkOutcome::Incomplete
         }
     }
 }
