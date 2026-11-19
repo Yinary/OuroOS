@@ -33,7 +33,8 @@ const OFF_UC_SIGMASK: usize = 168;
 /// uc_mcontext（sigcontext）偏移：uc_sigmask 128 字节后按 sigcontext 的
 /// 16 字节对齐补 8 字节填充（musl ucontext_t 显式 char __pad[8] 同位）。
 const OFF_UC_MCONTEXT: usize = 304;
-/// sc_fpregs / sc_extdesc 联合体偏移：sc_regs 248 字节后按 16 对齐。
+/// sc_fpregs / sc_extdesc 联合体偏移：sc_regs 256 字节（32 项）后恰为
+/// 16 对齐，无填充。
 const OFF_SC_UNION: usize = 560;
 /// sc_extdesc.reserved 偏移（联合体内 __padding[129] 之后，恒零字段）。
 const OFF_SC_RSVD: usize = 1076;
@@ -116,8 +117,9 @@ pub fn build_deliver(
     sigmask[..8].copy_from_slice(&old_blocked.to_ne_bytes());
     write(space, base + OFF_UC_SIGMASK, &sigmask)?;
 
-    // sc_regs：user_regs_struct = [pc, x1..x31]，即 pt_regs 的前缀原样拷出。
-    let mut regs = [0u8; 248];
+    // sc_regs：user_regs_struct = [pc, x1..x31]，32 项共 256 字节，
+    // 即 pt_regs 的前缀原样拷出。
+    let mut regs = [0u8; 256];
     regs[..8].copy_from_slice(&frame[TrapFrameArgs::SEPC].to_ne_bytes());
     for (i, r) in frame.x[1..].iter().enumerate() {
         regs[(i + 1) * 8..(i + 2) * 8].copy_from_slice(&r.to_ne_bytes());
@@ -192,7 +194,7 @@ pub fn restore(frame: &mut TrapFrame, space: &UserAddressSpace) -> Result<Signal
         return Err(FrameError::BadFrame);
     }
 
-    let mut regs = [0u8; 248];
+    let mut regs = [0u8; 256];
     read(space, base + OFF_UC_MCONTEXT, &mut regs)?;
     let mut fp = [0u8; 260];
     read(space, base + OFF_SC_UNION, &mut fp)?;
