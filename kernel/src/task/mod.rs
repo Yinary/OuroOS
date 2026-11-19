@@ -50,7 +50,7 @@ pub struct ProcessRecord {
     child_user_ns: u64,
     child_system_ns: u64,
     fs: Option<crate::fs::context::Context>,
-    /// 信号状态（模型见 signal 模块；投递逻辑由后续 commit 接入）。
+    /// 信号状态（模型见 signal 模块）。
     pub signal: SignalState,
     pub pid: Pid,
     pub name: &'static str,
@@ -163,7 +163,9 @@ mod registry {
                 },
                 pid: pid as u32,
                 status: match exit {
-                    ExitInfo::Exited(n) => n,
+                    // wait4 的 WEXITSTATUS 口径：si_status 只保留低 8 位
+                    //（Linux do_notify_parent 的 exit_code & 0xff）。
+                    ExitInfo::Exited(n) => n & 255,
                     ExitInfo::Signaled { sig, .. } => sig as i32,
                 },
                 ..Default::default()

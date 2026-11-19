@@ -8,7 +8,8 @@
 use super::Errno;
 use crate::mm::{address_space::UserAddressSpace, user_access};
 use crate::task::signal::{
-    SignalDisposition, SignalSet, SignalSetExt, SignalState, SIGKILL, SIGSTOP, SS_DISABLE,
+    default_action, DefaultAction, SignalDisposition, SignalSet, SignalSetExt, SignalState,
+    SIGKILL, SIGSTOP, SIG_DFL, SIG_IGN, SS_DISABLE,
 };
 
 /// SA_* 位与 SIG_BLOCK/UNBLOCK/SETMASK 的 UAPI 值（include/uapi/
@@ -82,8 +83,10 @@ impl KernelSigAction {
 /// 处置：flags 按 u32 存储（SA_* 最大 0x8000_0000 不丢失）并剥除
 /// SA_RESTORER 位，sa_mask 中 SIGKILL/SIGSTOP 位剥除（do_sigaction 的
 /// sigdelsetmask）。handler ∈ {SIG_DFL=0, SIG_IGN=1, 函数地址}。oact≠0
-/// 时回写旧值同构 24 字节（{handler, flags, mask}）。设置 IGN/DFL-Ign
-/// 时丢弃已排队信号的语义未实现，登记 docs/ostd-contracts.md。
+/// 时回写调用前的旧值同构 24 字节（{handler, flags, mask}；act 与 oact
+/// 同传时先快照旧值，同 Linux do_sigaction）。处置设为忽略（显式
+/// SIG_IGN，或 DFL 且默认动作属忽略集）时清除该信号的 pending 位与
+/// 信息槽（flush_sigqueue_mask 单信号语义）。
 pub(super) fn rt_sigaction(
     space: &crate::mm::address_space::UserAddressSpace,
     sig: usize,
@@ -107,6 +110,9 @@ pub(super) fn rt_sigaction(
         action.flags &= !SA_RESTORER;
         action.mask.del(SIGKILL);
         action.mask.del(SIGSTOP);
+        // 旧处置先快照：act 与 oact 同传时 oact 必须回写调用前的值
+        //（Linux do_sigaction 先 *oact=*k 再赋新）。
+        let old = (oact != 0).then(|| state.disposition(sig));
         state.set_disposition(
             sig,
             SignalDisposition {
@@ -115,8 +121,27 @@ pub(super) fn rt_sigaction(
                 mask: action.mask,
             },
         );
-    }
-    if oact != 0 {
+        // 处置转为忽略时冲刷该信号已排队的状态（Linux sig_handler_ignored
+        // 后的 flush_sigqueue_mask）：显式 SIG_IGN，或 DFL 且默认动作
+        // 属于忽略集（Ign/Cont）。
+        let ignored = action.handler == SIG_IGN
+            || (action.handler == SIG_DFL
+                && matches!(
+                    default_action(sig),
+                    DefaultAction::Ign | DefaultAction::Cont
+                ));
+        if ignored {
+            state.flush(sig);
+        }
+        if let Some(old) = old {
+            let old = KernelSigAction {
+                handler: old.handler,
+                flags: old.flags,
+                mask: old.mask,
+            };
+            user_access::copy_to_user(space, oact, &old.to_bytes()).map_err(|_| Errno::Fault)?;
+        }
+    } else if oact != 0 {
         let old = state.disposition(sig);
         let old = KernelSigAction {
             handler: old.handler,
@@ -164,9 +189,8 @@ pub(super) fn rt_sigprocmask(
 }
 
 /// rt_sigpending(2)（sys_rt_sigpending）：sigsetsize 必须为 8（Linux
-/// 允许不大于 8，此处收紧，登记 docs）；回写 pending 位图。中间态：
-/// Linux 回写 pending & blocked（"阻塞中不可取"），投递语义接入前
-/// 直接回写 pending。
+/// 允许不大于 8，此处收紧，登记 docs）；按 do_sigpending 回写
+/// pending & blocked（仅当前阻塞、尚未投递的信号对用户可见）。
 pub(super) fn rt_sigpending(
     space: &crate::mm::address_space::UserAddressSpace,
     set: usize,
@@ -176,8 +200,8 @@ pub(super) fn rt_sigpending(
     if sigsetsize != SIGSETSIZE {
         return Err(Errno::Invalid);
     }
-    user_access::copy_to_user(space, set, &state.pending().to_ne_bytes())
-        .map_err(|_| Errno::Fault)?;
+    let pending = state.pending() & state.blocked();
+    user_access::copy_to_user(space, set, &pending.to_ne_bytes()).map_err(|_| Errno::Fault)?;
     Ok(0)
 }
 
@@ -192,7 +216,8 @@ const STACK_T_SIZE: usize = 24;
 /// sp 不在备用栈上（在栈上改登记 → EPERM，Linux do_sigaltstack 的
 /// on_sig_stack 分支），再按 ss_flags：0 登记 sp/size 启用、SS_DISABLE
 /// 置禁用、其余 EINVAL（Linux 另接受 SS_ONSTACK 模式，本内核收紧，
-/// 偏差登记 docs）。size 下限 MINSIGSTKSZ 不检查，偏差登记 docs。
+/// 偏差登记 docs）。flags=0 时按 Linux 以 size != 0 判定启用（size=0
+/// 即未启用）。size 下限 MINSIGSTKSZ 不检查，偏差登记 docs。
 pub(super) fn rt_sigaltstack(
     space: &UserAddressSpace,
     sp: usize,
@@ -223,7 +248,8 @@ pub(super) fn rt_sigaltstack(
         } else if flags == 0 {
             let ss_sp = usize::from_ne_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
             let ss_size = usize::from_ne_bytes(raw[16..24].try_into().unwrap_or([0; 8]));
-            state.set_alt_stack(ss_sp, ss_size, true);
+            // Linux sas_ss_size != 0 即启用；size=0 等价于禁用。
+            state.set_alt_stack(ss_sp, ss_size, ss_size != 0);
         } else {
             return Err(Errno::Invalid);
         }

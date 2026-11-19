@@ -130,8 +130,8 @@ pub fn user_task_entry() -> ! {
                 // 用户态只完成一个信号，剩余 pending 下次陷入再投）。
                 // park 快路径 handler 分支留下的信号已处于 pending，由本
                 // 检查点消费；用户 handler（≠DFL/IGN）在此建帧投递。
-                let blocked = rec.signal.blocked();
-                match rec.signal.take_deliverable(blocked) {
+                let blocked_now = rec.signal.blocked();
+                match rec.signal.take_deliverable(blocked_now) {
                     None => None,
                     Some((sig, slot)) => {
                         let d = rec.signal.disposition(sig);
@@ -144,6 +144,14 @@ pub fn user_task_entry() -> ! {
                             // 锁外 exit_current——Linux force_sigsegv 会把
                             // 处置复位后重试投递，此处不递归重试（偏差
                             // 登记 docs/ostd-contracts.md）。
+                            //
+                            // 帧内 uc_sigmask 存 save_mask：sigsuspend 存续
+                            // 期间是换入临时集合之前的旧集合（Linux
+                            // saved_sigmask），sigreturn 恢复；其余场景与
+                            // blocked_now 相同。仅在建帧时取走 saved，
+                            // DFL/IGN 等无帧去向留给 RT_SIGSUSPEND 重入
+                            // 分支恢复，避免旧集合过早生效把信号永久屏蔽。
+                            let save_mask = sigsuspend_saved.take().unwrap_or(blocked_now);
                             let space = rec
                                 .space
                                 .as_ref()
@@ -155,7 +163,8 @@ pub fn user_task_entry() -> ! {
                                 sig,
                                 &slot,
                                 &d,
-                                blocked,
+                                blocked_now,
+                                save_mask,
                                 // SA_ONSTACK 选栈依据：当前登记的备用栈。
                                 rec.signal.alt_stack(),
                             ) {
@@ -370,16 +379,6 @@ pub fn user_task_entry() -> ! {
                         false,
                     );
                 }
-                // sigsuspend 的旧屏蔽集合恢复：两次决策之后、循环顶检查
-                // 点之前执行，保证 handler 帧内 uc_sigmask 与唤醒后的投
-                // 递判定使用恢复后的屏蔽集合（Linux set_restore_sigmask
-                // 同位）。
-                if let Some(old) = sigsuspend_saved.take() {
-                    let mut reg = REGISTRY.lock();
-                    if let Some(rec) = reg.records.iter_mut().find(|r| r.pid == pid) {
-                        rec.signal.setmask(old);
-                    }
-                }
             }
             Action::Continue => {
                 // 时间片起点由切入侧刷新。
@@ -480,18 +479,20 @@ fn park_check_signals(
             .find(|r| r.pid == pid)
             .expect("user task unregistered");
         let blocked = rec.signal.blocked();
-        match rec.signal.peek_deliverable(blocked) {
-            None => ParkPeek::Empty,
-            Some((sig, _)) => {
-                // 等待集内信号不经处置：同一锁内 take 消费——锁未放开
-                // 状态不变，take 与 peek 必为同一最低信号。
-                if matches!(tw_set, Some(s) if s.has(sig)) {
-                    let (sig, slot) = rec
-                        .signal
-                        .take_deliverable(blocked)
-                        .expect("peeked signal still deliverable");
-                    ParkPeek::TwHit { sig, slot }
-                } else {
+        // 先查等待集内：Linux dequeue_signal 只在等待集内出队，若先按
+        // 全局最低选信号，集合外的低号信号会抢在集合内命中之前被
+        // handler/默认动作处理（例如 SIGUSR1 干扰等待 SIGUSR2 的
+        // sigtimedwait）。命中即消费，不经处置。
+        let tw_hit = tw_set.and_then(|set| {
+            let mut hidden = blocked;
+            hidden |= !set;
+            rec.signal.take_deliverable(hidden)
+        });
+        match tw_hit {
+            Some((sig, slot)) => ParkPeek::TwHit { sig, slot },
+            None => match rec.signal.peek_deliverable(blocked) {
+                None => ParkPeek::Empty,
+                Some((sig, _)) => {
                     let d = rec.signal.disposition(sig);
                     if d.handler != SIG_DFL && d.handler != SIG_IGN {
                         // handler 分支不消费，peek 的槽不取用；DFL/IGN
@@ -507,7 +508,7 @@ fn park_check_signals(
                         ParkPeek::Default { sig, slot, d }
                     }
                 }
-            }
+            },
         }
     };
     match peeked {
@@ -621,11 +622,11 @@ fn process_call(
         sysnr::RT_SIGSUSPEND => {
             // rt_sigsuspend(2)（sys_rt_sigsuspend/sigsuspend）：换入新
             // 屏蔽集合并睡到有可投递信号。旧集合存循环局部
-            // sigsuspend_saved（跨重执行保持），由 Wait 臂或本分支重入
-            // 恢复——对应 Linux saved_sigmask + ERESTARTNOHAND：有
-            // handler 时 -EINTR、无 handler 才重启。本内核产生侧已过滤
-            // 可忽略信号，唤醒必为 handler 或致命，故一律按恢复旧集合
-            // + -EINTR 完成（偏差登记 docs/ostd-contracts.md）。
+            // sigsuspend_saved（跨重执行保持），由循环顶检查点建 handler
+            // 帧时写入帧内 uc_sigmask，sigreturn 自然恢复——handler 期间
+            // 运行在换入的临时集合下（Linux saved_sigmask 语义）。对应
+            // Linux ERESTARTNOHAND：有 handler 时 -EINTR、无 handler 才
+            // 重启；本内核有 handler 时按 -EINTR 完成（偏差登记 docs）。
             if sigsuspend_saved.is_none() {
                 // 首次：读 mask（剥 KILL/STOP）→ 存旧集合 → 换入 → 等。
                 if args[1] != SIGSETSIZE {
@@ -650,45 +651,18 @@ fn process_call(
                     }
                 }
             } else {
-                // 重入（防御性兜底）：现行控制流下 Wait 臂必然在 ecall
-                // 重执行前恢复旧集合并清空 saved，本分支正常不可达；保留
-                // 以保证控制流演化时旧集合仍被恢复。先恢复旧集合再重查：
-                // 有可投递 → 完成返 -EINTR（由检查点随后投递）；无 →
-                // 重新换入（重读用户 mask，Mesa 风格重查）继续等。
-                let old = sigsuspend_saved.take().unwrap_or(0);
-                let deliverable = {
+                // 防御性兜底：正常 handler 投递由循环顶检查点取走 saved
+                // 并建帧，不会到达本分支。若等待中的信号被 park 快路径
+                // 按 DFL/Ign 丢弃（信号已消费、没有帧可建），syscall
+                // 重执行会落到这里；恢复换入前的旧集合后以 -EINTR 完成，
+                // 保证 saved 不泄漏、临时屏蔽集合不残留。
+                if let Some(old) = sigsuspend_saved.take() {
                     let mut reg = REGISTRY.lock();
-                    match reg.records.iter_mut().find(|r| r.pid == parent) {
-                        Some(rec) => {
-                            rec.signal.setmask(old);
-                            rec.signal.peek_deliverable(old).is_some()
-                        }
-                        None => false,
-                    }
-                };
-                if deliverable {
-                    Err(Errno::Interrupted)
-                } else if args[1] != SIGSETSIZE {
-                    Err(Errno::Invalid)
-                } else {
-                    match read_sigset(parent, args[0]) {
-                        Err(e) => Err(e),
-                        Ok(mut new) => {
-                            new.del(SIGKILL);
-                            new.del(SIGSTOP);
-                            let mut reg = REGISTRY.lock();
-                            match reg.records.iter_mut().find(|r| r.pid == parent) {
-                                Some(rec) => {
-                                    *sigsuspend_saved = Some(old);
-                                    rec.signal.setmask(new);
-                                    drop(reg);
-                                    return ProcessResult::Wait(WaitReason::Signal);
-                                }
-                                None => Err(Errno::NoProcess),
-                            }
-                        }
+                    if let Some(rec) = reg.records.iter_mut().find(|r| r.pid == parent) {
+                        rec.signal.setmask(old);
                     }
                 }
+                Err(Errno::Interrupted)
             }
         }
         sysnr::RT_SIGTIMEDWAIT => {
@@ -1102,6 +1076,8 @@ fn kill_or_tgkill(parent: Pid, nr: usize, args: [usize; 6]) -> Result<usize, Err
         target,
         sig as u8,
         SigInfoSlot {
+            // kill(2) 恒 SI_USER(=0)；tgkill 发内核保留码 SI_TKILL。
+            code: if nr == sysnr::KILL { 0 } else { SI_TKILL },
             pid: parent as u32,
             ..Default::default()
         },
@@ -1152,20 +1128,30 @@ fn fork_user(parent: Pid, frame: &TrapFrame, flags: usize, stack: usize) -> Resu
     );
     {
         let mut reg = REGISTRY.lock();
-        // fork 继承：子进程整体拷贝父进程的信号状态（同一次锁内完成）
-        let parent_signal = reg
-            .records
-            .iter()
-            .find(|r| r.pid == parent)
-            .map(|r| r.signal.clone());
-        if let Some(r) = reg.records.iter_mut().find(|r| r.pid == pid) {
-            r.parent = parent;
-            r.fs = Some(fs);
-            if let Some(sig_state) = parent_signal {
-                r.signal = sig_state;
-                // 备用栈登记不跨 fork 继承（Linux copy_signal 清零）。
-                r.signal.set_alt_stack(0, 0, false);
+        // 两段式查找：先取父、子记录下标（各自借用已结束），再以
+        // split_at_mut 取得不相交借用，在子记录上就地 fork_from。
+        // 不整体 clone 父状态：SignalState 约 4.7 KiB，16 KiB 内核栈
+        // 承受不起整表临时值。
+        let parent_index = reg.records.iter().position(|r| r.pid == parent);
+        let child_index = reg.records.iter().position(|r| r.pid == pid);
+        if let (Some(pi), Some(ci)) = (parent_index, child_index) {
+            debug_assert_ne!(pi, ci, "fork parent and child share a record");
+            match pi.cmp(&ci) {
+                core::cmp::Ordering::Less => {
+                    let (head, tail) = reg.records.split_at_mut(ci);
+                    tail[0].signal.fork_from(&head[pi].signal);
+                }
+                core::cmp::Ordering::Greater => {
+                    let (head, tail) = reg.records.split_at_mut(pi);
+                    head[ci].signal.fork_from(&tail[0].signal);
+                }
+                core::cmp::Ordering::Equal => {}
             }
+            // fork 继承备用栈（execve 才清除）；pending/info 由
+            // fork_from 清零（Linux copy_signal）。
+            let child = &mut reg.records[ci];
+            child.parent = parent;
+            child.fs = Some(fs);
         }
     }
     sched::enqueue(task);

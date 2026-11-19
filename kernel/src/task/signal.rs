@@ -23,6 +23,8 @@ pub const SIGILL: u8 = 4;
 pub const SIGTRAP: u8 = 5;
 /// SIGBUS：非对齐访存等总线错误。
 pub const SIGBUS: u8 = 7;
+/// SIGFPE：算术异常。
+pub const SIGFPE: u8 = 8;
 /// SIGSEGV：无效内存访问。
 pub const SIGSEGV: u8 = 11;
 /// SIGPIPE：向无读者的管道写入。
@@ -33,6 +35,17 @@ pub const SIGKILL: u8 = 9;
 pub const SIGCHLD: u8 = 17;
 /// SIGSTOP：不可捕获、不可屏蔽的停止信号。
 pub const SIGSTOP: u8 = 19;
+/// SIGSYS：非法系统调用（同步信号）。
+pub const SIGSYS: u8 = 31;
+
+/// Linux next_signal 的 SYNCHRONOUS_MASK：SIGILL/SIGTRAP/SIGBUS/SIGFPE/
+/// SIGSEGV/SIGSYS 同步异常信号在出队选择中优先。
+const SYNCHRONOUS_MASK: SignalSet = (1u64 << (SIGILL - 1))
+    | (1u64 << (SIGTRAP - 1))
+    | (1u64 << (SIGBUS - 1))
+    | (1u64 << (SIGFPE - 1))
+    | (1u64 << (SIGSEGV - 1))
+    | (1u64 << (SIGSYS - 1));
 
 /// siginfo si_code 子集（来源：Linux include/uapi/asm-generic/siginfo.h）：
 /// SEGV_MAPERR，地址未映射（SIGSEGV）。
@@ -95,8 +108,8 @@ pub trait SignalSetExt {
     fn del(&mut self, sig: u8);
     /// 信号 sig 是否在集合中；sig 不在 1..=64 时返回 false。
     fn has(self, sig: u8) -> bool;
-    /// 取集合中最小的信号号（按信号号从小到大取出，与 Linux 一致）；
-    /// 空集合返回 None。
+    /// 取集合中优先出队的信号号：同步异常信号（SYNCHRONOUS_MASK）优先，
+    /// 其余按信号号从小到大（Linux next_signal）；空集合返回 None。
     fn lowest(self) -> Option<u8>;
 }
 
@@ -121,10 +134,12 @@ impl SignalSetExt for SignalSet {
 
     fn lowest(self) -> Option<u8> {
         if self == 0 {
-            None
-        } else {
-            Some(self.trailing_zeros() as u8 + 1)
+            return None;
         }
+        // 同步异常信号优先（Linux next_signal 的首字分支）。
+        let synchronous = self & SYNCHRONOUS_MASK;
+        let chosen = if synchronous != 0 { synchronous } else { self };
+        Some(chosen.trailing_zeros() as u8 + 1)
     }
 }
 
@@ -218,7 +233,7 @@ impl AltStack {
 /// 单进程的信号状态。字段按将来多线程迁移的归属分两组：共享侧
 /// 多线程时留 ProcessRecord，私有侧搬入线程记录（依据见
 /// docs/ostd-contracts.md）。
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SignalState {
     /// —— 共享侧（多线程时留 ProcessRecord）——
     /// 每信号处置表，下标即信号号；[0] 不是合法信号，恒为默认值。
@@ -235,6 +250,28 @@ pub struct SignalState {
     alt_stack: AltStack,
 }
 
+impl Clone for SignalState {
+    fn clone(&self) -> Self {
+        Self {
+            disposition: self.disposition,
+            pending: self.pending,
+            info: self.info,
+            blocked: self.blocked,
+            alt_stack: self.alt_stack,
+        }
+    }
+
+    /// 就地拷贝各字段，避免默认实现 `*self = source.clone()` 在 16 KiB
+    /// 内核栈上产生约 4.7 KiB 的整表临时值（fork_user 的栈约束）。
+    fn clone_from(&mut self, source: &Self) {
+        self.disposition.copy_from_slice(&source.disposition);
+        self.pending = source.pending;
+        self.info.copy_from_slice(&source.info);
+        self.blocked = source.blocked;
+        self.alt_stack = source.alt_stack;
+    }
+}
+
 impl SignalState {
     /// 全部处置为 DFL、pending/blocked 为空、备用栈禁用的新状态。
     pub fn new() -> Self {
@@ -248,8 +285,8 @@ impl SignalState {
     }
 
     /// execve 后的状态重置：处置全部恢复 DFL，恰为 SIG_IGN 的保持
-    /// IGN；flags/mask 清零；pending/info 与 blocked 保持不变
-    ///（execve(2) 语义）。
+    /// IGN；flags/mask 清零；备用栈登记清除；pending/info 与 blocked
+    /// 保持不变（execve(2) 语义）。
     pub fn reset_for_exec(&mut self) {
         // 下标 0 不是合法信号，不在重置范围。
         for d in &mut self.disposition[1..] {
@@ -260,18 +297,23 @@ impl SignalState {
                 mask: 0,
             };
         }
+        // fork(2) 继承备用栈、execve(2) 清除（sigaltstack(2) 语义）。
+        self.alt_stack = AltStack::default();
     }
 }
 
 impl SignalState {
     /// 将信号 sig 置为 pending 并写入信息槽；sig 不在 1..=64 时
-    /// 不修改任何状态。
+    /// 不修改任何状态。标准信号（sig<32）已在 pending 时不更新信息槽
+    ///（Linux legacy_queue 先到先得）；实时信号 32..=64 每次更新。
     pub fn queue(&mut self, sig: u8, slot: SigInfoSlot) {
         if !(1..=64).contains(&sig) {
             return;
         }
+        if sig >= 32 || !self.pending.has(sig) {
+            self.info[sig as usize] = slot;
+        }
         self.pending.add(sig);
-        self.info[sig as usize] = slot;
     }
 
     /// 同锁信号产生入口：record_exit 与 syscall 层在已持 REGISTRY 锁
@@ -282,8 +324,7 @@ impl SignalState {
     /// 本表 Ign 与 Cont 两类，对应 include/linux/signal.h 的
     /// SIG_KERNEL_IGNORE_MASK）的信号静默丢弃；其余入队，实际入队后
     /// 请求信号唤醒通道（send_signal 亦经此路径覆盖）；过滤丢弃不置位。
-    /// pending 消费与投递属投递阶段 commit。调用方保证 sig 在合法域
-    /// 1..=64；queue 对域外信号不修改状态。
+    /// 调用方保证 sig 在合法域 1..=64；queue 对域外信号不修改状态。
     pub fn generate(&mut self, sig: u8, slot: SigInfoSlot) {
         if !self.blocked.has(sig) {
             let d = self.disposition(sig);
@@ -365,6 +406,27 @@ impl SignalState {
     /// 当前 pending 位图（rt_sigpending 回写用）。
     pub fn pending(&self) -> SignalSet {
         self.pending
+    }
+
+    /// fork(2) 后的子进程信号状态，就地写入 self：处置表、屏蔽集合与
+    /// 备用栈登记从父进程继承，pending/info 清零（Linux copy_signal：
+    /// 未决信号不跨 fork 继承，备用栈跨 fork 保留）。调用方需保证
+    /// self 与 parent 是不同记录；就地拷贝避免整表临时值占用内核栈。
+    pub fn fork_from(&mut self, parent: &SignalState) {
+        self.clone_from(parent);
+        self.pending = 0;
+        for slot in &mut self.info {
+            *slot = SigInfoSlot::default();
+        }
+    }
+
+    /// 清除信号 sig 的 pending 位与信息槽（rt_sigaction 把处置改为
+    /// 忽略时的 flush_sigqueue_mask 单信号语义）；域外信号不修改状态。
+    pub fn flush(&mut self, sig: u8) {
+        if (1..=64).contains(&sig) {
+            self.pending.del(sig);
+            self.info[sig as usize] = SigInfoSlot::default();
+        }
     }
 
     /// 非消费版 take_deliverable：返回最低的 `pending & !blocked` 信号

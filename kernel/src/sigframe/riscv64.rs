@@ -5,7 +5,8 @@
 //! ucontext.h；musl arch/riscv64/bits/signal.h 交叉验证偏移一致。
 //! 帧布局（base 为 16 字节对齐的帧基址）：
 //!   +0     siginfo 128 字节
-//!   +128   ucontext：uc_flags/+128 uc_link/+136 uc_stack/+144（24 字节全零）
+//!   +128   ucontext：uc_flags/+128 uc_link/+136 uc_stack/+144
+//!          （stack_t：ss_sp@144、ss_flags@152、ss_size@160）
 //!          uc_sigmask/+168（128 字节 sigset，仅低 8 字节有效）
 //!   +304   uc_mcontext（sigcontext，16 字节对齐）：sc_regs 31×8
 //!          （user_regs_struct：[0]=pc、[i]=x[i]；x0 恒零不入帧）
@@ -28,6 +29,10 @@ use crate::task::signal::{
 
 use super::{fill_siginfo, on_alt_stack, FrameError};
 
+/// ucontext 起点（siginfo 之后）：uc_flags/uc_link 在此连续 16 字节。
+const OFF_UCONTEXT: usize = 128;
+/// uc_stack（stack_t：ss_sp/ss_flags/ss_size）偏移：uc_flags/uc_link 之后。
+const OFF_UC_STACK: usize = 144;
 /// uc_sigmask 偏移：ucontext 在帧内 +128，sigset_t 字段在其内 +40。
 const OFF_UC_SIGMASK: usize = 168;
 /// uc_mcontext（sigcontext）偏移：uc_sigmask 128 字节后按 sigcontext 的
@@ -65,24 +70,29 @@ fn read(space: &UserAddressSpace, vaddr: usize, dst: &mut [u8]) -> Result<(), Fr
 ///
 /// 对应 Linux setup_rt_frame：落帧栈位按 Linux sigsp 选择——处置带
 /// SA_ONSTACK、`alt` 登记了备用栈且当前 sp 不在备用栈上时，帧落备用栈
-/// 顶（向下增长）；否则当前用户栈。sp 下移对齐 16 后落帧，写 siginfo /
+/// 顶（向下增长）；否则当前用户栈。sp 下移帧总量后对齐 16 落帧，写 siginfo /
 /// ucontext（uc_flags=0、uc_link=0、uc_stack=当前备用栈登记（Linux
 /// __save_altstack 存登记原值，flags 启用为 0、未启用为 SS_DISABLE）、
-/// uc_sigmask=old_blocked）/ sigcontext（全通用寄存器 + d 态浮点 + END
+/// uc_sigmask=save_mask）/ sigcontext（全通用寄存器 + d 态浮点 + END
 /// 扩展链）/ 帧内嵌 sigreturn stub；返回地址 ra 指向 stub。handler 参数
 /// 恒传 a0=sig、a1=&siginfo、a2=&ucontext（SA_SIGINFO 仅语义差异，Linux
-/// 恒传）。返回 handler 期间屏蔽集合：old_blocked | sa_mask | 本信号位
+/// 恒传）。返回 handler 期间屏蔽集合：blocked_now | sa_mask | 本信号位
 ///（SA_NODEFER 未支持，恒加本信号位，偏差登记 docs/ostd-contracts.md）。
+/// `blocked_now` 是投递时的当前屏蔽集合，`save_mask` 写入帧内
+/// uc_sigmask 供 sigreturn 恢复；sigsuspend 存续期间后者是换入临时集合
+/// 之前的旧集合，其余场景两者相同。
 /// 任一用户写入失败即返回 [`FrameError::Access`]，`frame` 不被改动
 ///（Linux 同：寄存器改写只在全部拷贝成功后进行）。备用栈溢出防护
 ///（Linux get_sigframe 的 sp - framesize 出栈判定）未做，偏差登记 docs。
+#[allow(clippy::too_many_arguments)] // 建帧需要完整现场、处置与两份掩码。
 pub fn build_deliver(
     frame: &mut TrapFrame,
     space: &UserAddressSpace,
     sig: u8,
     slot: &SigInfoSlot,
     d: &SignalDisposition,
-    old_blocked: SignalSet,
+    blocked_now: SignalSet,
+    save_mask: SignalSet,
     alt: Option<(usize, usize)>,
 ) -> Result<SignalSet, FrameError> {
     // Linux get_sigframe + sigsp：SA_ONSTACK 且登记了备用栈且当前不在
@@ -99,22 +109,28 @@ pub fn build_deliver(
     };
     let base = stack_top.wrapping_sub(FRAME_SIZE) & !0xF;
 
-    // siginfo + uc_flags/uc_link/uc_stack。uc_stack 回写当前备用栈登记
-    //（帧内偏移 +144，head 内 +16；flags 按登记态，不回写 SS_ONSTACK）。
+    // 分区写帧头：siginfo 独占 base+0..128；ucontext 从 +128 开始，
+    // uc_flags/uc_link 恒零，uc_stack（stack_t，帧内偏移 +144）回写当前
+    // 备用栈登记：ss_sp@+144、ss_flags@+152、ss_size@+160（flags 按
+    // 登记态，不回写 SS_ONSTACK）。
     let (ss_sp, ss_size, ss_flags) = match alt {
         Some((ss_sp, ss_size)) => (ss_sp, ss_size, 0i32),
         None => (0, 0, SS_DISABLE),
     };
-    let mut head = [0u8; 176];
-    fill_siginfo(&mut head[..128], sig, slot);
-    head[16..24].copy_from_slice(&ss_sp.to_ne_bytes());
-    head[24..28].copy_from_slice(&ss_flags.to_ne_bytes());
-    head[32..40].copy_from_slice(&ss_size.to_ne_bytes());
-    write(space, base, &head)?;
+    let mut siginfo = [0u8; 128];
+    fill_siginfo(&mut siginfo, sig, slot);
+    write(space, base, &siginfo)?;
+    write(space, base + OFF_UCONTEXT, &[0u8; 16])?;
+    let mut uc_stack = [0u8; 24];
+    uc_stack[0..8].copy_from_slice(&ss_sp.to_ne_bytes());
+    uc_stack[8..12].copy_from_slice(&ss_flags.to_ne_bytes());
+    uc_stack[16..24].copy_from_slice(&ss_size.to_ne_bytes());
+    write(space, base + OFF_UC_STACK, &uc_stack)?;
 
-    // uc_sigmask：存 handler 前的 blocked，sigreturn 时恢复。
+    // uc_sigmask：存 save_mask（sigsuspend 存续期间为换入前的旧集合，
+    // 否则同 blocked_now），sigreturn 时恢复。
     let mut sigmask = [0u8; 128];
-    sigmask[..8].copy_from_slice(&old_blocked.to_ne_bytes());
+    sigmask[..8].copy_from_slice(&save_mask.to_ne_bytes());
     write(space, base + OFF_UC_SIGMASK, &sigmask)?;
 
     // sc_regs：user_regs_struct = [pc, x1..x31]，32 项共 256 字节，
@@ -151,11 +167,11 @@ pub fn build_deliver(
     frame[TrapFrameArgs::SP] = base;
     frame[TrapFrameArgs::ARG0] = sig as usize;
     frame[TrapFrameArgs::ARG1] = base;
-    frame[TrapFrameArgs::ARG2] = base + 128;
+    frame[TrapFrameArgs::ARG2] = base + OFF_UCONTEXT;
     frame[TrapFrameArgs::SEPC] = d.handler;
 
-    // handler 期间屏蔽：old | sa_mask | 本信号（Linux 恒加本信号位）。
-    let mut new_blocked = old_blocked | d.mask;
+    // handler 期间屏蔽：blocked_now | sa_mask | 本信号（Linux 恒加本信号位）。
+    let mut new_blocked = blocked_now | d.mask;
     new_blocked.add(sig);
     Ok(new_blocked)
 }
