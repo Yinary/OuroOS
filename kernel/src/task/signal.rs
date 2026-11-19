@@ -1,6 +1,5 @@
-//! 信号状态模型：每信号 disposition 表、pending/blocked 集合与信息槽。
-//! 存放位置与线程化形状依据见 docs/ostd-contracts.md。
-//! 消费侧：投递检查点（含建帧投递）/ park 快路径 / 信号登记类系统调用。
+//! 信号状态模型：每信号处置表、pending/blocked 集合与信息槽。
+//! 契约见 docs/ostd-contracts.md §4.5。
 #![deny(unsafe_code)]
 
 use super::task::Pid;
@@ -8,13 +7,12 @@ use super::REGISTRY;
 use crate::syscall::Errno;
 use crate::trap::{UserFault, UserFaultKind};
 
-/// 信号位图：位 (sig-1) 对应信号 sig，合法信号 1..=64
-///（标准 1..=31，实时 32..=64）。
+/// 信号位图：位 (sig-1) 对应信号 sig，合法域 1..=64。
 pub type SignalSet = u64;
 
-/// 默认处置（Linux UAPI 值）。
+/// 默认处置。
 pub const SIG_DFL: usize = 0;
-/// 忽略处置（Linux UAPI 值）。
+/// 忽略处置。
 pub const SIG_IGN: usize = 1;
 
 /// SIGILL：非法指令。
@@ -38,8 +36,7 @@ pub const SIGSTOP: u8 = 19;
 /// SIGSYS：非法系统调用（同步信号）。
 pub const SIGSYS: u8 = 31;
 
-/// Linux next_signal 的 SYNCHRONOUS_MASK：SIGILL/SIGTRAP/SIGBUS/SIGFPE/
-/// SIGSEGV/SIGSYS 同步异常信号在出队选择中优先。
+/// 同步异常信号掩码（SYNCHRONOUS_MASK）。
 const SYNCHRONOUS_MASK: SignalSet = (1u64 << (SIGILL - 1))
     | (1u64 << (SIGTRAP - 1))
     | (1u64 << (SIGBUS - 1))
@@ -47,8 +44,7 @@ const SYNCHRONOUS_MASK: SignalSet = (1u64 << (SIGILL - 1))
     | (1u64 << (SIGSEGV - 1))
     | (1u64 << (SIGSYS - 1));
 
-/// siginfo si_code 子集（来源：Linux include/uapi/asm-generic/siginfo.h）：
-/// SEGV_MAPERR，地址未映射（SIGSEGV）。
+/// siginfo si_code：SEGV_MAPERR，地址未映射（SIGSEGV）。
 pub const SEGV_MAPERR: i32 = 1;
 /// siginfo si_code：ILL_ILLOPC，非法操作码（SIGILL）。
 pub const ILL_ILLOPC: i32 = 1;
@@ -74,21 +70,17 @@ pub fn fault_siginfo(kind: UserFaultKind) -> (u8, i32) {
 pub enum DefaultAction {
     /// 终止进程。
     Term,
-    /// 终止并核心转储（消费方：投递阶段）。
+    /// 终止并核心转储。
     Core,
     /// 忽略。
     Ign,
-    /// 停止进程（消费方：投递阶段）。
+    /// 停止进程。
     Stop,
-    /// 被停止的进程继续执行（消费方：投递阶段）。
+    /// 继续执行。
     Cont,
 }
 
-/// 默认动作表，信号号为 asm-generic UAPI（rv64/la64，SIGRTMIN=32）：
-/// Core = 3/4/5/6/7/8/11/24/25/31，Ign = 17/23/28，Cont = 18，
-/// Stop = 19..=22，其余标准信号与实时信号 32..=64 为 Term。
-/// 取值与 man7.org signal(7) 表逐项核对，并同内核 include/linux/signal.h
-/// 的 SIG_KERNEL_{COREDUMP,IGNORE,STOP}_MASK 三组掩码一致。
+/// 返回信号 sig 的默认动作类别（signal(7) 默认处置表）。
 pub fn default_action(sig: u8) -> DefaultAction {
     match sig {
         3..=8 | 11 | 24 | 25 | 31 => DefaultAction::Core,
@@ -99,8 +91,7 @@ pub fn default_action(sig: u8) -> DefaultAction {
     }
 }
 
-/// SignalSet 的最小操作集：u64 别名无法定义固有方法（E0390），
-/// 以扩展 trait 提供，调用形式不变。
+/// SignalSet 的操作扩展 trait。
 pub trait SignalSetExt {
     /// 置入信号 sig；sig 不在 1..=64 时保持不变。
     fn add(&mut self, sig: u8);
@@ -108,8 +99,7 @@ pub trait SignalSetExt {
     fn del(&mut self, sig: u8);
     /// 信号 sig 是否在集合中；sig 不在 1..=64 时返回 false。
     fn has(self, sig: u8) -> bool;
-    /// 取集合中优先出队的信号号：同步异常信号（SYNCHRONOUS_MASK）优先，
-    /// 其余按信号号从小到大（Linux next_signal）；空集合返回 None。
+    /// 取集合中优先出队的信号号；空集合返回 None。
     fn lowest(self) -> Option<u8>;
 }
 
@@ -136,17 +126,15 @@ impl SignalSetExt for SignalSet {
         if self == 0 {
             return None;
         }
-        // 同步异常信号优先（Linux next_signal 的首字分支）。
+        // 同步异常信号优先。
         let synchronous = self & SYNCHRONOUS_MASK;
         let chosen = if synchronous != 0 { synchronous } else { self };
         Some(chosen.trailing_zeros() as u8 + 1)
     }
 }
 
-/// 单个信号的处置：handler 为 SIG_DFL/SIG_IGN 或用户函数地址。
-/// flags 由 record_exit（SA_NOCLDWAIT）、park 快路径（SA_RESTART）与
-/// 建帧投递（SA_NODEFER/SA_SIGINFO/SA_ONSTACK 固定语义处理）消费；
-/// mask 由建帧投递并入 handler 期间屏蔽集合；默认值即 DFL。
+/// 单个信号的处置：handler（SIG_DFL/SIG_IGN 或用户函数地址）、
+/// sa_flags 与 sa_mask。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SignalDisposition {
     /// 处理函数地址或 SIG_DFL/SIG_IGN。
@@ -157,28 +145,21 @@ pub struct SignalDisposition {
     pub mask: SignalSet,
 }
 
-/// siginfo si_code 子集（来源：Linux include/uapi/asm-generic/siginfo.h）。
-/// CLD_EXITED：子进程正常退出。
+/// siginfo si_code：CLD_EXITED，子进程正常退出。
 pub const CLD_EXITED: i32 = 1;
 /// siginfo si_code：子进程死于信号。
 pub const CLD_KILLED: i32 = 2;
-/// siginfo si_code 负码：SI_QUEUE，sigqueue/rt_sigqueueinfo 发送，
-/// siginfo 联合体按 _rt{pid, uid, value} 解释。
+/// siginfo si_code：SI_QUEUE，sigqueue 类发送。
 pub const SI_QUEUE: i32 = -1;
-/// siginfo si_code 负码：SI_TKILL，tkill/tgkill 发送（内核保留码，
-/// rt_sigqueueinfo 非自身目标发送被拒）。
+/// siginfo si_code：SI_TKILL，tkill/tgkill 发送。
 pub const SI_TKILL: i32 = -6;
 
-/// stack_t ss_flags（来源：Linux include/uapi/linux/signal.h）：
-/// SS_ONSTACK，当前在备用栈上执行。
+/// stack_t ss_flags：SS_ONSTACK，当前在备用栈上执行。
 pub(crate) const SS_ONSTACK: i32 = 1;
 /// stack_t ss_flags：SS_DISABLE，备用栈未启用。
 pub(crate) const SS_DISABLE: i32 = 2;
 
 /// 每信号一个信息槽（信号号由槽位下标隐含）：siginfo 字段子集。
-/// 产生侧只填充 code/pid/status 子集，force 投递另填 fault（硬件异常
-/// 细节，检查点终止时透传终态报告）；全部字段由建帧投递的 siginfo
-/// 组装（sigframe::fill_siginfo）读出。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SigInfoSlot {
     /// si_code。
@@ -191,34 +172,28 @@ pub struct SigInfoSlot {
     pub pid: u32,
     /// 子进程退出状态（SIGCHLD 用）。
     pub status: i32,
-    /// 硬件异常细节：force 投递路径（致命异常）填充，检查点终止时
-    /// 透传给终态报告。
+    /// 硬件异常细节（force 投递填写）。
     pub fault: Option<UserFault>,
 }
 
-/// 信号备用栈登记（sigaltstack(2) 的内核侧记录，对应 Linux task_struct
-/// 的 sas_ss_* 三元组）。enabled=false 时 sp/size 不解释。属线程私有侧，
-/// 多线程时随 blocked 一并搬入线程记录。
+/// 信号备用栈登记（sigaltstack(2)）；enabled=false 时 sp/size 不解释。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AltStack {
     /// 栈基址（低地址端；用户栈向下增长）。
     sp: usize,
-    /// 字节数（对应 Linux sas_ss_size；为 0 即未启用）。
+    /// 字节数；为 0 即未启用。
     size: usize,
     /// 是否启用（对应 sas_ss_size != 0）。
     enabled: bool,
 }
 
 impl AltStack {
-    /// 用户栈指针 sp 是否落在备用栈区间内。公式同 Linux on_sig_stack
-    ///（include/linux/sched/signal.h，向下增长分支）：sp 严格大于基址
-    /// 且偏移不超过 size（含上边界）。
+    /// 用户栈指针 sp 是否落在备用栈区间内。
     fn on_stack(&self, sp: usize) -> bool {
         self.enabled && sp > self.sp && sp - self.sp <= self.size
     }
 
-    /// Linux sas_ss_flags：未启用 → SS_DISABLE；在栈上 → SS_ONSTACK；
-    /// 启用且不在栈上 → 0。
+    /// sas_ss_flags 取值：未启用 SS_DISABLE、在栈上 SS_ONSTACK、否则 0。
     fn flags(&self, sp: usize) -> i32 {
         if !self.enabled {
             SS_DISABLE
@@ -230,20 +205,15 @@ impl AltStack {
     }
 }
 
-/// 单进程的信号状态。字段按将来多线程迁移的归属分两组：共享侧
-/// 多线程时留 ProcessRecord，私有侧搬入线程记录（依据见
-/// docs/ostd-contracts.md）。
+/// 单进程的信号状态。
 #[derive(Debug)]
 pub struct SignalState {
-    /// —— 共享侧（多线程时留 ProcessRecord）——
-    /// 每信号处置表，下标即信号号；[0] 不是合法信号，恒为默认值。
+    /// 每信号处置表，下标即信号号；[0] 恒为默认值。
     disposition: [SignalDisposition; 65],
     /// 已到达未投递的信号位图。
     pending: SignalSet,
-    /// 与 pending 对应的信息槽，仅在对应 pending 位有效时解释，
-    /// 由 [`SignalState::take_deliverable`] 连同 pending 位一并取出。
+    /// 与 pending 对应的信息槽，仅在对应 pending 位有效时解释。
     info: [SigInfoSlot; 65],
-    /// —— 私有侧（多线程时搬入线程记录）——
     /// 屏蔽位图。
     blocked: SignalSet,
     /// 信号备用栈（sigaltstack），默认禁用。
@@ -261,8 +231,7 @@ impl Clone for SignalState {
         }
     }
 
-    /// 就地拷贝各字段，避免默认实现 `*self = source.clone()` 在 16 KiB
-    /// 内核栈上产生约 4.7 KiB 的整表临时值（fork_user 的栈约束）。
+    /// 就地拷贝各字段。
     fn clone_from(&mut self, source: &Self) {
         self.disposition.copy_from_slice(&source.disposition);
         self.pending = source.pending;
@@ -284,9 +253,8 @@ impl SignalState {
         }
     }
 
-    /// execve 后的状态重置：处置全部恢复 DFL，恰为 SIG_IGN 的保持
-    /// IGN；flags/mask 清零；备用栈登记清除；pending/info 与 blocked
-    /// 保持不变（execve(2) 语义）。
+    /// execve 后的状态重置：处置恢复 DFL（SIG_IGN 保持）、flags/mask
+    /// 与备用栈登记清除；pending/info 与 blocked 保持不变。
     pub fn reset_for_exec(&mut self) {
         // 下标 0 不是合法信号，不在重置范围。
         for d in &mut self.disposition[1..] {
@@ -297,15 +265,14 @@ impl SignalState {
                 mask: 0,
             };
         }
-        // fork(2) 继承备用栈、execve(2) 清除（sigaltstack(2) 语义）。
+        // 备用栈登记在 execve 后清除。
         self.alt_stack = AltStack::default();
     }
 }
 
 impl SignalState {
     /// 将信号 sig 置为 pending 并写入信息槽；sig 不在 1..=64 时
-    /// 不修改任何状态。标准信号（sig<32）已在 pending 时不更新信息槽
-    ///（Linux legacy_queue 先到先得）；实时信号 32..=64 每次更新。
+    /// 不修改状态，标准信号已在 pending 时不更新信息槽。
     pub fn queue(&mut self, sig: u8, slot: SigInfoSlot) {
         if !(1..=64).contains(&sig) {
             return;
@@ -316,15 +283,8 @@ impl SignalState {
         self.pending.add(sig);
     }
 
-    /// 同锁信号产生入口：record_exit 与 syscall 层在已持 REGISTRY 锁
-    /// 时内联调用（锁非重入，禁止再经 send_signal 嵌套取锁）。过滤
-    /// 规则对应 Linux __send_signal/sig_ignored（kernel/signal.c）：
-    /// 屏蔽中的信号照常入队（sig_ignored 对 blocked 恒 false）；处置
-    /// IGN，或 DFL 且默认动作属 IGNORE 集（CHLD/CONT/URG/WINCH，即
-    /// 本表 Ign 与 Cont 两类，对应 include/linux/signal.h 的
-    /// SIG_KERNEL_IGNORE_MASK）的信号静默丢弃；其余入队，实际入队后
-    /// 请求信号唤醒通道（send_signal 亦经此路径覆盖）；过滤丢弃不置位。
-    /// 调用方保证 sig 在合法域 1..=64；queue 对域外信号不修改状态。
+    /// 同锁信号产生入口：按处置过滤后将 sig 入队并请求信号唤醒。
+    /// 调用方须已持 REGISTRY 锁；sig 须在 1..=64。
     pub fn generate(&mut self, sig: u8, slot: SigInfoSlot) {
         if !self.blocked.has(sig) {
             let d = self.disposition(sig);
@@ -368,7 +328,7 @@ impl SignalState {
         self.blocked &= !remove;
     }
 
-    /// 整体替换屏蔽集合（sigprocmask 的 SIG_SETMASK 语义）。
+    /// 整体替换屏蔽集合。
     pub fn setmask(&mut self, mask: SignalSet) {
         self.blocked = mask;
     }
@@ -378,27 +338,24 @@ impl SignalState {
         self.blocked
     }
 
-    /// 备用栈登记；启用时返回 (基址, 字节数)，供 SA_ONSTACK 建帧
-    /// 投递选栈（sigframe::build_deliver）。
+    /// 备用栈登记；启用时返回 (基址, 字节数)。
     pub fn alt_stack(&self) -> Option<(usize, usize)> {
         self.alt_stack
             .enabled
             .then_some((self.alt_stack.sp, self.alt_stack.size))
     }
 
-    /// 当前用户栈指针 sp 是否在备用栈区间内（sigaltstack 的 EPERM
-    /// 检查与 SS_ONSTACK 回写共用）。
+    /// 当前用户栈指针 sp 是否在备用栈区间内。
     pub fn on_alt_stack(&self, sp: usize) -> bool {
         self.alt_stack.on_stack(sp)
     }
 
-    /// Linux sas_ss_flags 的当前取值（old stack_t 的 ss_flags 回写）。
+    /// sas_ss_flags 的当前取值（old stack_t 的 ss_flags 回写）。
     pub fn alt_stack_flags(&self, sp: usize) -> i32 {
         self.alt_stack.flags(sp)
     }
 
-    /// 整体设置备用栈登记（sigaltstack(2)：SS_DISABLE 置禁用，否则
-    /// 登记 sp/size 启用）。
+    /// 设置备用栈登记。
     pub fn set_alt_stack(&mut self, sp: usize, size: usize, enabled: bool) {
         self.alt_stack = AltStack { sp, size, enabled };
     }
@@ -408,10 +365,8 @@ impl SignalState {
         self.pending
     }
 
-    /// fork(2) 后的子进程信号状态，就地写入 self：处置表、屏蔽集合与
-    /// 备用栈登记从父进程继承，pending/info 清零（Linux copy_signal：
-    /// 未决信号不跨 fork 继承，备用栈跨 fork 保留）。调用方需保证
-    /// self 与 parent 是不同记录；就地拷贝避免整表临时值占用内核栈。
+    /// fork(2) 后子进程的信号状态：处置、屏蔽与备用栈继承自父进程，
+    /// pending/info 清零。
     pub fn fork_from(&mut self, parent: &SignalState) {
         self.clone_from(parent);
         self.pending = 0;
@@ -420,8 +375,7 @@ impl SignalState {
         }
     }
 
-    /// 清除信号 sig 的 pending 位与信息槽（rt_sigaction 把处置改为
-    /// 忽略时的 flush_sigqueue_mask 单信号语义）；域外信号不修改状态。
+    /// 清除信号 sig 的 pending 位与信息槽；域外信号不修改状态。
     pub fn flush(&mut self, sig: u8) {
         if (1..=64).contains(&sig) {
             self.pending.del(sig);
@@ -429,18 +383,15 @@ impl SignalState {
         }
     }
 
-    /// 非消费版 take_deliverable：返回最低的 `pending & !blocked` 信号
-    /// 与信息槽拷贝，不清除 pending 位；无可投递信号返回 None。供
-    /// park 快路径先按处置分岔、再决定是否消费的场景。
+    /// 返回最低的可投递信号与信息槽拷贝，不清除 pending 位；
+    /// 无信号返回 None。
     pub fn peek_deliverable(&self, blocked: SignalSet) -> Option<(u8, SigInfoSlot)> {
         let sig = (self.pending & !blocked).lowest()?;
         Some((sig, self.info[sig as usize]))
     }
 
-    /// 取出最低的 `pending & !blocked` 信号：清除其 pending 位并返回
-    /// 信号号与信息槽拷贝；无可投递信号返回 None。SIGKILL/SIGSTOP
-    /// 不可能出现在 blocked（产生/登记侧已剥除），本方法只做纯集合
-    /// 运算；调用方取出后不放回（任一去向均视为已消费）。
+    /// 取出最低的可投递信号：清除 pending 位并返回信号号与信息槽；
+    /// 无信号返回 None。
     pub fn take_deliverable(&mut self, blocked: SignalSet) -> Option<(u8, SigInfoSlot)> {
         let sig = (self.pending & !blocked).lowest()?;
         let slot = self.info[sig as usize];
@@ -449,10 +400,8 @@ impl SignalState {
     }
 }
 
-/// 锁外路径的信号产生入口（kill/tgkill）：取 REGISTRY 锁、找活跃
-/// 目标后交 [`SignalState::generate`] 过滤入队。目标不存在或已退出
-///（僵尸）返回 ESRCH。已持 REGISTRY 锁的调用方须改用
-/// [`SignalState::generate`]（锁非重入，不可嵌套取锁）。
+/// 锁外信号产生入口（kill/tgkill）：取 REGISTRY 锁并调用 generate。
+/// 目标不存在或已退出返回 ESRCH；已持锁调用方须改用 generate。
 pub fn send_signal(target: Pid, sig: u8, slot: SigInfoSlot) -> Result<(), Errno> {
     let mut reg = REGISTRY.lock();
     let rec = reg
@@ -464,12 +413,9 @@ pub fn send_signal(target: Pid, sig: u8, slot: SigInfoSlot) -> Result<(), Errno>
     Ok(())
 }
 
-/// force 语义的信号产生入口（对应 Linux force_sig_info，kernel/signal.c）：
-/// 同步（硬件）信号不可被屏蔽或忽略——否则装 IGN 的程序访存出错会在
-/// 同一条指令上无限陷阱循环。取 REGISTRY 锁找活跃记录（force 目标恒为
-/// 自身，找不到仅防御返回），对该信号：IGN 处置重置为 DFL（flags/mask
-/// 一并清），从 blocked 清除该信号位，再 generate（此时必入队）。
-/// 已持 REGISTRY 锁的调用方禁止使用（锁非重入）。
+/// force 语义的信号产生入口：重置 IGN 处置并解蔽后入队，
+/// 同步信号因此不可屏蔽或忽略。
+/// 调用方不得持 REGISTRY 锁。
 pub fn force_signal(target: Pid, sig: u8, slot: SigInfoSlot) {
     let mut reg = REGISTRY.lock();
     if let Some(rec) = reg

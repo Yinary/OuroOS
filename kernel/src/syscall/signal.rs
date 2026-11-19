@@ -1,8 +1,6 @@
-//! 信号类系统调用：rt_sigaction/rt_sigprocmask/rt_sigpending/rt_sigaltstack，
-//! 对应 Linux kernel/signal.c 的 sys_rt_sig* 系列与 sys_sigaltstack；支持
-//! 范围与语义偏差统一登记 docs/ostd-contracts.md §4（登记由 docs commit
-//! 补做）。kill/tgkill/rt_sigqueueinfo/rt_sigsuspend/rt_sigtimedwait 走
-//! Flow::Process 路由，实现在 task 层，本模块不含。
+//! 信号类系统调用：rt_sigaction/rt_sigprocmask/rt_sigpending/rt_sigaltstack。
+//! 对应 Linux kernel/signal.c 的 sys_rt_sig* 系列与 sys_sigaltstack。
+//! 支持范围与偏差见 docs/ostd-contracts.md §4。
 #![deny(unsafe_code)]
 
 use super::Errno;
@@ -12,23 +10,17 @@ use crate::task::signal::{
     SIGKILL, SIGSTOP, SIG_DFL, SIG_IGN, SS_DISABLE,
 };
 
-/// SA_* 位与 SIG_BLOCK/UNBLOCK/SETMASK 的 UAPI 值（include/uapi/
-/// asm-generic/signal-defs.h；rv64/la64 共用，本机交叉工具链头一致）。
-/// SA_NOCLDWAIT 由 record_exit 消费；SA_RESTART 由 park 快路径
-///（task::user_task）消费；SA_NODEFER/SA_SIGINFO/SA_ONSTACK 由建帧
-/// 投递按固定语义处理（sigframe：恒加本信号屏蔽位 / 恒传三参 / 忽略），
-/// SA_NOCLDSTOP/SA_RESETHAND 暂无消费方。
+/// SA_* 与 SIG_BLOCK/UNBLOCK/SETMASK 的 UAPI 值
+///（include/uapi/asm-generic/signal-defs.h，rv64/la64 共用）。
 #[allow(dead_code)]
 const SA_NOCLDSTOP: u32 = 0x0000_0001;
 pub(crate) const SA_NOCLDWAIT: u32 = 0x0000_0002;
-/// SA_SIGINFO：rv/la ABI 恒传 siginfo/ucontext 三参，仅语义存档。
+/// SA_SIGINFO：rv/la ABI 恒传 siginfo/ucontext 三参。
 #[allow(dead_code)]
 const SA_SIGINFO: u32 = 0x0000_0004;
-/// rv/la 无 restorer 语义；存储时剥除（Linux UAPI_SA_FLAGS 对未定义
-/// 该位的架构同样屏蔽）。
+/// SA_RESTORER：rv/la 无 restorer 语义，存储时剥除。
 const SA_RESTORER: u32 = 0x0400_0000;
-/// SA_ONSTACK：建帧投递时若登记了备用栈且当前不在其上，帧落备用栈顶
-///（sigframe::build_deliver 按 Linux sigsp 选栈）。
+/// SA_ONSTACK：帧落备用栈顶。
 pub(crate) const SA_ONSTACK: u32 = 0x0800_0000;
 pub(crate) const SA_RESTART: u32 = 0x1000_0000;
 /// SA_NODEFER：未支持，建帧投递恒加本信号屏蔽位（sigframe）。
@@ -43,13 +35,8 @@ const SIG_SETMASK: usize = 2;
 /// 内核 sigset_t 字节数：内核侧 sigset 为单个 u64（1..=64）。
 pub(crate) const SIGSETSIZE: usize = 8;
 
-/// rt_sigaction 的 syscall 层结构（rv64/la64 ABI）。查证结论：两架构
-/// 的 UAPI 均无 SA_RESTORER（asm/riscv 无 uapi signal.h，loongarch 仅
-/// 补栈尺寸后含 asm-generic/signal.h；signal-defs.h 注明新架构不应
-/// 定义 SA_RESTORER），故 act/oact 均为 24 字节 {handler, flags, mask}，
-/// mask 靠后存放以便扩展；带 restorer 的 32 字节布局属 x86-64 等
-/// 定义了 SA_RESTORER 的架构（内核按 sizeof(struct sigaction) 原样
-/// copy_from/to_user，musl 侧 k_sigaction 同构）。
+/// rt_sigaction 的 syscall 层结构（24 字节：handler、flags、mask）。
+/// rv64/la64 无 SA_RESTORER，布局同 {handler, flags, mask}。
 #[derive(Debug, Clone, Copy)]
 struct KernelSigAction {
     handler: usize,
@@ -77,16 +64,9 @@ impl KernelSigAction {
     }
 }
 
-/// rt_sigaction(2)（sys_rt_sigaction）：单信号处置的读改写。sigsetsize
-/// 必须为 8；sig 合法域 1..=64，SIGKILL/SIGSTOP 仅不可改写（act≠0 时
-/// EINVAL，查询允许，同 Linux do_sigaction）。act≠0 时读 24 字节结构写
-/// 处置：flags 按 u32 存储（SA_* 最大 0x8000_0000 不丢失）并剥除
-/// SA_RESTORER 位，sa_mask 中 SIGKILL/SIGSTOP 位剥除（do_sigaction 的
-/// sigdelsetmask）。handler ∈ {SIG_DFL=0, SIG_IGN=1, 函数地址}。oact≠0
-/// 时回写调用前的旧值同构 24 字节（{handler, flags, mask}；act 与 oact
-/// 同传时先快照旧值，同 Linux do_sigaction）。处置设为忽略（显式
-/// SIG_IGN，或 DFL 且默认动作属忽略集）时清除该信号的 pending 位与
-/// 信息槽（flush_sigqueue_mask 单信号语义）。
+/// rt_sigaction(2)：单信号处置的读改写，成功返回 0。sigsetsize 须为 8，
+/// sig 合法域 1..=64，SIGKILL/SIGSTOP 仅不可改写。
+/// act/oact 可分别为空。
 pub(super) fn rt_sigaction(
     space: &crate::mm::address_space::UserAddressSpace,
     sig: usize,
@@ -110,8 +90,7 @@ pub(super) fn rt_sigaction(
         action.flags &= !SA_RESTORER;
         action.mask.del(SIGKILL);
         action.mask.del(SIGSTOP);
-        // 旧处置先快照：act 与 oact 同传时 oact 必须回写调用前的值
-        //（Linux do_sigaction 先 *oact=*k 再赋新）。
+        // 旧处置先快照：oact 回写调用前的值。
         let old = (oact != 0).then(|| state.disposition(sig));
         state.set_disposition(
             sig,
@@ -121,9 +100,7 @@ pub(super) fn rt_sigaction(
                 mask: action.mask,
             },
         );
-        // 处置转为忽略时冲刷该信号已排队的状态（Linux sig_handler_ignored
-        // 后的 flush_sigqueue_mask）：显式 SIG_IGN，或 DFL 且默认动作
-        // 属于忽略集（Ign/Cont）。
+        // 处置转为忽略时冲刷该信号已排队的状态。
         let ignored = action.handler == SIG_IGN
             || (action.handler == SIG_DFL
                 && matches!(
@@ -153,11 +130,8 @@ pub(super) fn rt_sigaction(
     Ok(0)
 }
 
-/// rt_sigprocmask(2)（sys_rt_sigprocmask）：改读屏蔽集合。sigsetsize
-/// 必须为 8；how ∈ {SIG_BLOCK=0, SIG_UNBLOCK=1, SIG_SETMASK=2}；set≠0
-/// 时读 8 字节 sigset，SIGKILL/SIGSTOP 位剥除后按 how 生效（三种 how
-/// 同样过滤，POSIX 不可屏蔽）；oldset≠0 时回写调用前的旧值（Linux 先
-/// 快照后生效，同序）。
+/// rt_sigprocmask(2)：改读屏蔽集合，成功返回 0。sigsetsize 须为 8，
+/// how 为 SIG_BLOCK/SIG_UNBLOCK/SIG_SETMASK，KILL/STOP 位剥除。
 pub(super) fn rt_sigprocmask(
     space: &crate::mm::address_space::UserAddressSpace,
     how: usize,
@@ -188,9 +162,8 @@ pub(super) fn rt_sigprocmask(
     Ok(0)
 }
 
-/// rt_sigpending(2)（sys_rt_sigpending）：sigsetsize 必须为 8（Linux
-/// 允许不大于 8，此处收紧，登记 docs）；按 do_sigpending 回写
-/// pending & blocked（仅当前阻塞、尚未投递的信号对用户可见）。
+/// rt_sigpending(2)：回写 pending & blocked，成功返回 0；sigsetsize 须为 8
+///（偏差登记 docs/ostd-contracts.md §4.5）。
 pub(super) fn rt_sigpending(
     space: &crate::mm::address_space::UserAddressSpace,
     set: usize,
@@ -205,19 +178,12 @@ pub(super) fn rt_sigpending(
     Ok(0)
 }
 
-/// stack_t 字节数（include/uapi/asm-generic/signal.h）：ss_sp@0、
-/// ss_flags@8（int，其后 4 字节填充）、ss_size@16。
+/// stack_t 字节数（ss_sp@0、ss_flags@8、ss_size@16）。
 const STACK_T_SIZE: usize = 24;
 
-/// sigaltstack(2)（sys_sigaltstack / do_sigaltstack）：备用栈登记的
-/// 换读。`sp` 为陷入前的用户栈指针，用于在/不在栈上的判定。
-/// uoldss≠0：回写当前登记（ss_flags 按 Linux sas_ss_flags：未启用
-/// SS_DISABLE、在栈上 SS_ONSTACK、启用不在栈上 0）。uss≠0：先查当前
-/// sp 不在备用栈上（在栈上改登记 → EPERM，Linux do_sigaltstack 的
-/// on_sig_stack 分支），再按 ss_flags：0 登记 sp/size 启用、SS_DISABLE
-/// 置禁用、其余 EINVAL（Linux 另接受 SS_ONSTACK 模式，本内核收紧，
-/// 偏差登记 docs）。flags=0 时按 Linux 以 size != 0 判定启用（size=0
-/// 即未启用）。size 下限 MINSIGSTKSZ 不检查，偏差登记 docs。
+/// sigaltstack(2)：备用栈登记的换读，成功返回 0。`sp` 为陷入前的用户 sp。
+/// uss 非空时先做在栈检查；uoldss 非空回写当前登记。
+/// 偏差登记 docs/ostd-contracts.md §4.5。
 pub(super) fn rt_sigaltstack(
     space: &UserAddressSpace,
     sp: usize,
@@ -248,7 +214,7 @@ pub(super) fn rt_sigaltstack(
         } else if flags == 0 {
             let ss_sp = usize::from_ne_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
             let ss_size = usize::from_ne_bytes(raw[16..24].try_into().unwrap_or([0; 8]));
-            // Linux sas_ss_size != 0 即启用；size=0 等价于禁用。
+            // size != 0 即启用；size=0 等价于禁用。
             state.set_alt_stack(ss_sp, ss_size, ss_size != 0);
         } else {
             return Err(Errno::Invalid);

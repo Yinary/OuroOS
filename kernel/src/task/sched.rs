@@ -23,9 +23,7 @@ use super::{
     ExitInfo,
 };
 
-/// 当前任务地址（0 = idle）。以整数存址而不是裸指针：percpu 槽要求
-/// 内容可跨“线程”声明安全，裸指针 !Send 会被静态拒收（与进程注册表
-/// 的单核凭证同理，见 mm::address_space::LocalSpace）。
+/// 当前任务地址（0 = idle）。以整数存址以满足 percpu 槽的 Send 要求。
 /// 单核 + 内核关中断下仅被调度器与当前任务自身访问。
 #[polyhal::percpu]
 static CURRENT: Cell<usize> = Cell::new(0);
@@ -154,14 +152,8 @@ impl Scheduler {
             self.move_waiting(|_, r| matches!(r, WaitReason::Pipe));
         }
         if WAKE_SIGNALS.swap(false, Ordering::AcqRel) {
-            // SCHED→REGISTRY 锁序嵌套点，见 docs/ostd-contracts.md §5
-            //（由 docs commit 登记）；全仓库仅此一处。
-            // 持 REGISTRY 一次 + 闭包查询，按可投递性精确判定（零分配）；
-            // 记录不存在或已退出的等待任务不搬。判定不感知等待原因，
-            // Deadline（nanosleep/sigtimedwait）与 Signal（sigsuspend）
-            // 等待者都按可投递性唤醒；sigtimedwait 的等待集不参与判定，
-            // 集合外信号也会唤醒（睡醒后的不落睡重查按各自语义处理，
-            // 见 user_task::park_check_signals）。
+            // 信号唤醒：持 REGISTRY 锁按可投递性搬回等待者（锁序
+            // SCHED→REGISTRY，见 docs/ostd-contracts.md §5）。
             let reg = super::REGISTRY.lock();
             self.move_waiting(|task, _| {
                 reg.records.iter().any(|r| {
@@ -406,10 +398,8 @@ pub(super) fn run_loop() {
 
 /// 上下文切换的唯一出口。from/to 指向稳定的堆或静态 KContext。
 fn switch_context(from: *mut KContext, to: *const KContext) {
-    // SAFETY:
-    // - from/to 均指向 Box<Task> 内或 static 的 KContext，调度期间不移动；
+    // SAFETY: from/to 指向 Box<Task> 内或 static 的 KContext，调度期间不移动；
     // - 两指针可指向同一实例（只有自己可让时），保存后恢复同组寄存器；
-    // - 单核、关中断执行，无并发进入；调度器锁已在调用前释放，
-    //   切入的任务可以再次取锁。
+    // - 单核、关中断执行，无并发进入；调度器锁在调用前已释放。
     unsafe { crate::hal::context_switch(from, to) }
 }

@@ -29,7 +29,7 @@ pub use user_task::{spawn_user, SpawnError};
 pub enum ExitInfo {
     /// exit(n) 或等效正常退出。
     Exited(i32),
-    /// 死于信号 sig；fault 携带硬件异常细节供终态报告（被 kill 杀死时为 None）。
+    /// 死于信号 sig；fault 为硬件异常细节。
     Signaled { sig: u8, fault: Option<UserFault> },
 }
 
@@ -41,9 +41,8 @@ impl ExitInfo {
 }
 
 /// 进程注册表条目：Task 之外的全部资源与终态。
-/// 生命周期：wait 成功收割即从表中删除；孤儿过继内核 init，
-/// 已退出者立即删除，活孤儿随后退出时删除，运行时间累归丢弃。
-/// 因此表内只存活跃进程与未被收割的僵尸，终态输出在任务时代结束时完成。
+/// 生命周期：wait 成功收割即删除；孤儿过继 init，运行时间累归丢弃。
+/// 表内只存活跃进程与未被收割的僵尸。
 pub struct ProcessRecord {
     user_ns: u64,
     system_ns: u64,
@@ -119,13 +118,9 @@ mod registry {
         });
     }
 
-    /// 任务退出的唯一登记点：记录终态并释放地址空间。
-    /// 终态行积攒到时代末统一输出（不混入用户程序的测试输出块，官方
-    /// oracle 按 START/END 块判定）；孤儿过继内核 init，已退出的孤儿
-    /// 即收（无消费者，运行时间累归丢弃）。向活跃父进程产生 SIGCHLD
-    ///（父 IGN/SA_NOCLDWAIT 时自动收割，语义见 docs/ostd-contracts.md）。
-    /// space/fs 的 Drop（页释放、fd 关闭、可能的磁盘回收）在锁外完成，
-    /// 避免 REGISTRY 锁内嵌套磁盘 I/O 与反向取锁。
+    /// 任务退出的唯一登记点：记录终态、释放地址空间并通知父进程。
+    /// 终态行积攒到时代末统一输出；父 IGN/SA_NOCLDWAIT 时自动收割。
+    /// space/fs 的 Drop 在锁外完成。
     pub fn record_exit(pid: Pid, exit: ExitInfo) {
         let taken = {
             let mut reg = REGISTRY.lock();
@@ -147,8 +142,7 @@ mod registry {
             }
             let init = INIT_PID.load(core::sync::atomic::Ordering::Relaxed);
             let orphan = rec.parent == init;
-            // SIGCHLD 挂接要用的字段先复制出来：父记录要在同一锁作用域
-            // 内另行 find（可变借用），不能与 rec 的借用重叠。
+            // 先复制出后续要用的字段，避免与 rec 借用重叠。
             let parent_pid = rec.parent;
             let (own_user, own_system, child_user, child_system) = (
                 rec.user_ns,
@@ -163,20 +157,15 @@ mod registry {
                 },
                 pid: pid as u32,
                 status: match exit {
-                    // wait4 的 WEXITSTATUS 口径：si_status 只保留低 8 位
-                    //（Linux do_notify_parent 的 exit_code & 0xff）。
+                    // wait4 口径：si_status 只保留低 8 位。
                     ExitInfo::Exited(n) => n & 255,
                     ExitInfo::Signaled { sig, .. } => sig as i32,
                 },
                 ..Default::default()
             };
             let taken = (rec.space.take(), rec.fs.take());
-            // SIGCHLD 通知（对应 Linux do_notify_parent/exit_notify）：
-            // 父处置 IGN 或 SA_NOCLDWAIT 时自动收割——不产生僵尸，本次
-            // 退出的记录在下方 retain 一并移除，运行时间累计并入父（与
-            // reap_child 口径一致）；否则向父入队 SIGCHLD。全程持
-            // REGISTRY 锁内联完成，禁止嵌套取锁；孤儿路径不通知（父为
-            // init，已即收）。
+            // SIGCHLD 通知：父 IGN 或 SA_NOCLDWAIT 时自动收割并入父
+            // 时间累计，否则向父入队 SIGCHLD。全程持 REGISTRY 锁内联完成。
             let auto_reap = if orphan {
                 false
             } else {
@@ -204,8 +193,7 @@ mod registry {
                     None => false,
                 }
             };
-            // 孤儿即收：清理已退出孩子及退出时已过继 init 的任务；
-            // 自动收割的记录在此一并移除。
+            // 孤儿即收：清理已退出孩子及过继 init 的任务，自动收割的记录一并移除。
             reg.records.retain(|r| {
                 !(r.parent == pid && r.exit.is_some() || (r.pid == pid && (orphan || auto_reap)))
             });
@@ -353,11 +341,9 @@ fn spawn_oom_probe() {
 #[cfg(not(debug_assertions))]
 fn spawn_oom_probe() {}
 
-/// 进入任务时代并运行到全部任务退出，返回前完成回收与帧守恒断言。
-/// 返回后由调用方关机（main）。
-///
-/// `baseline` 是任务时代开始前的帧统计（含已加载镜像、堆等固定开销），
-/// 全部退出后必须回到同一数值——kstack 与用户空间的释放被它覆盖。
+/// 进入任务时代并运行到全部任务退出，返回前完成回收与帧守恒断言；
+/// 返回后由调用方关机。
+/// `baseline` 为任务时代前的帧统计，全部退出后必须回到同一数值。
 pub fn run(baseline: (usize, usize)) {
     // 任务时代开始：内核关中断（用户态与 idle 等待两处例外，见契约）
     IRQ::int_disable();

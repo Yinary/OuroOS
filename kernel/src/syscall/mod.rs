@@ -1,11 +1,9 @@
 //! 系统调用分发：通用 UAPI 调用号分发表与进程/文件/内存三类实现入口。
 //! 调用号与寄存器约定按 riscv64/loongarch64 通用 UAPI（a7=调用号、
-//! a0..=a5=参数、a0=返回负 errno 或结果）。支持范围与 Linux 语义偏差
-//! 见 docs/ostd-contracts.md §4；PC 推进由运行循环统一处理。
+//! a0..=a5=参数、a0=返回值），支持范围与偏差见 docs/ostd-contracts.md §4。
 
 mod memory;
-// pub(crate)：SA_NOCLDWAIT 由 task 层 record_exit 消费（UAPI 常量
-// 集中在本模块定义）。
+// UAPI 常量集中在本模块定义。
 pub(crate) mod signal;
 
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
@@ -77,7 +75,7 @@ pub mod sysnr {
 /// Linux errno（仅当前用到的子集）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Errno {
-    /// EPERM: 操作不被允许（rt_sigqueueinfo 的内核保留 si_code 等）。
+    /// EPERM: 操作不被允许。
     Perm,
     Access,
     NoChild,
@@ -88,8 +86,7 @@ pub enum Errno {
     ExecFormat,
     Again,
     WouldBlock,
-    /// EINTR: 阻塞中的系统调用被信号打断时返回（park 快路径的
-    /// EINTR 完成）。
+    /// EINTR: 阻塞中的系统调用被信号打断时返回。
     Interrupted,
     Pipe,
     Io,
@@ -165,18 +162,16 @@ pub enum Flow {
     Yield,
     /// 在解除注册表借用后处理进程操作。
     Process,
-    /// rt_sigreturn：用户现场已整体从信号帧恢复，SEPC 即真实返回点，
-    /// 运行循环跳过 syscall_ok 直接续跑。
+    /// rt_sigreturn：现场已从信号帧恢复，SEPC 即真实返回点，
+    /// 运行循环不再推进。
     SigReturn,
     /// 任务已退出，携带退出状态。
     Exited(i32),
 }
 
-/// 系统调用分发。寄存器现场由调用方（用户任务运行循环）持有，
-/// 返回值写回 a0，PC 推进（syscall_ok）与执行流决策也由调用方统一处理。
-/// `pid` 为调用者标识（getpid 返回它）。调用发生在 REGISTRY 锁内：
-/// 需要改其他进程记录（kill/tgkill）的调用一律走 Flow::Process，
-/// 由运行循环在锁外处理。
+/// 系统调用分发，返回 Flow。返回值写回 a0，PC 推进与执行流决策由调用方处理。
+/// `pid` 为调用者标识。调用发生在 REGISTRY 锁内，改其他进程记录的
+/// 调用走 Flow::Process 在锁外处理。
 pub fn dispatch(
     cx: &mut TrapFrame,
     pid: usize,
@@ -217,10 +212,7 @@ pub fn dispatch(
             if ret == Err(Errno::WouldBlock) {
                 return Flow::Wait(WaitReason::Pipe);
             }
-            // 向无读者的管道写入：SIGPIPE 入队与 -EPIPE 返回并行
-            //（对应 Linux pipe_write，二者同时发生；信号是否致命由
-            // 投递阶段决定）。拦截在 dispatch 层：fs 层不持有调用者的
-            // 信号状态，保持文件层与信号机制无关。
+            // 向无读者的管道写入：SIGPIPE 入队并与 -EPIPE 返回并行。
             if ret == Err(Errno::Pipe) && (nr == sysnr::WRITE || nr == sysnr::WRITEV) {
                 signal.generate(
                     SIGPIPE,
@@ -278,17 +270,10 @@ pub fn dispatch(
             Flow::Continue
         }
         sysnr::RT_SIGRETURN => {
-            // rt_sigreturn(139)（sys_rt_sigreturn）：无参数，sp 指向信号帧。
-            // 成功：换入帧内保存的 handler 前 blocked，返回 Flow::SigReturn
-            //（现场已恢复，不再 syscall_ok）。失败（badframe/不可访问）：
-            // 按 Linux force_sigsegv 收敛——SIGSEGV 处置复位为 DFL（不重入
-            // 刚失败的 handler）、解除屏蔽并入队，下一轮循环顶检查点按
-            // DFL 终止，保证恰好一次投递（Linux badframe 用 force_sig，
-            // 若装了 SIGSEGV handler 可能循环，此处取不双重投递的简化，
-            // 偏差登记 docs/ostd-contracts.md）。
+            // rt_sigreturn(2)：按 sp 指向的信号帧恢复现场并换回屏蔽集合。
+            // 失败按 force SIGSEGV 处置，偏差登记 docs/ostd-contracts.md §4.5。
             match crate::sigframe::restore(cx, space) {
-                // 成功：屏蔽集合换回帧内保存值（KILL/STOP 位已剥除）；
-                // a0 透传 handler 返回值，Linux return regs->a0 同效。
+                // 成功：换回帧内保存的屏蔽集合（KILL/STOP 已剥除）。
                 Ok(old) => signal.setmask(old),
                 Err(_) => {
                     signal.set_disposition(SIGSEGV, Default::default());
@@ -312,10 +297,8 @@ pub fn dispatch(
             cx[TrapFrameArgs::RET] = 0;
             Flow::Yield
         }
-        // KILL/TGKILL 改目标进程的记录；RT_SIGSUSPEND/RT_SIGTIMEDWAIT
-        // 依赖运行循环的循环局部等待状态；RT_SIGQUEUEINFO 改目标进程
-        // 记录。dispatch 在 REGISTRY 锁内被调用、锁非重入，这些一律在
-        // 锁外（process_call）处理。
+        // KILL/TGKILL/RT_SIGSUSPEND/RT_SIGTIMEDWAIT/RT_SIGQUEUEINFO 改目标
+        // 记录或依赖循环局部等待状态，在锁外（process_call）处理。
         sysnr::KILL
         | sysnr::TGKILL
         | sysnr::RT_SIGSUSPEND
