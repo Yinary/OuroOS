@@ -18,7 +18,7 @@ use crate::{
 
 use super::{
     sched,
-    signal::fault_signal,
+    signal::{fault_signal, send_signal, SigInfoSlot},
     task::{Pid, Task, TaskBody, WaitReason},
     ExitInfo, REGISTRY,
 };
@@ -150,6 +150,7 @@ pub fn user_task_entry() -> ! {
                                 pid,
                                 &mut space.0,
                                 rec.fs.as_mut().expect("user fs context"),
+                                &mut rec.signal,
                             )
                         };
                             // 恰好推进一次 syscall PC：polyhal 对 SysCall
@@ -440,10 +441,60 @@ fn process_call(
                 }
             }
         }
+        sysnr::KILL | sysnr::TGKILL => kill_or_tgkill(parent, nr, args),
         _ => Err(Errno::NoSys),
     };
     frame[TrapFrameArgs::RET] = crate::syscall::to_abi(result);
     ProcessResult::Done
+}
+
+/// kill(2)/tgkill(2)（process_call 内、REGISTRY 锁外运行，可自由取
+/// 锁）。目标解析：pid>0 → 该 pid；pid==0 → 调用者自身（无进程组概念
+/// 的近似）；pid<0 → EINVAL（无进程组，-1 广播不支持）。tgkill 要求
+/// tgid==tid（单线程模型）。sig 合法域 0..=64：sig==0 仅做存在性检查
+///（目标活跃返回 0，否则 ESRCH）；SIGKILL/SIGSTOP 合法且正常发送。
+/// 偏差统一登记 docs/ostd-contracts.md。
+fn kill_or_tgkill(parent: Pid, nr: usize, args: [usize; 6]) -> Result<usize, Errno> {
+    let (pid_arg, sig_arg) = if nr == sysnr::KILL {
+        (args[0], args[1])
+    } else {
+        // tgkill(tgid, tid, sig)：两者须 > 0 且相等（Linux 校验 >0 且
+        // 同一线程组；相等性为本模型的单线程约束）。
+        let tgid = args[0] as u32 as i32;
+        let tid = args[1] as u32 as i32;
+        if tgid <= 0 || tgid != tid {
+            return Err(Errno::Invalid);
+        }
+        (args[1], args[2])
+    };
+    // pid_t 为 32 位：截断后再按符号解释，兼容寄存器零扩展/符号扩展。
+    let pid = pid_arg as u32 as i32;
+    if pid < 0 {
+        return Err(Errno::Invalid);
+    }
+    let target = if pid == 0 { parent } else { pid as usize };
+    // 负信号按 u32 解释为大值，落入 EINVAL（同 Linux valid_signal）。
+    let sig = sig_arg as u32;
+    if sig > 64 {
+        return Err(Errno::Invalid);
+    }
+    if sig == 0 {
+        let exists = REGISTRY
+            .lock()
+            .records
+            .iter()
+            .any(|r| r.pid == target && r.exit.is_none());
+        return if exists { Ok(0) } else { Err(Errno::NoProcess) };
+    }
+    send_signal(
+        target,
+        sig as u8,
+        SigInfoSlot {
+            pid: parent as u32,
+            ..Default::default()
+        },
+    )
+    .map(|_| 0)
 }
 /// 创建独立地址空间的子进程，保留父现场，子进程从下一条指令返回零。
 fn fork_user(parent: Pid, frame: &TrapFrame, flags: usize, stack: usize) -> Result<usize, Errno> {

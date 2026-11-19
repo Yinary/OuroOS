@@ -4,6 +4,9 @@
 //! 由接入方（后续 commit）移除。
 #![deny(unsafe_code)]
 
+use super::task::Pid;
+use super::REGISTRY;
+use crate::syscall::Errno;
 use crate::trap::UserFaultKind;
 
 /// 信号位图：位 (sig-1) 对应信号 sig，合法信号 1..=64
@@ -23,6 +26,10 @@ pub const SIGTRAP: u8 = 5;
 pub const SIGBUS: u8 = 7;
 /// SIGSEGV：无效内存访问。
 pub const SIGSEGV: u8 = 11;
+/// SIGKILL：不可捕获、不可屏蔽的终止信号。
+pub const SIGKILL: u8 = 9;
+/// SIGSTOP：不可捕获、不可屏蔽的停止信号。
+pub const SIGSTOP: u8 = 19;
 
 /// 致命用户异常对应的终止信号号。
 pub fn fault_signal(kind: UserFaultKind) -> u8 {
@@ -36,9 +43,38 @@ pub fn fault_signal(kind: UserFaultKind) -> u8 {
     }
 }
 
+/// 信号的默认动作类别（signal(7) 默认处置表）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultAction {
+    /// 终止进程。
+    Term,
+    /// 终止并核心转储（消费方：投递阶段）。
+    Core,
+    /// 忽略。
+    Ign,
+    /// 停止进程（消费方：投递阶段）。
+    Stop,
+    /// 被停止的进程继续执行（消费方：投递阶段）。
+    Cont,
+}
+
+/// 默认动作表，信号号为 asm-generic UAPI（rv64/la64，SIGRTMIN=32）：
+/// Core = 3/4/5/6/7/8/11/24/25/31，Ign = 17/23/28，Cont = 18，
+/// Stop = 19..=22，其余标准信号与实时信号 32..=64 为 Term。
+/// 取值与 man7.org signal(7) 表逐项核对，并同内核 include/linux/signal.h
+/// 的 SIG_KERNEL_{COREDUMP,IGNORE,STOP}_MASK 三组掩码一致。
+pub fn default_action(sig: u8) -> DefaultAction {
+    match sig {
+        3..=8 | 11 | 24 | 25 | 31 => DefaultAction::Core,
+        17 | 23 | 28 => DefaultAction::Ign,
+        18 => DefaultAction::Cont,
+        19..=22 => DefaultAction::Stop,
+        _ => DefaultAction::Term,
+    }
+}
+
 /// SignalSet 的最小操作集：u64 别名无法定义固有方法（E0390），
 /// 以扩展 trait 提供，调用形式不变。
-#[allow(dead_code)]
 pub trait SignalSetExt {
     /// 置入信号 sig；sig 不在 1..=64 时保持不变。
     fn add(&mut self, sig: u8);
@@ -47,7 +83,8 @@ pub trait SignalSetExt {
     /// 信号 sig 是否在集合中；sig 不在 1..=64 时返回 false。
     fn has(self, sig: u8) -> bool;
     /// 取集合中最小的信号号（按信号号从小到大取出，与 Linux 一致）；
-    /// 空集合返回 None。
+    /// 空集合返回 None。消费方为 take_deliverable（投递阶段接入）。
+    #[allow(dead_code)]
     fn lowest(self) -> Option<u8>;
 }
 
@@ -81,14 +118,15 @@ impl SignalSetExt for SignalSet {
 
 /// 单个信号的处置：handler 为 SIG_DFL/SIG_IGN 或用户函数地址。
 /// flags/mask 本步仅存储不消费；默认值即 DFL。
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SignalDisposition {
     /// 处理函数地址或 SIG_DFL/SIG_IGN。
     pub handler: usize,
-    /// sa_flags（sigaction 传入，本步仅存储）。
+    /// sa_flags（sigaction 传入，本步仅存储，消费方：投递阶段）。
+    #[allow(dead_code)]
     pub flags: u32,
-    /// sa_mask（本步仅存储）。
+    /// sa_mask（本步仅存储，消费方：投递阶段）。
+    #[allow(dead_code)]
     pub mask: SignalSet,
 }
 
@@ -112,7 +150,6 @@ pub struct SigInfoSlot {
 /// 单进程的信号状态。字段按将来多线程迁移的归属分两组：共享侧
 /// 多线程时留 ProcessRecord，私有侧搬入线程记录（依据见
 /// docs/ostd-contracts.md）。
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SignalState {
     /// —— 共享侧（多线程时留 ProcessRecord）——
@@ -121,6 +158,8 @@ pub struct SignalState {
     /// 已到达未投递的信号位图。
     pending: SignalSet,
     /// 与 pending 对应的信息槽，仅在对应 pending 位有效时解释。
+    /// 消费方为投递阶段的取槽。
+    #[allow(dead_code)]
     info: [SigInfoSlot; 65],
     /// —— 私有侧（多线程时搬入线程记录）——
     /// 屏蔽位图。
@@ -154,9 +193,6 @@ impl SignalState {
     }
 }
 
-/// 下列接口的消费方（kill/sigaction/sigprocmask 与投递循环）在后续
-/// commit 接入，此前压制 dead_code。
-#[allow(dead_code)]
 impl SignalState {
     /// 将信号 sig 置为 pending 并写入信息槽；sig 不在 1..=64 时
     /// 不修改任何状态。
@@ -166,16 +202,6 @@ impl SignalState {
         }
         self.pending.add(sig);
         self.info[sig as usize] = slot;
-    }
-
-    /// 取出最低的 `pending & !blocked` 信号：清除其 pending 位并返回
-    /// 信号号与信息槽拷贝；无可投递信号返回 None。SIGKILL/SIGSTOP
-    /// 不受屏蔽约束属投递阶段语义，本方法只做纯集合运算。
-    pub fn take_deliverable(&mut self, blocked: SignalSet) -> Option<(u8, SigInfoSlot)> {
-        let sig = (self.pending & !blocked).lowest()?;
-        let slot = self.info[sig as usize];
-        self.pending.del(sig);
-        Some((sig, slot))
     }
 
     /// 设置信号 sig 的处置；sig 不在 1..=64 时不修改任何状态。
@@ -208,6 +234,59 @@ impl SignalState {
     pub fn setmask(&mut self, mask: SignalSet) {
         self.blocked = mask;
     }
+
+    /// 当前屏蔽集合（rt_sigprocmask 回写 oldset 用）。
+    pub fn blocked(&self) -> SignalSet {
+        self.blocked
+    }
+
+    /// 当前 pending 位图（rt_sigpending 回写用）。
+    pub fn pending(&self) -> SignalSet {
+        self.pending
+    }
+
+    /// 取出最低的 `pending & !blocked` 信号：清除其 pending 位并返回
+    /// 信号号与信息槽拷贝；无可投递信号返回 None。SIGKILL/SIGSTOP
+    /// 不受屏蔽约束属投递阶段语义，本方法只做纯集合运算。
+    /// 消费方（投递循环）在后续 commit 接入，此前压制 dead_code。
+    #[allow(dead_code)]
+    pub fn take_deliverable(&mut self, blocked: SignalSet) -> Option<(u8, SigInfoSlot)> {
+        let sig = (self.pending & !blocked).lowest()?;
+        let slot = self.info[sig as usize];
+        self.pending.del(sig);
+        Some((sig, slot))
+    }
+}
+
+/// 信号产生的唯一入口：在目标进程的记录上登记一个信号。目标不存在
+/// 或已退出（僵尸）返回 ESRCH。过滤规则对应 Linux __send_signal/
+/// sig_ignored（kernel/signal.c）：屏蔽中的信号照常入队（sig_ignored
+/// 对 blocked 恒 false）；处置 IGN，或 DFL 且默认动作属 IGNORE 集
+///（CHLD/CONT/URG/WINCH，即本表 Ign 与 Cont 两类，对应 include/
+/// linux/signal.h 的 SIG_KERNEL_IGNORE_MASK）的信号静默丢弃并报告
+/// 成功；其余入队。本步只入队：pending 消费与唤醒属投递阶段 commit。
+/// 调用方保证 sig 在合法域 1..=64；queue 对域外信号不修改状态。
+pub fn send_signal(target: Pid, sig: u8, slot: SigInfoSlot) -> Result<(), Errno> {
+    let mut reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter_mut()
+        .find(|r| r.pid == target && r.exit.is_none())
+        .ok_or(Errno::NoProcess)?;
+    if !rec.signal.blocked.has(sig) {
+        let d = rec.signal.disposition(sig);
+        let ignored = d.handler == SIG_IGN
+            || (d.handler == SIG_DFL
+                && matches!(
+                    default_action(sig),
+                    DefaultAction::Ign | DefaultAction::Cont
+                ));
+        if ignored {
+            return Ok(());
+        }
+    }
+    rec.signal.queue(sig, slot);
+    Ok(())
 }
 
 impl Default for SignalState {

@@ -4,6 +4,7 @@
 //! 见 docs/ostd-contracts.md §4；PC 推进由运行循环统一处理。
 
 mod memory;
+mod signal;
 
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 
@@ -44,6 +45,11 @@ pub mod sysnr {
     pub const CLOCK_GETTIME: usize = 113;
     pub const SCHED_YIELD: usize = 124;
     pub const KILL: usize = 129;
+    pub const TGKILL: usize = 131;
+    // 信号
+    pub const RT_SIGACTION: usize = 134;
+    pub const RT_SIGPROCMASK: usize = 135;
+    pub const RT_SIGPENDING: usize = 136;
     pub const TIMES: usize = 153;
     pub const SET_TID_ADDRESS: usize = 96;
     pub const UNAME: usize = 160;
@@ -155,12 +161,15 @@ pub enum Flow {
 
 /// 系统调用分发。寄存器现场由调用方（用户任务运行循环）持有，
 /// 返回值写回 a0，PC 推进（syscall_ok）与执行流决策也由调用方统一处理。
-/// `pid` 为调用者标识（getpid 返回它）。
+/// `pid` 为调用者标识（getpid 返回它）。调用发生在 REGISTRY 锁内：
+/// 需要改其他进程记录（kill/tgkill）的调用一律走 Flow::Process，
+/// 由运行循环在锁外处理。
 pub fn dispatch(
     cx: &mut TrapFrame,
     pid: usize,
     space: &mut UserAddressSpace,
     fs: &mut crate::fs::context::Context,
+    signal: &mut crate::task::signal::SignalState,
 ) -> Flow {
     // 调用号在 a7（TrapFrameArgs::SYSCALL），参数在 a0..；返回值写回 a0
     let nr = cx[TrapFrameArgs::SYSCALL];
@@ -216,12 +225,34 @@ pub fn dispatch(
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
+        sysnr::RT_SIGACTION => {
+            // rt_sigaction(2)：单信号处置读改写
+            let ret = signal::rt_sigaction(space, a0, a1, a2, args[3], signal);
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        sysnr::RT_SIGPROCMASK => {
+            // rt_sigprocmask(2)：屏蔽集合改读
+            let ret = signal::rt_sigprocmask(space, a0, a1, a2, args[3], signal);
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        sysnr::RT_SIGPENDING => {
+            // rt_sigpending(2)：pending 位图回写
+            let ret = signal::rt_sigpending(space, a0, a1, signal);
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
         sysnr::SCHED_YIELD => {
             // sched_yield(2)：成功返回 0；让出意图交给运行循环
             cx[TrapFrameArgs::RET] = 0;
             Flow::Yield
         }
-        sysnr::NANOSLEEP
+        // KILL/TGKILL 改目标进程的记录，dispatch 在 REGISTRY 锁内被
+        // 调用、锁非重入，必须在锁外（process_call）处理。
+        sysnr::KILL
+        | sysnr::TGKILL
+        | sysnr::NANOSLEEP
         | sysnr::TIMES
         | sysnr::GETPPID
         | sysnr::CLONE
