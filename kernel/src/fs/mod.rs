@@ -177,12 +177,26 @@ pub fn write_raw(ino: u32, offset: usize, data: &[u8]) -> Result<usize, Errno> {
     }
 }
 
-/// 将普通文件截断到零字节。
-pub fn truncate(ino: u32) -> Result<(), Errno> {
+/// 调整普通文件长度；存活共享映射拒绝改变长度，FAT 仅支持原有清零操作。
+pub fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
+    let (mode, current, _, _) = stat(ino)?;
+    if mode & 0xf000 == 0x4000 {
+        return Err(Errno::IsDir);
+    }
+    if mode & 0xf000 != 0x8000 {
+        return Err(Errno::Invalid);
+    }
+    if current != length {
+        cache::check_truncate(ino)?;
+    }
     if ino & FAT_INODE != 0 {
-        fat::truncate(ino)
+        if length == 0 {
+            fat::truncate(ino)
+        } else {
+            Err(Errno::NotSupported)
+        }
     } else {
-        ext4::truncate(ino)
+        ext4::truncate(ino, length)
     }
 }
 

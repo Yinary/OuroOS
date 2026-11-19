@@ -523,6 +523,22 @@ fn directory(path: &str) -> Result<(), Errno> {
 }
 
 impl OpenFile {
+    /// 按可写 FD 调整普通文件长度，不改变共享文件偏移；其他对象返回 EINVAL。
+    pub(crate) fn truncate(&self, length: u64) -> Result<(), Errno> {
+        if self.flags & 0x200000 != 0 {
+            return Err(Errno::BadF);
+        }
+        if self.flags & 3 == 0 {
+            return Err(Errno::Invalid);
+        }
+        match self.kind {
+            Kind::Inode { ino, .. } if fs::stat(ino)?.0 & 0xf000 == 0x8000 => {
+                fs::truncate(ino, length)
+            }
+            _ => Err(Errno::Invalid),
+        }
+    }
+
     /// 查询共享的访问模式和文件状态标志。
     pub(crate) fn status_flags(&self) -> usize {
         self.flags

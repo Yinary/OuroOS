@@ -28,6 +28,8 @@ pub mod sysnr {
     pub const MOUNT: usize = 40;
     pub const STATFS: usize = 43;
     pub const FSTATFS: usize = 44;
+    pub const TRUNCATE: usize = 45;
+    pub const FTRUNCATE: usize = 46;
     pub const CHDIR: usize = 49;
     pub const OPENAT: usize = 56;
     pub const CLOSE: usize = 57;
@@ -197,6 +199,8 @@ pub fn dispatch(
         | sysnr::MOUNT
         | sysnr::STATFS
         | sysnr::FSTATFS
+        | sysnr::TRUNCATE
+        | sysnr::FTRUNCATE
         | sysnr::CHDIR
         | sysnr::OPENAT
         | sysnr::CLOSE

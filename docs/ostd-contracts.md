@@ -232,7 +232,7 @@ try_lock 失败即报告“持锁跨调度”。
 
 | 组 | 调用 | 实现 |
 |---|---|---|
-| 文件 | getcwd、dup、dup3、fcntl、mkdirat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、readlinkat、statfs、fstatfs、newfstatat、fstat、fsync、statx、umask、utimensat、renameat、renameat2 | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
+| 文件 | getcwd、dup、dup3、fcntl、mkdirat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、readlinkat、statfs、fstatfs、newfstatat、fstat、fsync、statx、umask、utimensat、renameat、renameat2、truncate、ftruncate | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
 | 进程 | exit、nanosleep、sched_yield、times、getpid、getppid、clone、execve、wait4 | `task::process_call` |
 | 内存 | brk、mmap、munmap、mprotect | `syscall/memory.rs` |
 | 其他 | uname、gettimeofday | `syscall/mod.rs` |
@@ -266,6 +266,7 @@ try_lock 失败即报告“持锁跨调度”。
 | mprotect | 支持 PROT_NONE 与含 X 的权限（W 必须同时有 R）；撤 X 返回 EOPNOTSUPP(95) | 两架构无 NX；实际可执行权限由 translate 报 |
 | brk/munmap | brk 失败返回原 break；munmap 起址页对齐、长度向上取整、允许空洞 | 均无按需分页；brk 立即分配/释放物理页 |
 | ELF | 仅 ET_EXEC 静态；p_vaddr 页对齐，p_filesz>0 时 p_offset 也页对齐；零地址允许 | 当前 basic ELF 只用 0x1000（rv 侧核对，两架构同链接脚本）；hint 与 MAP_FIXED 都可落到低址（低址并非不可达） |
+| truncate/ftruncate | 支持 Ext4 普通文件缩短、稀疏扩展与清零；路径形式跟随符号链接，FD 形式要求可写并支持已删名的打开 inode，长度操作不改共享偏移；O_TRUNC 复用同一 FS 接口。扩展区读零，缩短清空尾块剩余字节，回收含 unwritten 的尾部 extent 及多余索引块，更新长度、块计数与 mtime/ctime，并沿用后端清除 set-ID 位 | 负长度 EINVAL，超出 u32::MAX 个 4 KiB 逻辑块 EFBIG；无效 FD EBADF，只读 FD 和非普通 FD EINVAL，O_PATH FD EBADF。长度改变且存在存活共享页时 EOPNOTSUPP，包括子进程仍保留映射的情况；同长度允许，避免未实现的映射失效和旧共享页写回。FAT 仅沿用清零，非零长度 EOPNOTSUPP；旧式映射仅支持直接块清零，外部 xattr 与 HUGE_FILE 编码暂不支持。尚无完整身份权限、文件锁、执行文件占用保护及 immutable/append-only 校验；MAP_PRIVATE 截断后越过 EOF 的 SIGBUS 仍未实现，掉电/OOM/全部设备失败未验证 |
 | renameat/renameat2 | Ext4 支持同卷普通重命名、目标替换及 RENAME_NOREPLACE；按父目录 inode 更新目录项，末项链接自身被移动，中间链接跟随；跨挂载 EXDEV，目标非空目录 ENOTEMPTY，类型冲突分别 EISDIR/ENOTDIR；被替换但仍由 FD/映射引用的 inode 延迟回收 | EXCHANGE、WHITEOUT 和未知标志 EINVAL；FAT 卷内 EOPNOTSUPP；仍由任一进程 cwd、目录 FD 或挂载点引用的目录及其祖先返回 EBUSY，保护现有路径字符串身份。单核内核态串行化与根卷锁保证操作期间无其他任务观察中间状态；保存目录块及 inode 用于失败回滚，不保证掉电原子性，设备/回滚错误后拒绝继续访问卷；身份权限及 sticky/immutable/append-only 检查未实现；复杂分配失败回收及掉电恢复未验证。目标含外部 xattr 或有块的旧式映射暂不支持替换 |
 | unlink/unlinkat | EXT4 unlink 后句柄存活、最后关闭回收；FAT 有句柄时 EBUSY；unlinkat flags 仅 0 | AT_REMOVEDIR 返回 ENOTSUP |
 | getdents64 | fs 层提供目录项与续读位置，EXT4 后端按块解析，syscall 层打包 Linux dirent；单次最多 4KiB；FAT 返回 ENOTSUP | 后端目录块使用可失败堆分配；Linux 目录项打包的 4 KiB 栈缓冲区限制在不内联的 getdents64 函数内，避免普通文件 I/O 承担该栈帧；失败不推进文件偏移 |
@@ -281,6 +282,8 @@ FD 控制依据：[F_DUPFD](https://man7.org/linux/man-pages/man2/F_DUPFD.2const
 容量查询依据：[statfs(2)](https://man7.org/linux/man-pages/man2/statfs.2.html) 与 [asm-generic statfs UAPI](https://github.com/torvalds/linux/blob/v6.12/include/uapi/asm-generic/statfs.h)。仅按 ABI 独立编码；Ext4 fsid 取 UUID 前八字节，FAT 取卷序号，均作为不透明标识。
 
 链接读取依据：[readlink(2)](https://man7.org/linux/man-pages/man2/readlink.2.html) 与 [Linux v6.12 readlinkat ABI/空路径行为](https://github.com/torvalds/linux/blob/v6.12/fs/stat.c)。仅核对公开语义，未复制实现代码。
+
+截断依据：[truncate(2)](https://man7.org/linux/man-pages/man2/truncate.2.html)。按公开语义检查路径、FD、长度和偏移；存活共享映射下拒绝改长属于当前兼容性限制，不代表 Linux 的完整映射截断行为。
 
 重命名依据：[rename(2)](https://man7.org/linux/man-pages/man2/rename.2.html)。复用现有 FS 路径与引用管理，未复制 Linux 实现；当前支持范围见上表。
 
@@ -351,7 +354,7 @@ FD 控制依据：[F_DUPFD](https://man7.org/linux/man-pages/man2/F_DUPFD.2const
 | 只读与恢复 | `rsext4-readonly` 禁止 Ext4 适配层写入；挂载选项关闭日志重放，可写准入条件不作为只读卷的完整特性校验保证 |
 | Ext4 元数据布局 | rsext4 按超级块的 `s_desc_size`、`s_inode_size` 读取布局，不固定为 64 字节描述符或 128 字节 inode；4 KiB 限制来自后端 `BLOCK_SIZE` |
 | inode 标识 | 最高位区分 FAT 与 Ext4；Ext4 拒绝该位已置位的 inode，FAT 从 `0x8000_0000` 分配虚拟编号 |
-| 共享页与普通读写 | read 叠加已有共享页，write 更新后端后同步已有共享页；成功初始化的共享页在最后释放时尝试写回，长度限于当前 EOF 内；失败限制见 §6.5 |
+| 共享页与普通读写 | read 叠加已有共享页，write 更新后端后同步已有共享页；truncate 改变长度前检查存活共享页，当前单核非抢占路径中检查后直接进入截断，不允许中途调度；成功初始化的共享页在最后释放时尝试写回，长度限于当前 EOF 内；失败限制见 §6.5 |
 | 显式同步 | Ext4 fsync 先写回该 inode 的驻留共享页，再同步后端缓存、日志和设备；关机时同步并卸载可写根卷，FAT fsync 返回 ENOTSUP |
 | 字节块访问 | 完整对齐的扇区范围一次提交；不完整扇区先读后改，调用方负责串行化重叠写入 |
 | 错误边界 | FS 对外返回项目 `Errno`，后端错误由适配层转换；不保证任意失败都无磁盘副作用，也不据此保证第三方内部无 panic |
@@ -364,6 +367,7 @@ FD 控制依据：[F_DUPFD](https://man7.org/linux/man-pages/man2/F_DUPFD.2const
 | FD 与 inode 生命周期 | dup/fork 共享偏移，CLOEXEC 按描述符管理；Ext4 打开后 unlink 仍可访问，最后关闭回收 |
 | Ext4 目录遍历 | 后端按块解析，统一返回文件名、类型、inode 与续读位置；缓冲区可失败分配并跨块复用，FAT 尚未接入 |
 | 属性、容量与链接读取 | 统一 Metadata 提供所有者、大小、块数及可用时间；状态查询区分链接自身与目标，readlinkat 返回链接原文，statfs/fstatfs 查询 Ext4/FAT 卷容量，具体标志与限制见 §4 |
+| 任意长度截断 | truncate/ftruncate 与 O_TRUNC 共用 inode 接口；Ext4 稀疏扩展不按逻辑长度分配块，缩短处理尾块及预分配回收；映射、后端及权限边界见 §4 |
 | 定位与向量 I/O | 普通与定位读写共用搬运流程，iovec 先复制到内核；已有进展时返回短传输，支持范围见 §4 |
 | 共享页初始化失败处理 | 分配或填页失败不触发未初始化数据写回，已登记的 inode 引用由页生命周期持有 |
 | Ext4 日志同步 | 接入有日志卷的正常挂载、显式同步与卸载；不包含异常关机后的日志恢复 |
@@ -413,6 +417,7 @@ FD 控制依据：[F_DUPFD](https://man7.org/linux/man-pages/man2/F_DUPFD.2const
 | loongarch64 debug 启动自检（`trap/unaligned.rs`） | 直接验证模拟器 load/store、符号扩展、r0、跨页原子失败与只读拒绝 |
 | `tests/run_group.py` | 双架构 group/edges/selftest 整组验收：QEMU 10.0.2、官方 oracle、`e2fsck -fn` |
 | `tests/fs_stat.py --metadata` | `make all` 后执行 `python3 tests/fs_stat.py --metadata --output target/fs-validation/metadata`，验证双架构 128/256 字节 inode 的创建掩码、fork/exec、NOW/OMIT、FD/链接时间更新与落盘；只读版本先构建相应 feature，添加 --readonly 并指定独立输出目录，结束后恢复默认内核 |
+| `tests/fs_stat.py --truncate` | 构建后运行；验证双架构 128/256 字节 inode 的缩短、稀疏扩展、零尾部、预分配与索引回收、偏移不变、链接/已删名 FD、父子进程共享映射保护及错误参数；debugfs 独立核对落盘内容并运行 e2fsck/FAT fsck；只读构建增加 --readonly |
 | `tests/fs_stat.py --rename` / `tests/fs_rename_backend.py` | 前者在双架构及两种 inode 大小验证重命名、替换后的旧 FD、目录链接数/父项、扩容、目录引用保护与跨挂载拒绝，运行前后 e2fsck；只读构建另加 --readonly。后者在宿主端逐次注入元数据时间源 EIO，验证替换、插入和扩容后的回滚及 e2fsck，不代表磁盘掉电或所有 I/O 失败验证 |
 | `tests/fs_stat.py` | `make all` 后执行 `python3 tests/fs_stat.py`，验证双架构 128/256 字节 inode 的元数据、路径、readlinkat 和 statfs/fstatfs；容量与磁盘快照对照，并验证分配、最后关闭回收及 Ext4/FAT 隔离；镜像运行前后 e2fsck，FAT 卷运行后 fsck.fat。只读版本先构建 rsext4-readonly，同一脚本以 --output 指定独立输出目录 |
 | `tests/fs_io.py` | `make all` 后执行 `python3 tests/fs_io.py`，构造独立 Ext4 盘验证双架构定位/向量 I/O、用户缓冲区错误、管道与落盘一致性；只读版本先 `make all FEATURES=rsext4-readonly` 再加 `--readonly`，结束后恢复默认构建 |

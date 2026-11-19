@@ -9,6 +9,19 @@ use polyhal::PhysAddr;
 use spin::Mutex;
 static PAGES: Mutex<Vec<(u32, usize, Weak<SharedPage>)>> = Mutex::new(Vec::new());
 
+/// 有存活共享页时拒绝改变文件长度；调用方保证单核非抢占的检查与截断顺序。
+pub(super) fn check_truncate(ino: u32) -> Result<(), Errno> {
+    if PAGES
+        .lock()
+        .iter()
+        .any(|(id, _, page)| *id == ino && page.strong_count() != 0)
+    {
+        Err(Errno::NotSupported)
+    } else {
+        Ok(())
+    }
+}
+
 /// 一页共享文件内容，最后一个映射释放时写回。
 pub struct SharedPage {
     frame: OwnedFrame,

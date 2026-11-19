@@ -37,6 +37,7 @@ pub fn dispatch(
     match nr {
         sysnr::UMASK => Ok(ctx.set_umask(a[0])),
         sysnr::UTIMENSAT => utimensat(ctx, space, a),
+        sysnr::TRUNCATE | sysnr::FTRUNCATE => truncate(nr, ctx, space, a),
         sysnr::RENAMEAT | sysnr::RENAMEAT2 => renameat(nr, ctx, space, a),
         sysnr::GETCWD => {
             if a[1] < ctx.cwd().len() + 1 {
@@ -160,7 +161,7 @@ pub fn dispatch(
                 return Err(Errno::IsDir);
             }
             if a[2] & 0x200 != 0 && a[2] & 3 != 0 {
-                fs::truncate(ino)?;
+                fs::truncate(ino, 0)?;
             }
             ctx.open_inode(
                 ino,
@@ -228,6 +229,29 @@ pub fn dispatch(
         }
         _ => Err(Errno::NoSys),
     }
+}
+
+/// Linux truncate/ftruncate：检查有符号长度，按路径或可写 FD 调整普通文件长度。
+fn truncate(
+    nr: usize,
+    ctx: &Context,
+    space: &UserAddressSpace,
+    a: [usize; 6],
+) -> Result<usize, Errno> {
+    let length = a[1] as i64;
+    if length < 0 {
+        return Err(Errno::Invalid);
+    }
+    if nr == sysnr::TRUNCATE {
+        let path = user_string(space, a[0])?;
+        let info = ctx.query((-100isize) as usize, &path, false, true)?;
+        fs::truncate(info.ino as u32, length as u64)?;
+    } else {
+        ctx.get(a[0] as u32 as usize)?
+            .lock()
+            .truncate(length as u64)?;
+    }
+    Ok(0)
 }
 
 /// Linux getdents64：按后端续读位置打包目录项，缓冲区不足时返回 EINVAL。

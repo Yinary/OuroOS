@@ -494,14 +494,18 @@ pub(super) fn write_raw(ino: u32, offset: usize, data: &[u8]) -> Result<usize, E
     })
 }
 
-/// 将普通文件截断到零字节。
-pub(super) fn truncate(ino: u32) -> Result<(), Errno> {
+/// 按 inode 调整普通文件长度，I/O 或结构错误后停止访问卷。
+pub(super) fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
     if !WRITABLE {
         return Err(Errno::ReadOnly);
     }
     access(|v| {
         let ino = regular_inode(v, ino)?;
-        rsext4::file::truncate_inode(&mut v.device, &mut v.fs, ino, 0)
+        rsext4::file::truncate_inode(&mut v.device, &mut v.fs, ino, length).inspect_err(|e| {
+            if matches!(e.code, rsext4::Errno::EIO | rsext4::Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })
     })
 }
 

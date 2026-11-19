@@ -42,21 +42,38 @@ def verify_metadata(image, out, stem, small, readonly):
                 raise RuntimeError(f"落盘权限不符: {name}")
 
 
+def verify_truncate(image, out, stem, readonly):
+    expected = {"/meta/data": b"testing"} if readonly else {
+        "/meta/data": b"", "/prealloc": b"", "/prealloc-zero": b"",
+        "/fragmented": b"", "/reused": b"", "/after-free": bytes([0x33]) * 4096,
+        "/mapped": bytes(100) + bytes([0x7f]) + bytes(8192 - 101),
+    }
+    for number, (path, content) in enumerate(expected.items()):
+        dumped = out / f"{stem}-truncate-{number}.bin"
+        dumped.unlink(missing_ok=True)
+        log = out / f"{stem}-truncate-{number}.log"
+        run(["debugfs", "-R", f'dump {path} "{dumped}"', str(image)], log)
+        if not dumped.exists() or dumped.read_bytes() != content:
+            raise RuntimeError(f"截断落盘内容不符: {path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "target/fs-validation/stat")
     parser.add_argument("--metadata", action="store_true", help="验证 umask 和 utimensat")
     parser.add_argument("--rename", action="store_true", help="验证 renameat 和 renameat2")
+    parser.add_argument("--truncate", action="store_true", help="验证 truncate 和 ftruncate")
     parser.add_argument("--readonly", action="store_true", help="metadata 专项要求只读内核")
     args = parser.parse_args()
-    if args.metadata and args.rename:
-        parser.error("--metadata 与 --rename 不能同时使用")
+    if sum((args.metadata, args.rename, args.truncate)) > 1:
+        parser.error("--metadata、--rename 与 --truncate 不能同时使用")
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     user = out / "user"
     shutil.copytree(ROOT / "user/hello", user, dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns("target"))
-    program = "fs_rename.rs" if args.rename else "fs_metadata.rs" if args.metadata else "fs_stat.rs"
+    program = ("fs_truncate.rs" if args.truncate else "fs_rename.rs" if args.rename
+               else "fs_metadata.rs" if args.metadata else "fs_stat.rs")
     shutil.copyfile(ROOT / "tests" / program, user / "src/bin/hello.rs")
     if args.metadata:
         shutil.copyfile(ROOT / "tests/fs_metadata_exec.rs", user / "src/bin/check.rs")
@@ -116,6 +133,13 @@ def main():
                 commands += [f'write "{payload}" /hard-a', "link /hard-a /hard-b",
                              "set_inode_field /hard-a links_count 2", "mkdir /full"]
                 commands += [f'write "{empty}" /full/f{i:03d}' for i in range(338)]
+            if args.truncate:
+                commands += [f'write "{empty}" /prealloc', "fallocate /prealloc 0 31",
+                             "set_inode_field /prealloc size 65536",
+                             f'write "{empty}" /prealloc-zero', "fallocate /prealloc-zero 0 7",
+                             f'write "{empty}" /fragmented']
+                commands += [f"fallocate /fragmented {i} {i}" for i in (0, 3, 9, 16, 25, 40, 60, 90)]
+                commands += ["set_inode_field /fragmented size 372736"]
             script = out / f"{stem}-populate"
             script.write_text("\n".join(commands) + "\n")
             run(["debugfs", "-w", "-f", str(script), str(ext)], out / f"{stem}-populate.log")
@@ -186,7 +210,8 @@ def main():
                  "-nographic", "-no-reboot", "-drive", f"file={image},format=raw,if=none,id=disk",
                  "-device", f"{device},drive=disk"], out / f"{stem}.log")
             text = (out / f"{stem}.log").read_text(errors="replace")
-            markers = (("RENAME PASS:",) if args.rename else
+            markers = (("TRUNCATE PASS:",) if args.truncate else
+                       ("RENAME PASS:",) if args.rename else
                        ("METADATA PASS:", "MASK EXEC PASS") if args.metadata else
                        ("STAT PASS:", "READLINK PASS:", "STATFS PASS:"))
             if (not all(marker in text for marker in markers)
@@ -195,6 +220,8 @@ def main():
             if args.metadata and args.readonly != ("METADATA READONLY" in text):
                 raise RuntimeError(f"{stem}: 内核只读配置与测试要求不符")
             if args.rename and args.readonly != ("RENAME READONLY" in text):
+                raise RuntimeError(f"{stem}: 内核只读配置与测试要求不符")
+            if args.truncate and args.readonly != ("TRUNCATE READONLY" in text):
                 raise RuntimeError(f"{stem}: 内核只读配置与测试要求不符")
             if start:
                 with image.open("rb") as stream:
@@ -205,8 +232,11 @@ def main():
                 run(["fsck.fat", "-n", str(fat)], out / f"{stem}-after-fat-fsck.log")
             if args.metadata:
                 verify_metadata(ext, out, stem, inode_size == 128, args.readonly)
+            if args.truncate:
+                verify_truncate(ext, out, stem, args.readonly)
             run(["e2fsck", "-fn", str(ext)], out / f"{stem}-after-fsck.log")
-            suite = "rename" if args.rename else "metadata" if args.metadata else "status queries"
+            suite = ("truncate" if args.truncate else "rename" if args.rename
+                     else "metadata" if args.metadata else "status queries")
             print(f"{stem}: PASS ({suite} and e2fsck)", flush=True)
 
 

@@ -15,3 +15,5 @@
 rsext4 本地时间接口补丁（2026-11-18）：在 `src/metadata/api.rs` 新增 `utimens_inode`，由 `src/metadata/mod.rs` 导出；路径版接口复用同一实现。沿用 Apache-2.0，未新增依赖或复制其他内核代码。
 
 rsext4 本地重命名补丁（2026-11-19）：重写 `src/file/rename.rs`，从 `src/file/mod.rs` 导出按父 inode 重命名及旧目标回收接口；替换不提前释放目标，失败恢复目录块与 inode，目录移动维护父项及链接数，空目录目标回收维护分组目录计数。沿用 Apache-2.0，补丁由本项目实现，Linux 仅参考公开语义。
+
+rsext4 本地截断补丁（2026-11-19）：修改 `src/file/io.rs` 的 inode 截断流程及 `src/extents_tree/parse.rs` 的区间遍历，支持稀疏扩展、尾块清零、unwritten extent 和索引块回收；保留原 Apache-2.0 协议，无新增依赖，未复制 Linux 实现代码。
