@@ -48,6 +48,8 @@ pub enum WaitReason {
     Children,
     /// 等待任意 pipe 可读/可写。
     Pipe,
+    /// ppoll 同时等待管道变化或截止时间。
+    PollUntil(core::time::Duration),
 }
 
 /// 单个任务。

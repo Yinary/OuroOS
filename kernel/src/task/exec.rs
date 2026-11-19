@@ -36,7 +36,12 @@ fn strings(space: &UserAddressSpace, ptr: usize) -> Result<Vec<String>, Errno> {
     Err(Errno::TooBig)
 }
 /// 布置 argc/argv/envp/auxv，栈顶按 16 字节对齐。
-pub fn stack(space: &UserAddressSpace, argv: &[String], envp: &[String]) -> Result<usize, Errno> {
+pub fn stack(
+    space: &UserAddressSpace,
+    argv: &[String],
+    envp: &[String],
+    image: elf::ImageInfo,
+) -> Result<usize, Errno> {
     let mut sp = USER_STACK_TOP;
     let mut pointers = Vec::new();
     pointers
@@ -55,13 +60,20 @@ pub fn stack(space: &UserAddressSpace, argv: &[String], envp: &[String]) -> Resu
     }
     let mut words = Vec::new();
     words
-        .try_reserve(pointers.len() + 9)
+        .try_reserve(pointers.len() + 18)
         .map_err(|_| Errno::NoMem)?;
     words.push(argv.len());
     words.extend_from_slice(&pointers[..argv.len()]);
     words.push(0);
     words.extend_from_slice(&pointers[argv.len()..]);
-    words.extend_from_slice(&[0, 6, 4096, 0, 0]); // AT_PAGESZ 与 AT_NULL
+    words.extend_from_slice(&[0, 6, 4096, 9, image.entry]);
+    if let Some((phdr, size, count)) = image.headers {
+        words.extend_from_slice(&[3, phdr, 4, size, 5, count]);
+    }
+    let random = crate::entropy::exec_random().ok_or(Errno::Io)?;
+    sp = sp.checked_sub(random.len()).ok_or(Errno::TooBig)?;
+    user_access::copy_to_user(space, sp, &random).map_err(|_| Errno::TooBig)?;
+    words.extend_from_slice(&[25, sp, 0, 0]);
     sp = sp.checked_sub(words.len() * 8).ok_or(Errno::TooBig)? & !15;
     for (i, word) in words.iter().enumerate() {
         user_access::copy_to_user(space, sp + i * 8, &word.to_ne_bytes())
@@ -86,6 +98,16 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
         (image, argv, envp)
     };
     let mut space = UserAddressSpace::new().map_err(|_| Errno::NoMem)?;
+    {
+        let reg = REGISTRY.lock();
+        let current = reg
+            .records
+            .iter()
+            .find(|r| r.pid == pid)
+            .and_then(|r| r.space.as_ref())
+            .ok_or(Errno::Invalid)?;
+        space.inherit_memory_limits(current.as_space());
+    }
     let entry = elf::load_elf(&mut space, &image).map_err(|e| {
         if matches!(e, elf::ElfError::OutOfMemory) {
             Errno::NoMem
@@ -95,9 +117,9 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
     })?;
     space.init_heap();
     space.map_stack().map_err(|_| Errno::NoMem)?;
-    let sp = stack(&space, &argv, &envp)?;
+    let sp = stack(&space, &argv, &envp, entry)?;
     let mut next = TrapFrame::new();
-    next[TrapFrameArgs::SEPC] = entry;
+    next[TrapFrameArgs::SEPC] = entry.entry;
     next[TrapFrameArgs::SP] = sp;
     let mut reg = REGISTRY.lock();
     let rec = reg
@@ -106,6 +128,7 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
         .find(|r| r.pid == pid)
         .ok_or(Errno::Invalid)?;
     if let Some(old) = rec.space.as_ref() {
+        space.check_exec_limits().map_err(|_| Errno::NoMem)?;
         old.as_space().deactivate();
     }
     rec.space = Some(LocalSpace(space));

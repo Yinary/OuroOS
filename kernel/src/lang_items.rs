@@ -2,7 +2,7 @@
 
 use core::panic::PanicInfo;
 
-use polyhal::{instruction::shutdown, println};
+use polyhal::println;
 
 /// panic 回调：打印位置与消息后关机，不会返回。
 #[panic_handler]
@@ -17,5 +17,5 @@ fn panic(info: &PanicInfo) -> ! {
     } else {
         println!("[panic] {}", info.message());
     }
-    shutdown()
+    crate::hal::shutdown()
 }

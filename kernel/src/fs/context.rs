@@ -17,6 +17,7 @@ struct Pipe {
     writers: usize,
 }
 enum Kind {
+    MemInfo(String),
     Input,
     Output,
     Pipe {
@@ -75,12 +76,12 @@ impl Context {
     pub fn new() -> Result<Self, Errno> {
         let mut fds = Vec::new();
         fds.try_reserve(3).map_err(|_| Errno::NoMem)?;
-        for kind in [Kind::Input, Kind::Output, Kind::Output] {
+        for (kind, flags) in [(Kind::Input, 0), (Kind::Output, 1), (Kind::Output, 1)] {
             fds.push(Some(Descriptor {
                 handle: crate::fs::try_arc(Mutex::new(OpenFile {
                     kind,
                     offset: 0,
-                    flags: 2,
+                    flags,
                 }))?,
                 cloexec: false,
             }));
@@ -107,7 +108,13 @@ impl Context {
             .ok_or(Errno::BadF)
     }
     fn install(&mut self, file: Handle, cloexec: bool) -> Result<usize, Errno> {
-        if let Some(i) = self.fds.iter().position(Option::is_none) {
+        self.install_from(file, cloexec, 0)
+    }
+    fn install_from(&mut self, file: Handle, cloexec: bool, min: usize) -> Result<usize, Errno> {
+        if min >= 1024 {
+            return Err(Errno::Invalid);
+        }
+        if let Some(i) = (min..self.fds.len()).find(|&i| self.fds[i].is_none()) {
             self.fds[i] = Some(Descriptor {
                 handle: file,
                 cloexec,
@@ -117,7 +124,11 @@ impl Context {
         if self.fds.len() >= 1024 {
             return Err(Errno::TooManyFiles);
         }
-        self.fds.try_reserve(1).map_err(|_| Errno::NoMem)?;
+        let slot = min.max(self.fds.len());
+        self.fds
+            .try_reserve(slot + 1 - self.fds.len())
+            .map_err(|_| Errno::NoMem)?;
+        self.fds.resize_with(slot, || None);
         self.fds.push(Some(Descriptor {
             handle: file,
             cloexec,
@@ -214,6 +225,24 @@ pub fn dispatch(
             )
             .map_err(|_| Errno::Fault)?;
             Ok(ctx.cwd.len() + 1)
+        }
+        sysnr::FCNTL => {
+            let file = ctx.get(a[0])?;
+            match a[1] {
+                0 | 1030 => ctx.install_from(file, a[1] == 1030, a[2]),
+                // 打开时的创建标志与描述符上的 CLOEXEC 不属于 F_GETFL。
+                3 => Ok(file.lock().flags & !(0x40 | 0x80 | 0x100 | 0x200 | 0x80000)),
+                1 | 2 => {
+                    let fd = ctx.fds[a[0]].as_mut().ok_or(Errno::BadF)?;
+                    if a[1] == 1 {
+                        Ok(fd.cloexec as usize)
+                    } else {
+                        fd.cloexec = a[2] & 1 != 0;
+                        Ok(0)
+                    }
+                }
+                _ => Err(Errno::Invalid),
+            }
         }
         sysnr::DUP => ctx.install(ctx.get(a[0])?, false),
         sysnr::DUP3 => {
@@ -327,6 +356,47 @@ pub fn dispatch(
             }
             Ok(0)
         }
+        sysnr::READV | sysnr::WRITEV => {
+            ctx.get(a[0])?;
+            if a[2] > 1024 {
+                return Err(Errno::Invalid);
+            }
+            let mut vectors = Vec::new();
+            vectors.try_reserve_exact(a[2]).map_err(|_| Errno::NoMem)?;
+            let mut total = 0usize;
+            for i in 0..a[2] {
+                let mut pair = [0u8; 16];
+                let p = a[1].checked_add(i * 16).ok_or(Errno::Fault)?;
+                user_access::copy_from_user(space, p, &mut pair).map_err(|_| Errno::Fault)?;
+                let base = usize::from_ne_bytes(pair[..8].try_into().map_err(|_| Errno::Invalid)?);
+                let len = usize::from_ne_bytes(pair[8..].try_into().map_err(|_| Errno::Invalid)?);
+                total = total
+                    .checked_add(len)
+                    .filter(|n| *n <= isize::MAX as usize)
+                    .ok_or(Errno::Invalid)?;
+                vectors.push((base, len));
+            }
+            let mut done = 0;
+            let op = if nr == sysnr::READV {
+                sysnr::READ
+            } else {
+                sysnr::WRITE
+            };
+            for (base, len) in vectors {
+                base.checked_add(len).ok_or(Errno::Fault)?;
+                match rw(op, [a[0], base, len, 0, 0, 0], space, ctx) {
+                    Ok(n) => {
+                        done += n;
+                        if n < len {
+                            break;
+                        }
+                    }
+                    Err(_) if done != 0 => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(done)
+        }
         sysnr::GETDENTS64 => {
             let handle = ctx.get(a[0])?;
             let mut f = handle.lock();
@@ -337,7 +407,7 @@ pub fn dispatch(
             if fs::stat(ino)?.0 & 0xf000 != 0x4000 {
                 return Err(Errno::NotDir);
             }
-            let mut out = [0u8; 4096];
+            let mut out = io_buffer()?;
             let cap = a[2].min(out.len());
             let mut used = 0;
             let mut offset = f.offset;
@@ -422,6 +492,20 @@ pub fn dispatch(
                 }
                 Err(e) => return Err(e),
             };
+            if ino >= super::procfs::MEMINFO && a[2] & (3 | 0x200) != 0 {
+                return Err(Errno::ReadOnly);
+            }
+            if ino == super::procfs::MEMINFO {
+                if a[2] & 0x10000 != 0 {
+                    return Err(Errno::NotDir);
+                }
+                let file = OpenFile {
+                    kind: Kind::MemInfo(super::procfs::meminfo()?),
+                    offset: 0,
+                    flags: a[2],
+                };
+                return ctx.install(fs::try_arc(Mutex::new(file))?, a[2] & 0x80000 != 0);
+            }
             let mode = fs::stat(ino)?.0;
             if a[2] & 0x10000 != 0 && mode & 0xf000 != 0x4000 {
                 return Err(Errno::NotDir);
@@ -460,14 +544,15 @@ pub fn dispatch(
         sysnr::LSEEK => {
             let handle = ctx.get(a[0])?;
             let mut f = handle.lock();
-            let ino = match f.kind {
-                Kind::Inode { ino, .. } => ino,
+            let length = match &f.kind {
+                Kind::Inode { ino, .. } => fs::stat(*ino)?.1 as usize,
+                Kind::MemInfo(s) => s.len(),
                 _ => return Err(Errno::SeekPipe),
             };
             let base = match a[2] {
                 0 => 0,
                 1 => f.offset,
-                2 => fs::stat(ino)?.1 as usize,
+                2 => length,
                 _ => return Err(Errno::Invalid),
             };
             let offset = base as i128 + (a[1] as isize) as i128;
@@ -478,26 +563,39 @@ pub fn dispatch(
             Ok(f.offset)
         }
         sysnr::READ | sysnr::WRITE => rw(nr, a, space, ctx),
-        sysnr::STATX => {
+        sysnr::STATX | sysnr::FSTATAT => {
             let path = user_path(space, a[1])?;
-            if a[2] & !(0x1000 | 0x100 | 0x800 | 0x6000) != 0 {
+            let flags = if nr == sysnr::STATX { a[2] } else { a[3] };
+            let allowed = 0x1900 | if nr == sysnr::STATX { 0x6000 } else { 0 };
+            if flags & !allowed != 0 {
                 return Err(Errno::Invalid);
             }
-            let (ino, mode, size, links, blocks) = if path.is_empty() && a[2] & 0x1000 != 0 {
-                let handle = ctx.get(a[0])?;
-                let f = handle.lock();
-                match &f.kind {
-                    Kind::Inode { ino, .. } => {
-                        let (m, s, l, b) = fs::stat(*ino)?;
-                        (*ino as u64, m, s, l, b)
+            let (ino, mode, size, links, blocks) =
+                if path.is_empty() && flags & 0x1000 != 0 && a[0] as isize != -100 {
+                    let handle = ctx.get(a[0])?;
+                    let f = handle.lock();
+                    match &f.kind {
+                        Kind::Inode { ino, .. } => {
+                            let (m, s, l, b) = fs::stat(*ino)?;
+                            (*ino as u64, m, s, l, b)
+                        }
+                        Kind::MemInfo(_) => (super::procfs::MEMINFO as u64, 0o100444, 0, 1, 0),
+                        _ => (0, 0x2000 | 0o666, 0, 1, 0),
                     }
-                    _ => (0, 0x2000 | 0o666, 0, 1, 0),
-                }
-            } else {
-                let ino = fs::lookup(&ctx.path(a[0], &path)?)?;
-                let (m, s, l, b) = fs::stat(ino)?;
-                (ino as u64, m, s, l, b)
-            };
+                } else {
+                    let resolved =
+                        if path.is_empty() && flags & 0x1000 != 0 && a[0] as isize == -100 {
+                            string(&ctx.cwd)?
+                        } else {
+                            ctx.path(a[0], &path)?
+                        };
+                    let ino = fs::lookup(&resolved)?;
+                    let (m, s, l, b) = fs::stat(ino)?;
+                    (ino as u64, m, s, l, b)
+                };
+            if nr == sysnr::FSTATAT {
+                return write_stat(space, a[2], ino, mode, size, links, blocks);
+            }
             let mut data = [0u8; 256];
             data[0..4].copy_from_slice(&0x307u32.to_ne_bytes());
             data[4..8].copy_from_slice(&4096u32.to_ne_bytes());
@@ -517,24 +615,25 @@ pub fn dispatch(
                     let (m, s, l, b) = fs::stat(*ino)?;
                     (*ino as u64, m, s, l, b)
                 }
+                Kind::MemInfo(_) => (super::procfs::MEMINFO as u64, 0o100444, 0, 1, 0),
                 _ => (0, 0x2000 | 0o666, 0, 1, 0),
             };
-            let mut data = [0u8; 128];
-            data[8..16].copy_from_slice(&ino.to_ne_bytes());
-            data[16..20].copy_from_slice(&(mode as u32).to_ne_bytes());
-            data[20..24].copy_from_slice(&(links as u32).to_ne_bytes());
-            data[48..56].copy_from_slice(&size.to_ne_bytes());
-            data[56..60].copy_from_slice(&4096u32.to_ne_bytes());
-            data[64..72].copy_from_slice(&blocks.to_ne_bytes());
-            user_access::copy_to_user(space, a[1], &data).map_err(|_| Errno::Fault)?;
-            Ok(0)
+            write_stat(space, a[1], ino, mode, size, links, blocks)
         }
         _ => Err(Errno::NoSys),
     }
 }
 
+/// 创建清零的 I/O 暂存区，分配失败在任何 I/O 副作用之前返回。
+fn io_buffer() -> Result<Vec<u8>, Errno> {
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(4096).map_err(|_| Errno::NoMem)?;
+    buffer.resize(4096, 0);
+    Ok(buffer)
+}
+
 /// read(2)/write(2)：分块循环直至缓冲区填满/写尽或 EOF；单次分块上限
-/// 4KiB（内核栈缓冲）。pipe 读空/写满：O_NONBLOCK 返回 EAGAIN，否则
+/// 4KiB（可失败分配的堆缓冲）。pipe 读空/写满：O_NONBLOCK 返回 EAGAIN，否则
 /// 返回 EWOULDBLOCK 由分发层转为阻塞等待，醒来后重执行重查。
 /// 状态变化（pipe 读/写、对端关闭）请求唤醒对应等待者。
 fn rw(nr: usize, a: [usize; 6], space: &UserAddressSpace, ctx: &Context) -> Result<usize, Errno> {
@@ -548,7 +647,7 @@ fn rw(nr: usize, a: [usize; 6], space: &UserAddressSpace, ctx: &Context) -> Resu
     if total == 0 {
         return Ok(0);
     }
-    let mut chunk = [0u8; 4096];
+    let mut chunk = io_buffer()?;
     let mut done = 0;
     while done < total {
         let want = (total - done).min(chunk.len());
@@ -558,6 +657,14 @@ fn rw(nr: usize, a: [usize; 6], space: &UserAddressSpace, ctx: &Context) -> Resu
                     .map_err(|_| Errno::Fault)?;
             }
             match &f.kind {
+                Kind::MemInfo(text) if reading => {
+                    let bytes = text.as_bytes().get(f.offset..).unwrap_or(&[]);
+                    let n = want.min(bytes.len());
+                    user_access::copy_to_user(space, a[1] + done, &bytes[..n])
+                        .map_err(|_| Errno::Fault)?;
+                    f.offset += n;
+                    Ok(n)
+                }
                 Kind::Output if !reading => {
                     use polyhal::debug_console::DebugConsole;
                     for &b in &chunk[..want] {
@@ -673,7 +780,7 @@ pub fn mapping(ctx: &Context, fd: usize, write: bool) -> Result<(u32, bool), Err
     let handle = ctx.get(fd)?;
     let f = handle.lock();
     if f.flags & 3 == 1 || (write && f.flags & 3 != 2) {
-        return Err(Errno::BadF);
+        return Err(Errno::Access);
     }
     if let Kind::Inode { ino, .. } = f.kind {
         if fs::stat(ino)?.0 & 0xf000 == 0x8000 {
@@ -690,4 +797,78 @@ pub fn close_exec(ctx: &mut Context) {
             *fd = None;
         }
     }
+}
+
+/// pollfd 的 fd、events、revents 使用两架构相同的 Linux 布局。
+pub(crate) fn poll(
+    ctx: &Context,
+    space: &UserAddressSpace,
+    addr: usize,
+    count: usize,
+) -> Result<usize, Errno> {
+    if count > 1024 {
+        return Err(Errno::Invalid);
+    }
+    let mut ready = 0;
+    for i in 0..count {
+        let at = addr.checked_add(i * 8).ok_or(Errno::Fault)?;
+        let mut bytes = [0; 8];
+        user_access::copy_from_user(space, at, &mut bytes).map_err(|_| Errno::Fault)?;
+        let fd = i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let requested = u16::from_ne_bytes([bytes[4], bytes[5]]);
+        let events: u16 = if fd < 0 {
+            0
+        } else if let Ok(file) = ctx.get(fd as usize) {
+            let file = file.lock();
+            match &file.kind {
+                Kind::Input => 0x41 & requested,
+                Kind::Output => 0x104 & requested,
+                Kind::Inode { .. } | Kind::MemInfo(_) => 0x145 & requested,
+                Kind::Pipe { pipe, reading } => {
+                    let p = pipe.lock();
+                    if *reading {
+                        (if p.data.is_empty() {
+                            0
+                        } else {
+                            0x41 & requested
+                        }) | (if p.writers == 0 { 16 } else { 0 })
+                    } else {
+                        (if p.data.len() < PIPE_CAPACITY {
+                            0x104 & requested
+                        } else {
+                            0
+                        }) | (if p.readers == 0 { 8 } else { 0 })
+                    }
+                }
+            }
+        } else {
+            32
+        };
+        user_access::copy_to_user(space, at + 6, &events.to_ne_bytes())
+            .map_err(|_| Errno::Fault)?;
+        if events != 0 {
+            ready += 1;
+        }
+    }
+    Ok(ready)
+}
+
+fn write_stat(
+    space: &UserAddressSpace,
+    dest: usize,
+    ino: u64,
+    mode: u16,
+    size: u64,
+    links: u16,
+    blocks: u64,
+) -> Result<usize, Errno> {
+    let mut data = [0u8; 128];
+    data[8..16].copy_from_slice(&ino.to_ne_bytes());
+    data[16..20].copy_from_slice(&(mode as u32).to_ne_bytes());
+    data[20..24].copy_from_slice(&(links as u32).to_ne_bytes());
+    data[48..56].copy_from_slice(&size.to_ne_bytes());
+    data[56..60].copy_from_slice(&4096u32.to_ne_bytes());
+    data[64..72].copy_from_slice(&blocks.to_ne_bytes());
+    user_access::copy_to_user(space, dest, &data).map_err(|_| Errno::Fault)?;
+    Ok(0)
 }

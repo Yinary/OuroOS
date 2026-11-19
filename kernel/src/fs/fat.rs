@@ -143,7 +143,11 @@ fn node(m: &mut Mount, path: &str) -> Result<u32, Errno> {
         return Ok(n.ino);
     }
     m.nodes.try_reserve(1).map_err(|_| Errno::NoMem)?;
-    let ino = NEXT.fetch_add(1, Ordering::Relaxed);
+    let ino = NEXT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            (n < super::procfs::MEMINFO).then(|| n + 1)
+        })
+        .map_err(|_| Errno::NoMem)?;
     m.nodes.push(Node {
         ino,
         path: string(path)?,

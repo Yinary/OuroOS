@@ -25,7 +25,7 @@ pub enum Error {
 }
 
 struct Dma;
-// SAFETY: DMA 页来自连续物理帧；share 仅接收驱动持有的内核直映缓冲区；
+// SAFETY: DMA 页来自连续物理帧；share 接收驱动借用的物理连续内核缓冲区；
 // 同步请求完成前缓冲区保持存活，QEMU virt 平台 DMA 与 CPU 缓存一致。
 // 失败约定：dma_alloc 返回物理地址 0 时 virtio-drivers 的 Dma::new
 // 返回 Err（上游约定，hal.rs:32），dangling 指针不会被解引用；分配仅
@@ -57,7 +57,7 @@ unsafe impl Hal for Dma {
         unsafe { NonNull::new_unchecked(mmio_address(pa) as *mut u8) }
     }
     unsafe fn share(buffer: NonNull<[u8]>, _: BufferDirection) -> usize {
-        buffer.as_ptr() as *mut u8 as usize & !VIRT_ADDR_START
+        crate::mm::kstack::dma_address(buffer.as_ptr() as *mut u8 as usize)
     }
     unsafe fn unshare(_: usize, _: NonNull<[u8]>, _: BufferDirection) {}
 }

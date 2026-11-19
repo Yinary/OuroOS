@@ -143,7 +143,7 @@ __ouro_tlb_refill:
 "#
 );
 #[cfg(target_arch = "loongarch64")]
-fn install_refill() {
+pub(super) fn install_refill() {
     extern "C" {
         fn __ouro_tlb_refill();
     }

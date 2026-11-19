@@ -11,3 +11,7 @@
 | [rust-fatfs](https://github.com/rafalh/rust-fatfs) 38b3a7950bf0e765e34286d1dfe76c519ee347e2 | MIT | 锁定 Git revision，no_std + alloc + lfn，FAT 挂载/读写/unlink（无目录列举） | 2026-11-10 |
 
 历史条目：ext4_rs 1.3.3（MIT）曾作为 Ext4 后端 vendor 于 `third_party/ext4_rs`，含块分配起点与 panic 审计 9 处补丁，随 rsext4 接入而移除（fs/rsext4 集成分支）；审计工作待在 rsext4 上重做（见 ostd-contracts §6 欠账）。
+
+本地 JBD2 栈占用补丁：提交临时块改为预先可失败分配的堆缓冲，复用单个 payload，避免多块数组叠加；版本与协议不变，详见 rsext4 README。
+
+LoongArch 关机使用 PolyHAL 0.4.0（MIT）中 QEMU virt GED 的寄存器地址和关机值，等待循环位于 `kernel/src/hal.rs`。

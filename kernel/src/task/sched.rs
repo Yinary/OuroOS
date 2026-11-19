@@ -134,7 +134,7 @@ impl Scheduler {
         #[cfg(debug_assertions)]
         assert_eq!(
             crate::mm::frame::stats().1,
-            free_before + dead_count * crate::config::KSTACK_PAGES,
+            free_before + dead_count * (crate::config::KSTACK_PAGES + 1),
             "exited task stacks were not fully reclaimed"
         );
     }
@@ -145,7 +145,7 @@ impl Scheduler {
             self.move_waiting(|r| matches!(r, WaitReason::Children));
         }
         if WAKE_PIPES.swap(false, Ordering::AcqRel) {
-            self.move_waiting(|r| matches!(r, WaitReason::Pipe));
+            self.move_waiting(|r| matches!(r, WaitReason::Pipe | WaitReason::PollUntil(_)));
         }
     }
 
@@ -153,7 +153,7 @@ impl Scheduler {
     fn wake_expired(&mut self) {
         let now = polyhal::timer::current_time();
         self.move_waiting(|r| match r {
-            WaitReason::Deadline(d) => now >= *d,
+            WaitReason::Deadline(d) | WaitReason::PollUntil(d) => now >= *d,
             _ => false,
         });
     }

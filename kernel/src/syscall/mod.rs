@@ -3,7 +3,14 @@
 //! a0..=a5=参数、a0=返回负 errno 或结果）。支持范围与 Linux 语义偏差
 //! 见 docs/ostd-contracts.md §4；PC 推进由运行循环统一处理。
 
+//! readahead 对可读普通文件同步预取，每次最多 128 KiB。
+
 mod memory;
+
+#[cfg(debug_assertions)]
+pub(crate) fn memory_self_test() {
+    memory::self_test();
+}
 
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 
@@ -17,6 +24,7 @@ pub mod sysnr {
     // 文件
     pub const GETCWD: usize = 17;
     pub const DUP: usize = 23;
+    pub const FCNTL: usize = 25;
     pub const DUP3: usize = 24;
     pub const IOCTL: usize = 29;
     pub const MKDIRAT: usize = 34;
@@ -40,6 +48,8 @@ pub mod sysnr {
     // 进程
     pub const EXIT: usize = 93;
     pub const EXIT_GROUP: usize = 94;
+    pub const SYSINFO: usize = 179;
+    pub const PPOLL: usize = 73;
     pub const NANOSLEEP: usize = 101;
     pub const CLOCK_GETTIME: usize = 113;
     pub const SCHED_YIELD: usize = 124;
@@ -54,8 +64,18 @@ pub mod sysnr {
     pub const EXECVE: usize = 221;
     pub const WAIT4: usize = 260;
     // 内存
+    pub const READAHEAD: usize = 213;
     pub const BRK: usize = 214;
     pub const MUNMAP: usize = 215;
+    pub const MREMAP: usize = 216;
+    pub const MSYNC: usize = 227;
+    pub const MLOCKALL: usize = 230;
+    pub const MUNLOCKALL: usize = 231;
+    pub const MLOCK: usize = 228;
+    pub const MUNLOCK: usize = 229;
+    pub const MLOCK2: usize = 284;
+    pub const MINCORE: usize = 232;
+    pub const MADVISE: usize = 233;
     pub const MMAP: usize = 222;
     pub const MPROTECT: usize = 226;
 }
@@ -164,6 +184,7 @@ pub fn dispatch(
     match nr {
         sysnr::GETCWD
         | sysnr::DUP
+        | sysnr::FCNTL
         | sysnr::DUP3
         | sysnr::MKDIRAT
         | sysnr::UNLINKAT
@@ -177,6 +198,9 @@ pub fn dispatch(
         | sysnr::LSEEK
         | sysnr::READ
         | sysnr::WRITE
+        | sysnr::WRITEV
+        | sysnr::READV
+        | sysnr::FSTATAT
         | sysnr::FSTAT
         | sysnr::FSYNC
         | sysnr::STATX => {
@@ -193,13 +217,75 @@ pub fn dispatch(
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
-        sysnr::EXIT => Flow::Exited(a0 as i32),
+        sysnr::MLOCK | sysnr::MUNLOCK | sysnr::MLOCK2 => {
+            cx[TrapFrameArgs::RET] = to_abi(memory::mlock(
+                space,
+                a0,
+                a1,
+                nr != sysnr::MUNLOCK,
+                if nr == sysnr::MLOCK2 { a2 } else { 0 },
+            ));
+            Flow::Continue
+        }
+        sysnr::MSYNC => {
+            cx[TrapFrameArgs::RET] = to_abi(memory::msync(space, a0, a1, a2));
+            Flow::Continue
+        }
+        sysnr::MLOCKALL | sysnr::MUNLOCKALL => {
+            let flags = if nr == sysnr::MUNLOCKALL { 0 } else { a0 };
+            let ret = if nr == sysnr::MLOCKALL && (flags & !7 != 0 || flags & 3 == 0) {
+                Err(Errno::Invalid)
+            } else {
+                space.lock_all(flags).map(|_| 0).map_err(|_| Errno::NoMem)
+            };
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        163 | 164 | 261 => {
+            let (resource, new_ptr, old_ptr) = match nr {
+                163 => (a0, 0, a1),
+                164 => (a0, a1, 0),
+                _ => (a1, a2, args[3]),
+            };
+            let ret = if (nr == 163 || nr == 164) && a1 == 0 {
+                Err(Errno::Fault)
+            } else if nr == 261 && a0 != 0 && a0 != pid {
+                Err(Errno::NoProcess)
+            } else {
+                memory::limit(space, resource, new_ptr, old_ptr)
+            };
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        sysnr::SET_TID_ADDRESS => {
+            space.clear_child_tid = a0;
+            cx[TrapFrameArgs::RET] = pid;
+            Flow::Continue
+        }
+        sysnr::EXIT | sysnr::EXIT_GROUP => {
+            if space.clear_child_tid != 0 {
+                let _ = user_access::copy_to_user(space, space.clear_child_tid, &[0; 4]);
+            }
+            Flow::Exited(a0 as i32)
+        }
+        sysnr::READAHEAD => {
+            cx[TrapFrameArgs::RET] = to_abi(memory::readahead(fs, a0, a1, a2));
+            Flow::Continue
+        }
         sysnr::BRK => {
             cx[TrapFrameArgs::RET] = space.brk(a0);
             Flow::Continue
         }
-        sysnr::MUNMAP | sysnr::MMAP | sysnr::MPROTECT => {
+        sysnr::MUNMAP
+        | sysnr::MMAP
+        | sysnr::MPROTECT
+        | sysnr::MREMAP
+        | sysnr::MINCORE
+        | sysnr::MADVISE => {
             let ret = match nr {
+                sysnr::MADVISE => memory::madvise(space, a0, a1, a2),
+                sysnr::MINCORE => memory::mincore(space, a0, a1, a2),
+                sysnr::MREMAP => memory::mremap(space, [a0, a1, a2, args[3], args[4]]),
                 sysnr::MUNMAP => memory::munmap(space, a0, a1),
                 sysnr::MPROTECT => memory::mprotect(space, a0, a1, a2),
                 _ => memory::mmap(
@@ -216,7 +302,9 @@ pub fn dispatch(
             cx[TrapFrameArgs::RET] = 0;
             Flow::Yield
         }
-        sysnr::NANOSLEEP
+        sysnr::SYSINFO
+        | sysnr::PPOLL
+        | sysnr::NANOSLEEP
         | sysnr::TIMES
         | sysnr::GETPPID
         | sysnr::CLONE
