@@ -18,14 +18,10 @@ use crate::{
 
 use super::{
     sched,
+    signal::fault_signal,
     task::{Pid, Task, TaskBody, WaitReason},
     ExitInfo, REGISTRY,
 };
-
-/// 被用户态致命异常杀死时的退出码。Linux 将死亡原因编码进 wait
-/// status 位域；当前以 128+11（SIGSEGV 的 shell 惯例值）作简化占位，
-/// 偏差记录在 docs/ostd-contracts.md，wait 语义实现时统一编码。
-pub const FAULT_EXIT_CODE: i32 = 128 + 11;
 
 /// 孵化失败原因。
 #[derive(Debug)]
@@ -212,14 +208,17 @@ pub fn user_task_entry() -> ! {
                         };
                         match result {
                             Ok(()) => Action::Continue,
-                            Err(error) => Action::Exit(ExitInfo {
-                                code: FAULT_EXIT_CODE,
-                                fault: Some(UserFault {
-                                    kind: error.fault_kind(),
-                                    info: addr,
-                                    pc: frame[TrapFrameArgs::SEPC],
-                                }),
-                            }),
+                            Err(error) => {
+                                let kind = error.fault_kind();
+                                Action::Exit(ExitInfo::Signaled {
+                                    sig: fault_signal(kind),
+                                    fault: Some(UserFault {
+                                        kind,
+                                        info: addr,
+                                        pc: frame[TrapFrameArgs::SEPC],
+                                    }),
+                                })
+                            }
                         }
                     }
                     fatal => {
@@ -230,8 +229,8 @@ pub fn user_task_entry() -> ! {
                         }
                         let (kind, info) =
                             trap::fatal_fault(fatal).expect("fatal_fault covers fatal traps");
-                        Action::Exit(ExitInfo {
-                            code: FAULT_EXIT_CODE,
+                        Action::Exit(ExitInfo::Signaled {
+                            sig: fault_signal(kind),
                             fault: Some(UserFault {
                                 kind,
                                 info,
@@ -384,12 +383,11 @@ fn process_call(
                         let has_children = reg.records.iter().any(matches);
                         let status = ready.map(|i| {
                             let info = reg.records[i].exit;
-                            info.map_or(0, |e| {
-                                if e.fault.is_some() {
-                                    11u32
-                                } else {
-                                    (e.code as u32 & 255) << 8
-                                }
+                            info.map_or(0, |e| match e {
+                                // WEXITSTATUS：exit 码占高 8 位
+                                ExitInfo::Exited(n) => (n as u32 & 255) << 8,
+                                // WTERMSIG：死于信号时低位为信号号
+                                ExitInfo::Signaled { sig, .. } => sig as u32,
                             })
                         });
                         (
@@ -491,9 +489,18 @@ fn fork_user(parent: Pid, frame: &TrapFrame, flags: usize, stack: usize) -> Resu
     );
     {
         let mut reg = REGISTRY.lock();
+        // fork 继承：子进程整体拷贝父进程的信号状态（同一次锁内完成）
+        let parent_signal = reg
+            .records
+            .iter()
+            .find(|r| r.pid == parent)
+            .map(|r| r.signal.clone());
         if let Some(r) = reg.records.iter_mut().find(|r| r.pid == pid) {
             r.parent = parent;
             r.fs = Some(fs);
+            if let Some(sig_state) = parent_signal {
+                r.signal = sig_state;
+            }
         }
     }
     sched::enqueue(task);

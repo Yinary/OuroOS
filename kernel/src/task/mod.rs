@@ -3,6 +3,7 @@
 //! 完整契约见 docs/ostd-contracts.md §3。
 
 pub mod sched;
+pub mod signal;
 // Issue 指定的 `task/mod.rs` + `task/task.rs` 布局会自然形成同名子模块。
 #[allow(clippy::module_inception)]
 mod task;
@@ -14,23 +15,25 @@ use polyhal::{irq::IRQ, println};
 
 use crate::{mm, mm::address_space::LocalSpace, sync::DebugMutex, trap::UserFault};
 
+use signal::SignalState;
+
 pub use sched::yield_now;
 pub use task::{Pid, WaitReason};
 pub use user_task::{spawn_user, SpawnError};
 
 /// 一次任务终止的完整记录。
 #[derive(Debug, Clone, Copy)]
-pub struct ExitInfo {
-    /// 退出码：exit(n) 为 n；被杀为 128+11 占位（见模块契约）。
-    pub code: i32,
-    /// 致命用户异常（死因）；正常 exit 为 None。
-    pub fault: Option<UserFault>,
+pub enum ExitInfo {
+    /// exit(n) 或等效正常退出。
+    Exited(i32),
+    /// 死于信号 sig；fault 携带硬件异常细节供终态报告（被 kill 杀死时为 None）。
+    Signaled { sig: u8, fault: Option<UserFault> },
 }
 
 impl ExitInfo {
     /// 正常退出。
     pub fn exited(code: i32) -> Self {
-        Self { code, fault: None }
+        Self::Exited(code)
     }
 }
 
@@ -44,6 +47,8 @@ pub struct ProcessRecord {
     child_user_ns: u64,
     child_system_ns: u64,
     fs: Option<crate::fs::context::Context>,
+    /// 信号状态（模型见 signal 模块；投递逻辑由后续 commit 接入）。
+    pub signal: SignalState,
     pub pid: Pid,
     pub name: &'static str,
     /// 用户任务的地址空间（单核凭证包装，见 mm::address_space::
@@ -107,6 +112,7 @@ mod registry {
             child_user_ns: 0,
             child_system_ns: 0,
             fs: None,
+            signal: SignalState::new(),
         });
     }
 
@@ -186,15 +192,17 @@ mod registry {
     /// 终态报告在退出时积攒，这里统一输出。
     pub fn report_all() {
         for (pid, name, exit) in EXIT_REPORTS.lock().iter() {
-            match &exit.fault {
-                None => println!(
-                    "[task] pid {} ({}): exited with status {}",
-                    pid, name, exit.code
-                ),
-                Some(f) => println!(
-                    "[task] pid {} ({}): killed by {:?} @ {:#x}, pc {:#x}",
-                    pid, name, f.kind, f.info, f.pc
-                ),
+            match exit {
+                ExitInfo::Exited(code) => {
+                    println!("[task] pid {} ({}): exited with status {}", pid, name, code)
+                }
+                ExitInfo::Signaled { sig, fault } => match fault {
+                    Some(f) => println!(
+                        "[task] pid {} ({}): killed by {:?} @ {:#x}, pc {:#x}",
+                        pid, name, f.kind, f.info, f.pc
+                    ),
+                    None => println!("[task] pid {} ({}): killed by signal {}", pid, name, sig),
+                },
             }
         }
     }

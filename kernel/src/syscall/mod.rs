@@ -72,6 +72,10 @@ pub enum Errno {
     ExecFormat,
     Again,
     WouldBlock,
+    /// EINTR: 阻塞中的系统调用被信号打断时返回；返回点由信号投递阶段接入。
+    // 投递阶段接入前无构造点，压制 dead_code（参照 trap::UnalignedError::Fault）。
+    #[allow(dead_code)]
+    Interrupted,
     Pipe,
     Io,
     NoEntry,
@@ -111,6 +115,7 @@ impl Errno {
             Self::TooBig => 7,
             Self::ExecFormat => 8,
             Self::Again | Self::WouldBlock => 11,
+            Self::Interrupted => 4,
             Self::Pipe => 32,
             Self::Io => 5,
             Self::NoEntry => 2,
