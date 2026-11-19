@@ -34,6 +34,7 @@ static CURRENT: Cell<usize> = Cell::new(0);
 /// 在下一次调度边界统一消费。避免 fs 层在 REGISTRY 锁内反向取 SCHED。
 static WAKE_CHILDREN: AtomicBool = AtomicBool::new(false);
 static WAKE_PIPES: AtomicBool = AtomicBool::new(false);
+static WAKE_SIGNALS: AtomicBool = AtomicBool::new(false);
 
 /// 请求唤醒等待子进程的任务（子进程退出时调用）。
 pub fn request_children_wake() {
@@ -43,6 +44,11 @@ pub fn request_children_wake() {
 /// 请求唤醒 pipe 等待者（pipe 读/写/对端关闭时调用）。
 pub fn request_pipe_wake() {
     WAKE_PIPES.store(true, Ordering::Release);
+}
+
+/// 请求唤醒有可投递信号的等待任务（信号实际入队后调用）。
+pub fn request_signal_wake() {
+    WAKE_SIGNALS.store(true, Ordering::Release);
 }
 
 /// 读取当前任务指针（调用方保证处于任务上下文）。
@@ -142,28 +148,43 @@ impl Scheduler {
     /// 消费事件唤醒标志，把匹配的等待者搬回就绪表。
     fn drain_wake_requests(&mut self) {
         if WAKE_CHILDREN.swap(false, Ordering::AcqRel) {
-            self.move_waiting(|r| matches!(r, WaitReason::Children));
+            self.move_waiting(|_, r| matches!(r, WaitReason::Children));
         }
         if WAKE_PIPES.swap(false, Ordering::AcqRel) {
-            self.move_waiting(|r| matches!(r, WaitReason::Pipe));
+            self.move_waiting(|_, r| matches!(r, WaitReason::Pipe));
+        }
+        if WAKE_SIGNALS.swap(false, Ordering::AcqRel) {
+            // SCHED→REGISTRY 锁序嵌套点，见 docs/ostd-contracts.md §5
+            //（由 docs commit 登记）；全仓库仅此一处。
+            // 持 REGISTRY 一次 + 闭包查询，按可投递性精确判定（零分配）；
+            // 记录不存在或已退出的等待任务不搬。
+            let reg = super::REGISTRY.lock();
+            self.move_waiting(|task, _| {
+                reg.records.iter().any(|r| {
+                    r.pid == task.pid
+                        && r.exit.is_none()
+                        && r.signal.pending() & !r.signal.blocked() != 0
+                })
+            });
         }
     }
 
     /// 到期扫描：Deadline 已到的等待者搬回就绪表。
     fn wake_expired(&mut self) {
         let now = polyhal::timer::current_time();
-        self.move_waiting(|r| match r {
+        self.move_waiting(|_, r| match r {
             WaitReason::Deadline(d) => now >= *d,
             _ => false,
         });
     }
 
-    fn move_waiting(&mut self, f: impl Fn(&WaitReason) -> bool) {
+    /// 把谓词匹配的等待任务搬回就绪表；谓词可按任务与其等待原因联合判定。
+    fn move_waiting(&mut self, f: impl Fn(&Task, &WaitReason) -> bool) {
         // 自检：每次集中唤醒前，就绪表足以容纳全部等待任务。
         debug_assert!(self.ready.capacity() >= self.ready.len() + self.waiting.len());
         let mut i = 0;
         while i < self.waiting.len() {
-            if f(&self.waiting[i].1) {
+            if f(&self.waiting[i].0, &self.waiting[i].1) {
                 let (task, _) = self.waiting.swap_remove(i);
                 self.ready.push_back(task);
             } else {

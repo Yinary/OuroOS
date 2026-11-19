@@ -226,8 +226,9 @@ impl SignalState {
     /// 屏蔽中的信号照常入队（sig_ignored 对 blocked 恒 false）；处置
     /// IGN，或 DFL 且默认动作属 IGNORE 集（CHLD/CONT/URG/WINCH，即
     /// 本表 Ign 与 Cont 两类，对应 include/linux/signal.h 的
-    /// SIG_KERNEL_IGNORE_MASK）的信号静默丢弃；其余入队。本步只入队：
-    /// pending 消费与唤醒属投递阶段 commit。调用方保证 sig 在合法域
+    /// SIG_KERNEL_IGNORE_MASK）的信号静默丢弃；其余入队，实际入队后
+    /// 请求信号唤醒通道（send_signal 亦经此路径覆盖）；过滤丢弃不置位。
+    /// pending 消费与投递属投递阶段 commit。调用方保证 sig 在合法域
     /// 1..=64；queue 对域外信号不修改状态。
     pub fn generate(&mut self, sig: u8, slot: SigInfoSlot) {
         if !self.blocked.has(sig) {
@@ -243,6 +244,7 @@ impl SignalState {
             }
         }
         self.queue(sig, slot);
+        super::sched::request_signal_wake();
     }
 
     /// 设置信号 sig 的处置；sig 不在 1..=64 时不修改任何状态。
