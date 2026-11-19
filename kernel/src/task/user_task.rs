@@ -20,7 +20,7 @@ use super::{
     sched,
     signal::{
         default_action, fault_siginfo, force_signal, send_signal, DefaultAction, SigInfoSlot,
-        SignalDisposition, SIG_DFL, SIG_IGN,
+        SignalDisposition, SIGSEGV, SIG_DFL, SIG_IGN,
     },
     task::{Pid, Task, TaskBody, WaitReason},
     ExitInfo, REGISTRY,
@@ -120,15 +120,41 @@ pub fn user_task_entry() -> ! {
                 // 投递检查点：每次回用户态至多处理一个信号（Linux 每次回
                 // 用户态只完成一个信号，剩余 pending 下次陷入再投）。
                 // park 快路径 handler 分支留下的信号已处于 pending，由本
-                // 检查点消费；commit 6 在此建帧投递。handler 临时映射：
-                // 用户 handler 本轮按 DFL 判定（见 delivery_verdict）。
+                // 检查点消费；用户 handler（≠DFL/IGN）在此建帧投递。
                 let blocked = rec.signal.blocked();
-                rec.signal
-                    .take_deliverable(blocked)
-                    .and_then(|(sig, slot)| {
+                match rec.signal.take_deliverable(blocked) {
+                    None => None,
+                    Some((sig, slot)) => {
                         let d = rec.signal.disposition(sig);
-                        delivery_verdict(sig, slot, d)
-                    })
+                        if d.handler == SIG_DFL || d.handler == SIG_IGN {
+                            delivery_verdict(sig, slot, d)
+                        } else {
+                            // 真投递（Linux handle_signal → setup_rt_frame）：
+                            // 同一锁段内拿任务地址空间建帧并换入 handler
+                            // 期间屏蔽集合。失败简化为 Signaled{SIGSEGV}
+                            // 锁外 exit_current——Linux force_sigsegv 会把
+                            // 处置复位后重试投递，此处不递归重试（偏差
+                            // 登记 docs/ostd-contracts.md）。
+                            let space = rec
+                                .space
+                                .as_ref()
+                                .expect("running user task lost its space")
+                                .as_space();
+                            match crate::sigframe::build_deliver(
+                                &mut frame, space, sig, &slot, &d, blocked,
+                            ) {
+                                Ok(new_blocked) => {
+                                    rec.signal.setmask(new_blocked);
+                                    None
+                                }
+                                Err(_) => Some(ExitInfo::Signaled {
+                                    sig: SIGSEGV,
+                                    fault: None,
+                                }),
+                            }
+                        }
+                    }
+                }
             };
             if let Some(info) = signal_exit {
                 sched::exit_current(info);
@@ -175,12 +201,14 @@ pub fn user_task_entry() -> ! {
                         };
                             // 恰好推进一次 syscall PC：polyhal 对 SysCall
                             // 不推进，重复/遗漏都会破坏用户执行流。
-                            // 阻塞（Wait）不推 PC，挂起醒来后重执行重查。
+                            // 阻塞（Wait）不推 PC，挂起醒来后重执行重查；
+                            // SigReturn 现场已整体恢复，SEPC 无需推进。
                             let outcome = match flow {
                                 Flow::Process => {
                                     process_call(pid, &mut frame, &mut sleep_deadline)
                                 }
                                 Flow::Wait(reason) => ProcessResult::Wait(reason),
+                                Flow::SigReturn => ProcessResult::Restored,
                                 _ => ProcessResult::Done,
                             };
                             if matches!(outcome, ProcessResult::Done) {
@@ -197,9 +225,8 @@ pub fn user_task_entry() -> ! {
                                 Action::Wait(reason)
                             } else {
                                 match flow {
-                                    Flow::Continue | Flow::Process | Flow::Wait(_) => {
-                                        Action::Continue
-                                    }
+                                    Flow::Continue | Flow::Process | Flow::Wait(_)
+                                    | Flow::SigReturn => Action::Continue,
                                     Flow::Yield => Action::Yield,
                                     Flow::Exited(code) => Action::Exit(ExitInfo::exited(code)),
                                 }
@@ -313,12 +340,12 @@ pub fn user_task_entry() -> ! {
     }
 }
 
-/// 单个已取出信号的投递判定（循环顶检查点与 park 快路径共用）。
-/// handler 临时映射：用户 handler（≠DFL/IGN）本轮按 DFL 判定——真实
-/// 建帧投递由后续 commit 接入（偏差登记 docs/ostd-contracts.md）；
-/// IGN 理论上不可达（产生侧已过滤，仅屏蔽后改处置可残留），防御性
-/// 丢弃。Term/Core 返回 Signaled 死因（fault 槽透传终态报告）；
-/// Ign/Cont 丢弃；Stop 无停止态，降级为丢弃（登记 docs）。
+/// DFL/IGN 处置信号的投递判定（循环顶检查点与 park 快路径共用）。
+/// 用户 handler（≠DFL/IGN）不经过本函数：循环顶检查点对 handler 分支
+/// 直接建帧投递（sigframe::build_deliver）。IGN 理论上不可达（产生侧
+/// 已过滤，仅屏蔽后改处置可残留），防御性丢弃。Term/Core 返回 Signaled
+/// 死因（fault 槽透传终态报告）；Ign/Cont 丢弃；Stop 无停止态，降级
+/// 为丢弃（登记 docs）。
 fn delivery_verdict(sig: u8, slot: SigInfoSlot, d: SignalDisposition) -> Option<ExitInfo> {
     if d.handler == SIG_IGN {
         return None;
@@ -350,8 +377,7 @@ enum ParkPeek {
 /// park 快路径：挂起前先看有无可投递信号，按真实处置分岔。peek 不消费：
 /// - handler（≠DFL/IGN）：信号留在 pending，按 reason 分岔——nanosleep
 ///   例外 / SA_RESTART 不完成不睡 / 其余完成 -EINTR——随后不 park 直接
-///   返回，信号由循环顶检查点消费（commit 5 临时映射按 DFL，commit 6
-///   在该检查点建帧投递）；
+///   返回，信号由循环顶检查点建帧投递；
 /// - DFL/IGN：同一锁内 take 消费，Term/Core 终止，Ign/Cont/Stop 丢弃
 ///   后照旧 park。
 ///
@@ -457,6 +483,8 @@ enum ProcessResult {
     Done,
     Wait(WaitReason),
     Replaced,
+    /// rt_sigreturn：SEPC 已从信号帧恢复为真实返回点，不再推进。
+    Restored,
 }
 fn process_call(
     parent: Pid,

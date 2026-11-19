@@ -11,7 +11,7 @@ pub(crate) mod signal;
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 
 use crate::mm::{address_space::UserAddressSpace, user_access};
-use crate::task::signal::{SigInfoSlot, SIGPIPE};
+use crate::task::signal::{SigInfoSlot, SignalSet, SignalSetExt, SEGV_MAPERR, SIGPIPE, SIGSEGV};
 use crate::task::WaitReason;
 
 /// 已实现的通用 UAPI 调用号（asm-generic/unistd.h，rv64/la64 共用）。
@@ -53,6 +53,7 @@ pub mod sysnr {
     pub const RT_SIGACTION: usize = 134;
     pub const RT_SIGPROCMASK: usize = 135;
     pub const RT_SIGPENDING: usize = 136;
+    pub const RT_SIGRETURN: usize = 139;
     pub const TIMES: usize = 153;
     pub const SET_TID_ADDRESS: usize = 96;
     pub const UNAME: usize = 160;
@@ -157,6 +158,9 @@ pub enum Flow {
     Yield,
     /// 在解除注册表借用后处理进程操作。
     Process,
+    /// rt_sigreturn：用户现场已整体从信号帧恢复，SEPC 即真实返回点，
+    /// 运行循环跳过 syscall_ok 直接续跑。
+    SigReturn,
     /// 任务已退出，携带退出状态。
     Exited(i32),
 }
@@ -258,6 +262,36 @@ pub fn dispatch(
             let ret = signal::rt_sigpending(space, a0, a1, signal);
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
+        }
+        sysnr::RT_SIGRETURN => {
+            // rt_sigreturn(139)（sys_rt_sigreturn）：无参数，sp 指向信号帧。
+            // 成功：换入帧内保存的 handler 前 blocked，返回 Flow::SigReturn
+            //（现场已恢复，不再 syscall_ok）。失败（badframe/不可访问）：
+            // 按 Linux force_sigsegv 收敛——SIGSEGV 处置复位为 DFL（不重入
+            // 刚失败的 handler）、解除屏蔽并入队，下一轮循环顶检查点按
+            // DFL 终止，保证恰好一次投递（Linux badframe 用 force_sig，
+            // 若装了 SIGSEGV handler 可能循环，此处取不双重投递的简化，
+            // 偏差登记 docs/ostd-contracts.md）。
+            match crate::sigframe::restore(cx, space) {
+                // 成功：屏蔽集合换回帧内保存值（KILL/STOP 位已剥除）；
+                // a0 透传 handler 返回值，Linux return regs->a0 同效。
+                Ok(old) => signal.setmask(old),
+                Err(_) => {
+                    signal.set_disposition(SIGSEGV, Default::default());
+                    let mut one: SignalSet = 0;
+                    one.add(SIGSEGV);
+                    signal.unblock(one);
+                    signal.generate(
+                        SIGSEGV,
+                        SigInfoSlot {
+                            code: SEGV_MAPERR,
+                            addr: cx[TrapFrameArgs::SP],
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            Flow::SigReturn
         }
         sysnr::SCHED_YIELD => {
             // sched_yield(2)：成功返回 0；让出意图交给运行循环

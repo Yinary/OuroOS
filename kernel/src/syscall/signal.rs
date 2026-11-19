@@ -13,19 +13,23 @@ use crate::task::signal::{
 /// SA_* 位与 SIG_BLOCK/UNBLOCK/SETMASK 的 UAPI 值（include/uapi/
 /// asm-generic/signal-defs.h；rv64/la64 共用，本机交叉工具链头一致）。
 /// SA_NOCLDWAIT 由 record_exit 消费；SA_RESTART 由 park 快路径
-///（task::user_task）消费；SA_NOCLDSTOP 等其余位仅登记语义，消费方
-/// 为投递阶段的 flag 解析。
+///（task::user_task）消费；SA_NODEFER/SA_SIGINFO/SA_ONSTACK 由建帧
+/// 投递按固定语义处理（sigframe：恒加本信号屏蔽位 / 恒传三参 / 忽略），
+/// SA_NOCLDSTOP/SA_RESETHAND 暂无消费方。
 #[allow(dead_code)]
 const SA_NOCLDSTOP: u32 = 0x0000_0001;
 pub(crate) const SA_NOCLDWAIT: u32 = 0x0000_0002;
+/// SA_SIGINFO：rv/la ABI 恒传 siginfo/ucontext 三参，仅语义存档。
 #[allow(dead_code)]
 const SA_SIGINFO: u32 = 0x0000_0004;
 /// rv/la 无 restorer 语义；存储时剥除（Linux UAPI_SA_FLAGS 对未定义
 /// 该位的架构同样屏蔽）。
 const SA_RESTORER: u32 = 0x0400_0000;
+/// SA_ONSTACK：无 altstack 支持，建帧投递恒忽略（sigframe）。
 #[allow(dead_code)]
 const SA_ONSTACK: u32 = 0x0800_0000;
 pub(crate) const SA_RESTART: u32 = 0x1000_0000;
+/// SA_NODEFER：未支持，建帧投递恒加本信号屏蔽位（sigframe）。
 #[allow(dead_code)]
 const SA_NODEFER: u32 = 0x4000_0000;
 #[allow(dead_code)]

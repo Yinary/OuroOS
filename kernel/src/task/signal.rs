@@ -1,7 +1,6 @@
 //! 信号状态模型：每信号 disposition 表、pending/blocked 集合与信息槽。
 //! 存放位置与线程化形状依据见 docs/ostd-contracts.md。
-//! 消费侧（投递检查点 / park 快路径）已开始使用本模型；尚未被消费的
-//! 项仍以 allow(dead_code) 标注，由接入方（后续 commit）移除。
+//! 消费侧：投递检查点（含建帧投递）/ park 快路径 / 信号登记类系统调用。
 #![deny(unsafe_code)]
 
 use super::task::Pid;
@@ -130,17 +129,16 @@ impl SignalSetExt for SignalSet {
 }
 
 /// 单个信号的处置：handler 为 SIG_DFL/SIG_IGN 或用户函数地址。
-/// flags 由 record_exit（SA_NOCLDWAIT）与 park 快路径（SA_RESTART）
-/// 消费；mask 本步仅存储不消费；默认值即 DFL。
+/// flags 由 record_exit（SA_NOCLDWAIT）、park 快路径（SA_RESTART）与
+/// 建帧投递（SA_NODEFER/SA_SIGINFO/SA_ONSTACK 固定语义处理）消费；
+/// mask 由建帧投递并入 handler 期间屏蔽集合；默认值即 DFL。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SignalDisposition {
     /// 处理函数地址或 SIG_DFL/SIG_IGN。
     pub handler: usize,
-    /// sa_flags（sigaction 传入；SA_NOCLDWAIT 由 record_exit 消费，
-    /// 其余位消费方：投递阶段）。
+    /// sa_flags（sigaction 传入）。
     pub flags: u32,
-    /// sa_mask（本步仅存储，消费方：投递阶段）。
-    #[allow(dead_code)]
+    /// sa_mask：建帧投递时并入 handler 期间的屏蔽集合。
     pub mask: SignalSet,
 }
 
@@ -152,24 +150,19 @@ pub const CLD_KILLED: i32 = 2;
 
 /// 每信号一个信息槽（信号号由槽位下标隐含）：siginfo 字段子集。
 /// 产生侧只填充 code/pid/status 子集，force 投递另填 fault（硬件异常
-/// 细节，检查点终止时透传终态报告）；其余字段保持默认，未读字段以
-/// 定位 allow 标注。
+/// 细节，检查点终止时透传终态报告）；全部字段由建帧投递的 siginfo
+/// 组装（sigframe::fill_siginfo）读出。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SigInfoSlot {
     /// si_code。
-    #[allow(dead_code)]
     pub code: i32,
     /// si_errno。
-    #[allow(dead_code)]
     pub errno: i32,
     /// 出错地址（SIGSEGV/SIGBUS 等填充）。
-    #[allow(dead_code)]
     pub addr: usize,
     /// 发送方 pid。
-    #[allow(dead_code)]
     pub pid: u32,
     /// 子进程退出状态（SIGCHLD 用）。
-    #[allow(dead_code)]
     pub status: i32,
     /// 硬件异常细节：force 投递路径（致命异常）填充，检查点终止时
     /// 透传给终态报告。
