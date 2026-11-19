@@ -3,6 +3,7 @@
 //! a0..=a5=参数、a0=返回负 errno 或结果）。支持范围与 Linux 语义偏差
 //! 见 docs/ostd-contracts.md §4；PC 推进由运行循环统一处理。
 
+pub(crate) mod fs;
 mod memory;
 
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
@@ -18,11 +19,17 @@ pub mod sysnr {
     pub const GETCWD: usize = 17;
     pub const DUP: usize = 23;
     pub const DUP3: usize = 24;
+    pub const FCNTL: usize = 25;
     pub const IOCTL: usize = 29;
     pub const MKDIRAT: usize = 34;
     pub const UNLINKAT: usize = 35;
+    pub const RENAMEAT: usize = 38;
     pub const UMOUNT2: usize = 39;
     pub const MOUNT: usize = 40;
+    pub const STATFS: usize = 43;
+    pub const FSTATFS: usize = 44;
+    pub const TRUNCATE: usize = 45;
+    pub const FTRUNCATE: usize = 46;
     pub const CHDIR: usize = 49;
     pub const OPENAT: usize = 56;
     pub const CLOSE: usize = 57;
@@ -33,9 +40,17 @@ pub mod sysnr {
     pub const WRITE: usize = 64;
     pub const READV: usize = 65;
     pub const WRITEV: usize = 66;
+    pub const PREAD64: usize = 67;
+    pub const PWRITE64: usize = 68;
+    pub const PREADV: usize = 69;
+    pub const PWRITEV: usize = 70;
+    pub const READLINKAT: usize = 78;
     pub const FSTATAT: usize = 79;
     pub const FSTAT: usize = 80;
     pub const FSYNC: usize = 82;
+    pub const UTIMENSAT: usize = 88;
+    pub const UMASK: usize = 166;
+    pub const RENAMEAT2: usize = 276;
     pub const STATX: usize = 291;
     // 进程
     pub const EXIT: usize = 93;
@@ -69,6 +84,7 @@ pub enum Errno {
     SeekPipe,
     Busy,
     TooBig,
+    FileTooBig,
     ExecFormat,
     Again,
     WouldBlock,
@@ -83,6 +99,10 @@ pub enum Errno {
     TooManyFiles,
     Range,
     NameTooLong,
+    Loop,
+    CrossDevice,
+    NotEmpty,
+    TooManyLinks,
     /// 内存不足。
     NoMem,
     /// 参数无效。
@@ -109,6 +129,7 @@ impl Errno {
             Self::SeekPipe => 29,
             Self::Busy => 16,
             Self::TooBig => 7,
+            Self::FileTooBig => 27,
             Self::ExecFormat => 8,
             Self::Again | Self::WouldBlock => 11,
             Self::Pipe => 32,
@@ -122,6 +143,10 @@ impl Errno {
             Self::TooManyFiles => 24,
             Self::Range => 34,
             Self::NameTooLong => 36,
+            Self::Loop => 40,
+            Self::CrossDevice => 18,
+            Self::NotEmpty => 39,
+            Self::TooManyLinks => 31,
             Self::NoMem => 12,
             Self::Invalid => 22,
             Self::NotSupported => 95,
@@ -165,10 +190,17 @@ pub fn dispatch(
         sysnr::GETCWD
         | sysnr::DUP
         | sysnr::DUP3
+        | sysnr::FCNTL
         | sysnr::MKDIRAT
         | sysnr::UNLINKAT
+        | sysnr::RENAMEAT
+        | sysnr::RENAMEAT2
         | sysnr::UMOUNT2
         | sysnr::MOUNT
+        | sysnr::STATFS
+        | sysnr::FSTATFS
+        | sysnr::TRUNCATE
+        | sysnr::FTRUNCATE
         | sysnr::CHDIR
         | sysnr::OPENAT
         | sysnr::CLOSE
@@ -177,10 +209,20 @@ pub fn dispatch(
         | sysnr::LSEEK
         | sysnr::READ
         | sysnr::WRITE
+        | sysnr::READV
+        | sysnr::WRITEV
+        | sysnr::PREAD64
+        | sysnr::PWRITE64
+        | sysnr::PREADV
+        | sysnr::PWRITEV
+        | sysnr::READLINKAT
         | sysnr::FSTAT
+        | sysnr::FSTATAT
         | sysnr::FSYNC
+        | sysnr::UTIMENSAT
+        | sysnr::UMASK
         | sysnr::STATX => {
-            let ret = crate::fs::context::dispatch(
+            let ret = self::fs::dispatch(
                 nr,
                 [args[0], args[1], args[2], args[3], args[4], args[5]],
                 space,

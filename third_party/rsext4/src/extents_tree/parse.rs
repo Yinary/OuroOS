@@ -1,3 +1,4 @@
+//! extent 节点解析、查找及指定范围内的连续块区间遍历。
 use super::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,6 +114,27 @@ impl<'a> ExtentTree<'a> {
         start_lbn: u32,
         end_lbn: u32,
     ) -> Ext4Result<Vec<ExtentRun>> {
+        self.runs_in_range(dev, start_lbn, end_lbn, false)
+    }
+
+    // OuroOS patch: truncate-ranges，截断回收同时包含 unwritten extent。
+    /// 获取范围内所有已分配区间，包含尚未写入的预分配块。
+    pub(crate) fn allocated_runs_in_range<B: BlockDevice>(
+        &mut self,
+        dev: &mut Jbd2Dev<B>,
+        start_lbn: u32,
+        end_lbn: u32,
+    ) -> Ext4Result<Vec<ExtentRun>> {
+        self.runs_in_range(dev, start_lbn, end_lbn, true)
+    }
+
+    fn runs_in_range<B: BlockDevice>(
+        &mut self,
+        dev: &mut Jbd2Dev<B>,
+        start_lbn: u32,
+        end_lbn: u32,
+        include_unwritten: bool,
+    ) -> Ext4Result<Vec<ExtentRun>> {
         if start_lbn > end_lbn {
             return Ok(Vec::new());
         }
@@ -120,7 +142,7 @@ impl<'a> ExtentTree<'a> {
             return Ok(Vec::new());
         };
         let mut runs = Vec::new();
-        Self::collect_runs_in_node(dev, &root, start_lbn, end_lbn, &mut runs)?;
+        Self::collect_runs_in_node(dev, &root, start_lbn, end_lbn, &mut runs, include_unwritten)?;
         runs.sort_unstable_by_key(|run| run.logical_start);
         Ok(runs)
     }
@@ -183,12 +205,13 @@ impl<'a> ExtentTree<'a> {
         start_lbn: u32,
         end_lbn: u32,
         out: &mut Vec<ExtentRun>,
+        include_unwritten: bool,
     ) -> Ext4Result<()> {
         match node {
             ExtentNode::Leaf { entries, .. } => {
                 for ext in entries {
                     let len = ext.len();
-                    if len == 0 || ext.is_unwritten() {
+                    if len == 0 || ext.is_unwritten() && !include_unwritten {
                         continue;
                     }
                     let ext_start = ext.ee_block;
@@ -225,7 +248,14 @@ impl<'a> ExtentTree<'a> {
                     dev.read_block(child_block)?;
                     let child =
                         Self::parse_node_from_bytes(dev.buffer()).ok_or(Ext4Error::corrupted())?;
-                    Self::collect_runs_in_node(dev, &child, start_lbn, end_lbn, out)?;
+                    Self::collect_runs_in_node(
+                        dev,
+                        &child,
+                        start_lbn,
+                        end_lbn,
+                        out,
+                        include_unwritten,
+                    )?;
                 }
                 Ok(())
             }

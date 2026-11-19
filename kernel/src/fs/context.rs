@@ -1,15 +1,47 @@
-//! 每进程工作目录、fd 表与文件类系统调用分发；dup/fork 共享打开文件
-//! 的偏移；read/write 循环分块，pipe 阻塞语义见 ostd-contracts §4。
-use crate::{
-    fs,
-    mm::{address_space::UserAddressSpace, user_access},
-    syscall::{sysnr, Errno},
+//! 进程工作目录、FD 表和打开文件对象；提供内核缓冲区读写与管道操作。
+#![deny(unsafe_code)]
+use crate::{fs, syscall::Errno};
+use alloc::{
+    collections::VecDeque,
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
 };
-use alloc::{collections::VecDeque, string::String, sync::Arc, vec::Vec};
 use spin::Mutex;
 
 /// pipe 缓冲容量（对齐 Linux 默认 64KiB）；写满/读空时阻塞等待。
 const PIPE_CAPACITY: usize = 65536;
+const FD_LIMIT: usize = 1024;
+const OPEN_CREATION_FLAGS: usize = 0x40 | 0x80 | 0x100 | 0x200 | 0x80000;
+
+static DIRECTORIES: Mutex<Vec<Weak<DirectoryPath>>> = Mutex::new(Vec::new());
+
+struct DirectoryPath(String);
+
+fn directory_path(path: String) -> Result<Arc<DirectoryPath>, Errno> {
+    let mut paths = DIRECTORIES.lock();
+    paths.retain(|p| p.strong_count() != 0);
+    paths.try_reserve(1).map_err(|_| Errno::NoMem)?;
+    let path = fs::try_arc(DirectoryPath(path))?;
+    paths.push(Arc::downgrade(&path));
+    Ok(path)
+}
+
+fn contains(parent: &str, path: &str) -> bool {
+    parent == "/"
+        || path == parent
+        || path
+            .strip_prefix(parent)
+            .is_some_and(|s| s.starts_with('/'))
+}
+
+fn directory_busy(path: &str) -> bool {
+    DIRECTORIES
+        .lock()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .any(|p| contains(path, &p.0))
+}
 
 struct Pipe {
     data: VecDeque<u8>,
@@ -26,9 +58,11 @@ enum Kind {
     Inode {
         ino: u32,
         path: String,
+        _directory: Option<Arc<DirectoryPath>>,
     },
 }
-struct OpenFile {
+/// 共享偏移、打开标志和文件资源的持有者。
+pub(crate) struct OpenFile {
     kind: Kind,
     offset: usize,
     flags: usize,
@@ -52,7 +86,8 @@ impl Drop for OpenFile {
         }
     }
 }
-type Handle = Arc<Mutex<OpenFile>>;
+/// FD 表与调用期间共同持有的打开文件引用。
+pub(crate) type Handle = Arc<Mutex<OpenFile>>;
 #[derive(Clone)]
 struct Descriptor {
     handle: Handle,
@@ -61,8 +96,9 @@ struct Descriptor {
 
 /// 进程拥有 fd 表副本，共享打开文件描述，工作目录独立。
 pub struct Context {
-    cwd: String,
+    cwd: Arc<DirectoryPath>,
     fds: Vec<Option<Descriptor>>,
+    umask: u16,
 }
 fn string(s: &str) -> Result<String, Errno> {
     let mut result = String::new();
@@ -78,16 +114,17 @@ impl Context {
         for kind in [Kind::Input, Kind::Output, Kind::Output] {
             fds.push(Some(Descriptor {
                 handle: crate::fs::try_arc(Mutex::new(OpenFile {
+                    flags: if matches!(kind, Kind::Input) { 0 } else { 1 },
                     kind,
                     offset: 0,
-                    flags: 2,
                 }))?,
                 cloexec: false,
             }));
         }
         Ok(Self {
-            cwd: string("/")?,
+            cwd: directory_path(string("/")?)?,
             fds,
+            umask: 0o022,
         })
     }
     /// fork 复制描述符表，保留共享偏移。
@@ -96,66 +133,125 @@ impl Context {
         fds.try_reserve(self.fds.len()).map_err(|_| Errno::NoMem)?;
         fds.extend(self.fds.iter().cloned());
         Ok(Self {
-            cwd: string(&self.cwd)?,
+            cwd: self.cwd.clone(),
             fds,
+            umask: self.umask,
         })
     }
-    fn get(&self, fd: usize) -> Result<Handle, Errno> {
+    /// 设置创建权限掩码，仅保存权限位并返回旧值。
+    pub(crate) fn set_umask(&mut self, mask: usize) -> usize {
+        let previous = self.umask;
+        self.umask = mask as u16 & 0o777;
+        previous as usize
+    }
+
+    /// 对新建文件和目录的请求权限应用当前进程掩码。
+    pub(crate) fn creation_mode(&self, mode: usize) -> u16 {
+        mode as u16 & 0o777 & !self.umask
+    }
+
+    /// 取得打开文件引用，无效 FD 返回 EBADF。
+    pub(crate) fn get(&self, fd: usize) -> Result<Handle, Errno> {
         self.fds
             .get(fd)
             .and_then(|f| f.as_ref().map(|d| d.handle.clone()))
             .ok_or(Errno::BadF)
     }
-    fn install(&mut self, file: Handle, cloexec: bool) -> Result<usize, Errno> {
-        if let Some(i) = self.fds.iter().position(Option::is_none) {
+    /// 安装打开文件，返回最低可用 FD；容量不足返回错误。
+    pub(crate) fn install(&mut self, file: Handle, cloexec: bool) -> Result<usize, Errno> {
+        self.install_from(file, 0, cloexec)
+    }
+
+    /// 从指定下界安装到最低空闲 FD；超出上限返回 EINVAL，表满返回 EMFILE。
+    pub(crate) fn install_from(
+        &mut self,
+        file: Handle,
+        minimum: usize,
+        cloexec: bool,
+    ) -> Result<usize, Errno> {
+        if minimum >= FD_LIMIT {
+            return Err(Errno::Invalid);
+        }
+        if let Some(i) = (minimum..self.fds.len()).find(|&i| self.fds[i].is_none()) {
             self.fds[i] = Some(Descriptor {
                 handle: file,
                 cloexec,
             });
             return Ok(i);
         }
-        if self.fds.len() >= 1024 {
+        let i = minimum.max(self.fds.len());
+        if i >= FD_LIMIT {
             return Err(Errno::TooManyFiles);
         }
-        self.fds.try_reserve(1).map_err(|_| Errno::NoMem)?;
+        self.fds
+            .try_reserve(i + 1 - self.fds.len())
+            .map_err(|_| Errno::NoMem)?;
+        self.fds.resize_with(i, || None);
         self.fds.push(Some(Descriptor {
             handle: file,
             cloexec,
         }));
-        Ok(self.fds.len() - 1)
+        Ok(i)
     }
-    fn path(&self, dir: usize, input: &str) -> Result<String, Errno> {
+
+    /// 查询 FD_CLOEXEC；无效描述符返回 EBADF。
+    pub(crate) fn descriptor_flags(&self, fd: usize) -> Result<usize, Errno> {
+        self.fds
+            .get(fd)
+            .and_then(Option::as_ref)
+            .map(|d| usize::from(d.cloexec))
+            .ok_or(Errno::BadF)
+    }
+
+    /// 设置本描述符的 FD_CLOEXEC，忽略其他位；无效描述符返回 EBADF。
+    pub(crate) fn set_descriptor_flags(&mut self, fd: usize, flags: usize) -> Result<usize, Errno> {
+        let descriptor = self
+            .fds
+            .get_mut(fd)
+            .and_then(Option::as_mut)
+            .ok_or(Errno::BadF)?;
+        descriptor.cloexec = flags & 1 != 0;
+        Ok(0)
+    }
+    /// 相对工作目录或目录 FD 解析路径，失败返回路径错误。
+    pub(crate) fn path(&self, dir: usize, input: &str) -> Result<String, Errno> {
         if input.is_empty() {
             return Err(Errno::NoEntry);
         }
         let mut out = if input.starts_with('/') {
             string("/")?
         } else if dir as isize == -100 {
-            string(&self.cwd)?
+            string(self.cwd())?
         } else {
             let f = self.get(dir)?;
             let f = f.lock();
             match &f.kind {
-                Kind::Inode { ino, path } if fs::stat(*ino)?.0 & 0xf000 == 0x4000 => string(path)?,
+                Kind::Inode { ino, path, .. } if fs::stat(*ino)?.0 & 0xf000 == 0x4000 => {
+                    string(path)?
+                }
                 _ => return Err(Errno::NotDir),
             }
         };
         out.try_reserve(input.len() + 1).map_err(|_| Errno::NoMem)?;
+        let mut parent_end = None;
         for component in input.split('/') {
-            if !component.is_empty() && fs::stat(fs::lookup(&out)?)?.0 & 0xf000 != 0x4000 {
-                return Err(Errno::NotDir);
-            }
             match component {
-                "" | "." => {}
-                ".." => {
-                    if let Some(i) = out.rfind('/') {
-                        out.truncate(i.max(1));
+                "" => {}
+                "." | ".." => {
+                    directory(&out)?;
+                    parent_end = None;
+                    if component == ".." {
+                        if let Some(i) = out.rfind('/') {
+                            out.truncate(i.max(1));
+                        }
                     }
                 }
                 name => {
                     if name.len() > 255 {
+                        directory(&out)?;
                         return Err(Errno::NameTooLong);
                     }
+                    parent_end = Some(out.len());
                     if out != "/" {
                         out.push('/');
                     }
@@ -163,29 +259,526 @@ impl Context {
                 }
             }
         }
+        // 后端会检查中间目录；只验证末项的父目录，末项允许尚不存在。
+        if let Some(end) = parent_end {
+            directory(&out[..end])?;
+        }
         if out.len() > 4096 {
             return Err(Errno::NameTooLong);
         }
         Ok(out)
     }
+    /// 状态查询保留原始路径分量，由 FS 处理链接、点分量与尾斜杠。
+    pub(crate) fn query(
+        &self,
+        dir: usize,
+        input: &str,
+        empty: bool,
+        follow: bool,
+    ) -> Result<fs::Metadata, Errno> {
+        if input.is_empty() && empty {
+            if dir as isize == -100 {
+                return fs::query(self.cwd(), true);
+            }
+            return self.get(dir)?.lock().metadata();
+        }
+        if input.is_empty() {
+            return Err(Errno::NoEntry);
+        }
+        if input.starts_with('/') {
+            return fs::query(input, follow);
+        }
+        let base = if dir as isize == -100 {
+            string(self.cwd())?
+        } else {
+            let file = self.get(dir)?;
+            let file = file.lock();
+            file.directory()?;
+            match &file.kind {
+                Kind::Inode { path, .. } => string(path)?,
+                _ => return Err(Errno::NotDir),
+            }
+        };
+        let mut path = base;
+        path.try_reserve(input.len() + 1)
+            .map_err(|_| Errno::NoMem)?;
+        path.push('/');
+        path.push_str(input);
+        fs::query(&path, follow)
+    }
+
+    /// 返回当前工作目录。
+    pub(crate) fn cwd(&self) -> &str {
+        &self.cwd.0
+    }
+
+    /// 保存调用方已验证的绝对工作目录。
+    pub(crate) fn set_cwd(&mut self, path: String) -> Result<(), Errno> {
+        self.cwd = directory_path(path)?;
+        Ok(())
+    }
+
+    fn rename_path(&self, dir: usize, input: &str) -> Result<(String, u32, String), Errno> {
+        if input.is_empty() {
+            return Err(Errno::NoEntry);
+        }
+        let trimmed = input.trim_end_matches('/');
+        let (parent, name) = match trimmed.rsplit_once('/') {
+            Some(("", name)) => ("/", name),
+            Some(parts) => parts,
+            None => (".", trimmed),
+        };
+        if name.is_empty() || matches!(name, "." | "..") {
+            return Err(Errno::Busy);
+        }
+        if name.len() > 255 {
+            return Err(Errno::NameTooLong);
+        }
+        let mut base = if input.starts_with('/') {
+            string("")?
+        } else if dir as isize == -100 {
+            string(self.cwd())?
+        } else {
+            let handle = self.get(dir)?;
+            let file = handle.lock();
+            file.directory()?;
+            match &file.kind {
+                Kind::Inode { path, .. } => string(path)?,
+                _ => return Err(Errno::NotDir),
+            }
+        };
+        base.try_reserve(parent.len() + 1)
+            .map_err(|_| Errno::NoMem)?;
+        if !base.is_empty() {
+            base.push('/');
+        }
+        base.push_str(parent);
+        let (mut canonical, info) = fs::metadata::resolve(&base, true)?;
+        if info.mode & 0xf000 != 0x4000 {
+            return Err(Errno::NotDir);
+        }
+        canonical
+            .try_reserve(name.len() + 1)
+            .map_err(|_| Errno::NoMem)?;
+        if canonical != "/" {
+            canonical.push('/');
+        }
+        canonical.push_str(name);
+        if canonical.len() >= 4096 {
+            return Err(Errno::NameTooLong);
+        }
+        Ok((canonical, info.ino as u32, string(name)?))
+    }
+
+    /// 重命名文件或目录；拒绝移动仍由 cwd、目录 FD 或挂载引用的目录树。
+    pub(crate) fn rename(
+        &self,
+        old_dir: usize,
+        old: &str,
+        new_dir: usize,
+        new: &str,
+        no_replace: bool,
+    ) -> Result<(), Errno> {
+        let (old_path, old_parent, old_name) = self.rename_path(old_dir, old)?;
+        let (new_path, new_parent, new_name) = self.rename_path(new_dir, new)?;
+        let source = fs::query(&old_path, false)?;
+        let target = match fs::query(&new_path, false) {
+            Ok(info) => Some(info),
+            Err(Errno::NoEntry) => None,
+            Err(error) => return Err(error),
+        };
+        if (old.ends_with('/') || new.ends_with('/')) && source.mode & 0xf000 != 0x4000 {
+            return Err(Errno::NotDir);
+        }
+        if new.ends_with('/') && target.as_ref().is_some_and(|t| t.mode & 0xf000 != 0x4000) {
+            return Err(Errno::NotDir);
+        }
+        if no_replace && target.is_some() {
+            return Err(Errno::Exists);
+        }
+        if source.mode & 0xf000 == 0x4000 && contains(&old_path, &new_path) && old_path != new_path
+        {
+            return Err(Errno::Invalid);
+        }
+        if fs::fat::contains_mount(&old_path) || fs::fat::contains_mount(&new_path) {
+            return Err(Errno::Busy);
+        }
+        if !no_replace
+            && target
+                .as_ref()
+                .is_some_and(|t| t.dev == source.dev && t.ino == source.ino)
+        {
+            return fs::rename(old_parent, &old_name, new_parent, &new_name, false);
+        }
+        if source.mode & 0xf000 == 0x4000 && directory_busy(&old_path)
+            || target.as_ref().is_some_and(|t| t.mode & 0xf000 == 0x4000)
+                && directory_busy(&new_path)
+        {
+            return Err(Errno::Busy);
+        }
+        fs::rename(old_parent, &old_name, new_parent, &new_name, no_replace)
+    }
+
+    /// 将打开文件复制到指定 FD，替换原描述符。
+    pub(crate) fn dup_to(&mut self, from: usize, to: usize, cloexec: bool) -> Result<usize, Errno> {
+        let file = self.get(from)?;
+        if to >= FD_LIMIT {
+            return Err(Errno::BadF);
+        }
+        if to >= self.fds.len() {
+            self.fds
+                .try_reserve(to + 1 - self.fds.len())
+                .map_err(|_| Errno::NoMem)?;
+            self.fds.resize_with(to + 1, || None);
+        }
+        self.fds[to] = Some(Descriptor {
+            handle: file,
+            cloexec,
+        });
+        Ok(to)
+    }
+
+    /// 关闭 FD 并释放引用，无效 FD 返回 EBADF。
+    pub(crate) fn close(&mut self, fd: usize) -> Result<(), Errno> {
+        self.fds
+            .get_mut(fd)
+            .ok_or(Errno::BadF)?
+            .take()
+            .ok_or(Errno::BadF)?;
+        Ok(())
+    }
+
+    /// 安装 inode 的打开文件对象，失败自动释放已持有的引用。
+    pub(crate) fn open_inode(
+        &mut self,
+        ino: u32,
+        path: String,
+        flags: usize,
+        cloexec: bool,
+        is_directory: bool,
+    ) -> Result<usize, Errno> {
+        let directory = if is_directory {
+            Some(directory_path(string(&path)?)?)
+        } else {
+            None
+        };
+        fs::retain(ino)?;
+        self.install(
+            fs::try_arc(Mutex::new(OpenFile {
+                kind: Kind::Inode {
+                    ino,
+                    path,
+                    _directory: directory,
+                },
+                offset: 0,
+                flags: flags & !OPEN_CREATION_FLAGS,
+            }))?,
+            cloexec,
+        )
+    }
+
+    /// 创建管道两端，安装失败时回收已安装的 FD。
+    pub(crate) fn pipe(&mut self, flags: usize) -> Result<(usize, usize), Errno> {
+        let mut data = VecDeque::new();
+        data.try_reserve(4096).map_err(|_| Errno::NoMem)?;
+        let pipe = fs::try_arc(Mutex::new(Pipe {
+            data,
+            readers: 1,
+            writers: 1,
+        }))?;
+        let r = fs::try_arc(Mutex::new(OpenFile {
+            kind: Kind::Pipe {
+                pipe: pipe.clone(),
+                reading: true,
+            },
+            offset: 0,
+            flags: flags & 0x800,
+        }))?;
+        let w = fs::try_arc(Mutex::new(OpenFile {
+            kind: Kind::Pipe {
+                pipe,
+                reading: false,
+            },
+            offset: 0,
+            flags: (flags & 0x800) | 1,
+        }))?;
+        let rfd = self.install(r, flags & 0x80000 != 0)?;
+        let wfd = match self.install(w, flags & 0x80000 != 0) {
+            Ok(fd) => fd,
+            Err(e) => {
+                self.fds[rfd] = None;
+                return Err(e);
+            }
+        };
+        Ok((rfd, wfd))
+    }
 }
 
-/// 从用户内存读取 NUL 结尾路径，最长 4096 字节。
-pub fn user_path(space: &UserAddressSpace, ptr: usize) -> Result<String, Errno> {
-    let mut bytes = Vec::new();
-    bytes.try_reserve(4096).map_err(|_| Errno::NoMem)?;
-    for n in 0..4096 {
-        let mut b = [0];
-        user_access::copy_from_user(space, ptr.checked_add(n).ok_or(Errno::Fault)?, &mut b)
-            .map_err(|_| Errno::Fault)?;
-        if b[0] == 0 {
-            return String::from_utf8(bytes).map_err(|_| Errno::Invalid);
-        }
-        bytes.push(b[0]);
+/// 确认路径存在且为目录。
+fn directory(path: &str) -> Result<(), Errno> {
+    if fs::stat(fs::lookup(path)?)?.0 & 0xf000 != 0x4000 {
+        return Err(Errno::NotDir);
     }
-    Err(Errno::NameTooLong)
+    Ok(())
 }
-fn parent(path: &str) -> Result<(u32, &str), Errno> {
+
+impl OpenFile {
+    /// 按可写 FD 调整普通文件长度，不改变共享文件偏移；其他对象返回 EINVAL。
+    pub(crate) fn truncate(&self, length: u64) -> Result<(), Errno> {
+        if self.flags & 0x200000 != 0 {
+            return Err(Errno::BadF);
+        }
+        if self.flags & 3 == 0 {
+            return Err(Errno::Invalid);
+        }
+        match self.kind {
+            Kind::Inode { ino, .. } if fs::stat(ino)?.0 & 0xf000 == 0x8000 => {
+                fs::truncate(ino, length)
+            }
+            _ => Err(Errno::Invalid),
+        }
+    }
+
+    /// 查询共享的访问模式和文件状态标志。
+    pub(crate) fn status_flags(&self) -> usize {
+        self.flags
+    }
+
+    /// 更新共享的追加、非阻塞标志；未实现的可变标志返回 EOPNOTSUPP。
+    pub(crate) fn set_status_flags(&mut self, flags: usize) -> Result<usize, Errno> {
+        if flags & (0x2000 | 0x4000 | 0x40000) != 0 {
+            return Err(Errno::NotSupported);
+        }
+        let mutable = 0x400 | 0x800;
+        self.flags = (self.flags & !mutable) | (flags & mutable);
+        Ok(0)
+    }
+
+    /// 获取 inode，设备和管道返回 EINVAL。
+    #[cfg(not(feature = "rsext4-readonly"))]
+    pub(crate) fn inode(&self) -> Result<u32, Errno> {
+        match self.kind {
+            Kind::Inode { ino, .. } => Ok(ino),
+            _ => Err(Errno::Invalid),
+        }
+    }
+
+    /// 获取目录 inode，其他对象返回 ENOTDIR。
+    pub(crate) fn directory(&self) -> Result<u32, Errno> {
+        match self.kind {
+            Kind::Inode { ino, .. } if fs::stat(ino)?.0 & 0xf000 == 0x4000 => Ok(ino),
+            _ => Err(Errno::NotDir),
+        }
+    }
+
+    /// 更新打开 inode 的访问和修改时间；管道与控制台返回 EOPNOTSUPP。
+    pub(crate) fn update_times(&self, times: [fs::TimeUpdate; 2]) -> Result<(), Errno> {
+        match self.kind {
+            Kind::Inode { ino, .. } => fs::update_times(ino, times),
+            _ => Err(Errno::NotSupported),
+        }
+    }
+
+    /// 查询 inode 所属卷的容量；管道与控制台尚不提供卷统计。
+    pub(crate) fn filesystem_stats(&self) -> Result<fs::FileSystemStats, Errno> {
+        match self.kind {
+            Kind::Inode { ino, .. } => fs::filesystem_stats(ino),
+            _ => Err(Errno::NotSupported),
+        }
+    }
+
+    /// 返回打开对象的属性快照；管道与控制台提供合成属性。
+    pub(crate) fn metadata(&self) -> Result<fs::Metadata, Errno> {
+        match self.kind {
+            Kind::Inode { ino, .. } => fs::metadata::metadata(ino),
+            _ => Ok(fs::Metadata {
+                mode: (if matches!(self.kind, Kind::Pipe { .. }) {
+                    0x1000
+                } else {
+                    0x2000
+                }) | 0o666,
+                links: 1,
+                block_size: 4096,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// 返回共享的文件或目录偏移。
+    pub(crate) fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// 提交调用方已经完成的目录续读位置。
+    pub(crate) fn set_offset(&mut self, offset: usize) {
+        self.offset = offset;
+    }
+
+    /// 依据打开模式检查读写权限，失败返回 EBADF。
+    pub(crate) fn check_access(&self, reading: bool) -> Result<(), Errno> {
+        if (reading && self.flags & 3 == 1) || (!reading && self.flags & 3 == 0) {
+            return Err(Errno::BadF);
+        }
+        Ok(())
+    }
+
+    fn check_type(&self, first: bool) -> Result<(), Errno> {
+        if first {
+            if let Kind::Inode { ino, .. } = self.kind {
+                if fs::stat(ino)?.0 & 0xf000 == 0x4000 {
+                    return Err(Errno::IsDir);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 从起点、当前位置或文件末尾调整偏移；管道返回 ESPIPE。
+    pub(crate) fn seek(&mut self, delta: isize, whence: usize) -> Result<usize, Errno> {
+        let ino = match self.kind {
+            Kind::Inode { ino, .. } => ino,
+            _ => return Err(Errno::SeekPipe),
+        };
+        let base = match whence {
+            0 => 0,
+            1 => self.offset,
+            2 => fs::stat(ino)?.1 as usize,
+            _ => return Err(Errno::Invalid),
+        };
+        let offset = base as i128 + delta as i128;
+        if offset < 0 || offset > isize::MAX as i128 {
+            return Err(Errno::Invalid);
+        }
+        self.offset = offset as usize;
+        Ok(self.offset)
+    }
+
+    /// 读取一块内核缓冲区；交付成功后才消费管道数据或推进偏移。
+    /// first 指示本次读取的首块；交付函数返回实际写入用户缓冲区的长度。
+    pub(crate) fn read_chunk(
+        &mut self,
+        data: &mut [u8],
+        first: bool,
+        deliver: impl FnOnce(&[u8]) -> Result<usize, Errno>,
+    ) -> Result<usize, Errno> {
+        self.check_type(first)?;
+        match &self.kind {
+            Kind::Input => Ok(0),
+            Kind::Pipe { pipe, .. } => {
+                let mut p = pipe.lock();
+                if p.data.is_empty() {
+                    return if p.writers == 0 {
+                        Ok(0)
+                    } else {
+                        Err(nonblock_or_wait(self.flags))
+                    };
+                }
+                let count = data.len().min(p.data.len());
+                for (i, b) in p.data.iter().take(count).enumerate() {
+                    data[i] = *b;
+                }
+                let delivered = deliver(&data[..count])?;
+                if delivered > count {
+                    return Err(Errno::Invalid);
+                }
+                p.data.drain(..delivered);
+                crate::task::sched::request_pipe_wake();
+                Ok(delivered)
+            }
+            Kind::Inode { .. } => {
+                let count = self.read_at(self.offset, data, false, deliver)?;
+                self.offset = self.offset.checked_add(count).ok_or(Errno::Invalid)?;
+                Ok(count)
+            }
+            _ => Err(Errno::BadF),
+        }
+    }
+
+    /// 写入一块内核缓冲区；首块检查类型，追加模式逐块取得文件末尾。
+    /// 空间不足返回等待或 EAGAIN，无读者的管道返回 EPIPE。
+    pub(crate) fn write_chunk(&mut self, data: &[u8], first: bool) -> Result<usize, Errno> {
+        self.check_type(first)?;
+        match &self.kind {
+            Kind::Output => {
+                use polyhal::debug_console::DebugConsole;
+                for &b in data {
+                    DebugConsole::putchar(b);
+                }
+                Ok(data.len())
+            }
+            Kind::Pipe { pipe, .. } => {
+                let mut p = pipe.lock();
+                if p.readers == 0 {
+                    return Err(Errno::Pipe);
+                }
+                if PIPE_CAPACITY - p.data.len() < data.len() {
+                    return Err(nonblock_or_wait(self.flags));
+                }
+                p.data.extend(data);
+                crate::task::sched::request_pipe_wake();
+                Ok(data.len())
+            }
+            Kind::Inode { ino, .. } => {
+                let offset = if self.flags & 0x400 != 0 {
+                    fs::stat(*ino)?.1 as usize
+                } else {
+                    self.offset
+                };
+                let count = fs::write(*ino, offset, data)?;
+                self.offset = offset.checked_add(count).ok_or(Errno::Invalid)?;
+                Ok(count)
+            }
+            _ => Err(Errno::BadF),
+        }
+    }
+
+    /// 定位 I/O 只接受 inode 对象；流式对象返回 ESPIPE。
+    pub(crate) fn check_positioned(&self) -> Result<(), Errno> {
+        match self.kind {
+            Kind::Inode { .. } => Ok(()),
+            _ => Err(Errno::SeekPipe),
+        }
+    }
+
+    /// 从给定位置读取并交付，返回已交付长度；不改变共享偏移。
+    pub(crate) fn read_at(
+        &self,
+        offset: usize,
+        data: &mut [u8],
+        first: bool,
+        deliver: impl FnOnce(&[u8]) -> Result<usize, Errno>,
+    ) -> Result<usize, Errno> {
+        self.check_type(first)?;
+        let ino = match self.kind {
+            Kind::Inode { ino, .. } => ino,
+            _ => return Err(Errno::SeekPipe),
+        };
+        let count = fs::read(ino, offset, data)?;
+        let delivered = deliver(&data[..count])?;
+        if delivered > count {
+            return Err(Errno::Invalid);
+        }
+        Ok(delivered)
+    }
+
+    /// 写给定位置且不改变共享偏移；O_APPEND 沿用 Linux 的追加行为。
+    pub(crate) fn write_at(&self, offset: usize, data: &[u8], first: bool) -> Result<usize, Errno> {
+        self.check_type(first)?;
+        let ino = match self.kind {
+            Kind::Inode { ino, .. } => ino,
+            _ => return Err(Errno::SeekPipe),
+        };
+        let offset = if self.flags & 0x400 != 0 {
+            fs::stat(ino)?.1 as usize
+        } else {
+            offset
+        };
+        fs::write(ino, offset, data)
+    }
+}
+
+/// 查找路径的父目录并返回末项名称。
+pub(crate) fn parent(path: &str) -> Result<(u32, &str), Errno> {
     let i = path.rfind('/').ok_or(Errno::Invalid)?;
     let dir = fs::lookup(if i == 0 { "/" } else { &path[..i] })?;
     if fs::stat(dir)?.0 & 0xf000 != 0x4000 {
@@ -194,452 +787,6 @@ fn parent(path: &str) -> Result<(u32, &str), Errno> {
     Ok((dir, &path[i + 1..]))
 }
 
-/// Linux 文件调用，所有用户缓冲区经 user_access 复制。
-pub fn dispatch(
-    nr: usize,
-    a: [usize; 6],
-    space: &UserAddressSpace,
-    ctx: &mut Context,
-) -> Result<usize, Errno> {
-    match nr {
-        sysnr::GETCWD => {
-            if a[1] < ctx.cwd.len() + 1 {
-                return Err(Errno::Range);
-            }
-            user_access::copy_to_user(space, a[0], ctx.cwd.as_bytes()).map_err(|_| Errno::Fault)?;
-            user_access::copy_to_user(
-                space,
-                a[0].checked_add(ctx.cwd.len()).ok_or(Errno::Fault)?,
-                &[0],
-            )
-            .map_err(|_| Errno::Fault)?;
-            Ok(ctx.cwd.len() + 1)
-        }
-        sysnr::DUP => ctx.install(ctx.get(a[0])?, false),
-        sysnr::DUP3 => {
-            if a[2] & !0x80000 != 0 || a[0] == a[1] {
-                return Err(Errno::Invalid);
-            }
-            let file = ctx.get(a[0])?;
-            if a[1] >= 1024 {
-                return Err(Errno::BadF);
-            }
-            if a[1] >= ctx.fds.len() {
-                ctx.fds
-                    .try_reserve(a[1] + 1 - ctx.fds.len())
-                    .map_err(|_| Errno::NoMem)?;
-                ctx.fds.resize_with(a[1] + 1, || None);
-            }
-            ctx.fds[a[1]] = Some(Descriptor {
-                handle: file,
-                cloexec: a[2] & 0x80000 != 0,
-            });
-            Ok(a[1])
-        }
-        sysnr::MKDIRAT => {
-            let path = ctx.path(a[0], &user_path(space, a[1])?)?;
-            match fs::lookup(&path) {
-                Ok(_) => Err(Errno::Exists),
-                Err(Errno::NoEntry) => {
-                    let (p, name) = parent(&path)?;
-                    fs::create(p, name, 0x4000 | (a[2] as u16 & 0o777))?;
-                    Ok(0)
-                }
-                Err(e) => Err(e),
-            }
-        }
-        sysnr::MOUNT => {
-            if a[3] != 0 {
-                return Err(Errno::NotSupported);
-            }
-            let source = user_path(space, a[0])?;
-            let target = ctx.path((-100isize) as usize, &user_path(space, a[1])?)?;
-            let kind = user_path(space, a[2])?;
-            if kind != "vfat" && kind != "fat" {
-                return Err(Errno::NoDevice);
-            }
-            if fs::stat(fs::lookup(&target)?)?.0 & 0xf000 != 0x4000 {
-                return Err(Errno::NotDir);
-            }
-            fs::fat::mount(&source, &target)?;
-            Ok(0)
-        }
-        sysnr::UMOUNT2 => {
-            if a[1] != 0 {
-                return Err(Errno::NotSupported);
-            }
-            let target = ctx.path((-100isize) as usize, &user_path(space, a[0])?)?;
-            fs::fat::unmount(&target)?;
-            Ok(0)
-        }
-        sysnr::UNLINKAT => {
-            if a[2] != 0 {
-                return Err(Errno::NotSupported);
-            }
-            let path = ctx.path(a[0], &user_path(space, a[1])?)?;
-            let ino = fs::lookup(&path)?;
-            let (p, name) = parent(&path)?;
-            fs::unlink(p, ino, name)?;
-            Ok(0)
-        }
-        sysnr::PIPE2 => {
-            if a[1] & !(0x80000 | 0x800) != 0 {
-                return Err(Errno::Invalid);
-            }
-            let mut data = VecDeque::new();
-            data.try_reserve(4096).map_err(|_| Errno::NoMem)?;
-            let pipe = crate::fs::try_arc(Mutex::new(Pipe {
-                data,
-                readers: 1,
-                writers: 1,
-            }))?;
-            let r = crate::fs::try_arc(Mutex::new(OpenFile {
-                kind: Kind::Pipe {
-                    pipe: pipe.clone(),
-                    reading: true,
-                },
-                offset: 0,
-                flags: a[1],
-            }))?;
-            let w = crate::fs::try_arc(Mutex::new(OpenFile {
-                kind: Kind::Pipe {
-                    pipe,
-                    reading: false,
-                },
-                offset: 0,
-                flags: a[1] | 1,
-            }))?;
-            let rfd = ctx.install(r, a[1] & 0x80000 != 0)?;
-            let wfd = match ctx.install(w, a[1] & 0x80000 != 0) {
-                Ok(fd) => fd,
-                Err(e) => {
-                    ctx.fds[rfd] = None;
-                    return Err(e);
-                }
-            };
-            let mut pair = [0; 8];
-            pair[..4].copy_from_slice(&(rfd as u32).to_ne_bytes());
-            pair[4..].copy_from_slice(&(wfd as u32).to_ne_bytes());
-            if user_access::copy_to_user(space, a[0], &pair).is_err() {
-                ctx.fds[rfd] = None;
-                ctx.fds[wfd] = None;
-                return Err(Errno::Fault);
-            }
-            Ok(0)
-        }
-        sysnr::GETDENTS64 => {
-            let handle = ctx.get(a[0])?;
-            let mut f = handle.lock();
-            let ino = match f.kind {
-                Kind::Inode { ino, .. } => ino,
-                _ => return Err(Errno::NotDir),
-            };
-            if fs::stat(ino)?.0 & 0xf000 != 0x4000 {
-                return Err(Errno::NotDir);
-            }
-            let mut out = [0u8; 4096];
-            let cap = a[2].min(out.len());
-            let mut used = 0;
-            let mut offset = f.offset;
-            loop {
-                let mut entry = [0u8; 264];
-                let n = fs::read_dir_at(ino, offset, &mut entry)?;
-                if n == 0 {
-                    break;
-                }
-                if n < 8 {
-                    return Err(Errno::Io);
-                }
-                let inode = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
-                let disk_len = u16::from_le_bytes([entry[4], entry[5]]) as usize;
-                let name_len = entry[6] as usize;
-                if disk_len < 8
-                    || disk_len % 4 != 0
-                    || disk_len > fs::EXT4_BLOCK_SIZE - offset % fs::EXT4_BLOCK_SIZE
-                    || name_len + 8 > n
-                    || name_len + 8 > disk_len
-                {
-                    return Err(Errno::Io);
-                }
-                let next = offset.checked_add(disk_len).ok_or(Errno::Io)?;
-                if inode != 0 {
-                    let len = (19 + name_len + 1 + 7) & !7;
-                    if used + len > cap {
-                        if used == 0 {
-                            return Err(Errno::Invalid);
-                        }
-                        break;
-                    }
-                    let d = &mut out[used..used + len];
-                    d[..8].copy_from_slice(&(inode as u64).to_ne_bytes());
-                    d[8..16].copy_from_slice(&(next as u64).to_ne_bytes());
-                    d[16..18].copy_from_slice(&(len as u16).to_ne_bytes());
-                    d[18] = match entry[7] {
-                        1 => 8,
-                        2 => 4,
-                        3 => 2,
-                        4 => 6,
-                        5 => 1,
-                        6 => 12,
-                        7 => 10,
-                        _ => 0,
-                    };
-                    d[19..19 + name_len].copy_from_slice(&entry[8..8 + name_len]);
-                    used += len;
-                }
-                offset = next;
-            }
-            user_access::copy_to_user(space, a[1], &out[..used]).map_err(|_| Errno::Fault)?;
-            f.offset = offset;
-            Ok(used)
-        }
-        sysnr::CHDIR => {
-            let path = ctx.path((-100isize) as usize, &user_path(space, a[0])?)?;
-            if fs::stat(fs::lookup(&path)?)?.0 & 0xf000 != 0x4000 {
-                return Err(Errno::NotDir);
-            }
-            ctx.cwd = path;
-            Ok(0)
-        }
-        sysnr::OPENAT => {
-            if a[2] & 3 == 3 {
-                return Err(Errno::Invalid);
-            }
-            if a[2] & 0x10000 != 0 && a[2] & 64 != 0 {
-                return Err(Errno::Invalid);
-            }
-            let path = ctx.path(a[0], &user_path(space, a[1])?)?;
-            let ino = match fs::lookup(&path) {
-                Ok(ino) => {
-                    if a[2] & 0xc0 == 0xc0 {
-                        return Err(Errno::Exists);
-                    }
-                    ino
-                }
-                Err(Errno::NoEntry) if a[2] & 64 != 0 => {
-                    let (p, name) = parent(&path)?;
-                    fs::create(p, name, 0x8000 | (a[3] as u16 & 0o777))?
-                }
-                Err(e) => return Err(e),
-            };
-            let mode = fs::stat(ino)?.0;
-            if a[2] & 0x10000 != 0 && mode & 0xf000 != 0x4000 {
-                return Err(Errno::NotDir);
-            }
-            if mode & 0xf000 == 0x4000 && a[2] & 3 != 0 {
-                return Err(Errno::IsDir);
-            }
-            if a[2] & 0x200 != 0 && a[2] & 3 != 0 {
-                fs::truncate(ino)?;
-            }
-            fs::retain(ino)?;
-            ctx.install(
-                crate::fs::try_arc(Mutex::new(OpenFile {
-                    kind: Kind::Inode { ino, path },
-                    offset: 0,
-                    flags: a[2],
-                }))?,
-                a[2] & 0x80000 != 0,
-            )
-        }
-        #[cfg(not(feature = "rsext4-readonly"))]
-        sysnr::FSYNC => {
-            let handle = ctx.get(a[0])?;
-            let ino = match handle.lock().kind {
-                Kind::Inode { ino, .. } => ino,
-                _ => return Err(Errno::Invalid),
-            };
-            fs::sync_inode(ino)?;
-            Ok(0)
-        }
-        sysnr::CLOSE => {
-            let slot = ctx.fds.get_mut(a[0]).ok_or(Errno::BadF)?;
-            slot.take().ok_or(Errno::BadF)?;
-            Ok(0)
-        }
-        sysnr::LSEEK => {
-            let handle = ctx.get(a[0])?;
-            let mut f = handle.lock();
-            let ino = match f.kind {
-                Kind::Inode { ino, .. } => ino,
-                _ => return Err(Errno::SeekPipe),
-            };
-            let base = match a[2] {
-                0 => 0,
-                1 => f.offset,
-                2 => fs::stat(ino)?.1 as usize,
-                _ => return Err(Errno::Invalid),
-            };
-            let offset = base as i128 + (a[1] as isize) as i128;
-            if offset < 0 || offset > isize::MAX as i128 {
-                return Err(Errno::Invalid);
-            }
-            f.offset = offset as usize;
-            Ok(f.offset)
-        }
-        sysnr::READ | sysnr::WRITE => rw(nr, a, space, ctx),
-        sysnr::STATX => {
-            let path = user_path(space, a[1])?;
-            if a[2] & !(0x1000 | 0x100 | 0x800 | 0x6000) != 0 {
-                return Err(Errno::Invalid);
-            }
-            let (ino, mode, size, links, blocks) = if path.is_empty() && a[2] & 0x1000 != 0 {
-                let handle = ctx.get(a[0])?;
-                let f = handle.lock();
-                match &f.kind {
-                    Kind::Inode { ino, .. } => {
-                        let (m, s, l, b) = fs::stat(*ino)?;
-                        (*ino as u64, m, s, l, b)
-                    }
-                    _ => (0, 0x2000 | 0o666, 0, 1, 0),
-                }
-            } else {
-                let ino = fs::lookup(&ctx.path(a[0], &path)?)?;
-                let (m, s, l, b) = fs::stat(ino)?;
-                (ino as u64, m, s, l, b)
-            };
-            let mut data = [0u8; 256];
-            data[0..4].copy_from_slice(&0x307u32.to_ne_bytes());
-            data[4..8].copy_from_slice(&4096u32.to_ne_bytes());
-            data[16..20].copy_from_slice(&(links as u32).to_ne_bytes());
-            data[28..30].copy_from_slice(&mode.to_ne_bytes());
-            data[32..40].copy_from_slice(&ino.to_ne_bytes());
-            data[40..48].copy_from_slice(&size.to_ne_bytes());
-            data[48..56].copy_from_slice(&blocks.to_ne_bytes());
-            user_access::copy_to_user(space, a[4], &data).map_err(|_| Errno::Fault)?;
-            Ok(0)
-        }
-        sysnr::FSTAT => {
-            let handle = ctx.get(a[0])?;
-            let f = handle.lock();
-            let (ino, mode, size, links, blocks) = match &f.kind {
-                Kind::Inode { ino, .. } => {
-                    let (m, s, l, b) = fs::stat(*ino)?;
-                    (*ino as u64, m, s, l, b)
-                }
-                _ => (0, 0x2000 | 0o666, 0, 1, 0),
-            };
-            let mut data = [0u8; 128];
-            data[8..16].copy_from_slice(&ino.to_ne_bytes());
-            data[16..20].copy_from_slice(&(mode as u32).to_ne_bytes());
-            data[20..24].copy_from_slice(&(links as u32).to_ne_bytes());
-            data[48..56].copy_from_slice(&size.to_ne_bytes());
-            data[56..60].copy_from_slice(&4096u32.to_ne_bytes());
-            data[64..72].copy_from_slice(&blocks.to_ne_bytes());
-            user_access::copy_to_user(space, a[1], &data).map_err(|_| Errno::Fault)?;
-            Ok(0)
-        }
-        _ => Err(Errno::NoSys),
-    }
-}
-
-/// read(2)/write(2)：分块循环直至缓冲区填满/写尽或 EOF；单次分块上限
-/// 4KiB（内核栈缓冲）。pipe 读空/写满：O_NONBLOCK 返回 EAGAIN，否则
-/// 返回 EWOULDBLOCK 由分发层转为阻塞等待，醒来后重执行重查。
-/// 状态变化（pipe 读/写、对端关闭）请求唤醒对应等待者。
-fn rw(nr: usize, a: [usize; 6], space: &UserAddressSpace, ctx: &Context) -> Result<usize, Errno> {
-    let reading = nr == sysnr::READ;
-    let handle = ctx.get(a[0])?;
-    let mut f = handle.lock();
-    if (reading && f.flags & 3 == 1) || (!reading && f.flags & 3 == 0) {
-        return Err(Errno::BadF);
-    }
-    let total = a[2];
-    if total == 0 {
-        return Ok(0);
-    }
-    let mut chunk = [0u8; 4096];
-    let mut done = 0;
-    while done < total {
-        let want = (total - done).min(chunk.len());
-        let part: Result<usize, Errno> = (|| {
-            if !reading {
-                user_access::copy_from_user(space, a[1] + done, &mut chunk[..want])
-                    .map_err(|_| Errno::Fault)?;
-            }
-            match &f.kind {
-                Kind::Output if !reading => {
-                    use polyhal::debug_console::DebugConsole;
-                    for &b in &chunk[..want] {
-                        DebugConsole::putchar(b);
-                    }
-                    Ok(want)
-                }
-                Kind::Input if reading => Ok(0),
-                Kind::Pipe { pipe, .. } => {
-                    let mut p = pipe.lock();
-                    if reading {
-                        if p.data.is_empty() {
-                            if p.writers == 0 {
-                                return Ok(0);
-                            }
-                            return Err(nonblock_or_wait(f.flags));
-                        }
-                        let count = want.min(p.data.len());
-                        for (i, b) in p.data.iter().take(count).enumerate() {
-                            chunk[i] = *b;
-                        }
-                        user_access::copy_to_user(space, a[1] + done, &chunk[..count])
-                            .map_err(|_| Errno::Fault)?;
-                        p.data.drain(..count);
-                        // 腾出空间，唤醒写者
-                        crate::task::sched::request_pipe_wake();
-                        Ok(count)
-                    } else {
-                        if p.readers == 0 {
-                            return Err(Errno::Pipe);
-                        }
-                        if PIPE_CAPACITY - p.data.len() < want {
-                            return Err(nonblock_or_wait(f.flags));
-                        }
-                        p.data.extend(&chunk[..want]);
-                        // 有数据可读，唤醒读者
-                        crate::task::sched::request_pipe_wake();
-                        Ok(want)
-                    }
-                }
-                Kind::Inode { ino, .. } => {
-                    let ino = *ino;
-                    if fs::stat(ino)?.0 & 0xf000 == 0x4000 {
-                        return Err(Errno::IsDir);
-                    }
-                    let offset = if !reading && f.flags & 0x400 != 0 {
-                        fs::stat(ino)?.1 as usize
-                    } else {
-                        f.offset
-                    };
-                    let count = if reading {
-                        fs::read(ino, offset, &mut chunk[..want])?
-                    } else {
-                        fs::write(ino, offset, &chunk[..want])?
-                    };
-                    if reading {
-                        user_access::copy_to_user(space, a[1] + done, &chunk[..count])
-                            .map_err(|_| Errno::Fault)?;
-                    }
-                    f.offset = offset.checked_add(count).ok_or(Errno::Invalid)?;
-                    Ok(count)
-                }
-                _ => Err(Errno::BadF),
-            }
-        })();
-        match part {
-            Ok(0) => break, // EOF（或零长请求）
-            Ok(n) => done += n,
-            Err(e) => {
-                // 部分完成后出错：返回已完成量（Linux 短读/短写语义）
-                if done != 0 {
-                    return Ok(done);
-                }
-                return Err(e);
-            }
-        }
-    }
-    Ok(done)
-}
-
-/// pipe 阻塞判定：O_NONBLOCK 返回 EAGAIN，否则 EWOULDBLOCK（分发层
-/// 转为 Flow::Wait 挂起）。
 fn nonblock_or_wait(flags: usize) -> Errno {
     if flags & 0x800 != 0 {
         Errno::Again

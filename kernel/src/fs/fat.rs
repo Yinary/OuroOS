@@ -5,13 +5,25 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use fatfs::{FileSystem, FsOptions, IoBase, IoError, Read, Seek, SeekFrom, Write};
 use spin::Mutex;
 static MOUNTS: Mutex<Vec<Mount>> = Mutex::new(Vec::new());
+static NEXT_DEVICE: AtomicU32 = AtomicU32::new(2);
 static NEXT: AtomicU32 = AtomicU32::new(0x8000_0000);
+
+/// 判断路径本身或其子目录是否有挂载点。
+pub(super) fn contains_mount(path: &str) -> bool {
+    MOUNTS.lock().iter().any(|m| {
+        m.path == path
+            || m.path
+                .strip_prefix(path)
+                .is_some_and(|s| s.starts_with('/'))
+    })
+}
 struct Node {
     ino: u32,
     path: String,
     opens: usize,
 }
 struct Mount {
+    device: u64,
     path: String,
     fs: FileSystem<Disk>,
     nodes: Vec<Node>,
@@ -119,6 +131,7 @@ pub fn mount(source: &str, target: &str) -> Result<(), Errno> {
     }
     mounts.try_reserve(1).map_err(|_| Errno::NoMem)?;
     mounts.push(Mount {
+        device: NEXT_DEVICE.fetch_add(1, Ordering::Relaxed) as u64,
         path: string(target)?,
         fs,
         nodes: Vec::new(),
@@ -192,11 +205,43 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
         Ok((0x81ff, len, 1, len.div_ceil(512)))
     })
 }
+/// 返回 FAT 的合成 POSIX 属性；当前适配层未提供时间字段。
+pub(super) fn metadata(ino: u32) -> Result<super::Metadata, Errno> {
+    let (mode, size, links, blocks) = stat(ino)?;
+    Ok(super::Metadata {
+        ino: ino as u64,
+        dev: access(ino, |m, _| Ok(m.device))?,
+        mode,
+        size,
+        links: links as u32,
+        blocks,
+        block_size: 4096,
+        ..Default::default()
+    })
+}
 pub fn read(ino: u32, offset: usize, out: &mut [u8]) -> Result<usize, Errno> {
     access(ino, |m, i| {
         let mut file = m.fs.root_dir().open_file(&m.nodes[i].path).map_err(error)?;
         file.seek(SeekFrom::Start(offset as u64)).map_err(error)?;
         file.read(out).map_err(error)
+    })
+}
+
+/// 查询 FAT 卷的实际簇统计；没有固定 inode 池，文件计数返回零。
+pub(super) fn filesystem_stats(ino: u32) -> Result<super::FileSystemStats, Errno> {
+    access(ino, |m, _| {
+        let stats = m.fs.stats().map_err(error)?;
+        Ok(super::FileSystemStats {
+            kind: 0x4d44,
+            block_size: stats.cluster_size() as u64,
+            blocks: stats.total_clusters() as u64,
+            free_blocks: stats.free_clusters() as u64,
+            available_blocks: stats.free_clusters() as u64,
+            files: 0,
+            free_files: 0,
+            id: m.fs.volume_id() as u64,
+            flags: 0x20,
+        })
     })
 }
 pub fn write(ino: u32, offset: usize, data: &[u8]) -> Result<usize, Errno> {

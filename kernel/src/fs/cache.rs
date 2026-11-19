@@ -9,11 +9,25 @@ use polyhal::PhysAddr;
 use spin::Mutex;
 static PAGES: Mutex<Vec<(u32, usize, Weak<SharedPage>)>> = Mutex::new(Vec::new());
 
+/// 有存活共享页时拒绝改变文件长度；调用方保证单核非抢占的检查与截断顺序。
+pub(super) fn check_truncate(ino: u32) -> Result<(), Errno> {
+    if PAGES
+        .lock()
+        .iter()
+        .any(|(id, _, page)| *id == ino && page.strong_count() != 0)
+    {
+        Err(Errno::NotSupported)
+    } else {
+        Ok(())
+    }
+}
+
 /// 一页共享文件内容，最后一个映射释放时写回。
 pub struct SharedPage {
     frame: OwnedFrame,
     ino: u32,
     offset: usize,
+    retained: bool,
 }
 impl SharedPage {
     /// 页表映射使用的物理地址；所有权仍由 Arc 管理。
@@ -42,6 +56,9 @@ impl SharedPage {
 }
 impl Drop for SharedPage {
     fn drop(&mut self) {
+        if !self.retained {
+            return;
+        }
         if let Err(e) = self.write_back() {
             log::error!("shared page writeback failed: {:?}", e);
         }
@@ -74,9 +91,16 @@ pub fn page(ino: u32, offset: usize) -> Result<Arc<SharedPage>, Errno> {
     let frame = OwnedFrame::new().map_err(|_| Errno::NoMem)?;
     let mut data = [0; 4096];
     super::read_raw(ino, offset, &mut data)?;
-    super::retain(ino)?;
-    let p = crate::fs::try_arc(SharedPage { frame, ino, offset })?;
+    let mut p = crate::fs::try_arc(SharedPage {
+        frame,
+        ino,
+        offset,
+        retained: false,
+    })?;
     p.store(0, &data)?;
+    let page = Arc::get_mut(&mut p).ok_or(Errno::Io)?;
+    super::retain(ino)?;
+    page.retained = true;
     pages.push((ino, offset, Arc::downgrade(&p)));
     Ok(p)
 }
