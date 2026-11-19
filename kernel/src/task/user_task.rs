@@ -12,13 +12,16 @@ use polyhal_trap::{
 use crate::{
     elf::{self, ElfError},
     mm::address_space::{UserAddressSpace, USER_STACK_TOP},
-    syscall::{sysnr, Errno, Flow},
+    syscall::{signal::SA_RESTART, sysnr, Errno, Flow},
     trap::{self, UserFault},
 };
 
 use super::{
     sched,
-    signal::{fault_signal, send_signal, SigInfoSlot},
+    signal::{
+        default_action, fault_siginfo, force_signal, send_signal, DefaultAction, SigInfoSlot,
+        SignalDisposition, SIG_DFL, SIG_IGN,
+    },
     task::{Pid, Task, TaskBody, WaitReason},
     ExitInfo, REGISTRY,
 };
@@ -95,16 +98,18 @@ pub fn user_task_entry() -> ! {
     let mut sleep_deadline = None;
 
     loop {
-        // 一轮 = 激活页表 → 进用户态 → 消费一次逃逸。
+        // 一轮 = 激活页表 + 投递检查点 → 进用户态 → 消费一次逃逸。
         let kernel_start;
         let action = {
             // 每轮激活本任务页表：上次 yield 后其他任务的表可能上过。
             // REGISTRY 锁不跨 run_user_task（用户态执行期间不持锁）。
-            {
-                let reg = REGISTRY.lock();
+            // 同一锁段内做信号投递检查点；致命信号记下死因，锁释放后
+            // 跳过用户态直接退出（exit_current 不返回且要求无锁）。
+            let signal_exit = {
+                let mut reg = REGISTRY.lock();
                 let rec = reg
                     .records
-                    .iter()
+                    .iter_mut()
                     .find(|r| r.pid == pid)
                     .expect("user task unregistered");
                 rec.space
@@ -112,6 +117,21 @@ pub fn user_task_entry() -> ! {
                     .expect("running user task lost its space")
                     .as_space()
                     .activate();
+                // 投递检查点：每次回用户态至多处理一个信号（Linux 每次回
+                // 用户态只完成一个信号，剩余 pending 下次陷入再投）。
+                // park 快路径 handler 分支留下的信号已处于 pending，由本
+                // 检查点消费；commit 6 在此建帧投递。handler 临时映射：
+                // 用户 handler 本轮按 DFL 判定（见 delivery_verdict）。
+                let blocked = rec.signal.blocked();
+                rec.signal
+                    .take_deliverable(blocked)
+                    .and_then(|(sig, slot)| {
+                        let d = rec.signal.disposition(sig);
+                        delivery_verdict(sig, slot, d)
+                    })
+            };
+            if let Some(info) = signal_exit {
+                sched::exit_current(info);
             }
             let user_start = polyhal::timer::current_time();
             let trap_type = run_user_task(&mut frame);
@@ -211,14 +231,27 @@ pub fn user_task_entry() -> ! {
                             Ok(()) => Action::Continue,
                             Err(error) => {
                                 let kind = error.fault_kind();
-                                Action::Exit(ExitInfo::Signaled {
-                                    sig: fault_signal(kind),
-                                    fault: Some(UserFault {
-                                        kind,
-                                        info: addr,
-                                        pc: frame[TrapFrameArgs::SEPC],
-                                    }),
-                                })
+                                // force 投递：硬件信号不可屏蔽/忽略
+                                //（force_signal 重置 IGN 并解蔽），入队后
+                                // 由下一轮循环顶检查点消费——本指令不会
+                                // 先于投递重执行，无 handler 时按 DFL 终止
+                                // 且 fault 保留给终态报告。
+                                let (sig, code) = fault_siginfo(kind);
+                                force_signal(
+                                    pid,
+                                    sig,
+                                    SigInfoSlot {
+                                        code,
+                                        addr,
+                                        fault: Some(UserFault {
+                                            kind,
+                                            info: addr,
+                                            pc: frame[TrapFrameArgs::SEPC],
+                                        }),
+                                        ..Default::default()
+                                    },
+                                );
+                                Action::Continue
                             }
                         }
                     }
@@ -230,14 +263,24 @@ pub fn user_task_entry() -> ! {
                         }
                         let (kind, info) =
                             trap::fatal_fault(fatal).expect("fatal_fault covers fatal traps");
-                        Action::Exit(ExitInfo::Signaled {
-                            sig: fault_signal(kind),
-                            fault: Some(UserFault {
-                                kind,
-                                info,
-                                pc: frame[TrapFrameArgs::SEPC],
-                            }),
-                        })
+                        // force 投递同 AddressNotAligned：下一轮循环顶
+                        // 检查点消费，出错指令不会先于投递重执行。
+                        let (sig, code) = fault_siginfo(kind);
+                        force_signal(
+                            pid,
+                            sig,
+                            SigInfoSlot {
+                                code,
+                                addr: info,
+                                fault: Some(UserFault {
+                                    kind,
+                                    info,
+                                    pc: frame[TrapFrameArgs::SEPC],
+                                }),
+                                ..Default::default()
+                            },
+                        );
+                        Action::Continue
                     }
                 }
         };
@@ -256,7 +299,10 @@ pub fn user_task_entry() -> ! {
         match action {
             Action::Exit(info) => sched::exit_current(info),
             Action::Yield => sched::yield_now(),
-            Action::Wait(reason) => sched::park(reason),
+            // park 前快路径：信号决策表见 park_check_signals。
+            Action::Wait(reason) => {
+                park_check_signals(pid, reason, &mut frame, &mut sleep_deadline)
+            }
             Action::Continue => {
                 // 时间片起点由切入侧刷新。
                 if sched::slice_expired() {
@@ -264,6 +310,145 @@ pub fn user_task_entry() -> ! {
                 }
             }
         }
+    }
+}
+
+/// 单个已取出信号的投递判定（循环顶检查点与 park 快路径共用）。
+/// handler 临时映射：用户 handler（≠DFL/IGN）本轮按 DFL 判定——真实
+/// 建帧投递由后续 commit 接入（偏差登记 docs/ostd-contracts.md）；
+/// IGN 理论上不可达（产生侧已过滤，仅屏蔽后改处置可残留），防御性
+/// 丢弃。Term/Core 返回 Signaled 死因（fault 槽透传终态报告）；
+/// Ign/Cont 丢弃；Stop 无停止态，降级为丢弃（登记 docs）。
+fn delivery_verdict(sig: u8, slot: SigInfoSlot, d: SignalDisposition) -> Option<ExitInfo> {
+    if d.handler == SIG_IGN {
+        return None;
+    }
+    match default_action(sig) {
+        DefaultAction::Term | DefaultAction::Core => Some(ExitInfo::Signaled {
+            sig,
+            fault: slot.fault,
+        }),
+        DefaultAction::Ign | DefaultAction::Cont | DefaultAction::Stop => None,
+    }
+}
+
+/// park 快路径对 peek 到的信号的去向。
+enum ParkPeek {
+    /// 无可投递信号。
+    Empty,
+    /// 用户 handler（≠DFL/IGN）：不消费，信号留在 pending，留给循环顶
+    /// 检查点；携带处置供 SA_RESTART 判定。
+    Handler(SignalDisposition),
+    /// DFL/IGN：已在锁内 take 消费，按默认动作处置（IGN 为防御分支）。
+    Default {
+        sig: u8,
+        slot: SigInfoSlot,
+        d: SignalDisposition,
+    },
+}
+
+/// park 快路径：挂起前先看有无可投递信号，按真实处置分岔。peek 不消费：
+/// - handler（≠DFL/IGN）：信号留在 pending，按 reason 分岔——nanosleep
+///   例外 / SA_RESTART 不完成不睡 / 其余完成 -EINTR——随后不 park 直接
+///   返回，信号由循环顶检查点消费（commit 5 临时映射按 DFL，commit 6
+///   在该检查点建帧投递）；
+/// - DFL/IGN：同一锁内 take 消费，Term/Core 终止，Ign/Cont/Stop 丢弃
+///   后照旧 park。
+///
+/// nanosleep 的 EINTR+rem 必须在 park 前完成——循环顶检查点只会投递/
+/// 杀，handler 返回后 sigreturn 会重执行 ecall，nanosleep 将重读用户
+/// 参数从零睡，违反 Linux 语义（对应 Linux ERESTART_RESTARTBLOCK，
+/// 禁止朴素重启）。
+///
+/// Flow::Wait（pipe）与 ProcessResult::Wait（wait4/nanosleep）到达此处
+/// 时 PC/RET 均未推进，EINTR 完成方式相同。
+fn park_check_signals(
+    pid: Pid,
+    reason: WaitReason,
+    frame: &mut TrapFrame,
+    sleep_deadline: &mut Option<core::time::Duration>,
+) {
+    let peeked = {
+        let mut reg = REGISTRY.lock();
+        let rec = reg
+            .records
+            .iter_mut()
+            .find(|r| r.pid == pid)
+            .expect("user task unregistered");
+        let blocked = rec.signal.blocked();
+        match rec.signal.peek_deliverable(blocked) {
+            None => ParkPeek::Empty,
+            // handler 分支不消费，peek 的槽不取用；DFL/IGN 分支经
+            // take_deliverable 另取槽。
+            Some((sig, _)) => {
+                let d = rec.signal.disposition(sig);
+                if d.handler != SIG_DFL && d.handler != SIG_IGN {
+                    ParkPeek::Handler(d)
+                } else {
+                    // DFL/IGN：同一锁内 take 消费——锁未放开状态不变，
+                    // take 与 peek 必为同一最低信号；IGN 为防御分支
+                    //（产生侧已过滤，仅屏蔽后改处置可残留）。
+                    let (sig, slot) = rec
+                        .signal
+                        .take_deliverable(blocked)
+                        .expect("peeked signal still deliverable");
+                    ParkPeek::Default { sig, slot, d }
+                }
+            }
+        }
+    };
+    match peeked {
+        ParkPeek::Empty => {
+            // 无可投递信号：照旧挂起（保留 syscall PC，醒来后重执行）。
+            sched::park(reason);
+        }
+        ParkPeek::Handler(d) => match reason {
+            // nanosleep 例外：永远走 EINTR 分支（Linux
+            // ERESTART_RESTARTBLOCK，禁止朴素重启——重启即重读用户参数
+            // 从零睡）：清截止时间、回写剩余时间，再以 -EINTR 完成。
+            WaitReason::Deadline(until) => {
+                *sleep_deadline = None;
+                let rem_ptr = frame.args()[1];
+                if rem_ptr != 0 {
+                    // 剩余时间 timespec：16 字节 secs/nsecs，rv64/la64
+                    // 均小端（与请求解析的字节序一致）。
+                    let left = until.saturating_sub(polyhal::timer::current_time());
+                    let mut rem = [0u8; 16];
+                    rem[..8].copy_from_slice(&left.as_secs().to_ne_bytes());
+                    rem[8..].copy_from_slice(&(left.subsec_nanos() as u64).to_ne_bytes());
+                    // 新锁段拿地址空间回写；写失败忽略——Linux 不因 rem
+                    // 写失败改变返回值。
+                    let reg = REGISTRY.lock();
+                    if let Some(rec) = reg.records.iter().find(|r| r.pid == pid) {
+                        if let Some(space) = rec.space.as_ref() {
+                            let _ = crate::mm::user_access::copy_to_user(
+                                space.as_space(),
+                                rem_ptr,
+                                &rem,
+                            );
+                        }
+                    }
+                }
+                // Wait 路径原欠一次 syscall_ok，EINTR 完成恰好补上。
+                frame.syscall_ok();
+                frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
+            }
+            // SA_RESTART：不完成不睡，PC 留在 ecall；信号留在 pending，
+            // 循环顶检查点投递 handler，sigreturn 后重执行重查（Linux
+            // ERESTARTSYS 重启语义）。
+            WaitReason::Pipe | WaitReason::Children if d.flags & SA_RESTART != 0 => {}
+            // 其余：完成 syscall 返回 -EINTR；信号留给循环顶检查点。
+            _ => {
+                frame.syscall_ok();
+                frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
+            }
+        },
+        ParkPeek::Default { sig, slot, d } => match delivery_verdict(sig, slot, d) {
+            // Term/Core：已消费，按默认动作终止。
+            Some(info) => sched::exit_current(info),
+            // Ign/Cont/Stop（含防御 IGN）：丢弃后照旧挂起。
+            None => sched::park(reason),
+        },
     }
 }
 
@@ -283,7 +468,8 @@ fn process_call(
     let result: Result<usize, Errno> = match nr {
         sysnr::NANOSLEEP => {
             // nanosleep(2)：首次设定绝对截止时间并挂起，到期后重执行
-            // 返回 0；剩余时间报告（rem 参数）未支持。
+            // 返回 0；正常完成不回写 rem（被信号打断时由 park 快路径
+            // 回写剩余时间并返回 -EINTR）。
             if let Some(until) = *sleep_deadline {
                 if polyhal::timer::current_time() < until {
                     return ProcessResult::Wait(WaitReason::Deadline(until));

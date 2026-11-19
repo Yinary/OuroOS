@@ -12,8 +12,9 @@ use crate::task::signal::{
 
 /// SA_* 位与 SIG_BLOCK/UNBLOCK/SETMASK 的 UAPI 值（include/uapi/
 /// asm-generic/signal-defs.h；rv64/la64 共用，本机交叉工具链头一致）。
-/// SA_NOCLDWAIT 由 record_exit（task/mod.rs）消费；SA_NOCLDSTOP 等
-/// 其余位仅登记语义，消费方为投递阶段的 flag 解析。
+/// SA_NOCLDWAIT 由 record_exit 消费；SA_RESTART 由 park 快路径
+///（task::user_task）消费；SA_NOCLDSTOP 等其余位仅登记语义，消费方
+/// 为投递阶段的 flag 解析。
 #[allow(dead_code)]
 const SA_NOCLDSTOP: u32 = 0x0000_0001;
 pub(crate) const SA_NOCLDWAIT: u32 = 0x0000_0002;
@@ -24,8 +25,7 @@ const SA_SIGINFO: u32 = 0x0000_0004;
 const SA_RESTORER: u32 = 0x0400_0000;
 #[allow(dead_code)]
 const SA_ONSTACK: u32 = 0x0800_0000;
-#[allow(dead_code)]
-const SA_RESTART: u32 = 0x1000_0000;
+pub(crate) const SA_RESTART: u32 = 0x1000_0000;
 #[allow(dead_code)]
 const SA_NODEFER: u32 = 0x4000_0000;
 #[allow(dead_code)]

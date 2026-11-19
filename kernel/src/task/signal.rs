@@ -1,13 +1,13 @@
 //! 信号状态模型：每信号 disposition 表、pending/blocked 集合与信息槽。
 //! 存放位置与线程化形状依据见 docs/ostd-contracts.md。
-//! 模型先于投递逻辑落地：尚未被消费的项以 allow(dead_code) 标注，
-//! 由接入方（后续 commit）移除。
+//! 消费侧（投递检查点 / park 快路径）已开始使用本模型；尚未被消费的
+//! 项仍以 allow(dead_code) 标注，由接入方（后续 commit）移除。
 #![deny(unsafe_code)]
 
 use super::task::Pid;
 use super::REGISTRY;
 use crate::syscall::Errno;
-use crate::trap::UserFaultKind;
+use crate::trap::{UserFault, UserFaultKind};
 
 /// 信号位图：位 (sig-1) 对应信号 sig，合法信号 1..=64
 ///（标准 1..=31，实时 32..=64）。
@@ -35,15 +35,25 @@ pub const SIGCHLD: u8 = 17;
 /// SIGSTOP：不可捕获、不可屏蔽的停止信号。
 pub const SIGSTOP: u8 = 19;
 
-/// 致命用户异常对应的终止信号号。
-pub fn fault_signal(kind: UserFaultKind) -> u8 {
+/// siginfo si_code 子集（来源：Linux include/uapi/asm-generic/siginfo.h）：
+/// SEGV_MAPERR，地址未映射（SIGSEGV）。
+pub const SEGV_MAPERR: i32 = 1;
+/// siginfo si_code：ILL_ILLOPC，非法操作码（SIGILL）。
+pub const ILL_ILLOPC: i32 = 1;
+/// siginfo si_code：BUS_ADRALN，地址未对齐（SIGBUS）。
+pub const BUS_ADRALN: i32 = 1;
+/// siginfo si_code：TRAP_BRKPT，断点陷阱（SIGTRAP）。
+pub const TRAP_BRKPT: i32 = 1;
+
+/// 致命用户异常对应的 (信号号, si_code)。
+pub fn fault_siginfo(kind: UserFaultKind) -> (u8, i32) {
     match kind {
         UserFaultKind::StorePageFault
         | UserFaultKind::LoadPageFault
-        | UserFaultKind::InstructionPageFault => SIGSEGV,
-        UserFaultKind::IllegalInstruction | UserFaultKind::Unhandled => SIGILL,
-        UserFaultKind::AddressNotAligned => SIGBUS,
-        UserFaultKind::Breakpoint => SIGTRAP,
+        | UserFaultKind::InstructionPageFault => (SIGSEGV, SEGV_MAPERR),
+        UserFaultKind::IllegalInstruction | UserFaultKind::Unhandled => (SIGILL, ILL_ILLOPC),
+        UserFaultKind::AddressNotAligned => (SIGBUS, BUS_ADRALN),
+        UserFaultKind::Breakpoint => (SIGTRAP, TRAP_BRKPT),
     }
 }
 
@@ -87,8 +97,7 @@ pub trait SignalSetExt {
     /// 信号 sig 是否在集合中；sig 不在 1..=64 时返回 false。
     fn has(self, sig: u8) -> bool;
     /// 取集合中最小的信号号（按信号号从小到大取出，与 Linux 一致）；
-    /// 空集合返回 None。消费方为 take_deliverable（投递阶段接入）。
-    #[allow(dead_code)]
+    /// 空集合返回 None。
     fn lowest(self) -> Option<u8>;
 }
 
@@ -121,7 +130,8 @@ impl SignalSetExt for SignalSet {
 }
 
 /// 单个信号的处置：handler 为 SIG_DFL/SIG_IGN 或用户函数地址。
-/// flags/mask 本步仅存储不消费；默认值即 DFL。
+/// flags 由 record_exit（SA_NOCLDWAIT）与 park 快路径（SA_RESTART）
+/// 消费；mask 本步仅存储不消费；默认值即 DFL。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SignalDisposition {
     /// 处理函数地址或 SIG_DFL/SIG_IGN。
@@ -141,9 +151,9 @@ pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
 
 /// 每信号一个信息槽（信号号由槽位下标隐含）：siginfo 字段子集。
-/// 产生侧只填充 code/pid/status 子集，其余字段保持默认；字段在产生
-/// 侧只写不读，读取方（整体取槽）为投递阶段，未读字段以定位
-/// allow 标注。
+/// 产生侧只填充 code/pid/status 子集，force 投递另填 fault（硬件异常
+/// 细节，检查点终止时透传终态报告）；其余字段保持默认，未读字段以
+/// 定位 allow 标注。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SigInfoSlot {
     /// si_code。
@@ -161,6 +171,9 @@ pub struct SigInfoSlot {
     /// 子进程退出状态（SIGCHLD 用）。
     #[allow(dead_code)]
     pub status: i32,
+    /// 硬件异常细节：force 投递路径（致命异常）填充，检查点终止时
+    /// 透传给终态报告。
+    pub fault: Option<UserFault>,
 }
 
 /// 单进程的信号状态。字段按将来多线程迁移的归属分两组：共享侧
@@ -173,9 +186,8 @@ pub struct SignalState {
     disposition: [SignalDisposition; 65],
     /// 已到达未投递的信号位图。
     pending: SignalSet,
-    /// 与 pending 对应的信息槽，仅在对应 pending 位有效时解释。
-    /// 消费方为投递阶段的取槽。
-    #[allow(dead_code)]
+    /// 与 pending 对应的信息槽，仅在对应 pending 位有效时解释，
+    /// 由 [`SignalState::take_deliverable`] 连同 pending 位一并取出。
     info: [SigInfoSlot; 65],
     /// —— 私有侧（多线程时搬入线程记录）——
     /// 屏蔽位图。
@@ -288,11 +300,18 @@ impl SignalState {
         self.pending
     }
 
+    /// 非消费版 take_deliverable：返回最低的 `pending & !blocked` 信号
+    /// 与信息槽拷贝，不清除 pending 位；无可投递信号返回 None。供
+    /// park 快路径先按处置分岔、再决定是否消费的场景。
+    pub fn peek_deliverable(&self, blocked: SignalSet) -> Option<(u8, SigInfoSlot)> {
+        let sig = (self.pending & !blocked).lowest()?;
+        Some((sig, self.info[sig as usize]))
+    }
+
     /// 取出最低的 `pending & !blocked` 信号：清除其 pending 位并返回
     /// 信号号与信息槽拷贝；无可投递信号返回 None。SIGKILL/SIGSTOP
-    /// 不受屏蔽约束属投递阶段语义，本方法只做纯集合运算。
-    /// 消费方（投递循环）在后续 commit 接入，此前压制 dead_code。
-    #[allow(dead_code)]
+    /// 不可能出现在 blocked（产生/登记侧已剥除），本方法只做纯集合
+    /// 运算；调用方取出后不放回（任一去向均视为已消费）。
     pub fn take_deliverable(&mut self, blocked: SignalSet) -> Option<(u8, SigInfoSlot)> {
         let sig = (self.pending & !blocked).lowest()?;
         let slot = self.info[sig as usize];
@@ -314,6 +333,30 @@ pub fn send_signal(target: Pid, sig: u8, slot: SigInfoSlot) -> Result<(), Errno>
         .ok_or(Errno::NoProcess)?;
     rec.signal.generate(sig, slot);
     Ok(())
+}
+
+/// force 语义的信号产生入口（对应 Linux force_sig_info，kernel/signal.c）：
+/// 同步（硬件）信号不可被屏蔽或忽略——否则装 IGN 的程序访存出错会在
+/// 同一条指令上无限陷阱循环。取 REGISTRY 锁找活跃记录（force 目标恒为
+/// 自身，找不到仅防御返回），对该信号：IGN 处置重置为 DFL（flags/mask
+/// 一并清），从 blocked 清除该信号位，再 generate（此时必入队）。
+/// 已持 REGISTRY 锁的调用方禁止使用（锁非重入）。
+pub fn force_signal(target: Pid, sig: u8, slot: SigInfoSlot) {
+    let mut reg = REGISTRY.lock();
+    if let Some(rec) = reg
+        .records
+        .iter_mut()
+        .find(|r| r.pid == target && r.exit.is_none())
+    {
+        if rec.signal.disposition(sig).handler == SIG_IGN {
+            rec.signal
+                .set_disposition(sig, SignalDisposition::default());
+        }
+        let mut one: SignalSet = 0;
+        one.add(sig);
+        rec.signal.unblock(one);
+        rec.signal.generate(sig, slot);
+    }
 }
 
 impl Default for SignalState {

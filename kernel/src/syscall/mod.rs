@@ -81,9 +81,8 @@ pub enum Errno {
     ExecFormat,
     Again,
     WouldBlock,
-    /// EINTR: 阻塞中的系统调用被信号打断时返回；返回点由信号投递阶段接入。
-    // 投递阶段接入前无构造点，压制 dead_code（参照 trap::UnalignedError::Fault）。
-    #[allow(dead_code)]
+    /// EINTR: 阻塞中的系统调用被信号打断时返回（park 快路径的
+    /// EINTR 完成）。
     Interrupted,
     Pipe,
     Io,
