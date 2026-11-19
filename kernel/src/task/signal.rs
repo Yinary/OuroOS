@@ -147,6 +147,18 @@ pub struct SignalDisposition {
 pub const CLD_EXITED: i32 = 1;
 /// siginfo si_code：子进程死于信号。
 pub const CLD_KILLED: i32 = 2;
+/// siginfo si_code 负码：SI_QUEUE，sigqueue/rt_sigqueueinfo 发送，
+/// siginfo 联合体按 _rt{pid, uid, value} 解释。
+pub const SI_QUEUE: i32 = -1;
+/// siginfo si_code 负码：SI_TKILL，tkill/tgkill 发送（内核保留码，
+/// rt_sigqueueinfo 非自身目标发送被拒）。
+pub const SI_TKILL: i32 = -6;
+
+/// stack_t ss_flags（来源：Linux include/uapi/linux/signal.h）：
+/// SS_ONSTACK，当前在备用栈上执行。
+pub(crate) const SS_ONSTACK: i32 = 1;
+/// stack_t ss_flags：SS_DISABLE，备用栈未启用。
+pub(crate) const SS_DISABLE: i32 = 2;
 
 /// 每信号一个信息槽（信号号由槽位下标隐含）：siginfo 字段子集。
 /// 产生侧只填充 code/pid/status 子集，force 投递另填 fault（硬件异常
@@ -169,6 +181,40 @@ pub struct SigInfoSlot {
     pub fault: Option<UserFault>,
 }
 
+/// 信号备用栈登记（sigaltstack(2) 的内核侧记录，对应 Linux task_struct
+/// 的 sas_ss_* 三元组）。enabled=false 时 sp/size 不解释。属线程私有侧，
+/// 多线程时随 blocked 一并搬入线程记录。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AltStack {
+    /// 栈基址（低地址端；用户栈向下增长）。
+    sp: usize,
+    /// 字节数（对应 Linux sas_ss_size；为 0 即未启用）。
+    size: usize,
+    /// 是否启用（对应 sas_ss_size != 0）。
+    enabled: bool,
+}
+
+impl AltStack {
+    /// 用户栈指针 sp 是否落在备用栈区间内。公式同 Linux on_sig_stack
+    ///（include/linux/sched/signal.h，向下增长分支）：sp 严格大于基址
+    /// 且偏移不超过 size（含上边界）。
+    fn on_stack(&self, sp: usize) -> bool {
+        self.enabled && sp > self.sp && sp - self.sp <= self.size
+    }
+
+    /// Linux sas_ss_flags：未启用 → SS_DISABLE；在栈上 → SS_ONSTACK；
+    /// 启用且不在栈上 → 0。
+    fn flags(&self, sp: usize) -> i32 {
+        if !self.enabled {
+            SS_DISABLE
+        } else if self.on_stack(sp) {
+            SS_ONSTACK
+        } else {
+            0
+        }
+    }
+}
+
 /// 单进程的信号状态。字段按将来多线程迁移的归属分两组：共享侧
 /// 多线程时留 ProcessRecord，私有侧搬入线程记录（依据见
 /// docs/ostd-contracts.md）。
@@ -185,16 +231,19 @@ pub struct SignalState {
     /// —— 私有侧（多线程时搬入线程记录）——
     /// 屏蔽位图。
     blocked: SignalSet,
+    /// 信号备用栈（sigaltstack），默认禁用。
+    alt_stack: AltStack,
 }
 
 impl SignalState {
-    /// 全部处置为 DFL、pending/blocked 为空的新状态。
+    /// 全部处置为 DFL、pending/blocked 为空、备用栈禁用的新状态。
     pub fn new() -> Self {
         Self {
             disposition: [SignalDisposition::default(); 65],
             pending: 0,
             info: [SigInfoSlot::default(); 65],
             blocked: 0,
+            alt_stack: AltStack::default(),
         }
     }
 
@@ -286,6 +335,31 @@ impl SignalState {
     /// 当前屏蔽集合（rt_sigprocmask 回写 oldset 用）。
     pub fn blocked(&self) -> SignalSet {
         self.blocked
+    }
+
+    /// 备用栈登记；启用时返回 (基址, 字节数)，供 SA_ONSTACK 建帧
+    /// 投递选栈（sigframe::build_deliver）。
+    pub fn alt_stack(&self) -> Option<(usize, usize)> {
+        self.alt_stack
+            .enabled
+            .then_some((self.alt_stack.sp, self.alt_stack.size))
+    }
+
+    /// 当前用户栈指针 sp 是否在备用栈区间内（sigaltstack 的 EPERM
+    /// 检查与 SS_ONSTACK 回写共用）。
+    pub fn on_alt_stack(&self, sp: usize) -> bool {
+        self.alt_stack.on_stack(sp)
+    }
+
+    /// Linux sas_ss_flags 的当前取值（old stack_t 的 ss_flags 回写）。
+    pub fn alt_stack_flags(&self, sp: usize) -> i32 {
+        self.alt_stack.flags(sp)
+    }
+
+    /// 整体设置备用栈登记（sigaltstack(2)：SS_DISABLE 置禁用，否则
+    /// 登记 sp/size 启用）。
+    pub fn set_alt_stack(&mut self, sp: usize, size: usize, enabled: bool) {
+        self.alt_stack = AltStack { sp, size, enabled };
     }
 
     /// 当前 pending 位图（rt_sigpending 回写用）。

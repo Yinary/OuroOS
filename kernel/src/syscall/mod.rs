@@ -50,9 +50,13 @@ pub mod sysnr {
     pub const KILL: usize = 129;
     pub const TGKILL: usize = 131;
     // 信号
+    pub const SIGALTSTACK: usize = 132;
+    pub const RT_SIGSUSPEND: usize = 133;
     pub const RT_SIGACTION: usize = 134;
     pub const RT_SIGPROCMASK: usize = 135;
     pub const RT_SIGPENDING: usize = 136;
+    pub const RT_SIGTIMEDWAIT: usize = 137;
+    pub const RT_SIGQUEUEINFO: usize = 138;
     pub const RT_SIGRETURN: usize = 139;
     pub const TIMES: usize = 153;
     pub const SET_TID_ADDRESS: usize = 96;
@@ -73,6 +77,8 @@ pub mod sysnr {
 /// Linux errno（仅当前用到的子集）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Errno {
+    /// EPERM: 操作不被允许（rt_sigqueueinfo 的内核保留 si_code 等）。
+    Perm,
     Access,
     NoChild,
     NoProcess,
@@ -116,6 +122,7 @@ impl Errno {
     /// Linux errno 数值（asm-generic/errno-base.h）
     pub fn as_errno(self) -> isize {
         match self {
+            Self::Perm => 1,
             Self::Access => 13,
             Self::NoChild => 10,
             Self::NoProcess => 3,
@@ -263,6 +270,13 @@ pub fn dispatch(
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
+        sysnr::SIGALTSTACK => {
+            // sigaltstack(2)：备用栈登记的换读；只改调用者自身记录，
+            // on_alt/SS_ONSTACK 判定用陷入前的用户 sp。
+            let ret = signal::rt_sigaltstack(space, cx[TrapFrameArgs::SP], a0, a1, signal);
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
         sysnr::RT_SIGRETURN => {
             // rt_sigreturn(139)（sys_rt_sigreturn）：无参数，sp 指向信号帧。
             // 成功：换入帧内保存的 handler 前 blocked，返回 Flow::SigReturn
@@ -298,10 +312,15 @@ pub fn dispatch(
             cx[TrapFrameArgs::RET] = 0;
             Flow::Yield
         }
-        // KILL/TGKILL 改目标进程的记录，dispatch 在 REGISTRY 锁内被
-        // 调用、锁非重入，必须在锁外（process_call）处理。
+        // KILL/TGKILL 改目标进程的记录；RT_SIGSUSPEND/RT_SIGTIMEDWAIT
+        // 依赖运行循环的循环局部等待状态；RT_SIGQUEUEINFO 改目标进程
+        // 记录。dispatch 在 REGISTRY 锁内被调用、锁非重入，这些一律在
+        // 锁外（process_call）处理。
         sysnr::KILL
         | sysnr::TGKILL
+        | sysnr::RT_SIGSUSPEND
+        | sysnr::RT_SIGTIMEDWAIT
+        | sysnr::RT_SIGQUEUEINFO
         | sysnr::NANOSLEEP
         | sysnr::TIMES
         | sysnr::GETPPID

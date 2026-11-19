@@ -42,12 +42,17 @@ pub enum TaskState {
 /// 子进程退出唤醒全部 Children 等待者。
 #[derive(Clone, Copy, Debug)]
 pub enum WaitReason {
-    /// 绝对截止时间（nanosleep）。
+    /// 绝对截止时间（nanosleep / rt_sigtimedwait）。
     Deadline(core::time::Duration),
     /// 等待子进程退出（waitpid 无可收割孩子）。
     Children,
     /// 等待任意 pipe 可读/可写。
     Pipe,
+    /// 等待任意可投递信号（rt_sigsuspend）。仅经 WAKE_SIGNALS 通道
+    /// 唤醒：其余三条唤醒通道按具体变体 matches! 判定，不会匹配本
+    /// 变体（Deadline 只被到期扫描匹配，Children/Pipe 只被各自事件
+    /// 标志匹配），天然不冲突。
+    Signal,
 }
 
 /// 单个任务。

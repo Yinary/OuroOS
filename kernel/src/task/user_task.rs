@@ -11,8 +11,12 @@ use polyhal_trap::{
 
 use crate::{
     elf::{self, ElfError},
-    mm::address_space::{UserAddressSpace, USER_STACK_TOP},
-    syscall::{signal::SA_RESTART, sysnr, Errno, Flow},
+    mm::{
+        address_space::{UserAddressSpace, USER_STACK_TOP},
+        user_access,
+    },
+    sigframe::fill_siginfo,
+    syscall::{signal::SA_RESTART, signal::SIGSETSIZE, sysnr, Errno, Flow},
     trap::{self, UserFault},
 };
 
@@ -20,7 +24,8 @@ use super::{
     sched,
     signal::{
         default_action, fault_siginfo, force_signal, send_signal, DefaultAction, SigInfoSlot,
-        SignalDisposition, SIGSEGV, SIG_DFL, SIG_IGN,
+        SignalDisposition, SignalSet, SignalSetExt, SIGKILL, SIGSEGV, SIGSTOP, SIG_DFL, SIG_IGN,
+        SI_TKILL,
     },
     task::{Pid, Task, TaskBody, WaitReason},
     ExitInfo, REGISTRY,
@@ -96,6 +101,10 @@ pub fn user_task_entry() -> ! {
         TaskBody::Kernel(_) => panic!("kernel task entered user entry"),
     };
     let mut sleep_deadline = None;
+    // 循环局部等待状态（跨同一系统调用的重执行保持，Wait 决议时清空）：
+    // sigsuspend 存换入前的旧屏蔽集合；sigtimedwait 存等待集与绝对截止。
+    let mut sigsuspend_saved: Option<SignalSet> = None;
+    let mut timedwait: Option<(SignalSet, core::time::Duration)> = None;
 
     loop {
         // 一轮 = 激活页表 + 投递检查点 → 进用户态 → 消费一次逃逸。
@@ -141,7 +150,14 @@ pub fn user_task_entry() -> ! {
                                 .expect("running user task lost its space")
                                 .as_space();
                             match crate::sigframe::build_deliver(
-                                &mut frame, space, sig, &slot, &d, blocked,
+                                &mut frame,
+                                space,
+                                sig,
+                                &slot,
+                                &d,
+                                blocked,
+                                // SA_ONSTACK 选栈依据：当前登记的备用栈。
+                                rec.signal.alt_stack(),
                             ) {
                                 Ok(new_blocked) => {
                                     rec.signal.setmask(new_blocked);
@@ -204,9 +220,13 @@ pub fn user_task_entry() -> ! {
                             // 阻塞（Wait）不推 PC，挂起醒来后重执行重查；
                             // SigReturn 现场已整体恢复，SEPC 无需推进。
                             let outcome = match flow {
-                                Flow::Process => {
-                                    process_call(pid, &mut frame, &mut sleep_deadline)
-                                }
+                                Flow::Process => process_call(
+                                    pid,
+                                    &mut frame,
+                                    &mut sleep_deadline,
+                                    &mut sigsuspend_saved,
+                                    &mut timedwait,
+                                ),
                                 Flow::Wait(reason) => ProcessResult::Wait(reason),
                                 Flow::SigReturn => ProcessResult::Restored,
                                 _ => ProcessResult::Done,
@@ -326,9 +346,40 @@ pub fn user_task_entry() -> ! {
         match action {
             Action::Exit(info) => sched::exit_current(info),
             Action::Yield => sched::yield_now(),
-            // park 前快路径：信号决策表见 park_check_signals。
+            // park 前后两次信号决策（决策表见 park_check_signals）：第一次
+            // 可落睡，返回 true 表示真实睡过一觉；睡醒后补一次不落睡的
+            // 重查，把睡中到达的信号在唤醒点按 Linux 语义处理完（否则要
+            // 等到循环顶检查点，sigtimedwait 集合内信号会被按 DFL 杀掉、
+            // nanosleep/sigsuspend 被打断后静默续等），随后才回循环顶
+            // 检查点——彼时已无可投递信号，检查点不会越权消费。
             Action::Wait(reason) => {
-                park_check_signals(pid, reason, &mut frame, &mut sleep_deadline)
+                if park_check_signals(
+                    pid,
+                    reason,
+                    &mut frame,
+                    &mut sleep_deadline,
+                    &mut timedwait,
+                    true,
+                ) {
+                    park_check_signals(
+                        pid,
+                        reason,
+                        &mut frame,
+                        &mut sleep_deadline,
+                        &mut timedwait,
+                        false,
+                    );
+                }
+                // sigsuspend 的旧屏蔽集合恢复：两次决策之后、循环顶检查
+                // 点之前执行，保证 handler 帧内 uc_sigmask 与唤醒后的投
+                // 递判定使用恢复后的屏蔽集合（Linux set_restore_sigmask
+                // 同位）。
+                if let Some(old) = sigsuspend_saved.take() {
+                    let mut reg = REGISTRY.lock();
+                    if let Some(rec) = reg.records.iter_mut().find(|r| r.pid == pid) {
+                        rec.signal.setmask(old);
+                    }
+                }
             }
             Action::Continue => {
                 // 时间片起点由切入侧刷新。
@@ -363,6 +414,11 @@ fn delivery_verdict(sig: u8, slot: SigInfoSlot, d: SignalDisposition) -> Option<
 enum ParkPeek {
     /// 无可投递信号。
     Empty,
+    /// sigtimedwait 等待集内的信号：已在锁内 take 消费，由本调用不经
+    /// 处置地以信号号完成。Linux do_sigtimedwait 的出队只按
+    /// pending & 等待集判定，handler 与默认动作都不走——这正是该调用
+    /// 存在的意义（首次入口命中路径同此语义）。
+    TwHit { sig: u8, slot: SigInfoSlot },
     /// 用户 handler（≠DFL/IGN）：不消费，信号留在 pending，留给循环顶
     /// 检查点；携带处置供 SA_RESTART 判定。
     Handler(SignalDisposition),
@@ -374,26 +430,48 @@ enum ParkPeek {
     },
 }
 
-/// park 快路径：挂起前先看有无可投递信号，按真实处置分岔。peek 不消费：
-/// - handler（≠DFL/IGN）：信号留在 pending，按 reason 分岔——nanosleep
-///   例外 / SA_RESTART 不完成不睡 / 其余完成 -EINTR——随后不 park 直接
-///   返回，信号由循环顶检查点建帧投递；
-/// - DFL/IGN：同一锁内 take 消费，Term/Core 终止，Ign/Cont/Stop 丢弃
-///   后照旧 park。
+/// park 信号决策：看有无可投递信号并按真实处置分岔。peek 对 handler
+/// 不消费：
+/// - 等待集内（sigtimedwait）：同一锁内 take 消费，回写 uinfo 并以
+///   信号号完成，处置（handler/默认动作）一律不走；
+/// - handler（≠DFL/IGN）：信号留在 pending，按 reason 分岔——Deadline
+///   下按挂起归属（sigtimedwait 无 rem 回写的 -EINTR / nanosleep 例外）/
+///   SA_RESTART 不完成不睡 / 其余完成 -EINTR——随后不 park 直接返回，
+///   信号由循环顶检查点建帧投递；
+/// - DFL/IGN：同一锁内 take 消费，Term/Core 终止，Ign/Cont/Stop 丢弃。
 ///
-/// nanosleep 的 EINTR+rem 必须在 park 前完成——循环顶检查点只会投递/
+/// `allow_park` 控制落睡，配合运行循环对同一 Wait 的两次调用：第一次
+/// allow_park=true 在挂起前决策，无可投递信号才 `sched::park`，返回即
+/// 已被唤醒；第二次 allow_park=false 只决策不落睡，把睡中到达的信号
+/// 在唤醒点处理完（此前这些信号要等循环顶检查点，会把 sigtimedwait
+/// 集合内信号按 DFL 杀掉、令 nanosleep/sigsuspend 被打断后静默续等，
+/// 均为 Linux 语义偏差）。返回是否发生了一次真实挂起：true 时调用方
+/// 补第二次调用（快路径完成臂已推进 PC，二次进入会重复 syscall_ok）。
+///
+/// DFL/IGN 丢弃臂不在此重挂起：返回后由 syscall 重执行的 Mesa 重查
+/// 决定是否继续等。盲目 re-park 会吞掉与本次丢弃同时到达的 children/
+/// pipe 唤醒事件——等待条件可能已满足，只有重查才能发现。
+///
+/// nanosleep 的 EINTR+rem 必须在决策点完成——循环顶检查点只会投递/
 /// 杀，handler 返回后 sigreturn 会重执行 ecall，nanosleep 将重读用户
 /// 参数从零睡，违反 Linux 语义（对应 Linux ERESTART_RESTARTBLOCK，
-/// 禁止朴素重启）。
+/// 禁止朴素重启）。sigtimedwait 同理在决策点完成，但无 rem 回写
+///（Linux do_sigtimedwait 的 -EINTR 分支）。
 ///
-/// Flow::Wait（pipe）与 ProcessResult::Wait（wait4/nanosleep）到达此处
-/// 时 PC/RET 均未推进，EINTR 完成方式相同。
+/// Flow::Wait（pipe）与 ProcessResult::Wait（wait4/nanosleep/
+/// rt_sigsuspend/rt_sigtimedwait）到达此处时 PC/RET 均未推进，EINTR
+/// 完成方式相同。
 fn park_check_signals(
     pid: Pid,
     reason: WaitReason,
     frame: &mut TrapFrame,
     sleep_deadline: &mut Option<core::time::Duration>,
-) {
+    timedwait: &mut Option<(SignalSet, core::time::Duration)>,
+    allow_park: bool,
+) -> bool {
+    // sigtimedwait 的等待集；Some 即本次挂起属于 rt_sigtimedwait
+    //（与 nanosleep 的 Deadline 归属互斥：同一挂起至多一个 Some）。
+    let tw_set = timedwait.map(|(set, _)| set);
     let peeked = {
         let mut reg = REGISTRY.lock();
         let rec = reg
@@ -404,77 +482,121 @@ fn park_check_signals(
         let blocked = rec.signal.blocked();
         match rec.signal.peek_deliverable(blocked) {
             None => ParkPeek::Empty,
-            // handler 分支不消费，peek 的槽不取用；DFL/IGN 分支经
-            // take_deliverable 另取槽。
             Some((sig, _)) => {
-                let d = rec.signal.disposition(sig);
-                if d.handler != SIG_DFL && d.handler != SIG_IGN {
-                    ParkPeek::Handler(d)
-                } else {
-                    // DFL/IGN：同一锁内 take 消费——锁未放开状态不变，
-                    // take 与 peek 必为同一最低信号；IGN 为防御分支
-                    //（产生侧已过滤，仅屏蔽后改处置可残留）。
+                // 等待集内信号不经处置：同一锁内 take 消费——锁未放开
+                // 状态不变，take 与 peek 必为同一最低信号。
+                if matches!(tw_set, Some(s) if s.has(sig)) {
                     let (sig, slot) = rec
                         .signal
                         .take_deliverable(blocked)
                         .expect("peeked signal still deliverable");
-                    ParkPeek::Default { sig, slot, d }
+                    ParkPeek::TwHit { sig, slot }
+                } else {
+                    let d = rec.signal.disposition(sig);
+                    if d.handler != SIG_DFL && d.handler != SIG_IGN {
+                        // handler 分支不消费，peek 的槽不取用；DFL/IGN
+                        // 分支经 take_deliverable 另取槽。
+                        ParkPeek::Handler(d)
+                    } else {
+                        // IGN 为防御分支（产生侧已过滤，仅屏蔽后改处置
+                        // 可残留）。
+                        let (sig, slot) = rec
+                            .signal
+                            .take_deliverable(blocked)
+                            .expect("peeked signal still deliverable");
+                        ParkPeek::Default { sig, slot, d }
+                    }
                 }
             }
         }
     };
     match peeked {
         ParkPeek::Empty => {
-            // 无可投递信号：照旧挂起（保留 syscall PC，醒来后重执行）。
-            sched::park(reason);
+            if allow_park {
+                // 无可投递信号：挂起（保留 syscall PC，醒来后由调用方
+                // 补一次不落睡的重查）。
+                sched::park(reason);
+                true
+            } else {
+                false
+            }
+        }
+        ParkPeek::TwHit { sig, slot } => {
+            // uinfo 写失败按 Linux copy_siginfo_to_user 返回 -EFAULT
+            //（信号已消费，不回队）。
+            *timedwait = None;
+            let ret = match write_uinfo(pid, frame.args()[1], sig, &slot) {
+                Ok(()) => sig as usize,
+                Err(e) => crate::syscall::to_abi(Err(e)),
+            };
+            // Wait 路径原欠一次 syscall_ok，完成恰好补上。
+            frame.syscall_ok();
+            frame[TrapFrameArgs::RET] = ret;
+            false
         }
         ParkPeek::Handler(d) => match reason {
-            // nanosleep 例外：永远走 EINTR 分支（Linux
-            // ERESTART_RESTARTBLOCK，禁止朴素重启——重启即重读用户参数
-            // 从零睡）：清截止时间、回写剩余时间，再以 -EINTR 完成。
             WaitReason::Deadline(until) => {
-                *sleep_deadline = None;
-                let rem_ptr = frame.args()[1];
-                if rem_ptr != 0 {
-                    // 剩余时间 timespec：16 字节 secs/nsecs，rv64/la64
-                    // 均小端（与请求解析的字节序一致）。
-                    let left = until.saturating_sub(polyhal::timer::current_time());
-                    let mut rem = [0u8; 16];
-                    rem[..8].copy_from_slice(&left.as_secs().to_ne_bytes());
-                    rem[8..].copy_from_slice(&(left.subsec_nanos() as u64).to_ne_bytes());
-                    // 新锁段拿地址空间回写；写失败忽略——Linux 不因 rem
-                    // 写失败改变返回值。
-                    let reg = REGISTRY.lock();
-                    if let Some(rec) = reg.records.iter().find(|r| r.pid == pid) {
-                        if let Some(space) = rec.space.as_ref() {
-                            let _ = crate::mm::user_access::copy_to_user(
-                                space.as_space(),
-                                rem_ptr,
-                                &rem,
-                            );
+                // sigtimedwait 被集合外 handler 信号打断：清等待状态，
+                // 以 -EINTR 完成（无 rem 回写），信号留给循环顶检查点。
+                if tw_set.is_some() {
+                    *timedwait = None;
+                    // Wait 路径原欠一次 syscall_ok，EINTR 完成恰好补上。
+                    frame.syscall_ok();
+                    frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
+                } else {
+                    // nanosleep 例外：永远走 EINTR 分支（Linux
+                    // ERESTART_RESTARTBLOCK，禁止朴素重启——重启即重读
+                    // 用户参数从零睡）：清截止时间、回写剩余时间，再以
+                    // -EINTR 完成。
+                    *sleep_deadline = None;
+                    let rem_ptr = frame.args()[1];
+                    if rem_ptr != 0 {
+                        // 剩余时间 timespec：16 字节 secs/nsecs，rv64/la64
+                        // 均小端（与请求解析的字节序一致）。
+                        let left = until.saturating_sub(polyhal::timer::current_time());
+                        let mut rem = [0u8; 16];
+                        rem[..8].copy_from_slice(&left.as_secs().to_ne_bytes());
+                        rem[8..].copy_from_slice(&(left.subsec_nanos() as u64).to_ne_bytes());
+                        // 新锁段拿地址空间回写；写失败忽略——Linux 不因
+                        // rem 写失败改变返回值。
+                        let reg = REGISTRY.lock();
+                        if let Some(rec) = reg.records.iter().find(|r| r.pid == pid) {
+                            if let Some(space) = rec.space.as_ref() {
+                                let _ = crate::mm::user_access::copy_to_user(
+                                    space.as_space(),
+                                    rem_ptr,
+                                    &rem,
+                                );
+                            }
                         }
                     }
+                    // Wait 路径原欠一次 syscall_ok，EINTR 完成恰好补上。
+                    frame.syscall_ok();
+                    frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
                 }
-                // Wait 路径原欠一次 syscall_ok，EINTR 完成恰好补上。
-                frame.syscall_ok();
-                frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
+                false
             }
             // SA_RESTART：不完成不睡，PC 留在 ecall；信号留在 pending，
             // 循环顶检查点投递 handler，sigreturn 后重执行重查（Linux
             // ERESTARTSYS 重启语义）。
-            WaitReason::Pipe | WaitReason::Children if d.flags & SA_RESTART != 0 => {}
+            WaitReason::Pipe | WaitReason::Children if d.flags & SA_RESTART != 0 => false,
             // 其余：完成 syscall 返回 -EINTR；信号留给循环顶检查点。
             _ => {
                 frame.syscall_ok();
                 frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
+                false
             }
         },
-        ParkPeek::Default { sig, slot, d } => match delivery_verdict(sig, slot, d) {
-            // Term/Core：已消费，按默认动作终止。
-            Some(info) => sched::exit_current(info),
-            // Ign/Cont/Stop（含防御 IGN）：丢弃后照旧挂起。
-            None => sched::park(reason),
-        },
+        ParkPeek::Default { sig, slot, d } => {
+            if let Some(info) = delivery_verdict(sig, slot, d) {
+                // Term/Core：已消费，按默认动作终止。
+                sched::exit_current(info);
+            }
+            // Ign/Cont/Stop（含防御 IGN）：丢弃即可，不在此重挂起——
+            // 由 syscall 重执行的 Mesa 重查决定是否继续等（理由见函数
+            // 注释）。
+            false
+        }
     }
 }
 
@@ -490,10 +612,161 @@ fn process_call(
     parent: Pid,
     frame: &mut TrapFrame,
     sleep_deadline: &mut Option<core::time::Duration>,
+    sigsuspend_saved: &mut Option<SignalSet>,
+    timedwait: &mut Option<(SignalSet, core::time::Duration)>,
 ) -> ProcessResult {
     let args = frame.args();
     let nr = frame[TrapFrameArgs::SYSCALL];
     let result: Result<usize, Errno> = match nr {
+        sysnr::RT_SIGSUSPEND => {
+            // rt_sigsuspend(2)（sys_rt_sigsuspend/sigsuspend）：换入新
+            // 屏蔽集合并睡到有可投递信号。旧集合存循环局部
+            // sigsuspend_saved（跨重执行保持），由 Wait 臂或本分支重入
+            // 恢复——对应 Linux saved_sigmask + ERESTARTNOHAND：有
+            // handler 时 -EINTR、无 handler 才重启。本内核产生侧已过滤
+            // 可忽略信号，唤醒必为 handler 或致命，故一律按恢复旧集合
+            // + -EINTR 完成（偏差登记 docs/ostd-contracts.md）。
+            if sigsuspend_saved.is_none() {
+                // 首次：读 mask（剥 KILL/STOP）→ 存旧集合 → 换入 → 等。
+                if args[1] != SIGSETSIZE {
+                    Err(Errno::Invalid)
+                } else {
+                    match read_sigset(parent, args[0]) {
+                        Err(e) => Err(e),
+                        Ok(mut new) => {
+                            new.del(SIGKILL);
+                            new.del(SIGSTOP);
+                            let mut reg = REGISTRY.lock();
+                            match reg.records.iter_mut().find(|r| r.pid == parent) {
+                                Some(rec) => {
+                                    *sigsuspend_saved = Some(rec.signal.blocked());
+                                    rec.signal.setmask(new);
+                                    drop(reg);
+                                    return ProcessResult::Wait(WaitReason::Signal);
+                                }
+                                None => Err(Errno::NoProcess),
+                            }
+                        }
+                    }
+                }
+            } else {
+                // 重入（防御性兜底）：现行控制流下 Wait 臂必然在 ecall
+                // 重执行前恢复旧集合并清空 saved，本分支正常不可达；保留
+                // 以保证控制流演化时旧集合仍被恢复。先恢复旧集合再重查：
+                // 有可投递 → 完成返 -EINTR（由检查点随后投递）；无 →
+                // 重新换入（重读用户 mask，Mesa 风格重查）继续等。
+                let old = sigsuspend_saved.take().unwrap_or(0);
+                let deliverable = {
+                    let mut reg = REGISTRY.lock();
+                    match reg.records.iter_mut().find(|r| r.pid == parent) {
+                        Some(rec) => {
+                            rec.signal.setmask(old);
+                            rec.signal.peek_deliverable(old).is_some()
+                        }
+                        None => false,
+                    }
+                };
+                if deliverable {
+                    Err(Errno::Interrupted)
+                } else if args[1] != SIGSETSIZE {
+                    Err(Errno::Invalid)
+                } else {
+                    match read_sigset(parent, args[0]) {
+                        Err(e) => Err(e),
+                        Ok(mut new) => {
+                            new.del(SIGKILL);
+                            new.del(SIGSTOP);
+                            let mut reg = REGISTRY.lock();
+                            match reg.records.iter_mut().find(|r| r.pid == parent) {
+                                Some(rec) => {
+                                    *sigsuspend_saved = Some(old);
+                                    rec.signal.setmask(new);
+                                    drop(reg);
+                                    return ProcessResult::Wait(WaitReason::Signal);
+                                }
+                                None => Err(Errno::NoProcess),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        sysnr::RT_SIGTIMEDWAIT => {
+            // rt_sigtimedwait(2)（do_sigtimedwait）：同步等待集合内未
+            // 屏蔽信号，命中即取出并返回信号号——不经处置（不建
+            // handler 帧、不按默认动作终止，这是它与 sigsuspend 的差
+            // 别）；uinfo≠0 时回写 siginfo（写失败 EFAULT，Linux
+            // copy_siginfo_to_user 同）；超时 EAGAIN；集合外 handler
+            // 信号打断 -EINTR（无 uinfo 写）。等待集与绝对截止时间存
+            // 循环局部 timedwait，挂起复用 Deadline 唤醒通道；睡中到
+            // 达的信号（含集合内命中与集合外打断）由 Wait 臂睡醒后的
+            // 不落睡重查（park_check_signals 第二次调用）按同款语义
+            // 完成。drain 不感知等待集：集合外信号也会假唤醒，无害。
+            // Linux 的等待集不对当前屏蔽位做交集过滤（内部临时放宽
+            // blocked），本实现按"set ∩ 未屏蔽"判定，偏差登记
+            // docs/ostd-contracts.md。
+            if let Some((set, deadline)) = *timedwait {
+                // 重入：先查命中（Mesa），再查截止。
+                let taken = {
+                    let mut reg = REGISTRY.lock();
+                    reg.records
+                        .iter_mut()
+                        .find(|r| r.pid == parent)
+                        .and_then(|rec| {
+                            let mut hidden = rec.signal.blocked();
+                            hidden |= !set;
+                            rec.signal.take_deliverable(hidden)
+                        })
+                };
+                if let Some((sig, slot)) = taken {
+                    *timedwait = None;
+                    write_uinfo(parent, args[1], sig, &slot).map(|_| sig as usize)
+                } else if polyhal::timer::current_time() >= deadline {
+                    *timedwait = None;
+                    Err(Errno::Again)
+                } else {
+                    // 未到截止被假唤醒：带剩余时间重新挂起。
+                    return ProcessResult::Wait(WaitReason::Deadline(deadline));
+                }
+            } else {
+                // 首次：sigsetsize==8；读集合剥 KILL/STOP；已命中立即
+                // 取出返回；未命中读超时（NULL 永等）后挂起。
+                if args[3] != SIGSETSIZE {
+                    Err(Errno::Invalid)
+                } else {
+                    match read_sigset(parent, args[0]) {
+                        Err(e) => Err(e),
+                        Ok(mut set) => {
+                            set.del(SIGKILL);
+                            set.del(SIGSTOP);
+                            let taken = {
+                                let mut reg = REGISTRY.lock();
+                                reg.records
+                                    .iter_mut()
+                                    .find(|r| r.pid == parent)
+                                    .and_then(|rec| {
+                                        let mut hidden = rec.signal.blocked();
+                                        hidden |= !set;
+                                        rec.signal.take_deliverable(hidden)
+                                    })
+                            };
+                            if let Some((sig, slot)) = taken {
+                                write_uinfo(parent, args[1], sig, &slot).map(|_| sig as usize)
+                            } else {
+                                match timedwait_deadline(parent, args[2]) {
+                                    Err(e) => Err(e),
+                                    Ok(deadline) => {
+                                        *timedwait = Some((set, deadline));
+                                        return ProcessResult::Wait(WaitReason::Deadline(deadline));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        sysnr::RT_SIGQUEUEINFO => queue_info(parent, args),
         sysnr::NANOSLEEP => {
             // nanosleep(2)：首次设定绝对截止时间并挂起，到期后重执行
             // 返回 0；正常完成不回写 rem（被信号打断时由 park 快路径
@@ -662,6 +935,131 @@ fn process_call(
     ProcessResult::Done
 }
 
+/// 从用户空间读 8 字节 sigset_t（sigsuspend/sigtimedwait 共用），
+/// 失败折叠为 EFAULT。
+fn read_sigset(parent: Pid, ptr: usize) -> Result<SignalSet, Errno> {
+    let mut raw = [0u8; SIGSETSIZE];
+    let ok = REGISTRY
+        .lock()
+        .records
+        .iter()
+        .find(|r| r.pid == parent)
+        .and_then(|r| r.space.as_ref())
+        .is_some_and(|s| user_access::copy_from_user(s.as_space(), ptr, &mut raw).is_ok());
+    if ok {
+        Ok(SignalSet::from_ne_bytes(raw))
+    } else {
+        Err(Errno::Fault)
+    }
+}
+
+/// rt_sigtimedwait 命中后的 siginfo 回写（对应 Linux
+/// copy_siginfo_to_user）；指针为 0 视作 uinfo==NULL 不写，写失败
+/// 返回 EFAULT（信号已消费，不回队）。
+fn write_uinfo(parent: Pid, uinfo: usize, sig: u8, slot: &SigInfoSlot) -> Result<(), Errno> {
+    if uinfo == 0 {
+        return Ok(());
+    }
+    let mut buf = [0u8; 128];
+    fill_siginfo(&mut buf, sig, slot);
+    let ok = REGISTRY
+        .lock()
+        .records
+        .iter()
+        .find(|r| r.pid == parent)
+        .and_then(|r| r.space.as_ref())
+        .is_some_and(|s| user_access::copy_to_user(s.as_space(), uinfo, &buf).is_ok());
+    if ok {
+        Ok(())
+    } else {
+        Err(Errno::Fault)
+    }
+}
+
+/// 解析 rt_sigtimedwait 的相对超时（timespec 16 字节；NULL →
+/// Duration::MAX 表示永等，Deadline 通道对 MAX 永不到期）。校验与
+/// nanosleep 同款：负秒数/纳秒越界 EINVAL，加法溢出 EINVAL。
+fn timedwait_deadline(parent: Pid, ts_ptr: usize) -> Result<core::time::Duration, Errno> {
+    if ts_ptr == 0 {
+        return Ok(core::time::Duration::MAX);
+    }
+    let mut raw = [0u8; 16];
+    let ok = REGISTRY
+        .lock()
+        .records
+        .iter()
+        .find(|r| r.pid == parent)
+        .and_then(|r| r.space.as_ref())
+        .is_some_and(|s| user_access::copy_from_user(s.as_space(), ts_ptr, &mut raw).is_ok());
+    if !ok {
+        return Err(Errno::Fault);
+    }
+    let sec = i64::from_ne_bytes(raw[..8].try_into().unwrap_or([0; 8]));
+    let ns = i64::from_ne_bytes(raw[8..].try_into().unwrap_or([0; 8]));
+    if sec < 0 || !(0..1_000_000_000).contains(&ns) {
+        return Err(Errno::Invalid);
+    }
+    polyhal::timer::current_time()
+        .checked_add(core::time::Duration::new(sec as u64, ns as u32))
+        .ok_or(Errno::Invalid)
+}
+
+/// rt_sigqueueinfo(2)（sys_rt_sigqueueinfo / do_rt_sigqueueinfo）：
+/// 向目标进程发送携带 siginfo 的信号。校验链对应 Linux：读 128 字节
+/// siginfo_t（EFAULT）→ si_code 为内核保留码（≥0 或 SI_TKILL，
+/// si_code_reserved_to_kernel）且目标非自身 → EPERM → sig>64 EINVAL、
+/// sig==0 存在性检查（check_kill_permission / kill 家族同款）。槽映射
+/// 按 _rt{pid, uid, value} 布局：errno→si_errno、pid→si_pid@16、
+/// value→si_value@24（fill_siginfo 的 SI_QUEUE 臂回写）。标准信号与
+/// 实时信号统一位图登记（RT 无排队，偏差登记 docs/ostd-contracts.md）。
+fn queue_info(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    // pid_t 32 位：截断后按符号解释；负 pid 回绕为大值，查无此进程
+    // 自然落 ESRCH（Linux find_vpid 同果）。
+    let pid = args[0] as u32 as i32;
+    let sig = args[1] as u32;
+    let mut raw = [0u8; 128];
+    let ok = REGISTRY
+        .lock()
+        .records
+        .iter()
+        .find(|r| r.pid == parent)
+        .and_then(|r| r.space.as_ref())
+        .is_some_and(|s| user_access::copy_from_user(s.as_space(), args[2], &mut raw).is_ok());
+    if !ok {
+        return Err(Errno::Fault);
+    }
+    let code = i32::from_ne_bytes(raw[8..12].try_into().unwrap_or([0; 4]));
+    // 内核保留 si_code 只能对自身使用（Linux 允许进程给自己发保留码
+    // 信号）；KILL/STOP 与其他信号一样允许排队（kill 家族语义）。
+    if (code >= 0 || code == SI_TKILL) && pid != parent as i32 {
+        return Err(Errno::Perm);
+    }
+    if sig > 64 {
+        return Err(Errno::Invalid);
+    }
+    let target = pid as usize;
+    if sig == 0 {
+        let exists = REGISTRY
+            .lock()
+            .records
+            .iter()
+            .any(|r| r.pid == target && r.exit.is_none());
+        return if exists { Ok(0) } else { Err(Errno::NoProcess) };
+    }
+    send_signal(
+        target,
+        sig as u8,
+        SigInfoSlot {
+            code,
+            errno: i32::from_ne_bytes(raw[4..8].try_into().unwrap_or([0; 4])),
+            pid: u32::from_ne_bytes(raw[16..20].try_into().unwrap_or([0; 4])),
+            addr: usize::from_ne_bytes(raw[24..32].try_into().unwrap_or([0; 8])),
+            ..Default::default()
+        },
+    )
+    .map(|_| 0)
+}
+
 /// kill(2)/tgkill(2)（process_call 内、REGISTRY 锁外运行，可自由取
 /// 锁）。目标解析：pid>0 → 该 pid；pid==0 → 调用者自身（无进程组概念
 /// 的近似）；pid<0 → EINVAL（无进程组，-1 广播不支持）。tgkill 要求
@@ -765,6 +1163,8 @@ fn fork_user(parent: Pid, frame: &TrapFrame, flags: usize, stack: usize) -> Resu
             r.fs = Some(fs);
             if let Some(sig_state) = parent_signal {
                 r.signal = sig_state;
+                // 备用栈登记不跨 fork 继承（Linux copy_signal 清零）。
+                r.signal.set_alt_stack(0, 0, false);
             }
         }
     }

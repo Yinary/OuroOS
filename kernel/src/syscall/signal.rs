@@ -1,13 +1,14 @@
-//! 信号类系统调用：rt_sigaction/rt_sigprocmask/rt_sigpending，对应
-//! Linux kernel/signal.c 的 sys_rt_sig* 系列；支持范围与语义偏差统一
-//! 登记 docs/ostd-contracts.md §4（登记由 docs commit 补做）。kill/
-//! tgkill 走 Flow::Process 路由，实现在 task 层，本模块不含。
+//! 信号类系统调用：rt_sigaction/rt_sigprocmask/rt_sigpending/rt_sigaltstack，
+//! 对应 Linux kernel/signal.c 的 sys_rt_sig* 系列与 sys_sigaltstack；支持
+//! 范围与语义偏差统一登记 docs/ostd-contracts.md §4（登记由 docs commit
+//! 补做）。kill/tgkill/rt_sigqueueinfo/rt_sigsuspend/rt_sigtimedwait 走
+//! Flow::Process 路由，实现在 task 层，本模块不含。
 #![deny(unsafe_code)]
 
 use super::Errno;
-use crate::mm::user_access;
+use crate::mm::{address_space::UserAddressSpace, user_access};
 use crate::task::signal::{
-    SignalDisposition, SignalSet, SignalSetExt, SignalState, SIGKILL, SIGSTOP,
+    SignalDisposition, SignalSet, SignalSetExt, SignalState, SIGKILL, SIGSTOP, SS_DISABLE,
 };
 
 /// SA_* 位与 SIG_BLOCK/UNBLOCK/SETMASK 的 UAPI 值（include/uapi/
@@ -25,9 +26,9 @@ const SA_SIGINFO: u32 = 0x0000_0004;
 /// rv/la 无 restorer 语义；存储时剥除（Linux UAPI_SA_FLAGS 对未定义
 /// 该位的架构同样屏蔽）。
 const SA_RESTORER: u32 = 0x0400_0000;
-/// SA_ONSTACK：无 altstack 支持，建帧投递恒忽略（sigframe）。
-#[allow(dead_code)]
-const SA_ONSTACK: u32 = 0x0800_0000;
+/// SA_ONSTACK：建帧投递时若登记了备用栈且当前不在其上，帧落备用栈顶
+///（sigframe::build_deliver 按 Linux sigsp 选栈）。
+pub(crate) const SA_ONSTACK: u32 = 0x0800_0000;
 pub(crate) const SA_RESTART: u32 = 0x1000_0000;
 /// SA_NODEFER：未支持，建帧投递恒加本信号屏蔽位（sigframe）。
 #[allow(dead_code)]
@@ -39,7 +40,7 @@ const SIG_UNBLOCK: usize = 1;
 const SIG_SETMASK: usize = 2;
 
 /// 内核 sigset_t 字节数：内核侧 sigset 为单个 u64（1..=64）。
-const SIGSETSIZE: usize = 8;
+pub(crate) const SIGSETSIZE: usize = 8;
 
 /// rt_sigaction 的 syscall 层结构（rv64/la64 ABI）。查证结论：两架构
 /// 的 UAPI 均无 SA_RESTORER（asm/riscv 无 uapi signal.h，loongarch 仅
@@ -177,5 +178,55 @@ pub(super) fn rt_sigpending(
     }
     user_access::copy_to_user(space, set, &state.pending().to_ne_bytes())
         .map_err(|_| Errno::Fault)?;
+    Ok(0)
+}
+
+/// stack_t 字节数（include/uapi/asm-generic/signal.h）：ss_sp@0、
+/// ss_flags@8（int，其后 4 字节填充）、ss_size@16。
+const STACK_T_SIZE: usize = 24;
+
+/// sigaltstack(2)（sys_sigaltstack / do_sigaltstack）：备用栈登记的
+/// 换读。`sp` 为陷入前的用户栈指针，用于在/不在栈上的判定。
+/// uoldss≠0：回写当前登记（ss_flags 按 Linux sas_ss_flags：未启用
+/// SS_DISABLE、在栈上 SS_ONSTACK、启用不在栈上 0）。uss≠0：先查当前
+/// sp 不在备用栈上（在栈上改登记 → EPERM，Linux do_sigaltstack 的
+/// on_sig_stack 分支），再按 ss_flags：0 登记 sp/size 启用、SS_DISABLE
+/// 置禁用、其余 EINVAL（Linux 另接受 SS_ONSTACK 模式，本内核收紧，
+/// 偏差登记 docs）。size 下限 MINSIGSTKSZ 不检查，偏差登记 docs。
+pub(super) fn rt_sigaltstack(
+    space: &UserAddressSpace,
+    sp: usize,
+    uss: usize,
+    uoldss: usize,
+    state: &mut SignalState,
+) -> Result<usize, Errno> {
+    if uoldss != 0 {
+        let (ss_sp, ss_size, ss_flags) = match state.alt_stack() {
+            Some((ss_sp, ss_size)) => (ss_sp, ss_size, state.alt_stack_flags(sp)),
+            None => (0, 0, SS_DISABLE),
+        };
+        let mut out = [0u8; STACK_T_SIZE];
+        out[0..8].copy_from_slice(&ss_sp.to_ne_bytes());
+        out[8..12].copy_from_slice(&ss_flags.to_ne_bytes());
+        out[16..24].copy_from_slice(&ss_size.to_ne_bytes());
+        user_access::copy_to_user(space, uoldss, &out).map_err(|_| Errno::Fault)?;
+    }
+    if uss != 0 {
+        let mut raw = [0u8; STACK_T_SIZE];
+        user_access::copy_from_user(space, uss, &mut raw).map_err(|_| Errno::Fault)?;
+        if state.on_alt_stack(sp) {
+            return Err(Errno::Perm);
+        }
+        let flags = u32::from_ne_bytes(raw[8..12].try_into().unwrap_or([0; 4]));
+        if flags as i32 == SS_DISABLE {
+            state.set_alt_stack(0, 0, false);
+        } else if flags == 0 {
+            let ss_sp = usize::from_ne_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
+            let ss_size = usize::from_ne_bytes(raw[16..24].try_into().unwrap_or([0; 8]));
+            state.set_alt_stack(ss_sp, ss_size, true);
+        } else {
+            return Err(Errno::Invalid);
+        }
+    }
     Ok(0)
 }

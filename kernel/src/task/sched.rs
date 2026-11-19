@@ -157,7 +157,11 @@ impl Scheduler {
             // SCHED→REGISTRY 锁序嵌套点，见 docs/ostd-contracts.md §5
             //（由 docs commit 登记）；全仓库仅此一处。
             // 持 REGISTRY 一次 + 闭包查询，按可投递性精确判定（零分配）；
-            // 记录不存在或已退出的等待任务不搬。
+            // 记录不存在或已退出的等待任务不搬。判定不感知等待原因，
+            // Deadline（nanosleep/sigtimedwait）与 Signal（sigsuspend）
+            // 等待者都按可投递性唤醒；sigtimedwait 的等待集不参与判定，
+            // 集合外信号也会唤醒（睡醒后的不落睡重查按各自语义处理，
+            // 见 user_task::park_check_signals）。
             let reg = super::REGISTRY.lock();
             self.move_waiting(|task, _| {
                 reg.records.iter().any(|r| {

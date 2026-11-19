@@ -13,17 +13,19 @@
 //!          fpu_context（regs[32]×u64 + fcc u64 + fcsr u32）
 //!   +864   END sctx_info（magic=size=0）
 //!   +880   帧内嵌 sigreturn stub（Linux 用 vDSO，本内核无 vDSO）
-//! 帧总量 888 字节。SA_ONSTACK 无 altstack 可用而忽略（uc_stack 全零）。
+//! 帧总量 888 字节。SA_ONSTACK 按登记的备用栈落帧（sigsp 语义，
+//! uc_stack 回写当前登记），rt_sigreturn 不回改备用栈登记。
 #![deny(unsafe_code)]
 
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 
 use crate::mm::{address_space::UserAddressSpace, user_access};
+use crate::syscall::signal::SA_ONSTACK;
 use crate::task::signal::{
-    SigInfoSlot, SignalDisposition, SignalSet, SignalSetExt, SIGKILL, SIGSTOP,
+    SigInfoSlot, SignalDisposition, SignalSet, SignalSetExt, SIGKILL, SIGSTOP, SS_DISABLE,
 };
 
-use super::{fill_siginfo, FrameError};
+use super::{fill_siginfo, on_alt_stack, FrameError};
 
 /// uc_sigmask 偏移：ucontext 在帧内 +128，sigset_t 字段在其内 +40。
 const OFF_UC_SIGMASK: usize = 168;
@@ -76,19 +78,24 @@ fn read(space: &UserAddressSpace, vaddr: usize, dst: &mut [u8]) -> Result<(), Fr
     user_access::copy_from_user(space, vaddr, dst).map_err(|_| FrameError::Access)
 }
 
-/// 在当前用户栈上构造 rt_sigframe（含 extcontext 链）并改写 `frame`
-/// 进入 handler。
+/// 在用户栈（或备用栈）上构造 rt_sigframe（含 extcontext 链）并改写
+/// `frame` 进入 handler。
 ///
-/// 对应 Linux setup_rt_frame：原 sp 对齐 16 后预留 extcontext 链再落帧
-///（本实现把链并入帧内连续区间，rt_sigreturn 以 sp 取帧，形状等价），
-/// 写 siginfo / ucontext（uc_flags=0、uc_link=0、uc_stack 全零、
-/// uc_sigmask=old_blocked）/ sigcontext（sc_pc、sc_regs[1..32]、
-/// sc_flags=SC_USED_FP）/ FPU 块 / END 结点 / 帧内嵌 sigreturn stub；
-/// 返回地址 r1 指向 stub。handler 参数恒传 a0=sig、a1=&siginfo、
-/// a2=&ucontext（SA_SIGINFO 仅语义差异，Linux 恒传）。返回 handler 期间
-/// 屏蔽集合：old_blocked | sa_mask | 本信号位（SA_NODEFER 未支持，恒加
-/// 本信号位，偏差登记 docs/ostd-contracts.md）。任一用户写入失败即返回
-/// [`FrameError::Access`]，`frame` 不被改动。
+/// 对应 Linux setup_rt_frame：落帧栈位按 Linux sigsp 选择——处置带
+/// SA_ONSTACK、`alt` 登记了备用栈且当前 sp 不在备用栈上时，帧落备用栈
+/// 顶（向下增长）；否则当前用户栈。原 sp 对齐 16 后预留 extcontext 链
+/// 再落帧（本实现把链并入帧内连续区间，rt_sigreturn 以 sp 取帧，形状
+/// 等价），写 siginfo / ucontext（uc_flags=0、uc_link=0、uc_stack=当前
+/// 备用栈登记（Linux __save_altstack 存登记原值，flags 启用为 0、未
+/// 启用为 SS_DISABLE）、uc_sigmask=old_blocked）/ sigcontext（sc_pc、
+/// sc_regs[1..32]、sc_flags=SC_USED_FP）/ FPU 块 / END 结点 / 帧内嵌
+/// sigreturn stub；返回地址 r1 指向 stub。handler 参数恒传 a0=sig、
+/// a1=&siginfo、a2=&ucontext（SA_SIGINFO 仅语义差异，Linux 恒传）。
+/// 返回 handler 期间屏蔽集合：old_blocked | sa_mask | 本信号位
+///（SA_NODEFER 未支持，恒加本信号位，偏差登记 docs/ostd-contracts.md）。
+/// 任一用户写入失败即返回 [`FrameError::Access`]，`frame` 不被改动。
+/// 备用栈溢出防护（Linux get_sigframe 的 sp - framesize 出栈判定）未做，
+/// 偏差登记 docs。
 pub fn build_deliver(
     frame: &mut TrapFrame,
     space: &UserAddressSpace,
@@ -96,13 +103,33 @@ pub fn build_deliver(
     slot: &SigInfoSlot,
     d: &SignalDisposition,
     old_blocked: SignalSet,
+    alt: Option<(usize, usize)>,
 ) -> Result<SignalSet, FrameError> {
-    // Linux get_sigframe：sp = round_down(sp, 16) 再减帧与扩展块总量。
-    let base = (frame[TrapFrameArgs::SP] & !0xF).saturating_sub(FRAME_SIZE);
+    // Linux get_sigframe + sigsp：SA_ONSTACK 且登记了备用栈且当前不在
+    // 其上 → 从备用栈顶向下落帧；否则从当前用户栈向下落帧。再
+    // sp = round_down(sp, 16) 减帧与扩展块总量。
+    let cur_sp = frame[TrapFrameArgs::SP];
+    let stack_top = match alt {
+        Some((alt_sp, alt_size))
+            if d.flags & SA_ONSTACK != 0 && !on_alt_stack(cur_sp, alt_sp, alt_size) =>
+        {
+            alt_sp + alt_size
+        }
+        _ => cur_sp,
+    };
+    let base = (stack_top & !0xF).saturating_sub(FRAME_SIZE);
 
-    // siginfo + uc_flags/uc_link/uc_stack（后三者在 head 内保持全零）。
+    // siginfo + uc_flags/uc_link/uc_stack。uc_stack 回写当前备用栈登记
+    //（帧内偏移 +144，head 内 +16；flags 按登记态，不回写 SS_ONSTACK）。
+    let (ss_sp, ss_size, ss_flags) = match alt {
+        Some((ss_sp, ss_size)) => (ss_sp, ss_size, 0i32),
+        None => (0, 0, SS_DISABLE),
+    };
     let mut head = [0u8; 176];
     fill_siginfo(&mut head[..128], sig, slot);
+    head[16..24].copy_from_slice(&ss_sp.to_ne_bytes());
+    head[24..28].copy_from_slice(&ss_flags.to_ne_bytes());
+    head[32..40].copy_from_slice(&ss_size.to_ne_bytes());
     write(space, base, &head)?;
 
     // uc_sigmask：存 handler 前的 blocked，sigreturn 时恢复。
@@ -171,7 +198,9 @@ pub fn build_deliver(
 /// 走 extcontext 链（只认 FPU 块与 END，其余 magic 为 badframe）→ 恢复
 /// sc_pc、sc_regs[1..32]（$r0 恒零不恢复）与 FPU 现场。失败返回
 /// [`FrameError::BadFrame`]，`frame` 不被改动，由调用方按 badframe 处置
-///（Linux force_sig(SIGSEGV)）。altstack 无支持，不恢复（偏差登记 docs）。
+///（Linux force_sig(SIGSEGV)）。备用栈登记不随 sigreturn 恢复（Linux
+/// restore_altstack 从 uc_stack 回读改登记；本内核登记不受 sigreturn
+/// 影响，偏差登记 docs）。
 /// 成功后 a0 保持 handler 的返回值（Linux 以 return regs->regs[4] 透传），
 /// PC 已是真实返回点，无需 syscall_ok。
 pub fn restore(frame: &mut TrapFrame, space: &UserAddressSpace) -> Result<SignalSet, FrameError> {
