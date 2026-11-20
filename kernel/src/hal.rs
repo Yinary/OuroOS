@@ -252,3 +252,22 @@ pub fn wait_for_interrupt() {
     core::hint::spin_loop();
     polyhal::irq::IRQ::int_disable();
 }
+
+/// 请求虚拟机关机。GED 请求异步处理，CPU 可在设备完成关机前被唤醒。
+#[cfg(target_arch = "loongarch64")]
+pub(crate) fn shutdown() -> ! {
+    // GED 寄存器和关机值来自本项目固定版本 PolyHAL 0.4.0（MIT）的
+    // components/instruction/loongarch64.rs。DMW0 为非缓存设备窗口。
+    let ged_sleep_control = (0x8000_0000_0000_0000usize | 0x100e_001c) as *mut u8;
+    // SAFETY: 仅在内核关机阶段访问 QEMU virt 的 ACPI GED 寄存器。
+    unsafe {
+        ged_sleep_control.write_volatile(0x34);
+        core::arch::asm!("dbar 0");
+        loop {
+            core::arch::asm!("idle 0");
+        }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+pub(crate) use polyhal::instruction::shutdown;

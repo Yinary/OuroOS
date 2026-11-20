@@ -131,7 +131,7 @@ clippy: clippy-rv clippy-la
 
 # 覆盖内核 workspace 与独立的用户 crate
 fmt:
-	cargo fmt --all
+	cargo fmt -p kernel
 	cargo fmt --manifest-path $(USER_CRATE)/Cargo.toml --all
 
 # ---------- 本地运行 ----------

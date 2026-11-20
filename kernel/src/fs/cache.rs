@@ -17,7 +17,6 @@ pub(super) fn has_live(ino: u32) -> bool {
 }
 
 /// 查询同一 inode/offset 是否已有驻留共享页；不触发读取/分配。
-#[allow(dead_code)] // MM mincore 在后续 PR 接入
 pub fn resident(ino: u32, offset: usize) -> bool {
     PAGES
         .lock()
@@ -166,7 +165,6 @@ pub(crate) fn resize_inode(ino: u32, old: usize, new: usize) {
 }
 
 /// 仅使文件偏移范围内相交的共享页失效；范围外的页保持原状。
-#[allow(dead_code)] // MM msync 在后续 PR 接入
 pub(crate) fn invalidate_range(ino: u32, offset: usize, length: usize) -> Result<(), Errno> {
     let end = offset.checked_add(length).ok_or(Errno::Invalid)?;
     let mut pages = PAGES.lock();
@@ -227,7 +225,6 @@ pub(super) fn sync_inode(ino: u32) -> Result<(), Errno> {
 }
 
 /// 将所有仍被缓存持有的页写回；失败时保留页，供后续重试。
-#[allow(dead_code)] // MM 任务退出在后续 PR 接入
 pub(crate) fn flush(ino: Option<u32>) -> Result<(), Errno> {
     let mut pages = PAGES.lock();
     for (id, _, page) in pages.iter() {
@@ -246,7 +243,6 @@ pub(crate) fn flush(ino: Option<u32>) -> Result<(), Errno> {
 }
 
 /// 仍被缓存持有的页帧数（任务退出帧守恒自检用）。
-#[allow(dead_code)] // MM 帧守恒在后续 PR 接入
 pub(crate) fn retained_frames() -> usize {
     PAGES.lock().iter().filter(|(_, _, p)| p.is_valid()).count()
 }

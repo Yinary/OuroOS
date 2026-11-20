@@ -11,7 +11,7 @@ use polyhal_trap::{
 
 use crate::{
     elf::{self, ElfError},
-    mm::address_space::{UserAddressSpace, USER_STACK_TOP},
+    mm::address_space::UserAddressSpace,
     syscall::{sysnr, Errno, Flow},
     trap::{self, UserFault},
 };
@@ -52,11 +52,13 @@ pub fn spawn_user(name: &'static str, elf: &[u8]) -> Result<Pid, SpawnError> {
     space.init_heap();
     space.map_stack().map_err(|_| SpawnError::OutOfMemory)?;
     let mut frame = TrapFrame::new();
-    frame[TrapFrameArgs::SEPC] = entry;
-    // 初始栈包含 argc=0、argv/envp 终止项和 AT_NULL。
-    let sp = USER_STACK_TOP - 48;
-    crate::mm::user_access::copy_to_user(&space, sp, &[0u8; 48])
+    frame[TrapFrameArgs::SEPC] = entry.entry;
+    let mut arg0 = alloc::string::String::new();
+    arg0.try_reserve_exact(name.len())
         .map_err(|_| SpawnError::OutOfMemory)?;
+    arg0.push_str(name);
+    let sp =
+        super::exec::stack(&space, &[arg0], &[], entry).map_err(|_| SpawnError::OutOfMemory)?;
     frame[TrapFrameArgs::SP] = sp;
     let task = Task::new_user(pid, name, frame).map_err(|_| SpawnError::OutOfMemory)?;
 
@@ -213,13 +215,40 @@ pub fn user_task_entry() -> ! {
                         match result {
                             Ok(()) => Action::Continue,
                             Err(error) => Action::Exit(ExitInfo {
-                                code: FAULT_EXIT_CODE,
+                                code: 128 + error.fault_kind().signal() as i32,
                                 fault: Some(UserFault {
                                     kind: error.fault_kind(),
                                     info: addr,
                                     pc: frame[TrapFrameArgs::SEPC],
                                 }),
                             }),
+                        }
+                    }
+                    fault @ (TrapType::StorePageFault(_) | TrapType::LoadPageFault(_) | TrapType::InstructionPageFault(_)) => {
+                        if !frame.from_user() { panic!("kernel-origin page fault: {:?}", fault); }
+                        let (kind, addr) = trap::fatal_fault(fault).expect("page fault classification");
+                        let access = match fault {
+                            TrapType::StorePageFault(_) => polyhal::pagetable::MappingFlags::W,
+                            TrapType::LoadPageFault(_) => polyhal::pagetable::MappingFlags::R,
+                            _ => polyhal::pagetable::MappingFlags::X,
+                        } | polyhal::pagetable::MappingFlags::U;
+                        let result = {
+                            let reg = REGISTRY.lock();
+                            reg.records.iter().find(|r| r.pid == pid)
+                                .and_then(|r| r.space.as_ref())
+                                .ok_or(crate::mm::address_space::MapError::NotMapped)
+                                .and_then(|s| { let space = s.as_space(); if space.translate(addr).is_some() { return Err(crate::mm::address_space::MapError::PermissionDenied); } space.ensure_access(addr, access) })
+                        };
+                        if result.is_ok() { Action::Continue } else {
+                            use crate::mm::address_space::MapError;
+                            let kind = match result {
+                                Err(MapError::FileFault) => trap::UserFaultKind::FileBusError,
+                                Err(MapError::FileIo) => trap::UserFaultKind::FileIoError,
+                                Err(MapError::OutOfMemory) => trap::UserFaultKind::UserFaultOom,
+                                _ => kind,
+                            };
+                            Action::Exit(ExitInfo { code: 128 + kind.signal() as i32,
+                                fault: Some(UserFault { kind, info: addr, pc: frame[TrapFrameArgs::SEPC] }) })
                         }
                     }
                     fatal => {
@@ -281,6 +310,84 @@ fn process_call(
     let args = frame.args();
     let nr = frame[TrapFrameArgs::SYSCALL];
     let result: Result<usize, Errno> = match nr {
+        sysnr::SYSINFO => {
+            // asm-generic 64 位 struct sysinfo。内存以 KiB 为单位；未统计负载均值。
+            let reg = REGISTRY.lock();
+            let mut data = [0u8; 112];
+            let mem = crate::mm::frame::memory_snapshot();
+            data[..8].copy_from_slice(&polyhal::timer::current_time().as_secs().to_ne_bytes());
+            data[32..40].copy_from_slice(&mem.total_kib.to_ne_bytes());
+            data[40..48].copy_from_slice(&mem.free_kib.to_ne_bytes());
+            data[80..82].copy_from_slice(
+                &(reg
+                    .records
+                    .iter()
+                    .filter(|r| r.exit.is_none())
+                    .count()
+                    .min(u16::MAX as usize) as u16)
+                    .to_ne_bytes(),
+            );
+            data[104..108].copy_from_slice(&1024u32.to_ne_bytes());
+            reg.records
+                .iter()
+                .find(|r| r.pid == parent)
+                .and_then(|r| r.space.as_ref())
+                .ok_or(Errno::NoProcess)
+                .and_then(|s| {
+                    crate::mm::user_access::copy_to_user(s.as_space(), args[0], &data)
+                        .map_err(|_| Errno::Fault)
+                })
+                .map(|()| 0)
+        }
+        sysnr::PPOLL => {
+            let reg = REGISTRY.lock();
+            let checked = (|| {
+                let rec = reg
+                    .records
+                    .iter()
+                    .find(|r| r.pid == parent)
+                    .ok_or(Errno::NoProcess)?;
+                let space = rec.space.as_ref().ok_or(Errno::Invalid)?.as_space();
+                if args[3] != 0 {
+                    return Err(Errno::NotSupported);
+                }
+                if args[2] != 0 && sleep_deadline.is_none() {
+                    let mut ts = [0; 16];
+                    crate::mm::user_access::copy_from_user(space, args[2], &mut ts)
+                        .map_err(|_| Errno::Fault)?;
+                    let mut bytes = [0; 8];
+                    bytes.copy_from_slice(&ts[..8]);
+                    let sec = i64::from_ne_bytes(bytes);
+                    bytes.copy_from_slice(&ts[8..]);
+                    let ns = i64::from_ne_bytes(bytes);
+                    if sec < 0 || !(0..1_000_000_000).contains(&ns) {
+                        return Err(Errno::Invalid);
+                    }
+                    *sleep_deadline = Some(
+                        polyhal::timer::current_time()
+                            .checked_add(core::time::Duration::new(sec as u64, ns as u32))
+                            .ok_or(Errno::Invalid)?,
+                    );
+                }
+                crate::fs::context::poll(
+                    rec.fs.as_ref().ok_or(Errno::Invalid)?,
+                    space,
+                    args[0],
+                    args[1],
+                )
+            })();
+            if checked == Ok(0) {
+                match *sleep_deadline {
+                    None => return ProcessResult::Wait(WaitReason::Pipe),
+                    Some(d) if polyhal::timer::current_time() < d => {
+                        return ProcessResult::Wait(WaitReason::PollUntil(d))
+                    }
+                    _ => {}
+                }
+            }
+            *sleep_deadline = None;
+            checked
+        }
         sysnr::NANOSLEEP => {
             // nanosleep(2)：首次设定绝对截止时间并挂起，到期后重执行
             // 返回 0；剩余时间报告（rem 参数）未支持。
@@ -365,10 +472,11 @@ fn process_call(
             // wait4(2)：wanted <= 0 等任意孩子（无进程组概念，0 与 -1
             // 等价）；>0 指定 pid；其余负值 EINVAL。无可收割孩子时挂起，
             // 无孩子 ECHILD。收割即从注册表删除（生命周期见 mod.rs）。
-            if args[2] & !1 != 0 {
+            // 可请求停止、恢复事件；当前没有产生这两种状态的信号接口。
+            if args[2] & !(1 | 2 | 8) != 0 {
                 Err(Errno::Invalid)
             } else {
-                let wanted = args[0] as isize;
+                let wanted = args[0] as i32;
                 if wanted < -1 {
                     Err(Errno::Invalid)
                 } else {
@@ -385,8 +493,8 @@ fn process_call(
                         let status = ready.map(|i| {
                             let info = reg.records[i].exit;
                             info.map_or(0, |e| {
-                                if e.fault.is_some() {
-                                    11u32
+                                if let Some(fault) = e.fault {
+                                    fault.kind.signal()
                                 } else {
                                     (e.code as u32 & 255) << 8
                                 }

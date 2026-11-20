@@ -20,6 +20,16 @@ use crate::{
     metadata::Ext4InodeMetadataUpdate,
 };
 
+// OuroOS patch: 分配失败由现有 Ext4Result 返回，禁止在这里触发 OOM panic。
+fn commit_buffer() -> Ext4Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(BLOCK_SIZE)
+        .map_err(|_| Ext4Error::new(Errno::ENOMEM))?;
+    buffer.resize(BLOCK_SIZE, 0);
+    Ok(buffer)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ReplayTag {
     block: AbsoluteBN,
@@ -380,7 +390,19 @@ impl JBD2DEVSYSTEM {
             return Ok(false);
         }
 
-        let mut desc_buffer = vec![0; BLOCK_SIZE];
+        // OuroOS patch: 提交前可失败分配暂存块，避免块数组叠加占用内核栈。
+        let mut desc_buffer = commit_buffer()?;
+        let mut payload_buffer = commit_buffer()?;
+        let mut commit_buffer = commit_buffer()?;
+        let tags_end = self
+            .commit_queue
+            .len()
+            .checked_mul(JBD2_TAG_SIZE)
+            .and_then(|n| n.checked_add(JBD2_DESCRIPTOR_HEADER_SIZE + JBD2_UUID_SIZE))
+            .ok_or_else(Ext4Error::invalid_input)?;
+        if tags_end > BLOCK_SIZE {
+            return Err(Ext4Error::invalid_input());
+        }
 
         // Build the descriptor block in memory first.
         let new_jbd_header = JournalHeaderS {
@@ -436,28 +458,14 @@ impl JBD2DEVSYSTEM {
         debug!("[JBD2 commit] tid={tid} descriptor_block_id={block_id} (absolute)");
         block_dev.write(&desc_buffer, block_id, 1)?;
 
-        let mut no_escape: Vec<(AbsoluteBN, [u8; BLOCK_SIZE])> = Vec::new();
-        for update in self.commit_queue.iter() {
-            let mut check_data: [u8; BLOCK_SIZE] = [0; BLOCK_SIZE];
-            check_data.copy_from_slice(&*update.1);
-            let magic = u32::from_be_bytes(check_data[0..4].try_into().unwrap());
-            if magic == JBD2_MAGIC {
-                debug!("[JBD2 commit] zero escaped journal magic in payload copy");
-                check_data[0..4].fill(0);
+        // OuroOS patch: 复用单个 payload，原队列保留未转义内容供 checkpoint。
+        for idx in 0..self.commit_queue.len() {
+            payload_buffer.copy_from_slice(&self.commit_queue[idx].1[..]);
+            if payload_buffer[..4] == JBD2_MAGIC.to_be_bytes() {
+                payload_buffer[..4].fill(0);
             }
-            no_escape.push((update.0, check_data));
-        }
-
-        // Then write the journaled metadata payload blocks.
-        for (idx, up) in no_escape.iter().enumerate() {
-            let metadata_journal_block_id =
-                self.set_next_log_block_with_mapping(block_dev, journal_blocks)?;
-            debug!(
-                "[JBD2 commit] tid={} meta_idx={} journal_block_id={} (absolute) \
-                 target_phys_block={}",
-                tid, idx, metadata_journal_block_id, up.0
-            );
-            block_dev.write(&up.1, metadata_journal_block_id, 1)?;
+            let block = self.set_next_log_block_with_mapping(block_dev, journal_blocks)?;
+            block_dev.write(&payload_buffer, block, 1)?;
         }
 
         block_dev.flush()?;
@@ -465,7 +473,6 @@ impl JBD2DEVSYSTEM {
         // Write the commit block BEFORE checkpointing so that a crash during
         // checkpoint still leaves a valid committed transaction in the journal
         // for replay on the next mount.
-        let mut commit_buffer = [0_u8; BLOCK_SIZE];
 
         let commit_block = CommitHeader {
             h_header: JournalHeaderS {

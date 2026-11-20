@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use polyhal::{
     consts::VIRT_ADDR_START,
     pagetable::{MappingFlags, TLB},
-    PhysAddr,
+    PhysAddr, VirtAddr,
 };
 
 pub(super) struct UserPageTable {
@@ -18,7 +18,7 @@ pub(super) struct UserPageTable {
 }
 
 // 不返回 &'static mut 页表切片，避免对同一物理页制造多个可变引用。
-fn read(pa: PhysAddr, i: usize) -> usize {
+pub(super) fn read(pa: PhysAddr, i: usize) -> usize {
     debug_assert!(i < 512);
     // SAFETY: 仅传入 root/tables 持有的页或引导根页，i 是 9 位页索引。
     unsafe {
@@ -27,7 +27,7 @@ fn read(pa: PhysAddr, i: usize) -> usize {
             .read_volatile()
     }
 }
-fn write(pa: PhysAddr, i: usize, value: usize) {
+pub(super) fn write(pa: PhysAddr, i: usize, value: usize) {
     debug_assert!(i < 512);
     // SAFETY: 页由本对象独占持有，修改需 &mut self；借用的内核半区从不修改。
     unsafe {
@@ -101,7 +101,9 @@ impl UserPageTable {
             pa = arch::address(pte);
         }
         write(pa, (va >> 12) & 511, arch::leaf(data, flags));
-        TLB::flush_all();
+        if self.is_active() {
+            TLB::flush_vaddr(VirtAddr::new(va));
+        }
         Ok(())
     }
     pub(super) fn translate(&self, va: usize) -> Option<(PhysAddr, MappingFlags)> {
@@ -118,13 +120,17 @@ impl UserPageTable {
     pub(super) fn protect(&mut self, va: usize, data: PhysAddr, flags: MappingFlags) {
         if let Some((pa, i)) = self.path(va) {
             write(pa, i, arch::leaf(data, flags));
+            if self.is_active() {
+                TLB::flush_vaddr(VirtAddr::new(va));
+            }
         }
-        TLB::flush_all();
     }
     pub(super) fn unmap(&mut self, va: usize) {
+        let active = self.is_active();
         if let Some((pa, i)) = self.path(va) {
             write(pa, i, 0);
         }
+        let mut released = false;
         let root = self.root.addr();
         let ri = (va >> 30) & 511;
         let r = read(root, ri);
@@ -136,17 +142,22 @@ impl UserPageTable {
                 let leaf = arch::address(m);
                 if (0..512).all(|i| read(leaf, i) == 0) {
                     write(middle, mi, 0);
-                    TLB::flush_all();
+                    released = true;
                     self.release_table(leaf);
                 }
             }
             if (0..512).all(|i| read(middle, i) == 0) {
                 write(root, ri, 0);
-                TLB::flush_all();
+                released = true;
                 self.release_table(middle);
             }
         }
-        TLB::flush_all();
+        if active {
+            TLB::flush_vaddr(VirtAddr::new(va));
+            if released {
+                TLB::flush_all();
+            }
+        }
     }
     fn release_table(&mut self, pa: PhysAddr) {
         if let Some(i) = self.tables.iter().position(|f| f.addr().raw() == pa.raw()) {
