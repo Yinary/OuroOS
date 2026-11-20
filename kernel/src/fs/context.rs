@@ -533,10 +533,8 @@ pub fn dispatch(
     }
 }
 
-/// read(2)/write(2)：分块循环直至缓冲区填满/写尽或 EOF；单次分块上限
-/// 4KiB（内核栈缓冲）。pipe 读空/写满：O_NONBLOCK 返回 EAGAIN，否则
-/// 返回 EWOULDBLOCK 由分发层转为阻塞等待，醒来后重执行重查。
-/// 状态变化（pipe 读/写、对端关闭）请求唤醒对应等待者。
+/// read(2)/write(2)：分块循环直至填满/写尽或 EOF，单次分块上限 4KiB
+///（内核栈缓冲）；pipe 阻塞语义与唤醒见 ostd-contracts §4。
 fn rw(nr: usize, a: [usize; 6], space: &UserAddressSpace, ctx: &Context) -> Result<usize, Errno> {
     let reading = nr == sysnr::READ;
     let handle = ctx.get(a[0])?;
