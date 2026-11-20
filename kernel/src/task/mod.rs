@@ -311,3 +311,8 @@ pub fn run(baseline: (usize, usize)) {
 }
 
 mod exec;
+
+#[cfg(debug_assertions)]
+pub(crate) fn exec_self_test() {
+    exec::self_test();
+}

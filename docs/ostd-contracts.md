@@ -258,7 +258,7 @@ try_lock 失败即报告“持锁跨调度”。
 | pipe | 容量 64 KiB；读空或空间不足当前分块时等待，O_NONBLOCK 返回 EAGAIN；总长不超过 4 KiB 的 writev 合并后写入，空间不足不写入前缀；更大请求可在分块间返回短写；无读者返回 EPIPE | 无 SIGPIPE；运行期 VecDeque 扩容的不可失败分配仍待处理；复制失败只消费已交付数据 |
 | wait4 | wanted<=0 等任意孩子，>0 指定 pid，<-1 EINVAL；无僵尸则阻塞，无孩子 ECHILD；WNOHANG 支持；status：正常 `(code&255)<<8`，异常 11 | 语义接近；忽略 rusage；无进程组概念 |
 | clone | 仅 flags 恰好为 SIGCHLD(17) 的进程 fork；非零 stack 设置子 SP | 仅为兼容传入栈顶的调用方；不支持线程/共享地址空间 |
-| execve | argv/envp 各 ≤256 项、单串 ≤4095 字节；字符串总计最多 32 KiB，用户栈默认预留 8 MiB 并逐页填充；auxv 提供 AT_ENTRY、AT_PAGESZ、AT_NULL；程序头表位于可读 PT_LOAD 内时提供 AT_PHDR、AT_PHENT、AT_PHNUM；整镜像读入内核堆 | AT_RANDOM 依赖 HAL 熵源 |
+| execve | argv/envp 各 ≤256 项、单串 ≤4095 字节；字符串总计最多 32 KiB，用户栈默认预留 8 MiB 并逐页填充；auxv 提供 AT_ENTRY、AT_PAGESZ、AT_NULL；程序头表位于可读 PT_LOAD 内时提供 AT_PHDR、AT_PHENT、AT_PHNUM；整镜像读入内核堆 | 无 /chosen/rng-seed 时 exec 返回 EIO 并报告 no boot entropy，不生成可预测的 AT_RANDOM |
 | nanosleep | 到期返回 0；rem 不回写；相对 now | 语义兼容 |
 | times | tms 四字段来自任务记账；返回启动以来 100Hz tick | 语义兼容 |
 | uname | sysname=OuroOS、nodename=ouro、release=内核版本、version=OuroOS、machine=架构名、domainname=local | 合成身份信息 |
@@ -485,7 +485,7 @@ msync 按相交 VMA 的文件偏移选择缓存页，再同步 Ext4 后端，失
 
 三层页表为信号只读返回页预留最高 1 GiB 根槽，普通用户映射上界为 2^38 − 2^30，可装入默认链接在 0x120000000 的 LoongArch 静态 ELF。exec 按继承的 STACK 软限额确定栈预留量，上限 8 MiB。mprotect 验证整段覆盖、文件写权限和限额后提交；空洞返回 ENOMEM，未对齐地址返回 EINVAL。两架构原版 mprotect01 的空洞与非对齐检查均通过；后续 /dev/zero 的打开及映射依赖设备文件接口。
 
-exec/spawn 从设备树启动熵派生独立的 16 字节，AT_RANDOM 指向新用户栈。静态 LoongArch glibc BusyBox 重定位后使用 mprotect(PROT_READ) 关闭写权限；页表保留执行权限。QEMU 10.0.2 上 `busybox sh -c exit` 成功；运行本地 pre-2025 原版 BusyBox 脚本时，LoongArch 随后在 fork 报 EINVAL。两架构已实测 musl BusyBox free；不能据此推断整组通过。设备文件 /dev/zero 的打开和映射仍依赖 VFS。
+exec/spawn 从设备树启动熵派生独立的 16 字节，AT_RANDOM 指向新用户栈；没有可信 rng-seed 时 fail-closed，不伪造 AT_RANDOM。静态 LoongArch glibc BusyBox 重定位后使用 mprotect(PROT_READ) 关闭写权限；页表保留执行权限。QEMU 10.0.2 上 `busybox sh -c exit` 成功；运行本地 pre-2025 原版 BusyBox 脚本时，LoongArch 随后在 fork 报 EINVAL。两架构已实测 musl BusyBox free；不能据此推断整组通过。设备文件 /dev/zero 的打开和映射仍依赖 VFS。
 
 固定地址映射支持 MAP_FIXED_NOREPLACE（重叠返回 EEXIST，原数据保留）。MAP_LOCKED 使用与 mlockall 相同的限额，在建立映射后尽力预取，不改变未来映射的锁策略；没有交换空间预留账本，MAP_NORESERVE 不额外预留。MAP_POPULATE 在 VMA 建立后尽力预取；与 MAP_NONBLOCK 同用时不预取。未锁定的私有匿名 mremap 扩展只增加虚拟区间。MADV_DONTFORK/DOFORK 控制子进程是否继承该区间；WIPEONFORK/KEEPONFORK 控制私有匿名、堆、栈页在子进程内是否重新取零页。父进程内容不变。共享匿名扩展仅增加虚拟页描述，物理数据页按需分配；私有页 fork 深拷贝，没有实现 COW 或换出。
 

@@ -112,9 +112,14 @@ fn rust_main(hartid: usize) {
             ("ill", user_images::ILL_ELF),
         ]
     };
+    let mut spawned = 0usize;
+    let mut no_entropy = false;
     for &(name, elf) in images {
         match task::spawn_user(name, elf) {
-            Ok(pid) => println!("[task] spawned {} as pid {}", name, pid),
+            Ok(pid) => {
+                spawned += 1;
+                println!("[task] spawned {} as pid {}", name, pid);
+            }
             // 空镜像（脱离 Makefile 构建时）或加载失败：报告后继续
             Err(task::SpawnError::Load(e)) => {
                 println!("[task] spawn {} failed: elf {:?}", name, e)
@@ -122,7 +127,19 @@ fn rust_main(hartid: usize) {
             Err(task::SpawnError::OutOfMemory) => {
                 println!("[task] spawn {} failed: out of memory", name)
             }
+            Err(task::SpawnError::NoEntropy) => {
+                no_entropy = true;
+                println!("[task] spawn {} failed: no boot entropy", name)
+            }
         }
+    }
+    if spawned == 0 && no_entropy {
+        log::error!("no user task spawned: boot entropy is unavailable");
+        #[cfg(not(feature = "rsext4-readonly"))]
+        if let Err(error) = fs::shutdown() {
+            log::error!("Ext4 shutdown failed: {:?}", error);
+        }
+        hal::shutdown();
     }
 
     // 进入任务时代：关中断、跑调度器到全部退出、汇总并断言帧守恒

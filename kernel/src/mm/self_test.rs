@@ -16,6 +16,8 @@ pub(super) fn run() {
     crate::elf::self_test();
     #[cfg(debug_assertions)]
     crate::syscall::memory_self_test();
+    #[cfg(debug_assertions)]
+    crate::task::exec_self_test();
     {
         let baseline = frame::stats();
         let mut space = UserAddressSpace::new().expect("lazy root");
