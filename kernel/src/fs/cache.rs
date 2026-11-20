@@ -80,8 +80,21 @@ impl SharedPage {
         Ok(())
     }
 
+    /// 该页是否仍可写回；截断越过 EOF 后为 false。
+    #[allow(dead_code)] // MM 的 stale 检查在后续 PR 接入
+    pub fn is_valid(&self) -> bool {
+        self.valid.load(Ordering::Acquire)
+    }
+
     fn invalidate(&self) {
         self.valid.store(false, Ordering::Release);
+    }
+
+    fn zero(&self, offset: usize, count: usize) {
+        let zeros = [0u8; 4096];
+        if let Err(e) = self.store(offset, &zeros[..count]) {
+            log::error!("shared page zero failed: {:?}", e);
+        }
     }
 }
 impl Drop for SharedPage {
@@ -98,8 +111,41 @@ impl Drop for SharedPage {
     }
 }
 
+/// 文件长度变化后调整共享页：整页越过新 EOF 的失效，保留页清零新暴露/截掉区间。
+pub(crate) fn resize_inode(ino: u32, old: usize, new: usize) {
+    let mut pages = PAGES.lock();
+    for (id, off, page) in pages.iter() {
+        if *id != ino {
+            continue;
+        }
+        let Some(page) = page.upgrade() else {
+            continue;
+        };
+        if new <= *off {
+            page.invalidate();
+            continue;
+        }
+        if new > old {
+            let begin = old.max(*off);
+            let stop = new.min(*off + 4096);
+            if begin < stop {
+                page.zero(begin - *off, stop - begin);
+            }
+        }
+        if new < old {
+            let begin = new.max(*off);
+            let stop = old.min(*off + 4096);
+            if begin < stop {
+                page.zero(begin - *off, stop - begin);
+            }
+        }
+    }
+    pages.retain(|(id, off, page)| *id != ino || (*off < new && page.strong_count() != 0));
+}
+
 /// 截断前使某 inode 的旧共享页失效，后续不再写回；索引立即移除。
-pub(super) fn invalidate_inode(ino: u32) {
+#[allow(dead_code)] // msync/后续范围失效入口
+pub(crate) fn invalidate_inode(ino: u32) {
     let mut pages = PAGES.lock();
     for (id, _, page) in pages.iter() {
         if *id == ino {

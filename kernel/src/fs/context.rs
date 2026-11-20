@@ -881,7 +881,7 @@ pub fn mapping(ctx: &Context, fd: usize, write: bool) -> Result<(u32, bool), Err
     let handle = ctx.get(fd)?;
     let f = handle.lock();
     if f.flags & 3 == 1 || (write && f.flags & 3 != 2) {
-        return Err(Errno::BadF);
+        return Err(Errno::Access);
     }
     if let Kind::Inode { ino, .. } = f.kind {
         if fs::stat(ino)?.0 & 0xf000 == 0x8000 {

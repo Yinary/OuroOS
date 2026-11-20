@@ -219,7 +219,7 @@ pub fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
         ext4::truncate(ino, length)
     };
     if result.is_ok() && current != length {
-        cache::invalidate_inode(ino);
+        cache::resize_inode(ino, current as usize, length as usize);
         mapping::commit_resize(ino, current, length);
     }
     result
@@ -261,7 +261,13 @@ pub fn read(ino: u32, offset: usize, data: &mut [u8]) -> Result<usize, Errno> {
 }
 /// 写磁盘后同步共享页。
 pub fn write(ino: u32, offset: usize, data: &[u8]) -> Result<usize, Errno> {
+    let old = stat(ino)?.1 as usize;
     let n = write_raw(ino, offset, data)?;
+    let end = offset.checked_add(n).ok_or(Errno::Invalid)?;
+    if end > old {
+        cache::resize_inode(ino, old, end);
+        mapping::commit_resize(ino, old as u64, end as u64);
+    }
     let mut buf = [0; 4096];
     let mut done = 0;
     while done < n {
