@@ -50,6 +50,8 @@ pub const SEGV_MAPERR: i32 = 1;
 pub const ILL_ILLOPC: i32 = 1;
 /// siginfo si_code：BUS_ADRALN，地址未对齐（SIGBUS）。
 pub const BUS_ADRALN: i32 = 1;
+/// siginfo si_code：BUS_ADRERR，访问不存在/损坏的映射对象（SIGBUS）。
+pub const BUS_ADRERR: i32 = 2;
 /// siginfo si_code：TRAP_BRKPT，断点陷阱（SIGTRAP）。
 pub const TRAP_BRKPT: i32 = 1;
 
@@ -62,6 +64,8 @@ pub fn fault_siginfo(kind: UserFaultKind) -> (u8, i32) {
         UserFaultKind::IllegalInstruction | UserFaultKind::Unhandled => (SIGILL, ILL_ILLOPC),
         UserFaultKind::AddressNotAligned => (SIGBUS, BUS_ADRALN),
         UserFaultKind::Breakpoint => (SIGTRAP, TRAP_BRKPT),
+        UserFaultKind::FileBusError | UserFaultKind::FileIoError => (SIGBUS, BUS_ADRERR),
+        UserFaultKind::UserFaultOom => (SIGKILL, 0),
     }
 }
 

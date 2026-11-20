@@ -149,7 +149,7 @@ impl Scheduler {
             self.move_waiting(|_, r| matches!(r, WaitReason::Children));
         }
         if WAKE_PIPES.swap(false, Ordering::AcqRel) {
-            self.move_waiting(|_, r| matches!(r, WaitReason::Pipe));
+            self.move_waiting(|_, r| matches!(r, WaitReason::Pipe | WaitReason::PollUntil(_)));
         }
         if WAKE_SIGNALS.swap(false, Ordering::AcqRel) {
             // 信号唤醒：持 REGISTRY 锁按可投递性搬回等待者（锁序
@@ -169,7 +169,7 @@ impl Scheduler {
     fn wake_expired(&mut self) {
         let now = polyhal::timer::current_time();
         self.move_waiting(|_, r| match r {
-            WaitReason::Deadline(d) => now >= *d,
+            WaitReason::Deadline(d) | WaitReason::PollUntil(d) => now >= *d,
             _ => false,
         });
     }

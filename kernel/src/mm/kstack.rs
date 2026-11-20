@@ -65,6 +65,17 @@ fn read_leaf(page: usize) -> usize {
     read_pte(l0_for(page), page % L0_ENTRIES)
 }
 
+/// 将窗口 VA（或普通直映 VA）转换为 DMA 物理地址；调用方保证缓冲存活且物理连续。
+pub(crate) fn dma_address(va: usize) -> usize {
+    if !(WINDOW_BASE..WINDOW_BASE + WINDOW_SIZE).contains(&va) {
+        return va & !VIRT_ADDR_START;
+    }
+    // guard 页叶项为 0，断言拦截栈边界外的 DMA。
+    let pte = read_leaf((va - WINDOW_BASE) / PAGE_SIZE);
+    assert_ne!(pte, 0, "DMA outside a live stack page");
+    arch::address(pte).raw() + va % PAGE_SIZE
+}
+
 /// 建立共享窗口页表与内核根表项；须在第一个地址空间/内核栈之前调用。
 pub(super) fn init_window() -> Result<(), FrameError> {
     assert!(
@@ -181,4 +192,22 @@ impl Drop for KernelStack {
         }
         free_slot(self.slot, self.pages + 1);
     }
+}
+
+/// 自检：窗口槽分配 OOM 回滚无副作用，guard 页保持不映射（仅 selftest 档运行）。
+#[cfg(debug_assertions)]
+pub(super) fn check() {
+    let baseline = frame::stats();
+    // 本实现仅一次物理页分配，budget=0 即完整覆盖 OOM 回滚路径。
+    frame::set_test_budget(Some(0));
+    let attempt = KernelStack::new(2);
+    frame::set_test_budget(None);
+    assert!(matches!(attempt, Err(FrameError::OutOfMemory)));
+    assert_eq!(frame::stats(), baseline);
+    let stack = KernelStack::new(2).expect("guarded stack");
+    assert_eq!(
+        read_leaf(stack.slot),
+        0,
+        "kernel stack guard must stay unmapped"
+    );
 }

@@ -2,9 +2,15 @@
 //! 调用号与寄存器约定按 riscv64/loongarch64 通用 UAPI（a7=调用号、
 //! a0..=a5=参数、a0=返回值），支持范围与偏差见 docs/ostd-contracts.md §4。
 
+pub(crate) mod fs;
 mod memory;
 // UAPI 常量集中在本模块定义。
 pub(crate) mod signal;
+
+#[cfg(debug_assertions)]
+pub(crate) fn memory_self_test() {
+    memory::self_test();
+}
 
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 
@@ -20,11 +26,17 @@ pub mod sysnr {
     pub const GETCWD: usize = 17;
     pub const DUP: usize = 23;
     pub const DUP3: usize = 24;
+    pub const FCNTL: usize = 25;
     pub const IOCTL: usize = 29;
     pub const MKDIRAT: usize = 34;
     pub const UNLINKAT: usize = 35;
+    pub const RENAMEAT: usize = 38;
     pub const UMOUNT2: usize = 39;
     pub const MOUNT: usize = 40;
+    pub const STATFS: usize = 43;
+    pub const FSTATFS: usize = 44;
+    pub const TRUNCATE: usize = 45;
+    pub const FTRUNCATE: usize = 46;
     pub const CHDIR: usize = 49;
     pub const OPENAT: usize = 56;
     pub const CLOSE: usize = 57;
@@ -35,13 +47,23 @@ pub mod sysnr {
     pub const WRITE: usize = 64;
     pub const READV: usize = 65;
     pub const WRITEV: usize = 66;
+    pub const PREAD64: usize = 67;
+    pub const PWRITE64: usize = 68;
+    pub const PREADV: usize = 69;
+    pub const PWRITEV: usize = 70;
+    pub const READLINKAT: usize = 78;
     pub const FSTATAT: usize = 79;
     pub const FSTAT: usize = 80;
     pub const FSYNC: usize = 82;
+    pub const UTIMENSAT: usize = 88;
+    pub const UMASK: usize = 166;
+    pub const RENAMEAT2: usize = 276;
     pub const STATX: usize = 291;
     // 进程
     pub const EXIT: usize = 93;
     pub const EXIT_GROUP: usize = 94;
+    pub const SYSINFO: usize = 179;
+    pub const PPOLL: usize = 73;
     pub const NANOSLEEP: usize = 101;
     pub const CLOCK_GETTIME: usize = 113;
     pub const SCHED_YIELD: usize = 124;
@@ -66,10 +88,20 @@ pub mod sysnr {
     pub const EXECVE: usize = 221;
     pub const WAIT4: usize = 260;
     // 内存
+    pub const READAHEAD: usize = 213;
     pub const BRK: usize = 214;
     pub const MUNMAP: usize = 215;
+    pub const MREMAP: usize = 216;
     pub const MMAP: usize = 222;
     pub const MPROTECT: usize = 226;
+    pub const MSYNC: usize = 227;
+    pub const MLOCK: usize = 228;
+    pub const MUNLOCK: usize = 229;
+    pub const MLOCKALL: usize = 230;
+    pub const MUNLOCKALL: usize = 231;
+    pub const MINCORE: usize = 232;
+    pub const MADVISE: usize = 233;
+    pub const MLOCK2: usize = 284;
 }
 
 /// Linux errno（仅当前用到的子集）
@@ -83,6 +115,7 @@ pub enum Errno {
     SeekPipe,
     Busy,
     TooBig,
+    FileTooBig,
     ExecFormat,
     Again,
     WouldBlock,
@@ -99,6 +132,10 @@ pub enum Errno {
     TooManyFiles,
     Range,
     NameTooLong,
+    Loop,
+    CrossDevice,
+    NotEmpty,
+    TooManyLinks,
     /// 内存不足。
     NoMem,
     /// 参数无效。
@@ -126,6 +163,7 @@ impl Errno {
             Self::SeekPipe => 29,
             Self::Busy => 16,
             Self::TooBig => 7,
+            Self::FileTooBig => 27,
             Self::ExecFormat => 8,
             Self::Again | Self::WouldBlock => 11,
             Self::Interrupted => 4,
@@ -140,6 +178,10 @@ impl Errno {
             Self::TooManyFiles => 24,
             Self::Range => 34,
             Self::NameTooLong => 36,
+            Self::Loop => 40,
+            Self::CrossDevice => 18,
+            Self::NotEmpty => 39,
+            Self::TooManyLinks => 31,
             Self::NoMem => 12,
             Self::Invalid => 22,
             Self::NotSupported => 95,
@@ -187,10 +229,17 @@ pub fn dispatch(
         sysnr::GETCWD
         | sysnr::DUP
         | sysnr::DUP3
+        | sysnr::FCNTL
         | sysnr::MKDIRAT
         | sysnr::UNLINKAT
+        | sysnr::RENAMEAT
+        | sysnr::RENAMEAT2
         | sysnr::UMOUNT2
         | sysnr::MOUNT
+        | sysnr::STATFS
+        | sysnr::FSTATFS
+        | sysnr::TRUNCATE
+        | sysnr::FTRUNCATE
         | sysnr::CHDIR
         | sysnr::OPENAT
         | sysnr::CLOSE
@@ -199,10 +248,20 @@ pub fn dispatch(
         | sysnr::LSEEK
         | sysnr::READ
         | sysnr::WRITE
+        | sysnr::READV
+        | sysnr::WRITEV
+        | sysnr::PREAD64
+        | sysnr::PWRITE64
+        | sysnr::PREADV
+        | sysnr::PWRITEV
+        | sysnr::READLINKAT
         | sysnr::FSTAT
+        | sysnr::FSTATAT
         | sysnr::FSYNC
+        | sysnr::UTIMENSAT
+        | sysnr::UMASK
         | sysnr::STATX => {
-            let ret = crate::fs::context::dispatch(
+            let ret = self::fs::dispatch(
                 nr,
                 [args[0], args[1], args[2], args[3], args[4], args[5]],
                 space,
@@ -226,13 +285,75 @@ pub fn dispatch(
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
-        sysnr::EXIT => Flow::Exited(a0 as i32),
+        sysnr::MLOCK | sysnr::MUNLOCK | sysnr::MLOCK2 => {
+            cx[TrapFrameArgs::RET] = to_abi(memory::mlock(
+                space,
+                a0,
+                a1,
+                nr != sysnr::MUNLOCK,
+                if nr == sysnr::MLOCK2 { a2 } else { 0 },
+            ));
+            Flow::Continue
+        }
+        sysnr::MSYNC => {
+            cx[TrapFrameArgs::RET] = to_abi(memory::msync(space, a0, a1, a2));
+            Flow::Continue
+        }
+        sysnr::MLOCKALL | sysnr::MUNLOCKALL => {
+            let flags = if nr == sysnr::MUNLOCKALL { 0 } else { a0 };
+            let ret = if nr == sysnr::MLOCKALL && (flags & !7 != 0 || flags & 3 == 0) {
+                Err(Errno::Invalid)
+            } else {
+                space.lock_all(flags).map(|_| 0).map_err(|_| Errno::NoMem)
+            };
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        163 | 164 | 261 => {
+            let (resource, new_ptr, old_ptr) = match nr {
+                163 => (a0, 0, a1),
+                164 => (a0, a1, 0),
+                _ => (a1, a2, args[3]),
+            };
+            let ret = if (nr == 163 || nr == 164) && a1 == 0 {
+                Err(Errno::Fault)
+            } else if nr == 261 && a0 != 0 && a0 != pid {
+                Err(Errno::NoProcess)
+            } else {
+                memory::limit(space, resource, new_ptr, old_ptr)
+            };
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        sysnr::SET_TID_ADDRESS => {
+            space.clear_child_tid = a0;
+            cx[TrapFrameArgs::RET] = pid;
+            Flow::Continue
+        }
+        sysnr::EXIT | sysnr::EXIT_GROUP => {
+            if space.clear_child_tid != 0 {
+                let _ = user_access::copy_to_user(space, space.clear_child_tid, &[0; 4]);
+            }
+            Flow::Exited(a0 as i32)
+        }
+        sysnr::READAHEAD => {
+            cx[TrapFrameArgs::RET] = to_abi(memory::readahead(fs, a0, a1, a2));
+            Flow::Continue
+        }
         sysnr::BRK => {
             cx[TrapFrameArgs::RET] = space.brk(a0);
             Flow::Continue
         }
-        sysnr::MUNMAP | sysnr::MMAP | sysnr::MPROTECT => {
+        sysnr::MUNMAP
+        | sysnr::MMAP
+        | sysnr::MPROTECT
+        | sysnr::MREMAP
+        | sysnr::MINCORE
+        | sysnr::MADVISE => {
             let ret = match nr {
+                sysnr::MADVISE => memory::madvise(space, a0, a1, a2),
+                sysnr::MINCORE => memory::mincore(space, a0, a1, a2),
+                sysnr::MREMAP => memory::mremap(space, [a0, a1, a2, args[3], args[4]]),
                 sysnr::MUNMAP => memory::munmap(space, a0, a1),
                 sysnr::MPROTECT => memory::mprotect(space, a0, a1, a2),
                 _ => memory::mmap(
@@ -297,13 +418,15 @@ pub fn dispatch(
             cx[TrapFrameArgs::RET] = 0;
             Flow::Yield
         }
-        // KILL/TGKILL/RT_SIGSUSPEND/RT_SIGTIMEDWAIT/RT_SIGQUEUEINFO 改目标
-        // 记录或依赖循环局部等待状态，在锁外（process_call）处理。
+        // KILL/TGKILL/RT_SIGSUSPEND/RT_SIGTIMEDWAIT/RT_SIGQUEUEINFO/SYSINFO/
+        // PPOLL 改目标记录或依赖循环局部等待状态，在锁外（process_call）处理。
         sysnr::KILL
         | sysnr::TGKILL
         | sysnr::RT_SIGSUSPEND
         | sysnr::RT_SIGTIMEDWAIT
         | sysnr::RT_SIGQUEUEINFO
+        | sysnr::SYSINFO
+        | sysnr::PPOLL
         | sysnr::NANOSLEEP
         | sysnr::TIMES
         | sysnr::GETPPID

@@ -3,12 +3,14 @@
 
 pub mod address_space;
 mod arch;
+pub(crate) mod file;
 pub mod frame;
 pub mod kernel_pt;
 pub mod kstack;
 mod page_table;
 pub mod region;
 mod self_test;
+mod shared;
 pub mod user_access;
 use core::sync::atomic::{AtomicUsize, Ordering};
 static KERNEL_ROOT: AtomicUsize = AtomicUsize::new(0);
@@ -17,7 +19,14 @@ static KERNEL_ROOT: AtomicUsize = AtomicUsize::new(0);
 /// 引导数据不可用或元数据分配失败是启动失败，不属于用户系统调用路径。
 pub fn init() {
     region::init().expect("physical memory initialization failed");
+    file::install_hooks();
+    let snapshot = frame::memory_snapshot();
     let (total, free) = frame::stats();
+    debug_assert_eq!(
+        snapshot.free_kib,
+        free * (polyhal::pagetable::PAGE_SIZE / 1024)
+    );
+    debug_assert!(snapshot.total_kib >= snapshot.free_kib);
     assert!(total > 0, "no usable physical memory");
     log::info!(
         "frame allocator: {} pages free / {} registered",

@@ -56,9 +56,17 @@ pub fn emulate_unaligned(
 /// 用户异常的种类（对应用户程序可能触发的 TrapType 子集）。
 #[derive(Debug, Clone, Copy)]
 pub enum UserFaultKind {
+    /// 文件映射整页超出 EOF，信号模块接收 BUS_ADRERR。
+    #[allow(dead_code)]
+    FileBusError,
+    /// 文件后端 I/O 失败，信号模块接收 BUS_OBJERR。
+    #[allow(dead_code)]
+    FileIoError,
     StorePageFault,
     LoadPageFault,
     InstructionPageFault,
+    /// 用户缺页耗尽内存，终止当前任务。
+    UserFaultOom,
     IllegalInstruction,
     Breakpoint,
     /// HAL 无法分类的异常（polyhal-trap 补丁新增，见其 README；

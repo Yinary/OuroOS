@@ -47,6 +47,8 @@ pub enum WaitReason {
     Pipe,
     /// 等待任意可投递信号（rt_sigsuspend），仅经 WAKE_SIGNALS 通道唤醒。
     Signal,
+    /// ppoll 同时等待管道变化或截止时间。
+    PollUntil(core::time::Duration),
 }
 
 /// 单个任务。

@@ -197,8 +197,10 @@ fn error(err: Ext4Error) -> Errno {
         Ext4Errno::ENOMEM => Errno::NoMem,
         Ext4Errno::ENOSPC => Errno::NoSpace,
         Ext4Errno::EEXIST => Errno::Exists,
+        Ext4Errno::ENOTEMPTY => Errno::NotEmpty,
+        Ext4Errno::EMLINK => Errno::TooManyLinks,
         Ext4Errno::ENAMETOOLONG => Errno::NameTooLong,
-        Ext4Errno::EFBIG => Errno::TooBig,
+        Ext4Errno::EFBIG => Errno::FileTooBig,
         Ext4Errno::EROFS => Errno::ReadOnly,
         Ext4Errno::EOPNOTSUPP => Errno::NotSupported,
         _ => Errno::Io,
@@ -232,6 +234,162 @@ pub(super) fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
     })
 }
 
+/// 读取 inode 的所有者、精确时间及基本属性。
+pub(super) fn metadata(ino: u32) -> Result<super::Metadata, Errno> {
+    access(|v| {
+        let inode =
+            v.fs.get_inode_by_num(&mut v.device, InodeNumber::new(ino)?)?;
+        let size = v.fs.superblock.s_inode_size;
+        let time = |t: Ext4Timestamp| super::Timestamp {
+            sec: t.sec,
+            nsec: t.nsec,
+        };
+        let rdev = if matches!(inode.i_mode & 0xf000, 0x2000 | 0x6000) {
+            if inode.i_block[0] != 0 {
+                inode.i_block[0]
+            } else {
+                inode.i_block[1]
+            }
+        } else {
+            0
+        };
+        Ok(super::Metadata {
+            ino: ino as u64,
+            dev: 1,
+            rdev: rdev as u64,
+            mode: inode.i_mode,
+            links: inode.i_links_count as u32,
+            uid: inode.uid(),
+            gid: inode.gid(),
+            size: inode.size(),
+            blocks: inode
+                .blocks_count()
+                // HUGE_FILE 将 i_blocks 的单位从扇区切换为文件系统块。
+                .checked_mul(if inode.i_flags & 0x40000 != 0 {
+                    (BLOCK_SIZE / 512) as u64
+                } else {
+                    1
+                })
+                .ok_or_else(Ext4Error::io)?,
+            block_size: BLOCK_SIZE as u32,
+            atime: Some(time(inode.atime_ts(size))),
+            mtime: Some(time(inode.mtime_ts(size))),
+            ctime: Some(time(inode.ctime_ts(size))),
+            btime: inode.crtime_ts(size).map(time),
+        })
+    })
+}
+
+/// 更新 inode 时间，保留后端的时间编码、校验和与日志写回流程。
+pub(super) fn update_times(ino: u32, times: [super::TimeUpdate; 2]) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        use rsext4::{disknode::Ext4Inode, Ext4TimeSpec};
+        let size = match v.fs.superblock.s_inode_size {
+            0 => Ext4Inode::LARGE_INODE_SIZE,
+            size => size,
+        };
+        let convert = |update, field_end| match update {
+            super::TimeUpdate::Omit => Ext4TimeSpec::Omit,
+            super::TimeUpdate::Now => Ext4TimeSpec::Now,
+            super::TimeUpdate::Set(t) => {
+                let max = if size >= field_end {
+                    0x3_7fff_ffff
+                } else {
+                    i32::MAX as i64
+                };
+                let sec = t.sec.clamp(i32::MIN as i64, max);
+                Ext4TimeSpec::Set(Ext4Timestamp::new(
+                    sec,
+                    if sec == t.sec { t.nsec } else { 0 },
+                ))
+            }
+        };
+        rsext4::metadata::utimens_inode(
+            &mut v.device,
+            &mut v.fs,
+            InodeNumber::new(ino)?,
+            convert(times[0], Ext4Inode::FIELD_END_I_ATIME_EXTRA),
+            convert(times[1], Ext4Inode::FIELD_END_I_MTIME_EXTRA),
+        )
+    })
+}
+
+/// 查询根卷容量，空闲计数取自后端当前快照。
+pub(super) fn filesystem_stats() -> Result<super::FileSystemStats, Errno> {
+    access(|v| {
+        let stats = v.fs.statfs();
+        let sb = &v.fs.superblock;
+        let overhead = (sb.s_overhead_blocks as u64)
+            .checked_shl(sb.s_log_cluster_size.saturating_sub(sb.s_log_block_size))
+            .ok_or_else(Ext4Error::corrupted)?;
+        let blocks = stats
+            .total_blocks
+            .checked_sub(overhead)
+            .ok_or_else(Ext4Error::corrupted)?;
+        let u = sb.s_uuid;
+        Ok(super::FileSystemStats {
+            kind: 0xef53,
+            block_size: stats.block_size,
+            blocks,
+            free_blocks: stats.free_blocks,
+            available_blocks: stats.free_blocks.saturating_sub(sb.reserved_blocks_count()),
+            files: stats.total_inodes as u64,
+            free_files: stats.free_inodes as u64,
+            id: u64::from_le_bytes([u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7]]),
+            flags: 0x20 | u64::from(!WRITABLE),
+        })
+    })
+}
+
+/// 读取有界的链接目标；不更新访问时间，非 UTF-8 或损坏数据返回 EIO。
+pub(super) fn link_target(ino: u32) -> Result<alloc::string::String, Errno> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(4096).map_err(|_| Errno::NoMem)?;
+    access(|v| {
+        let mut inode =
+            v.fs.get_inode_by_num(&mut v.device, InodeNumber::new(ino)?)?;
+        if !inode.is_symlink() {
+            return Err(Ext4Error::invalid_input());
+        }
+        let size = usize::try_from(inode.size()).map_err(|_| Ext4Error::invalid_input())?;
+        if size >= 4096 {
+            return Err(Ext4Error::new(rsext4::Errno::ENAMETOOLONG));
+        }
+        let xattr_sectors = if inode.file_acl() == 0 {
+            0
+        } else {
+            (BLOCK_SIZE / 512) as u64
+        };
+        if size < 60 && inode.blocks_count() == xattr_sectors {
+            for word in inode.i_block {
+                data.extend_from_slice(&word.to_le_bytes());
+            }
+            data.truncate(size);
+        } else if size != 0 {
+            // 一个链接目标小于一块；非 extent 链接使用首个直接块。
+            let block = if inode.have_extend_header_and_use_extend() {
+                rsext4::loopfile::resolve_inode_block(&mut v.device, &mut inode, 0)?
+                    .ok_or_else(Ext4Error::io)?
+            } else {
+                if inode.i_block[0] == 0 {
+                    return Err(Ext4Error::io());
+                }
+                AbsoluteBN::new(inode.i_block[0] as u64)
+            };
+            v.device.read_block(block)?;
+            data.extend_from_slice(&v.device.buffer()[..size]);
+        }
+        Ok(())
+    })?;
+    if data.contains(&0) {
+        return Err(Errno::Io);
+    }
+    alloc::string::String::from_utf8(data).map_err(|_| Errno::Io)
+}
+
 /// 读取 inode 指定偏移的内容，EOF 返回零。
 pub(super) fn read_raw(ino: u32, offset: usize, data: &mut [u8]) -> Result<usize, Errno> {
     access(|v| {
@@ -261,17 +419,66 @@ pub(super) fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
     })
 }
 
-/// 读取当前目录块中的原始目录项字节。
-pub(super) fn read_dir_at(ino: u32, offset: usize, data: &mut [u8]) -> Result<usize, Errno> {
-    access(|v| {
-        rsext4::dir::read_dir_at(
-            &mut v.device,
-            &mut v.fs,
-            InodeNumber::new(ino)?,
-            offset,
-            data,
-        )
-    })
+/// 按块读取 Ext4 目录，逐项交付解析结果。
+pub(super) fn read_dir(
+    ino: u32,
+    mut offset: usize,
+    mut visit: impl FnMut(super::DirEntry<'_>) -> bool,
+) -> Result<usize, Errno> {
+    use super::{DirEntry, DirEntryKind};
+
+    let mut block = Vec::new();
+    block
+        .try_reserve_exact(BLOCK_SIZE)
+        .map_err(|_| Errno::NoMem)?;
+    block.resize(BLOCK_SIZE, 0);
+    loop {
+        let n = access(|v| {
+            rsext4::dir::read_dir_at(
+                &mut v.device,
+                &mut v.fs,
+                InodeNumber::new(ino)?,
+                offset,
+                &mut block,
+            )
+        })?;
+        if n == 0 {
+            return Ok(offset);
+        }
+        let mut remaining = &block[..n];
+        while !remaining.is_empty() {
+            let h = remaining.first_chunk::<8>().ok_or(Errno::Io)?;
+            let inode = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
+            let len = u16::from_le_bytes([h[4], h[5]]) as usize;
+            let name_end = 8 + h[6] as usize;
+            if len % 4 != 0 || len < name_end || len > remaining.len() {
+                return Err(Errno::Io);
+            }
+            let next = offset.checked_add(len).ok_or(Errno::Io)?;
+            let kind = match h[7] {
+                1 => DirEntryKind::File,
+                2 => DirEntryKind::Directory,
+                3 => DirEntryKind::Character,
+                4 => DirEntryKind::Block,
+                5 => DirEntryKind::Fifo,
+                6 => DirEntryKind::Socket,
+                7 => DirEntryKind::Symlink,
+                _ => DirEntryKind::Unknown,
+            };
+            if inode != 0
+                && !visit(DirEntry {
+                    inode,
+                    kind,
+                    name: &remaining[8..name_end],
+                    next,
+                })
+            {
+                return Ok(offset);
+            }
+            offset = next;
+            remaining = &remaining[len..];
+        }
+    }
 }
 
 /// 将数据写到普通文件的指定偏移。
@@ -287,14 +494,18 @@ pub(super) fn write_raw(ino: u32, offset: usize, data: &[u8]) -> Result<usize, E
     })
 }
 
-/// 将普通文件截断到零字节。
-pub(super) fn truncate(ino: u32) -> Result<(), Errno> {
+/// 按 inode 调整普通文件长度，I/O 或结构错误后停止访问卷。
+pub(super) fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
     if !WRITABLE {
         return Err(Errno::ReadOnly);
     }
     access(|v| {
         let ino = regular_inode(v, ino)?;
-        rsext4::file::truncate_inode(&mut v.device, &mut v.fs, ino, 0)
+        rsext4::file::truncate_inode(&mut v.device, &mut v.fs, ino, length).inspect_err(|e| {
+            if matches!(e.code, rsext4::Errno::EIO | rsext4::Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })
     })
 }
 
@@ -353,6 +564,42 @@ pub(super) fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
         })?;
         if links == 0 && !v.opens.iter().any(|&(id, _)| id == ino) {
             reclaim_unlinked(v, ino)?;
+        }
+        Ok(())
+    })
+}
+
+/// 串行更新目录项，旧目标 inode 无链接且无打开引用时才回收。
+pub(super) fn rename(
+    old: u32,
+    name: &str,
+    new: u32,
+    target: &str,
+    no_replace: bool,
+) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        let replaced = rsext4::file::rename_entry(
+            &mut v.fs,
+            &mut v.device,
+            InodeNumber::new(old)?,
+            name,
+            InodeNumber::new(new)?,
+            target,
+            no_replace,
+        )
+        .inspect_err(|e| {
+            if matches!(e.code, rsext4::Errno::EIO | rsext4::Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })?;
+        if let Some(ino) = replaced {
+            if !v.opens.iter().any(|&(id, _)| id == ino.raw()) {
+                rsext4::file::reclaim_rename_target(&mut v.fs, &mut v.device, ino)
+                    .inspect_err(|_| v.failed = true)?;
+            }
         }
         Ok(())
     })

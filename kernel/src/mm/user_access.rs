@@ -1,86 +1,99 @@
 //! 用户内存访问：内核与用户地址空间之间的数据复制——地址范围校验、
 //! 逐页翻译与权限校验、经内核直映窗口复制；用户指针不构造为 Rust 引用。
 
-use polyhal::pagetable::{MappingFlags, PAGE_SIZE};
+use alloc::vec::Vec;
+use polyhal::{
+    pagetable::{MappingFlags, PAGE_SIZE},
+    PhysAddr,
+};
 
 use super::address_space::{phys_to_kernel_vaddr, UserAddressSpace, USER_TOP};
-
-/// 复制到内核缓冲区的分块大小上限。
-const KERNEL_CHUNK: usize = 256;
 
 /// 用户缓冲区访问失败原因
 #[derive(Debug)]
 pub enum AccessError {
     /// 地址溢出、越界、未映射、非用户页或权限不符 → EFAULT
     Fault,
+    /// 用户态直接访存需报告 SIGBUS；系统调用复制仍转换为 EFAULT。
+    FileFault,
+    FileIo,
+    OutOfMemory,
 }
 
-/// 两架构统一检查用户位与读权限。
-fn page_readable(flags: MappingFlags) -> bool {
-    flags.contains(MappingFlags::U | MappingFlags::R)
+impl From<super::address_space::MapError> for AccessError {
+    fn from(error: super::address_space::MapError) -> Self {
+        match error {
+            super::address_space::MapError::FileFault => Self::FileFault,
+            super::address_space::MapError::FileIo => Self::FileIo,
+            super::address_space::MapError::OutOfMemory => Self::OutOfMemory,
+            _ => Self::Fault,
+        }
+    }
 }
-/// 两架构统一检查用户位与写权限。
-fn page_writable(flags: MappingFlags) -> bool {
-    flags.contains(MappingFlags::U | MappingFlags::W)
-}
-/// 把用户缓冲区 `[vaddr, vaddr+len)` 的内容分块交给 `consume`。
-/// 两遍式验证的流式接口；当前无调用方，保留供 writev 等散布 I/O
-/// 接入时使用。
-#[allow(dead_code)]
-pub fn read_user_bytes<F>(
+
+/// 第一遍校验整段，并缓存每页的物理地址与页内长度；缓存分配失败时
+/// 返回 None，由调用方退回逐页两遍处理。缓存内容不跨调用保存。
+fn prepare_pages(
     space: &UserAddressSpace,
     vaddr: usize,
     len: usize,
-    mut consume: F,
-) -> Result<(), AccessError>
-where
-    F: FnMut(&[u8]),
-{
+    required: MappingFlags,
+) -> Result<Option<Vec<(PhysAddr, usize)>>, AccessError> {
     let end = check_span(vaddr, len)?;
-    // 第一遍：整段映射与权限检查
+    if len == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let first = vaddr / PAGE_SIZE;
+    let last = (end - 1) / PAGE_SIZE;
+    let pages = last - first + 1;
+    let mut cache = Vec::new();
+    if cache.try_reserve(pages).is_err() {
+        return Ok(None);
+    }
     let mut va = vaddr;
     while va < end {
-        let (_, flags) = space.translate(va).ok_or(AccessError::Fault)?;
-        if !page_readable(flags) {
-            return Err(AccessError::Fault);
-        }
-        va = (va / PAGE_SIZE + 1) * PAGE_SIZE;
+        space.ensure_access(va, required)?;
+        let (paddr, _) = space.translate(va).ok_or(AccessError::Fault)?;
+        let n = ((va / PAGE_SIZE + 1) * PAGE_SIZE).min(end) - va;
+        cache.push((paddr, n));
+        va += n;
     }
-    // 第二遍：经内核直接映射分块复制
-    let mut buf = [0u8; KERNEL_CHUNK];
-    let mut pos = vaddr;
-    while pos < end {
-        let page_end = ((pos / PAGE_SIZE + 1) * PAGE_SIZE).min(end);
-        // translate 返回的物理地址含页内偏移
-        let (paddr, _) = space.translate(pos).ok_or(AccessError::Fault)?;
-        let mut copied = 0usize;
-        while copied < page_end - pos {
-            // SAFETY: 上一循环已确认本页映射存在且可读；src 为本页的
-            // 内核直接映射地址，n 不超过页内剩余长度。
-            let src = phys_to_kernel_vaddr(paddr) + copied;
-            let n = (page_end - pos - copied).min(KERNEL_CHUNK);
-            let chunk = unsafe { core::slice::from_raw_parts(src as *const u8, n) };
-            buf[..n].copy_from_slice(chunk);
-            consume(&buf[..n]);
-            copied += n;
-        }
-        pos = page_end;
-    }
-    Ok(())
+    Ok(Some(cache))
 }
 
 /// 把 `src` 写入用户地址 `[vaddr, vaddr+src.len())`。
 ///
 /// 先对整段做可写检查，全部通过后才写入；失败时不产生部分写入。
-/// 按页切分，每页单独翻译；用户虚拟地址连续不要求物理连续。
 pub fn copy_to_user(space: &UserAddressSpace, vaddr: usize, src: &[u8]) -> Result<(), AccessError> {
+    if let Some(cache) = prepare_pages(space, vaddr, src.len(), MappingFlags::U | MappingFlags::W)?
+    {
+        let mut done = 0usize;
+        for (paddr, n) in cache {
+            // SAFETY: prepare_pages 已确认本页属于用户且可写；dst 为本页的
+            // 内核直接映射地址，n 不越过页尾，src 与 dst 不重叠。
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src.as_ptr().add(done),
+                    phys_to_kernel_vaddr(paddr) as *mut u8,
+                    n,
+                );
+            }
+            done += n;
+        }
+        return Ok(());
+    }
+    copy_to_user_slow(space, vaddr, src)
+}
+
+fn copy_to_user_slow(
+    space: &UserAddressSpace,
+    vaddr: usize,
+    src: &[u8],
+) -> Result<(), AccessError> {
     let end = check_span(vaddr, src.len())?;
     let mut va = vaddr;
     while va < end {
-        let (_, flags) = space.translate(va).ok_or(AccessError::Fault)?;
-        if !page_writable(flags) {
-            return Err(AccessError::Fault);
-        }
+        space.ensure_access(va, MappingFlags::U | MappingFlags::W)?;
         va = (va / PAGE_SIZE + 1) * PAGE_SIZE;
     }
     let mut pos = vaddr;
@@ -130,13 +143,35 @@ fn copy_from_user_with_flags(
     dst: &mut [u8],
     required: MappingFlags,
 ) -> Result<(), AccessError> {
+    if let Some(cache) = prepare_pages(space, vaddr, dst.len(), required)? {
+        let mut done = 0usize;
+        for (paddr, n) in cache {
+            // SAFETY: prepare_pages 已确认本页属于用户且可读；src 为本页的
+            // 内核直接映射地址，n 不越过页尾，src 与 dst 不重叠。
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    phys_to_kernel_vaddr(paddr) as *const u8,
+                    dst.as_mut_ptr().add(done),
+                    n,
+                );
+            }
+            done += n;
+        }
+        return Ok(());
+    }
+    copy_from_user_slow(space, vaddr, dst, required)
+}
+
+fn copy_from_user_slow(
+    space: &UserAddressSpace,
+    vaddr: usize,
+    dst: &mut [u8],
+    required: MappingFlags,
+) -> Result<(), AccessError> {
     let end = check_span(vaddr, dst.len())?;
     let mut va = vaddr;
     while va < end {
-        let (_, flags) = space.translate(va).ok_or(AccessError::Fault)?;
-        if !flags.contains(required) {
-            return Err(AccessError::Fault);
-        }
+        space.ensure_access(va, required)?;
         va = (va / PAGE_SIZE + 1) * PAGE_SIZE;
     }
     let mut pos = vaddr;
