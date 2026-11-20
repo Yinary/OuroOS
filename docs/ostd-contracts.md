@@ -185,7 +185,9 @@ CURRENT 记录当前任务地址；调度器的 `current` Box 持有实体，切
   无 core 位（未实现 core dump，见 §4.5）。
 - 子进程退出时向活跃父进程产生 SIGCHLD（槽含 CLD_EXITED/CLD_KILLED、
   子 pid 与状态）；父处置 IGN 或 SA_NOCLDWAIT 时不产生僵尸，记录即收，
-  运行时间并入父（与收割口径一致）；孤儿过继 init 的路径维持即收。
+  运行时间并入父（与收割口径一致）。自动收割不抑制通知：父装 handler
+  时仍照常投递（含 SA_NOCLDWAIT 组合），IGN/DFL-Ign 由处置过滤丢弃；
+  孤儿过继 init 的路径维持即收。
 
 ### 3.5 等待与唤醒
 

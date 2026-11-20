@@ -119,7 +119,7 @@ mod registry {
     }
 
     /// 任务退出的唯一登记点：记录终态、释放地址空间并通知父进程。
-    /// 终态行积攒到时代末统一输出；父 IGN/SA_NOCLDWAIT 时自动收割。
+    /// 终态行积攒到时代末统一输出；父 IGN/SA_NOCLDWAIT 时自动收割（通知不受影响）。
     /// space/fs 的 Drop 在锁外完成。
     pub fn record_exit(pid: Pid, exit: ExitInfo) {
         let taken = {
@@ -164,8 +164,9 @@ mod registry {
                 ..Default::default()
             };
             let taken = (rec.space.take(), rec.fs.take());
-            // SIGCHLD 通知：父 IGN 或 SA_NOCLDWAIT 时自动收割并入父
-            // 时间累计，否则向父入队 SIGCHLD。全程持 REGISTRY 锁内联完成。
+            // 自动收割（IGN/SA_NOCLDWAIT）与 SIGCHLD 通知解耦：前者决定
+            // 是否留僵尸并入父时间，通知统一经 generate 按处置过滤。
+            // 全程持 REGISTRY 锁内联完成。
             let auto_reap = if orphan {
                 false
             } else {
@@ -176,18 +177,21 @@ mod registry {
                 {
                     Some(parent) => {
                         let d = parent.signal.disposition(SIGCHLD);
-                        if d.handler == SIG_IGN || d.flags & SA_NOCLDWAIT != 0 {
+                        let auto_reap = d.handler == SIG_IGN || d.flags & SA_NOCLDWAIT != 0;
+                        if auto_reap {
                             parent.child_user_ns = parent
                                 .child_user_ns
                                 .saturating_add(own_user.saturating_add(child_user));
                             parent.child_system_ns = parent
                                 .child_system_ns
                                 .saturating_add(own_system.saturating_add(child_system));
-                            true
-                        } else {
-                            parent.signal.generate(SIGCHLD, chld_slot);
-                            false
                         }
+                        // SIGCHLD 生产点 IGN 无条件丢弃（do_notify_parent 的
+                        // sig=0，屏蔽也不例外）；其余经 generate 过滤入队。
+                        if d.handler != SIG_IGN {
+                            parent.signal.generate(SIGCHLD, chld_slot);
+                        }
+                        auto_reap
                     }
                     // 父记录不在表（如内核任务父为 0）：维持现状，不通知。
                     None => false,
