@@ -177,17 +177,22 @@ pub fn restore(frame: &mut TrapFrame, space: &UserAddressSpace) -> Result<Signal
     let mut flags = [0u8; 4];
     read(space, frame_addr(base, OFF_SC_FLAGS)?, &mut flags)?;
 
-    // parse_extcontext：走到 END；只认 FPU 块，其余 magic 为 badframe。
+    // parse_extcontext：必须走到 END；只认 FPU 块，其余 magic 为 badframe。
     // 步数上限 8。
     let mut fpu_base = None;
     let mut cursor = frame_addr(base, OFF_SC_EXT)?;
+    let mut saw_end = false;
     for _ in 0..8 {
         let mut hdr = [0u8; SCTX_INFO_SIZE];
         read(space, cursor, &mut hdr)?;
         let magic = u32::from_ne_bytes(hdr[..4].try_into().expect("4 bytes"));
         let size = u32::from_ne_bytes(hdr[4..8].try_into().expect("4 bytes")) as usize;
         match magic {
-            0 => break, // END：不校验 size
+            0 => {
+                // END：不校验 size。
+                saw_end = true;
+                break;
+            }
             m if m == FPU_CTX_MAGIC => {
                 if size < FPU_BLOCK_MIN {
                     return Err(FrameError::BadFrame);
@@ -198,20 +203,28 @@ pub fn restore(frame: &mut TrapFrame, space: &UserAddressSpace) -> Result<Signal
         }
         cursor = frame_addr(cursor, size)?;
     }
+    // 未遇 END 即链未终止，按坏帧处理。
+    if !saw_end {
+        return Err(FrameError::BadFrame);
+    }
 
     let mut sc_pc = [0u8; 8];
     read(space, frame_addr(base, OFF_SC_PC)?, &mut sc_pc)?;
     let mut regs = [0u8; 256];
     read(space, frame_addr(base, OFF_SC_REGS)?, &mut regs)?;
+    let mut fpu = None;
+    if let Some(addr) = fpu_base {
+        let mut data = [0u8; FPU_CTX_DATA];
+        read(space, addr, &mut data)?;
+        fpu = Some(data);
+    }
 
     // 全部校验通过后恢复 sc_pc、sc_regs 与 FPU 现场。
     frame[TrapFrameArgs::SEPC] = usize::from_ne_bytes(sc_pc);
     for (i, r) in frame.regs[1..].iter_mut().enumerate() {
         *r = usize::from_ne_bytes(regs[(i + 1) * 8..(i + 2) * 8].try_into().expect("8 bytes"));
     }
-    if let Some(addr) = fpu_base {
-        let mut fpu = [0u8; FPU_CTX_DATA];
-        read(space, addr, &mut fpu)?;
+    if let Some(fpu) = fpu {
         for (i, f) in frame.fp.iter_mut().enumerate() {
             *f = u64::from_ne_bytes(fpu[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
         }
