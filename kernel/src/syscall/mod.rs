@@ -1,10 +1,11 @@
 //! 系统调用分发：通用 UAPI 调用号分发表与进程/文件/内存三类实现入口。
 //! 调用号与寄存器约定按 riscv64/loongarch64 通用 UAPI（a7=调用号、
-//! a0..=a5=参数、a0=返回负 errno 或结果）。支持范围与 Linux 语义偏差
-//! 见 docs/ostd-contracts.md §4；PC 推进由运行循环统一处理。
+//! a0..=a5=参数、a0=返回值），支持范围与偏差见 docs/ostd-contracts.md §4。
 
 pub(crate) mod fs;
 mod memory;
+// UAPI 常量集中在本模块定义。
+pub(crate) mod signal;
 
 #[cfg(debug_assertions)]
 pub(crate) fn memory_self_test() {
@@ -14,6 +15,7 @@ pub(crate) fn memory_self_test() {
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 
 use crate::mm::{address_space::UserAddressSpace, user_access};
+use crate::task::signal::{SigInfoSlot, SignalSet, SignalSetExt, SEGV_MAPERR, SIGPIPE, SIGSEGV};
 use crate::task::WaitReason;
 
 /// 已实现的通用 UAPI 调用号（asm-generic/unistd.h，rv64/la64 共用）。
@@ -66,6 +68,16 @@ pub mod sysnr {
     pub const CLOCK_GETTIME: usize = 113;
     pub const SCHED_YIELD: usize = 124;
     pub const KILL: usize = 129;
+    pub const TGKILL: usize = 131;
+    // 信号
+    pub const SIGALTSTACK: usize = 132;
+    pub const RT_SIGSUSPEND: usize = 133;
+    pub const RT_SIGACTION: usize = 134;
+    pub const RT_SIGPROCMASK: usize = 135;
+    pub const RT_SIGPENDING: usize = 136;
+    pub const RT_SIGTIMEDWAIT: usize = 137;
+    pub const RT_SIGQUEUEINFO: usize = 138;
+    pub const RT_SIGRETURN: usize = 139;
     pub const TIMES: usize = 153;
     pub const SET_TID_ADDRESS: usize = 96;
     pub const UNAME: usize = 160;
@@ -95,6 +107,8 @@ pub mod sysnr {
 /// Linux errno（仅当前用到的子集）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Errno {
+    /// EPERM: 操作不被允许。
+    Perm,
     Access,
     NoChild,
     NoProcess,
@@ -105,6 +119,8 @@ pub enum Errno {
     ExecFormat,
     Again,
     WouldBlock,
+    /// EINTR: 阻塞中的系统调用被信号打断时返回。
+    Interrupted,
     Pipe,
     Io,
     NoEntry,
@@ -140,6 +156,7 @@ impl Errno {
     /// Linux errno 数值（asm-generic/errno-base.h）
     pub fn as_errno(self) -> isize {
         match self {
+            Self::Perm => 1,
             Self::Access => 13,
             Self::NoChild => 10,
             Self::NoProcess => 3,
@@ -149,6 +166,7 @@ impl Errno {
             Self::FileTooBig => 27,
             Self::ExecFormat => 8,
             Self::Again | Self::WouldBlock => 11,
+            Self::Interrupted => 4,
             Self::Pipe => 32,
             Self::Io => 5,
             Self::NoEntry => 2,
@@ -186,18 +204,22 @@ pub enum Flow {
     Yield,
     /// 在解除注册表借用后处理进程操作。
     Process,
+    /// rt_sigreturn：现场已从信号帧恢复，SEPC 即真实返回点，
+    /// 运行循环不再推进。
+    SigReturn,
     /// 任务已退出，携带退出状态。
     Exited(i32),
 }
 
-/// 系统调用分发。寄存器现场由调用方（用户任务运行循环）持有，
-/// 返回值写回 a0，PC 推进（syscall_ok）与执行流决策也由调用方统一处理。
-/// `pid` 为调用者标识（getpid 返回它）。
+/// 系统调用分发，返回 Flow。返回值写回 a0，PC 推进与执行流决策由调用方处理。
+/// `pid` 为调用者标识。调用发生在 REGISTRY 锁内，改其他进程记录的
+/// 调用走 Flow::Process 在锁外处理。
 pub fn dispatch(
     cx: &mut TrapFrame,
     pid: usize,
     space: &mut UserAddressSpace,
     fs: &mut crate::fs::context::Context,
+    signal: &mut crate::task::signal::SignalState,
 ) -> Flow {
     // 调用号在 a7（TrapFrameArgs::SYSCALL），参数在 a0..；返回值写回 a0
     let nr = cx[TrapFrameArgs::SYSCALL];
@@ -248,6 +270,17 @@ pub fn dispatch(
             // pipe 无数据/无空间且非 O_NONBLOCK：转为阻塞等待
             if ret == Err(Errno::WouldBlock) {
                 return Flow::Wait(WaitReason::Pipe);
+            }
+            // 向无读者的管道写入：SIGPIPE 入队并与 -EPIPE 返回并行。
+            if ret == Err(Errno::Pipe) && (nr == sysnr::WRITE || nr == sysnr::WRITEV) {
+                signal.generate(
+                    SIGPIPE,
+                    // code=0 即 SI_USER，发送者为调用进程自身。
+                    SigInfoSlot {
+                        pid: pid as u32,
+                        ..Default::default()
+                    },
+                );
             }
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
@@ -332,12 +365,67 @@ pub fn dispatch(
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
+        sysnr::RT_SIGACTION => {
+            // rt_sigaction(2)：单信号处置读改写
+            let ret = signal::rt_sigaction(space, a0, a1, a2, args[3], signal);
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        sysnr::RT_SIGPROCMASK => {
+            // rt_sigprocmask(2)：屏蔽集合改读
+            let ret = signal::rt_sigprocmask(space, a0, a1, a2, args[3], signal);
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        sysnr::RT_SIGPENDING => {
+            // rt_sigpending(2)：pending 位图回写
+            let ret = signal::rt_sigpending(space, a0, a1, signal);
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        sysnr::SIGALTSTACK => {
+            // sigaltstack(2)：备用栈登记的换读；只改调用者自身记录，
+            // on_alt/SS_ONSTACK 判定用陷入前的用户 sp。
+            let ret = signal::rt_sigaltstack(space, cx[TrapFrameArgs::SP], a0, a1, signal);
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        sysnr::RT_SIGRETURN => {
+            // rt_sigreturn(2)：按 sp 指向的信号帧恢复现场并换回屏蔽集合。
+            // 失败按 force SIGSEGV 处置，偏差登记 docs/ostd-contracts.md §4.5。
+            match crate::sigframe::restore(cx, space) {
+                // 成功：换回帧内保存的屏蔽集合（KILL/STOP 已剥除）。
+                Ok(old) => signal.setmask(old),
+                Err(_) => {
+                    signal.set_disposition(SIGSEGV, Default::default());
+                    let mut one: SignalSet = 0;
+                    one.add(SIGSEGV);
+                    signal.unblock(one);
+                    signal.generate(
+                        SIGSEGV,
+                        SigInfoSlot {
+                            code: SEGV_MAPERR,
+                            addr: cx[TrapFrameArgs::SP],
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            Flow::SigReturn
+        }
         sysnr::SCHED_YIELD => {
             // sched_yield(2)：成功返回 0；让出意图交给运行循环
             cx[TrapFrameArgs::RET] = 0;
             Flow::Yield
         }
-        sysnr::SYSINFO
+        // KILL/TGKILL/RT_SIGSUSPEND/RT_SIGTIMEDWAIT/RT_SIGQUEUEINFO/SYSINFO/
+        // PPOLL 改目标记录或依赖循环局部等待状态，在锁外（process_call）处理。
+        sysnr::KILL
+        | sysnr::TGKILL
+        | sysnr::RT_SIGSUSPEND
+        | sysnr::RT_SIGTIMEDWAIT
+        | sysnr::RT_SIGQUEUEINFO
+        | sysnr::SYSINFO
         | sysnr::PPOLL
         | sysnr::NANOSLEEP
         | sysnr::TIMES

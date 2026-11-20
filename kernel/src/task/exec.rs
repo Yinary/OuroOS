@@ -132,6 +132,7 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
         old.as_space().deactivate();
     }
     rec.space = Some(LocalSpace(space));
+    rec.signal.reset_for_exec();
     if let Some(ctx) = rec.fs.as_mut() {
         context::close_exec(ctx);
     }

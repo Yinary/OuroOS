@@ -40,9 +40,9 @@ pub fn init() {
     );
     assert_eq!(frame::stats(), (total, free));
     log::info!("frame allocator oversized allocation: rejected without changing free pages");
-    // 顺序约束：kernel_pt::init 先于 KERNEL_ROOT 读取
+    // 顺序约束：kernel_pt::init → 窗口建表 → KERNEL_ROOT 读取/用户空间创建
     kernel_pt::init();
-    kstack::init();
+    kstack::init_window().expect("kernel stack window initialization failed");
     KERNEL_ROOT.store(arch::current(), Ordering::Relaxed);
     self_test::run();
 }
