@@ -80,6 +80,15 @@ pub(super) fn install_hooks() {
     fs::mapping::register(&MAPPING_HOOKS);
 }
 
+/// 清理已无驻留页的 inode 组，避免历史 inode 长期占用登记表。
+pub(crate) fn compact() {
+    let mut groups = RESIDENT.lock();
+    for group in groups.iter_mut() {
+        group.pages.retain(|p| p.strong_count() != 0);
+    }
+    groups.retain(|group| !group.pages.is_empty());
+}
+
 /// 与打开描述符无关的 inode 引用。
 pub(crate) struct MappingFile {
     ino: u32,
@@ -197,6 +206,7 @@ impl FilePage {
     }
     pub(super) fn discard(&self) {
         self.data.borrow_mut().take();
+        compact();
     }
     pub(super) fn addr(&self) -> Option<PhysAddr> {
         self.data.borrow().as_ref().map(|p| p.data.addr())

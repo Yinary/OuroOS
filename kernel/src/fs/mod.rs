@@ -225,10 +225,17 @@ pub fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
     result
 }
 
-/// 同步指定 inode 的共享文件页；当前实现按 inode 全量同步。
+/// 同步指定 inode 的共享文件页范围。
 #[cfg(not(feature = "rsext4-readonly"))]
-pub fn sync_mapping(ino: u32, _offset: usize, _length: usize) -> Result<(), Errno> {
-    sync_inode(ino)
+pub fn sync_mapping(ino: u32, offset: usize, length: usize) -> Result<(), Errno> {
+    cache::sync_span(ino, offset, length)?;
+    ext4::sync()
+}
+
+/// 只读构建没有可写回的后端。
+#[cfg(feature = "rsext4-readonly")]
+pub fn sync_mapping(_ino: u32, _offset: usize, _length: usize) -> Result<(), Errno> {
+    Err(Errno::ReadOnly)
 }
 
 /// 持有 inode 的打开引用。

@@ -70,7 +70,7 @@ pub fn stack(
     if let Some((phdr, size, count)) = image.headers {
         words.extend_from_slice(&[3, phdr, 4, size, 5, count]);
     }
-    let random = crate::entropy::exec_random().ok_or(Errno::Io)?;
+    let random = crate::entropy::exec_random();
     sp = sp.checked_sub(random.len()).ok_or(Errno::TooBig)?;
     user_access::copy_to_user(space, sp, &random).map_err(|_| Errno::TooBig)?;
     words.extend_from_slice(&[25, sp, 0, 0]);

@@ -72,6 +72,8 @@ struct Disk {
     writes: usize,
     fail: bool,
 }
+static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
 static DISK: Mutex<Disk> = Mutex::new(Disk {
     data: Vec::new(),
     refs: 0,
@@ -115,6 +117,7 @@ fn write_raw(_: u32, at: usize, data: &[u8]) -> Result<usize, Errno> {
 
 #[test]
 fn page_cache_roundtrip() {
+    let _guard = TEST_LOCK.lock().unwrap();
     DISK.lock().data = vec![11; 4100];
     let page = cache::page(1, 0).unwrap();
     // SAFETY: page 拥有整页，单线程测试独占。
@@ -131,6 +134,7 @@ fn page_cache_roundtrip() {
 
 #[test]
 fn resize_zeroes_tail_and_expands() {
+    let _guard = TEST_LOCK.lock().unwrap();
     DISK.lock().data = vec![11; 8];
     let page = cache::page(1, 0).unwrap();
     // SAFETY: page 拥有整页，单线程测试独占。
