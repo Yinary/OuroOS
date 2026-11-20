@@ -71,6 +71,8 @@ struct Disk {
     refs: usize,
     writes: usize,
     fail: bool,
+    write_fail: bool,
+    write_fail_at: Option<usize>,
 }
 static TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
@@ -79,6 +81,8 @@ static DISK: Mutex<Disk> = Mutex::new(Disk {
     refs: 0,
     writes: 0,
     fail: false,
+    write_fail: false,
+    write_fail_at: None,
 });
 
 pub(crate) fn try_arc<T>(value: T) -> Result<Arc<T>, Errno> {
@@ -108,7 +112,7 @@ pub(crate) fn read_raw(_: u32, at: usize, data: &mut [u8]) -> Result<usize, Errn
 fn write_raw(_: u32, at: usize, data: &[u8]) -> Result<usize, Errno> {
     let mut d = DISK.lock();
     d.writes += 1;
-    if d.fail {
+    if d.fail || d.write_fail || d.write_fail_at == Some(at) {
         return Err(Errno::Io);
     }
     d.data[at..at + data.len()].copy_from_slice(data);
@@ -172,10 +176,10 @@ fn flush_retries_after_writeback_failure() {
         (page.addr() as *mut u8).write(42);
     }
     drop(page);
-    DISK.lock().fail = true;
+    DISK.lock().write_fail = true;
     assert!(cache::flush(None).is_err());
     assert!(cache::resident(1, 0));
-    DISK.lock().fail = false;
+    DISK.lock().write_fail = false;
     cache::flush(None).unwrap();
     assert_eq!(DISK.lock().data[0], 42);
     assert!(!cache::resident(1, 0));
@@ -190,5 +194,52 @@ fn read_only_sparse_page_does_not_write() {
     drop(page);
     cache::flush(None).unwrap();
     assert_eq!(DISK.lock().writes, 0);
+    assert!(!cache::resident(1, 0));
+}
+
+#[test]
+fn flush_continues_after_one_page_failure() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    DISK.lock().data = vec![0; 8192];
+    let first = cache::page(1, 0).unwrap();
+    let second = cache::page(1, 4096).unwrap();
+    cache::coherent(1, 0, &mut [1], true);
+    cache::coherent(1, 4096, &mut [2], true);
+    drop((first, second));
+    DISK.lock().write_fail_at = Some(0);
+    assert!(cache::flush(None).is_err());
+    assert_eq!(DISK.lock().data[4096], 2);
+    assert_eq!(DISK.lock().data[0], 0);
+    assert!(!cache::resident(1, 4096));
+    assert!(cache::resident(1, 0));
+    let mut retained = [0u8; 1];
+    cache::coherent(1, 0, &mut retained, false);
+    assert_eq!(retained[0], 1);
+    DISK.lock().write_fail_at = None;
+    cache::flush(None).unwrap();
+    assert_eq!(DISK.lock().data[0], 1);
+    assert!(!cache::resident(1, 0) && !cache::resident(1, 4096));
+}
+
+#[test]
+fn dirty_page_survives_failed_second_writeback() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    DISK.lock().data = vec![0; 4096];
+    let page = cache::page(1, 0).unwrap();
+    cache::coherent(1, 0, &mut [7], true);
+    drop(page);
+    cache::flush(None).unwrap();
+    assert_eq!(DISK.lock().data[0], 7);
+
+    let page = cache::page(1, 0).unwrap();
+    cache::coherent(1, 0, &mut [8], true);
+    drop(page);
+    DISK.lock().write_fail_at = Some(0);
+    assert!(cache::flush(None).is_err());
+    assert!(cache::resident(1, 0));
+    assert_eq!(DISK.lock().data[0], 7);
+    DISK.lock().write_fail_at = None;
+    cache::flush(None).unwrap();
+    assert_eq!(DISK.lock().data[0], 8);
     assert!(!cache::resident(1, 0));
 }

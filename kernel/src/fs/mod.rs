@@ -228,6 +228,9 @@ pub fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
 /// 同步指定 inode 的共享文件页范围。
 #[cfg(not(feature = "rsext4-readonly"))]
 pub fn sync_mapping(ino: u32, offset: usize, length: usize) -> Result<(), Errno> {
+    if ino & FAT_INODE != 0 {
+        return Err(Errno::NotSupported);
+    }
     cache::sync_span(ino, offset, length)?;
     ext4::sync()
 }

@@ -70,7 +70,7 @@ pub fn stack(
     if let Some((phdr, size, count)) = image.headers {
         words.extend_from_slice(&[3, phdr, 4, size, 5, count]);
     }
-    let random = crate::entropy::exec_random();
+    let random = require_random(crate::entropy::exec_random())?;
     sp = sp.checked_sub(random.len()).ok_or(Errno::TooBig)?;
     user_access::copy_to_user(space, sp, &random).map_err(|_| Errno::TooBig)?;
     words.extend_from_slice(&[25, sp, 0, 0]);
@@ -138,4 +138,14 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
     }
     *frame = next;
     Ok(())
+}
+
+fn require_random(random: Option<[u8; 16]>) -> Result<[u8; 16], Errno> {
+    random.ok_or(Errno::Io)
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn self_test() {
+    assert_eq!(require_random(None), Err(Errno::Io));
+    assert!(require_random(Some([0; 16])).is_ok());
 }
