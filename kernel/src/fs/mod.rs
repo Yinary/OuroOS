@@ -8,7 +8,9 @@ mod ext4;
 pub mod cache;
 pub mod context;
 pub mod fat;
+pub mod mapping;
 mod metadata;
+pub mod procfs;
 
 pub(crate) use metadata::{query, Metadata, Timestamp};
 
@@ -87,6 +89,15 @@ pub fn shutdown() -> Result<(), Errno> {
 
 /// 按绝对路径查找 inode。
 pub fn lookup(path: &str) -> Result<u32, Errno> {
+    if path == "/proc" {
+        return Ok(procfs::DIR);
+    }
+    if path == "/proc/meminfo" {
+        return Ok(procfs::MEMINFO);
+    }
+    if path.starts_with("/proc/") {
+        return Err(Errno::NoEntry);
+    }
     match fat::lookup(path)? {
         Some(ino) => Ok(ino),
         None => ext4::lookup(path),
@@ -95,6 +106,12 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
 
 /// 返回 inode 类型、长度、链接数和磁盘占用。
 pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
+    if ino == procfs::DIR {
+        return Ok((0o040555, 0, 2, 0));
+    }
+    if ino == procfs::MEMINFO {
+        return Ok((0o100444, procfs::meminfo()?.len() as u64, 1, 0));
+    }
     if ino & FAT_INODE != 0 {
         fat::stat(ino)
     } else {
@@ -177,7 +194,7 @@ pub fn write_raw(ino: u32, offset: usize, data: &[u8]) -> Result<usize, Errno> {
     }
 }
 
-/// 调整普通文件长度；存活共享映射拒绝改变长度，FAT 仅支持原有清零操作。
+/// 调整普通文件长度；有 MM hooks 时通知其撤销映射，否则拒绝存活共享页。
 pub fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
     let (mode, current, _, _) = stat(ino)?;
     if mode & 0xf000 == 0x4000 {
@@ -187,9 +204,12 @@ pub fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
         return Err(Errno::Invalid);
     }
     if current != length {
-        cache::check_truncate(ino)?;
+        if cache::has_live(ino) && !mapping::registered() {
+            return Err(Errno::NotSupported);
+        }
+        mapping::prepare_resize(ino, current, length)?;
     }
-    if ino & FAT_INODE != 0 {
+    let result = if ino & FAT_INODE != 0 {
         if length == 0 {
             fat::truncate(ino)
         } else {
@@ -197,7 +217,12 @@ pub fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
         }
     } else {
         ext4::truncate(ino, length)
+    };
+    if result.is_ok() && current != length {
+        cache::invalidate_inode(ino);
+        mapping::commit_resize(ino, current, length);
     }
+    result
 }
 
 /// 持有 inode 的打开引用。

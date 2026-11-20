@@ -5,21 +5,43 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::sync::atomic::{AtomicBool, Ordering};
 use polyhal::PhysAddr;
 use spin::Mutex;
+
 static PAGES: Mutex<Vec<(u32, usize, Weak<SharedPage>)>> = Mutex::new(Vec::new());
 
-/// 有存活共享页时拒绝改变文件长度；调用方保证单核非抢占的检查与截断顺序。
-pub(super) fn check_truncate(ino: u32) -> Result<(), Errno> {
-    if PAGES
+/// 是否有存活共享页；调用方保证单核非抢占的检查与截断顺序。
+pub(super) fn has_live(ino: u32) -> bool {
+    PAGES
         .lock()
         .iter()
         .any(|(id, _, page)| *id == ino && page.strong_count() != 0)
-    {
-        Err(Errno::NotSupported)
-    } else {
-        Ok(())
-    }
+}
+
+/// 查询同一 inode/offset 是否已有驻留共享页；不触发读取/分配。
+#[allow(dead_code)] // MM 的 mincore 在后续 PR 接入
+pub fn resident(ino: u32, offset: usize) -> bool {
+    PAGES.lock().iter().any(|(id, off, page)| {
+        *id == ino
+            && *off == offset
+            && page
+                .upgrade()
+                .is_some_and(|page| page.valid.load(Ordering::Acquire))
+    })
+}
+
+/// 当前驻留共享页的 KiB 数（按 4 KiB 页计）。
+pub(super) fn cached_kib() -> usize {
+    PAGES
+        .lock()
+        .iter()
+        .filter(|(_, _, page)| {
+            page.upgrade()
+                .is_some_and(|page| page.valid.load(Ordering::Acquire))
+        })
+        .count()
+        * 4
 }
 
 /// 一页共享文件内容，最后一个映射释放时写回。
@@ -28,6 +50,7 @@ pub struct SharedPage {
     ino: u32,
     offset: usize,
     retained: bool,
+    valid: AtomicBool,
 }
 impl SharedPage {
     /// 页表映射使用的物理地址；所有权仍由 Arc 管理。
@@ -42,6 +65,9 @@ impl SharedPage {
     }
 
     fn write_back(&self) -> Result<(), Errno> {
+        if !self.valid.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let len = super::stat(self.ino)?.1 as usize;
         let count = len.saturating_sub(self.offset).min(4096);
         if count != 0 {
@@ -53,17 +79,36 @@ impl SharedPage {
         }
         Ok(())
     }
+
+    fn invalidate(&self) {
+        self.valid.store(false, Ordering::Release);
+    }
 }
 impl Drop for SharedPage {
     fn drop(&mut self) {
         if !self.retained {
             return;
         }
-        if let Err(e) = self.write_back() {
-            log::error!("shared page writeback failed: {:?}", e);
+        if self.valid.load(Ordering::Acquire) {
+            if let Err(e) = self.write_back() {
+                log::error!("shared page writeback failed: {:?}", e);
+            }
         }
         super::release(self.ino);
     }
+}
+
+/// 截断前使某 inode 的旧共享页失效，后续不再写回；索引立即移除。
+pub(super) fn invalidate_inode(ino: u32) {
+    let mut pages = PAGES.lock();
+    for (id, _, page) in pages.iter() {
+        if *id == ino {
+            if let Some(page) = page.upgrade() {
+                page.invalidate();
+            }
+        }
+    }
+    pages.retain(|(id, _, _)| *id != ino);
 }
 
 /// 将指定 inode 的驻留共享页写回文件后端。
@@ -71,11 +116,14 @@ impl Drop for SharedPage {
 pub(super) fn sync_inode(ino: u32) -> Result<(), Errno> {
     for (_, _, page) in PAGES.lock().iter().filter(|(id, _, _)| *id == ino) {
         if let Some(page) = page.upgrade() {
-            page.write_back()?;
+            if page.valid.load(Ordering::Acquire) {
+                page.write_back()?;
+            }
         }
     }
     Ok(())
 }
+
 /// 取得同一 inode/offset 的唯一共享页。
 pub fn page(ino: u32, offset: usize) -> Result<Arc<SharedPage>, Errno> {
     let mut pages = PAGES.lock();
@@ -84,6 +132,7 @@ pub fn page(ino: u32, offset: usize) -> Result<Arc<SharedPage>, Errno> {
         .iter()
         .find(|(i, o, _)| *i == ino && *o == offset)
         .and_then(|(_, _, p)| p.upgrade())
+        .filter(|page| page.valid.load(Ordering::Acquire))
     {
         return Ok(p);
     }
@@ -96,6 +145,7 @@ pub fn page(ino: u32, offset: usize) -> Result<Arc<SharedPage>, Errno> {
         ino,
         offset,
         retained: false,
+        valid: AtomicBool::new(true),
     })?;
     p.store(0, &data)?;
     let page = Arc::get_mut(&mut p).ok_or(Errno::Io)?;
@@ -104,6 +154,7 @@ pub fn page(ino: u32, offset: usize) -> Result<Arc<SharedPage>, Errno> {
     pages.push((ino, offset, Arc::downgrade(&p)));
     Ok(p)
 }
+
 /// 文件 read 覆盖共享页中的最新内容，write 同步更新已有映射。
 pub fn coherent(ino: u32, offset: usize, data: &mut [u8], write: bool) {
     let Some(request_end) = offset.checked_add(data.len()) else {
@@ -120,6 +171,9 @@ pub fn coherent(ino: u32, offset: usize, data: &mut [u8], write: bool) {
             continue;
         }
         if let Some(page) = page.upgrade() {
+            if !page.valid.load(Ordering::Acquire) {
+                continue;
+            }
             let result = if write {
                 page.store(begin - *start, &data[begin - offset..end - offset])
             } else {
