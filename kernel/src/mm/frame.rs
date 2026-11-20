@@ -42,6 +42,20 @@ pub fn stats() -> (usize, usize) {
     (a.total, a.free)
 }
 
+/// 供 procfs 读取的帧统计快照，单位 KiB；未包含永久保留区。
+pub struct MemorySnapshot {
+    pub total_kib: usize,
+    pub free_kib: usize,
+}
+
+pub fn memory_snapshot() -> MemorySnapshot {
+    let (total, free) = stats();
+    MemorySnapshot {
+        total_kib: total * (PAGE_SIZE / 1024),
+        free_kib: free * (PAGE_SIZE / 1024),
+    }
+}
+
 /// 登记经过 region 层排除保留区的页对齐区间；只允许启动主核调用。
 pub(super) fn add_frame_range(start: usize, end: usize) -> Result<(), FrameError> {
     if start >= end || start % PAGE_SIZE != 0 || end % PAGE_SIZE != 0 {
@@ -187,6 +201,20 @@ impl OwnedFrame {
             );
         }
         Ok(())
+    }
+    /// 清零页内半开区间；边界裁剪到本页，空区间无副作用。
+    pub(crate) fn clear_range(&self, start: usize, end: usize) {
+        let end = end.min(PAGE_SIZE);
+        if start < end {
+            // SAFETY: self 持有整页，start < end <= PAGE_SIZE，用户态已暂停。
+            unsafe {
+                core::ptr::write_bytes(
+                    (direct_map_addr(self.pa) + start) as *mut u8,
+                    0,
+                    end - start,
+                );
+            }
+        }
     }
     /// 将另一拥有页复制到本页；传入自身也合法。
     pub fn copy_from(&self, source: &OwnedFrame) {

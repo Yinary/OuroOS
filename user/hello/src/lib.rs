@@ -137,6 +137,11 @@ pub fn sys_sched_yield() -> isize {
     syscall3(124, 0, 0, 0)
 }
 
+/// 请求预读可读普通文件，不改变文件偏移。
+pub fn sys_readahead(fd: usize, offset: usize, count: usize) -> isize {
+    syscall3(213, fd, offset, count)
+}
+
 /// getpid(2)：返回调用者 pid。
 pub fn sys_getpid() -> isize {
     syscall3(172, 0, 0, 0)

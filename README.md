@@ -53,17 +53,18 @@ check: all syscall paths ok, faulting now
 
 | 编号 | 名称 | 已支持与限制 |
 |---|---|---|
-| 214 | brk | 查询、扩展、收缩；失败返回原 break，立即分配物理页 |
-| 222 | mmap | 私有匿名、私有/共享文件映射、MAP_FIXED 事务替换；偏移按页对齐，超出文件 EOF 的整页范围拒绝（尚无 SIGBUS 缺页） |
+| 213 | readahead | 普通文件按偏移预读，最多 128 KiB，保留文件游标 |
+| 214 | brk | 查询、扩展、收缩；失败返回原 break，物理页按首次访问分配 |
+| 222 | mmap | 私有与共享匿名、文件映射、MAP_FIXED 事务替换；访问整个位于 EOF 外的页按 SIGBUS 终止 |
 | 215 | munmap | 起址必须页对齐，长度向上取整，允许空洞；零长度拒绝 |
-| 226 | mprotect | 修改读写、PROT_NONE；两架构不实现 NX，撤销 PROT_EXEC 返回 EOPNOTSUPP（95） |
+| 226 | mprotect | 支持修改读写权限和 PROT_NONE；可访问页实际可执行，写保护由页表执行 |
 
-可访问页实际允许执行，PROT_WRITE 蕴含 PROT_READ。尚未实现按需分页、COW、SIGBUS 与远端 TLB 同步。
+可访问页实际允许执行，PROT_WRITE 蕴含 PROT_READ。每个任务拥有带未映射保护页的内核栈。支持 mremap、mincore、madvise、msync 和锁页调用，细节见内存契约。fork 深拷贝私有驻留页，TLB 刷新限于当前核。
 
 ## 测试情况
 
 - 2026-11 双架构 `basic` 组 32 个官方测试点在本地通过（官方 ELF 未修改），`basic_edges` 与 `selftest` 档（mm 自检 + 帧守恒）同样通过。
-- 其余官方测例（busybox、lua、libctest 等）尚未接入。
+- 双架构已运行 musl BusyBox 脚本及部分原版 LTP 内存用例；整套尚未通过。
 
 ## 文档
 
@@ -97,3 +98,5 @@ check: all syscall paths ok, faulting now
 ## 许可证
 
 MIT，见 [LICENSE](LICENSE)。
+
+MM 回归入口：`tests/run_group.py` 分别运行两架构 basic、边界测试和内核自检。文件映射短写重试使用 `tests/file_mapping.rs` 注入故障。 与存储分支联合运行时，`tests/mm_file_resize.c` 验证共享页驻留、文件截断与扩长写回。支持范围、无 NX 的权限约定及原版 LTP 尚未通过的原因见 [内核接口契约](docs/ostd-contracts.md)。

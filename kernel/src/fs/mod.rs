@@ -227,7 +227,6 @@ pub fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
 
 /// 同步指定 inode 的共享文件页范围。
 #[cfg(not(feature = "rsext4-readonly"))]
-#[allow(dead_code)] // MM msync 在后续 PR 接入
 pub fn sync_mapping(ino: u32, offset: usize, length: usize) -> Result<(), Errno> {
     cache::sync_span(ino, offset, length)?;
     ext4::sync()
@@ -235,7 +234,6 @@ pub fn sync_mapping(ino: u32, offset: usize, length: usize) -> Result<(), Errno>
 
 /// 只读构建没有可写回的后端。
 #[cfg(feature = "rsext4-readonly")]
-#[allow(dead_code)] // MM msync 在后续 PR 接入
 pub fn sync_mapping(_ino: u32, _offset: usize, _length: usize) -> Result<(), Errno> {
     Err(Errno::ReadOnly)
 }

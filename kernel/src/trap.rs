@@ -56,9 +56,17 @@ pub fn emulate_unaligned(
 /// 用户异常的种类（对应用户程序可能触发的 TrapType 子集）。
 #[derive(Debug, Clone, Copy)]
 pub enum UserFaultKind {
+    /// 文件映射整页超出 EOF，信号模块接收 BUS_ADRERR。
+    #[allow(dead_code)]
+    FileBusError,
+    /// 文件后端 I/O 失败，信号模块接收 BUS_OBJERR。
+    #[allow(dead_code)]
+    FileIoError,
     StorePageFault,
     LoadPageFault,
     InstructionPageFault,
+    /// 用户缺页耗尽内存，终止当前任务。
+    UserFaultOom,
     IllegalInstruction,
     Breakpoint,
     /// HAL 无法分类的异常（polyhal-trap 补丁新增，见其 README；
@@ -66,6 +74,17 @@ pub enum UserFaultKind {
     Unhandled,
     /// 用户非对齐指令无法安全模拟。
     AddressNotAligned,
+}
+
+impl UserFaultKind {
+    /// 当前默认致命异常的 wait 状态（尚无用户信号处理器）。
+    pub fn signal(self) -> u32 {
+        match self {
+            Self::FileBusError | Self::FileIoError => 7,
+            Self::UserFaultOom => 9,
+            _ => 11,
+        }
+    }
 }
 
 /// 一次用户态异常的信息。
