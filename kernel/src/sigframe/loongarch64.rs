@@ -11,7 +11,7 @@ use crate::task::signal::{
     SigInfoSlot, SignalDisposition, SignalSet, SignalSetExt, SIGKILL, SIGSTOP, SS_DISABLE,
 };
 
-use super::{fill_siginfo, on_alt_stack, FrameError};
+use super::{fill_siginfo, frame_addr, on_alt_stack, FrameError};
 
 /// ucontext 起点（siginfo 之后）：uc_flags/uc_link 在此连续 16 字节。
 const OFF_UCONTEXT: usize = 128;
@@ -80,12 +80,16 @@ pub fn build_deliver(
         Some((alt_sp, alt_size))
             if d.flags & SA_ONSTACK != 0 && !on_alt_stack(cur_sp, alt_sp, alt_size) =>
         {
-            alt_sp + alt_size
+            // 登记区间上界不可表达时该备用栈不可用，回退主栈。
+            alt_sp.checked_add(alt_size).unwrap_or(cur_sp)
         }
         _ => cur_sp,
     };
-    // 先减帧再对齐 16 字节。
-    let base = stack_top.saturating_sub(FRAME_SIZE) & !0xF;
+    // 帧基址下溢视为用户地址访问失败。
+    let base = stack_top
+        .checked_sub(FRAME_SIZE)
+        .ok_or(FrameError::Access)?
+        & !0xF;
 
     // 写帧头：siginfo 与 ucontext（uc_flags/uc_link 为零），
     // uc_stack 回写当前备用栈登记。
@@ -96,17 +100,17 @@ pub fn build_deliver(
     let mut siginfo = [0u8; 128];
     fill_siginfo(&mut siginfo, sig, slot);
     write(space, base, &siginfo)?;
-    write(space, base + OFF_UCONTEXT, &[0u8; 16])?;
+    write(space, frame_addr(base, OFF_UCONTEXT)?, &[0u8; 16])?;
     let mut uc_stack = [0u8; 24];
     uc_stack[0..8].copy_from_slice(&ss_sp.to_ne_bytes());
     uc_stack[8..12].copy_from_slice(&ss_flags.to_ne_bytes());
     uc_stack[16..24].copy_from_slice(&ss_size.to_ne_bytes());
-    write(space, base + OFF_UC_STACK, &uc_stack)?;
+    write(space, frame_addr(base, OFF_UC_STACK)?, &uc_stack)?;
 
     // uc_sigmask：存 save_mask，sigreturn 时恢复。
     let mut sigmask = [0u8; 128];
     sigmask[..8].copy_from_slice(&save_mask.to_ne_bytes());
-    write(space, base + OFF_UC_SIGMASK, &sigmask)?;
+    write(space, frame_addr(base, OFF_UC_SIGMASK)?, &sigmask)?;
 
     // sigcontext：sc_pc、sc_regs、sc_flags=SC_USED_FP。
     let mut sc = [0u8; 272];
@@ -116,7 +120,7 @@ pub fn build_deliver(
     }
     // 缓冲区内偏移：pc 8 + regs 256 = 264，sc_flags 紧随其后。
     sc[264..268].copy_from_slice(&SC_USED_FP.to_ne_bytes());
-    write(space, base + OFF_SC_PC, &sc)?;
+    write(space, frame_addr(base, OFF_SC_PC)?, &sc)?;
 
     // FPU 块：sctx_info + regs[32] + fcc + fcsr（小端）。
     // fcsr_pending 未实现，偏差登记 docs/ostd-contracts.md §4.5。
@@ -132,23 +136,23 @@ pub fn build_deliver(
     }
     fpu[SCTX_INFO_SIZE + 256..SCTX_INFO_SIZE + 264].copy_from_slice(&fcc.to_ne_bytes());
     fpu[SCTX_INFO_SIZE + 264..SCTX_INFO_SIZE + 268].copy_from_slice(&frame.fcsr.to_ne_bytes());
-    write(space, base + OFF_SC_EXT, &fpu)?;
+    write(space, frame_addr(base, OFF_SC_EXT)?, &fpu)?;
 
     // END 结点：magic=size=0（16 字节全零一次写入）。
-    write(space, base + OFF_SC_END, &[0u8; SCTX_INFO_SIZE])?;
+    write(space, frame_addr(base, OFF_SC_END)?, &[0u8; SCTX_INFO_SIZE])?;
 
     // 帧内嵌 sigreturn stub，r1 指向它（本内核无 vDSO）。
     let mut stub = [0u8; 8];
     stub[..4].copy_from_slice(&SIGRETURN_STUB[0].to_ne_bytes());
     stub[4..].copy_from_slice(&SIGRETURN_STUB[1].to_ne_bytes());
-    write(space, base + OFF_STUB, &stub)?;
+    write(space, frame_addr(base, OFF_STUB)?, &stub)?;
 
     // handler 现场寄存器。
-    frame[TrapFrameArgs::RA] = base + OFF_STUB;
+    frame[TrapFrameArgs::RA] = frame_addr(base, OFF_STUB)?;
     frame[TrapFrameArgs::SP] = base;
     frame[TrapFrameArgs::ARG0] = sig as usize;
     frame[TrapFrameArgs::ARG1] = base;
-    frame[TrapFrameArgs::ARG2] = base + OFF_UCONTEXT;
+    frame[TrapFrameArgs::ARG2] = frame_addr(base, OFF_UCONTEXT)?;
     frame[TrapFrameArgs::SEPC] = d.handler;
 
     // handler 期间屏蔽：blocked_now | sa_mask | 本信号。
@@ -164,19 +168,19 @@ pub fn restore(frame: &mut TrapFrame, space: &UserAddressSpace) -> Result<Signal
 
     // 校验前移：整段读出并核验，全部通过才写回现场。
     let mut sigmask = [0u8; 8];
-    read(space, base + OFF_UC_SIGMASK, &mut sigmask)?;
+    read(space, frame_addr(base, OFF_UC_SIGMASK)?, &mut sigmask)?;
     let mut old_blocked = SignalSet::from_ne_bytes(sigmask);
     old_blocked.del(SIGKILL);
     old_blocked.del(SIGSTOP);
 
     // sc_flags 仅核验可读性，浮点恒恢复。
     let mut flags = [0u8; 4];
-    read(space, base + OFF_SC_FLAGS, &mut flags)?;
+    read(space, frame_addr(base, OFF_SC_FLAGS)?, &mut flags)?;
 
     // parse_extcontext：走到 END；只认 FPU 块，其余 magic 为 badframe。
     // 步数上限 8。
     let mut fpu_base = None;
-    let mut cursor = base + OFF_SC_EXT;
+    let mut cursor = frame_addr(base, OFF_SC_EXT)?;
     for _ in 0..8 {
         let mut hdr = [0u8; SCTX_INFO_SIZE];
         read(space, cursor, &mut hdr)?;
@@ -188,17 +192,17 @@ pub fn restore(frame: &mut TrapFrame, space: &UserAddressSpace) -> Result<Signal
                 if size < FPU_BLOCK_MIN {
                     return Err(FrameError::BadFrame);
                 }
-                fpu_base = Some(cursor + SCTX_INFO_SIZE);
+                fpu_base = Some(frame_addr(cursor, SCTX_INFO_SIZE)?);
             }
             _ => return Err(FrameError::BadFrame),
         }
-        cursor += size;
+        cursor = frame_addr(cursor, size)?;
     }
 
     let mut sc_pc = [0u8; 8];
-    read(space, base + OFF_SC_PC, &mut sc_pc)?;
+    read(space, frame_addr(base, OFF_SC_PC)?, &mut sc_pc)?;
     let mut regs = [0u8; 256];
-    read(space, base + OFF_SC_REGS, &mut regs)?;
+    read(space, frame_addr(base, OFF_SC_REGS)?, &mut regs)?;
 
     // 全部校验通过后恢复 sc_pc、sc_regs 与 FPU 现场。
     frame[TrapFrameArgs::SEPC] = usize::from_ne_bytes(sc_pc);

@@ -331,7 +331,7 @@ IGN 或 DFL 且默认动作属 Ign/Cont 静默丢弃。同步（硬件）信号�
 **欠账**（下一里程碑）：停止/继续状态机（SIGSTOP/SIGTSTP/SIGCONT、
 Stopped 态、wait4 WUNTRACED/WCONTINUED——libc-test 前必须）；进程组/
 会话/TTY（交互作业控制前置）；RT 信号排队；setitimer/SIGALRM；
-signalfd4；restart_syscall(219) 精确重启。验证方式：本地 18 项综合
+signalfd4；restart_syscall(219) 精确重启。验证方式：本地 19 项综合
 自测（两架构，不入库）；libc-test 信号用例待接入。
 
 ## 5. sync 锁模型

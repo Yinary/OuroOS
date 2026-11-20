@@ -24,6 +24,11 @@ pub enum FrameError {
     BadFrame,
 }
 
+/// 合成帧内字段地址 `base + off`；溢出返回 [`FrameError::Access`]。
+pub(super) fn frame_addr(base: usize, off: usize) -> Result<usize, FrameError> {
+    base.checked_add(off).ok_or(FrameError::Access)
+}
+
 /// 用户栈指针 sp 是否落在备用栈区间内。
 pub(super) fn on_alt_stack(sp: usize, base: usize, size: usize) -> bool {
     sp > base && sp - base <= size

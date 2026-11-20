@@ -214,6 +214,10 @@ pub(super) fn rt_sigaltstack(
         } else if flags == 0 {
             let ss_sp = usize::from_ne_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
             let ss_size = usize::from_ne_bytes(raw[16..24].try_into().unwrap_or([0; 8]));
+            // 区间上界不可表达：按 access_ok 失败返回 EFAULT，拒绝登记。
+            if ss_sp.checked_add(ss_size).is_none() {
+                return Err(Errno::Fault);
+            }
             // size != 0 即启用；size=0 等价于禁用。
             state.set_alt_stack(ss_sp, ss_size, ss_size != 0);
         } else {

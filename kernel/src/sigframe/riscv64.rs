@@ -11,7 +11,7 @@ use crate::task::signal::{
     SigInfoSlot, SignalDisposition, SignalSet, SignalSetExt, SIGKILL, SIGSTOP, SS_DISABLE,
 };
 
-use super::{fill_siginfo, on_alt_stack, FrameError};
+use super::{fill_siginfo, frame_addr, on_alt_stack, FrameError};
 
 /// ucontext 起点（siginfo 之后）：uc_flags/uc_link 在此连续 16 字节。
 const OFF_UCONTEXT: usize = 128;
@@ -66,11 +66,16 @@ pub fn build_deliver(
         Some((alt_sp, alt_size))
             if d.flags & SA_ONSTACK != 0 && !on_alt_stack(cur_sp, alt_sp, alt_size) =>
         {
-            alt_sp + alt_size
+            // 登记区间上界不可表达时该备用栈不可用，回退主栈。
+            alt_sp.checked_add(alt_size).unwrap_or(cur_sp)
         }
         _ => cur_sp,
     };
-    let base = stack_top.wrapping_sub(FRAME_SIZE) & !0xF;
+    // 帧基址下溢视为用户地址访问失败。
+    let base = stack_top
+        .checked_sub(FRAME_SIZE)
+        .ok_or(FrameError::Access)?
+        & !0xF;
 
     // 写帧头：siginfo 与 ucontext（uc_flags/uc_link 为零），
     // uc_stack 回写当前备用栈登记。
@@ -81,17 +86,17 @@ pub fn build_deliver(
     let mut siginfo = [0u8; 128];
     fill_siginfo(&mut siginfo, sig, slot);
     write(space, base, &siginfo)?;
-    write(space, base + OFF_UCONTEXT, &[0u8; 16])?;
+    write(space, frame_addr(base, OFF_UCONTEXT)?, &[0u8; 16])?;
     let mut uc_stack = [0u8; 24];
     uc_stack[0..8].copy_from_slice(&ss_sp.to_ne_bytes());
     uc_stack[8..12].copy_from_slice(&ss_flags.to_ne_bytes());
     uc_stack[16..24].copy_from_slice(&ss_size.to_ne_bytes());
-    write(space, base + OFF_UC_STACK, &uc_stack)?;
+    write(space, frame_addr(base, OFF_UC_STACK)?, &uc_stack)?;
 
     // uc_sigmask：存 save_mask，sigreturn 时恢复。
     let mut sigmask = [0u8; 128];
     sigmask[..8].copy_from_slice(&save_mask.to_ne_bytes());
-    write(space, base + OFF_UC_SIGMASK, &sigmask)?;
+    write(space, frame_addr(base, OFF_UC_SIGMASK)?, &sigmask)?;
 
     // sc_regs：pc 与 x1..x31，共 256 字节。
     let mut regs = [0u8; 256];
@@ -99,7 +104,7 @@ pub fn build_deliver(
     for (i, r) in frame.x[1..].iter().enumerate() {
         regs[(i + 1) * 8..(i + 2) * 8].copy_from_slice(&r.to_ne_bytes());
     }
-    write(space, base + OFF_UC_MCONTEXT, &regs)?;
+    write(space, frame_addr(base, OFF_UC_MCONTEXT)?, &regs)?;
 
     // sc_fpregs：d 态（f[0..32] 位模式 + fcsr 低 32 位）。
     let mut fp = [0u8; 260];
@@ -107,23 +112,23 @@ pub fn build_deliver(
         fp[i * 8..i * 8 + 8].copy_from_slice(&r.to_ne_bytes());
     }
     fp[256..260].copy_from_slice(&(frame.fcsr as u32).to_ne_bytes());
-    write(space, base + OFF_SC_UNION, &fp)?;
+    write(space, frame_addr(base, OFF_SC_UNION)?, &fp)?;
 
     // sc_extdesc：reserved 与 END 头共 12 字节全零。
-    write(space, base + OFF_SC_RSVD, &[0u8; 12])?;
+    write(space, frame_addr(base, OFF_SC_RSVD)?, &[0u8; 12])?;
 
     // 帧内嵌 sigreturn stub，ra 指向它（本内核无 vDSO）。
     let mut stub = [0u8; 8];
     stub[..4].copy_from_slice(&SIGRETURN_STUB[0].to_ne_bytes());
     stub[4..].copy_from_slice(&SIGRETURN_STUB[1].to_ne_bytes());
-    write(space, base + OFF_STUB, &stub)?;
+    write(space, frame_addr(base, OFF_STUB)?, &stub)?;
 
     // handler 现场寄存器。
-    frame[TrapFrameArgs::RA] = base + OFF_STUB;
+    frame[TrapFrameArgs::RA] = frame_addr(base, OFF_STUB)?;
     frame[TrapFrameArgs::SP] = base;
     frame[TrapFrameArgs::ARG0] = sig as usize;
     frame[TrapFrameArgs::ARG1] = base;
-    frame[TrapFrameArgs::ARG2] = base + OFF_UCONTEXT;
+    frame[TrapFrameArgs::ARG2] = frame_addr(base, OFF_UCONTEXT)?;
     frame[TrapFrameArgs::SEPC] = d.handler;
 
     // handler 期间屏蔽：blocked_now | sa_mask | 本信号。
@@ -139,27 +144,27 @@ pub fn restore(frame: &mut TrapFrame, space: &UserAddressSpace) -> Result<Signal
 
     // 校验前移：整段读出并核验，全部通过才写回现场。
     let mut sigmask = [0u8; 8];
-    read(space, base + OFF_UC_SIGMASK, &mut sigmask)?;
+    read(space, frame_addr(base, OFF_UC_SIGMASK)?, &mut sigmask)?;
     let mut old_blocked = SignalSet::from_ne_bytes(sigmask);
     old_blocked.del(SIGKILL);
     old_blocked.del(SIGSTOP);
 
     let mut rsvd = [0u8; 4];
-    read(space, base + OFF_SC_RSVD, &mut rsvd)?;
+    read(space, frame_addr(base, OFF_SC_RSVD)?, &mut rsvd)?;
     if rsvd != [0; 4] {
         return Err(FrameError::BadFrame);
     }
 
     let mut hdr = [0u8; 8];
-    read(space, base + OFF_SC_HDR, &mut hdr)?;
+    read(space, frame_addr(base, OFF_SC_HDR)?, &mut hdr)?;
     if hdr != [0; 8] {
         return Err(FrameError::BadFrame);
     }
 
     let mut regs = [0u8; 256];
-    read(space, base + OFF_UC_MCONTEXT, &mut regs)?;
+    read(space, frame_addr(base, OFF_UC_MCONTEXT)?, &mut regs)?;
     let mut fp = [0u8; 260];
-    read(space, base + OFF_SC_UNION, &mut fp)?;
+    read(space, frame_addr(base, OFF_SC_UNION)?, &mut fp)?;
 
     // 全部校验通过后恢复 pc、x1..x31 与浮点。
     frame[TrapFrameArgs::SEPC] = usize::from_ne_bytes(regs[..8].try_into().expect("8 bytes"));
