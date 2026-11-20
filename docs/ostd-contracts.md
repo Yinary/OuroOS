@@ -285,6 +285,9 @@ FD 控制依据：[F_DUPFD](https://man7.org/linux/man-pages/man2/F_DUPFD.2const
 
 截断依据：[truncate(2)](https://man7.org/linux/man-pages/man2/truncate.2.html)。按公开语义检查路径、FD、长度和偏移；存活共享映射下拒绝改长属于当前兼容性限制，不代表 Linux 的完整映射截断行为。
 
+FS 通过 `fs::mapping` 注册 MM 映射钩子：注册后，长度改变先由 MM `prepare_resize` 校验并预分配，后端成功后再 `cache::invalidate_inode` 禁止旧共享页写回、`commit_resize` 撤销旧映射；未注册钩子时仍按上面的 EOPNOTSUPP 保守处理。`/proc/meminfo` 为只读快照，open 时捕获一次帧统计与共享页缓存量。
+
+
 重命名依据：[rename(2)](https://man7.org/linux/man-pages/man2/rename.2.html)。复用现有 FS 路径与引用管理，未复制 Linux 实现；当前支持范围见上表。
 
 文件状态查询依据：[stat(2)](https://man7.org/linux/man-pages/man2/stat.2.html)、[statx(2)](https://man7.org/linux/man-pages/man2/statx.2.html) 与 [Linux asm-generic stat UAPI](https://github.com/torvalds/linux/blob/v6.12/include/uapi/asm-generic/stat.h)。按公开 ABI 独立编码，未复制 Linux 实现代码。

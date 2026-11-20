@@ -60,6 +60,7 @@ enum Kind {
         path: String,
         _directory: Option<Arc<DirectoryPath>>,
     },
+    MemInfo(String),
 }
 /// 共享偏移、打开标志和文件资源的持有者。
 pub(crate) struct OpenFile {
@@ -276,6 +277,18 @@ impl Context {
         empty: bool,
         follow: bool,
     ) -> Result<fs::Metadata, Errno> {
+        if input == "/proc" {
+            return Ok(fs::Metadata {
+                ino: super::procfs::DIR as u64,
+                mode: 0o040555,
+                links: 2,
+                block_size: 4096,
+                ..Default::default()
+            });
+        }
+        if input == "/proc/meminfo" {
+            return super::procfs::metadata();
+        }
         if input.is_empty() && empty {
             if dir as isize == -100 {
                 return fs::query(self.cwd(), true);
@@ -477,6 +490,22 @@ impl Context {
         )
     }
 
+    /// 打开只读 /proc/meminfo 快照。
+    pub(crate) fn open_meminfo(&mut self, flags: usize, cloexec: bool) -> Result<usize, Errno> {
+        if flags & (3 | 0x200) != 0 {
+            return Err(Errno::ReadOnly);
+        }
+        if flags & 0x10000 != 0 {
+            return Err(Errno::NotDir);
+        }
+        let file = OpenFile {
+            kind: Kind::MemInfo(super::procfs::meminfo()?),
+            offset: 0,
+            flags: flags & !OPEN_CREATION_FLAGS,
+        };
+        self.install(fs::try_arc(Mutex::new(file))?, cloexec)
+    }
+
     /// 创建管道两端，安装失败时回收已安装的 FD。
     pub(crate) fn pipe(&mut self, flags: usize) -> Result<(usize, usize), Errno> {
         let mut data = VecDeque::new();
@@ -589,10 +618,18 @@ impl OpenFile {
 
     /// 返回打开对象的属性快照；管道与控制台提供合成属性。
     pub(crate) fn metadata(&self) -> Result<fs::Metadata, Errno> {
-        match self.kind {
-            Kind::Inode { ino, .. } => fs::metadata::metadata(ino),
+        match &self.kind {
+            Kind::Inode { ino, .. } => fs::metadata::metadata(*ino),
+            Kind::MemInfo(text) => Ok(fs::Metadata {
+                ino: super::procfs::MEMINFO as u64,
+                mode: 0o100444,
+                links: 1,
+                size: text.len() as u64,
+                block_size: 4096,
+                ..Default::default()
+            }),
             _ => Ok(fs::Metadata {
-                mode: (if matches!(self.kind, Kind::Pipe { .. }) {
+                mode: (if matches!(&self.kind, Kind::Pipe { .. }) {
                     0x1000
                 } else {
                     0x2000
@@ -635,15 +672,20 @@ impl OpenFile {
 
     /// 从起点、当前位置或文件末尾调整偏移；管道返回 ESPIPE。
     pub(crate) fn seek(&mut self, delta: isize, whence: usize) -> Result<usize, Errno> {
-        let ino = match self.kind {
-            Kind::Inode { ino, .. } => ino,
+        let base = match &self.kind {
+            Kind::Inode { ino, .. } => match whence {
+                0 => 0,
+                1 => self.offset,
+                2 => fs::stat(*ino)?.1 as usize,
+                _ => return Err(Errno::Invalid),
+            },
+            Kind::MemInfo(text) => match whence {
+                0 => 0,
+                1 => self.offset,
+                2 => text.len(),
+                _ => return Err(Errno::Invalid),
+            },
             _ => return Err(Errno::SeekPipe),
-        };
-        let base = match whence {
-            0 => 0,
-            1 => self.offset,
-            2 => fs::stat(ino)?.1 as usize,
-            _ => return Err(Errno::Invalid),
         };
         let offset = base as i128 + delta as i128;
         if offset < 0 || offset > isize::MAX as i128 {
@@ -683,6 +725,16 @@ impl OpenFile {
                 }
                 p.data.drain(..delivered);
                 crate::task::sched::request_pipe_wake();
+                Ok(delivered)
+            }
+            Kind::MemInfo(text) => {
+                let bytes = text.as_bytes().get(self.offset..).unwrap_or(&[]);
+                let count = data.len().min(bytes.len());
+                let delivered = deliver(&bytes[..count])?;
+                if delivered > count {
+                    return Err(Errno::Invalid);
+                }
+                self.offset = self.offset.checked_add(delivered).ok_or(Errno::Invalid)?;
                 Ok(delivered)
             }
             Kind::Inode { .. } => {
@@ -735,7 +787,7 @@ impl OpenFile {
     /// 定位 I/O 只接受 inode 对象；流式对象返回 ESPIPE。
     pub(crate) fn check_positioned(&self) -> Result<(), Errno> {
         match self.kind {
-            Kind::Inode { .. } => Ok(()),
+            Kind::Inode { .. } | Kind::MemInfo(_) => Ok(()),
             _ => Err(Errno::SeekPipe),
         }
     }
@@ -749,6 +801,15 @@ impl OpenFile {
         deliver: impl FnOnce(&[u8]) -> Result<usize, Errno>,
     ) -> Result<usize, Errno> {
         self.check_type(first)?;
+        if let Kind::MemInfo(text) = &self.kind {
+            let bytes = text.as_bytes().get(offset..).unwrap_or(&[]);
+            let count = data.len().min(bytes.len());
+            let delivered = deliver(&bytes[..count])?;
+            if delivered > count {
+                return Err(Errno::Invalid);
+            }
+            return Ok(delivered);
+        }
         let ino = match self.kind {
             Kind::Inode { ino, .. } => ino,
             _ => return Err(Errno::SeekPipe),
@@ -820,7 +881,7 @@ pub fn mapping(ctx: &Context, fd: usize, write: bool) -> Result<(u32, bool), Err
     let handle = ctx.get(fd)?;
     let f = handle.lock();
     if f.flags & 3 == 1 || (write && f.flags & 3 != 2) {
-        return Err(Errno::BadF);
+        return Err(Errno::Access);
     }
     if let Kind::Inode { ino, .. } = f.kind {
         if fs::stat(ino)?.0 & 0xf000 == 0x8000 {

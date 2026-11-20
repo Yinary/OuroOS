@@ -140,6 +140,9 @@ pub fn dispatch(
                 return Err(Errno::Invalid);
             }
             let path = ctx.path(a[0], &user_string(space, a[1])?)?;
+            if path == "/proc/meminfo" {
+                return ctx.open_meminfo(a[2], a[2] & 0x80000 != 0);
+            }
             let ino = match fs::lookup(&path) {
                 Ok(ino) => {
                     if a[2] & 0xc0 == 0xc0 {

@@ -8,7 +8,9 @@ mod ext4;
 pub mod cache;
 pub mod context;
 pub mod fat;
+pub mod mapping;
 mod metadata;
+pub mod procfs;
 
 pub(crate) use metadata::{query, Metadata, Timestamp};
 
@@ -87,6 +89,15 @@ pub fn shutdown() -> Result<(), Errno> {
 
 /// 按绝对路径查找 inode。
 pub fn lookup(path: &str) -> Result<u32, Errno> {
+    if path == "/proc" {
+        return Ok(procfs::DIR);
+    }
+    if path == "/proc/meminfo" {
+        return Ok(procfs::MEMINFO);
+    }
+    if path.starts_with("/proc/") {
+        return Err(Errno::NoEntry);
+    }
     match fat::lookup(path)? {
         Some(ino) => Ok(ino),
         None => ext4::lookup(path),
@@ -95,6 +106,12 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
 
 /// 返回 inode 类型、长度、链接数和磁盘占用。
 pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
+    if ino == procfs::DIR {
+        return Ok((0o040555, 0, 2, 0));
+    }
+    if ino == procfs::MEMINFO {
+        return Ok((0o100444, procfs::meminfo()?.len() as u64, 1, 0));
+    }
     if ino & FAT_INODE != 0 {
         fat::stat(ino)
     } else {
@@ -177,7 +194,7 @@ pub fn write_raw(ino: u32, offset: usize, data: &[u8]) -> Result<usize, Errno> {
     }
 }
 
-/// 调整普通文件长度；存活共享映射拒绝改变长度，FAT 仅支持原有清零操作。
+/// 调整普通文件长度；有 MM hooks 时通知其撤销映射，否则拒绝存活共享页。
 pub fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
     let (mode, current, _, _) = stat(ino)?;
     if mode & 0xf000 == 0x4000 {
@@ -187,9 +204,12 @@ pub fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
         return Err(Errno::Invalid);
     }
     if current != length {
-        cache::check_truncate(ino)?;
+        if cache::has_live(ino) && !mapping::registered() {
+            return Err(Errno::NotSupported);
+        }
+        mapping::prepare_resize(ino, current, length)?;
     }
-    if ino & FAT_INODE != 0 {
+    let result = if ino & FAT_INODE != 0 {
         if length == 0 {
             fat::truncate(ino)
         } else {
@@ -197,7 +217,27 @@ pub fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
         }
     } else {
         ext4::truncate(ino, length)
+    };
+    if result.is_ok() && current != length {
+        cache::resize_inode(ino, current as usize, length as usize);
+        mapping::commit_resize(ino, current, length);
     }
+    result
+}
+
+/// 同步指定 inode 的共享文件页范围。
+#[cfg(not(feature = "rsext4-readonly"))]
+#[allow(dead_code)] // MM msync 在后续 PR 接入
+pub fn sync_mapping(ino: u32, offset: usize, length: usize) -> Result<(), Errno> {
+    cache::sync_span(ino, offset, length)?;
+    ext4::sync()
+}
+
+/// 只读构建没有可写回的后端。
+#[cfg(feature = "rsext4-readonly")]
+#[allow(dead_code)] // MM msync 在后续 PR 接入
+pub fn sync_mapping(_ino: u32, _offset: usize, _length: usize) -> Result<(), Errno> {
+    Err(Errno::ReadOnly)
 }
 
 /// 持有 inode 的打开引用。
@@ -236,7 +276,13 @@ pub fn read(ino: u32, offset: usize, data: &mut [u8]) -> Result<usize, Errno> {
 }
 /// 写磁盘后同步共享页。
 pub fn write(ino: u32, offset: usize, data: &[u8]) -> Result<usize, Errno> {
+    let old = stat(ino)?.1 as usize;
     let n = write_raw(ino, offset, data)?;
+    let end = offset.checked_add(n).ok_or(Errno::Invalid)?;
+    if end > old {
+        cache::resize_inode(ino, old, end);
+        mapping::commit_resize(ino, old as u64, end as u64);
+    }
     let mut buf = [0; 4096];
     let mut done = 0;
     while done < n {
