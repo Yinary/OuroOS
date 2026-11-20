@@ -225,6 +225,12 @@ pub fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
     result
 }
 
+/// 同步指定 inode 的共享文件页；当前实现按 inode 全量同步。
+#[cfg(not(feature = "rsext4-readonly"))]
+pub fn sync_mapping(ino: u32, _offset: usize, _length: usize) -> Result<(), Errno> {
+    sync_inode(ino)
+}
+
 /// 持有 inode 的打开引用。
 pub fn retain(ino: u32) -> Result<(), Errno> {
     if ino & FAT_INODE != 0 {

@@ -48,6 +48,9 @@ fn expect(got: isize, want: isize) {
 /// 用户主函数（由 _start 调用，不返回）
 #[no_mangle]
 extern "C" fn ouro_main() -> ! {
+    if hello::sys_readahead(usize::MAX, 0, 1) != EBADF {
+        sys_exit(1);
+    }
     let msg: &[u8] = b"check: write ok\n";
 
     // 1) 正常写 + 返回字节数
@@ -96,7 +99,12 @@ fn mm_checks() {
     expect(sys_write_raw(1, base, 1), EFAULT);
     expect(sys_mmap(0, 0, 3, 0x22, usize::MAX, 0), -22);
     expect(sys_mmap(0, 4096, 3, 0x22, usize::MAX, 1), -22);
-    expect(sys_mmap(0, 4096, 3, 0x21, usize::MAX, 0), -95);
+    let shared = sys_mmap(0, 4096, 3, 0x21, usize::MAX, 0);
+    if shared < 0 {
+        sys_exit(1);
+    }
+    expect(sys_mprotect(shared as usize, 4096, 1), 0);
+    expect(sys_munmap(shared as usize, 4096), 0);
     let p = sys_mmap(0, 12288, 3, 0x22, usize::MAX, 0);
     if p < 0 {
         sys_exit(11);
@@ -118,7 +126,8 @@ fn mm_checks() {
         expect(((p + 4096) as *const u8).read_volatile() as isize, 0);
         expect(((p + 8192) as *const u8).read_volatile() as isize, 31);
     }
-    expect(sys_mprotect(p, 4096, 3), -95);
+    expect(sys_mprotect(p, 4096, 1), 0);
+    expect(sys_mprotect(p, 4096, 3), 0);
     expect(sys_mprotect(p, 4096, 0), 0);
     expect(sys_write_raw(1, p, 1), EFAULT);
     expect(sys_mprotect(p, 4096, 7), 0);

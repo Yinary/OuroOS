@@ -81,7 +81,6 @@ impl SharedPage {
     }
 
     /// 该页是否仍可写回；截断越过 EOF 后为 false。
-    #[allow(dead_code)] // MM 的 stale 检查在后续 PR 接入
     pub fn is_valid(&self) -> bool {
         self.valid.load(Ordering::Acquire)
     }
@@ -155,6 +154,30 @@ pub(crate) fn invalidate_inode(ino: u32) {
         }
     }
     pages.retain(|(id, _, _)| *id != ino);
+}
+
+/// 将驻留共享页写回文件后端；None 表示全部 inode。
+pub(crate) fn flush(ino: Option<u32>) -> Result<(), Errno> {
+    for (id, _, page) in PAGES.lock().iter() {
+        if ino.is_some_and(|want| *id != want) {
+            continue;
+        }
+        if let Some(page) = page.upgrade() {
+            if page.valid.load(Ordering::Acquire) {
+                page.write_back()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 仍被强引用持有的共享页帧数（任务退出帧守恒自检用）。
+pub(crate) fn retained_frames() -> usize {
+    PAGES
+        .lock()
+        .iter()
+        .filter_map(|(_, _, page)| page.upgrade())
+        .count()
 }
 
 /// 将指定 inode 的驻留共享页写回文件后端。

@@ -1,6 +1,10 @@
 //! 进程工作目录、FD 表和打开文件对象；提供内核缓冲区读写与管道操作。
 #![deny(unsafe_code)]
-use crate::{fs, syscall::Errno};
+use crate::{
+    fs,
+    mm::{address_space::UserAddressSpace, user_access},
+    syscall::Errno,
+};
 use alloc::{
     collections::VecDeque,
     string::String,
@@ -877,6 +881,60 @@ pub fn executable(ctx: &Context, path: &str) -> Result<Vec<u8>, Errno> {
     Ok(data)
 }
 /// 获取 mmap 用的普通文件，权限来自打开方式。
+/// poll(2) 子集：按 fd 表状态返回就绪数；pipe 的等待由任务层处理。
+pub(crate) fn poll(
+    ctx: &Context,
+    space: &UserAddressSpace,
+    addr: usize,
+    count: usize,
+) -> Result<usize, Errno> {
+    if count > 1024 {
+        return Err(Errno::Invalid);
+    }
+    let mut ready = 0;
+    for i in 0..count {
+        let at = addr.checked_add(i * 8).ok_or(Errno::Fault)?;
+        let mut bytes = [0; 8];
+        user_access::copy_from_user(space, at, &mut bytes).map_err(|_| Errno::Fault)?;
+        let fd = i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let requested = u16::from_ne_bytes([bytes[4], bytes[5]]);
+        let events: u16 = if fd < 0 {
+            0
+        } else if let Ok(file) = ctx.get(fd as usize) {
+            let file = file.lock();
+            match &file.kind {
+                Kind::Input => 0x41 & requested,
+                Kind::Output => 0x104 & requested,
+                Kind::Inode { .. } | Kind::MemInfo(_) => 0x145 & requested,
+                Kind::Pipe { pipe, reading } => {
+                    let p = pipe.lock();
+                    if *reading {
+                        (if p.data.is_empty() {
+                            0
+                        } else {
+                            0x41 & requested
+                        }) | (if p.writers == 0 { 16 } else { 0 })
+                    } else {
+                        (if p.data.len() < PIPE_CAPACITY {
+                            0x104 & requested
+                        } else {
+                            0
+                        }) | (if p.readers == 0 { 8 } else { 0 })
+                    }
+                }
+            }
+        } else {
+            32
+        };
+        user_access::copy_to_user(space, at + 6, &events.to_ne_bytes())
+            .map_err(|_| Errno::Fault)?;
+        if events != 0 {
+            ready += 1;
+        }
+    }
+    Ok(ready)
+}
+
 pub fn mapping(ctx: &Context, fd: usize, write: bool) -> Result<(u32, bool), Errno> {
     let handle = ctx.get(fd)?;
     let f = handle.lock();

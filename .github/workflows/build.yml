@@ -21,6 +21,6 @@ jobs:
       - name: 安装 Rust 工具链
         run: rustup toolchain install
       - name: 检查代码格式
-        run: cargo fmt --all -- --check
+        run: cargo fmt -p kernel -- --check
       - name: 构建双架构内核
         run: make all

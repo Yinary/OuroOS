@@ -10,6 +10,7 @@ mod allocator;
 mod config;
 mod drivers;
 mod elf;
+mod entropy;
 mod fs;
 mod hal;
 mod lang_items;
@@ -27,7 +28,7 @@ use core::{
 
 use polyhal::{
     common::get_cpu_num,
-    instruction::{ebreak, shutdown},
+    instruction::ebreak,
     irq::IRQ,
     println,
     timer::{current_time, set_next_timer},
@@ -53,6 +54,7 @@ pub static BREAK_TICKS: AtomicUsize = AtomicUsize::new(0);
 fn rust_main(hartid: usize) {
     allocator::init();
     mm::init();
+    entropy::init();
     #[cfg(all(debug_assertions, target_arch = "loongarch64"))]
     trap::self_test_unaligned();
     drivers::init().expect("block device initialization failed");
@@ -129,7 +131,7 @@ fn rust_main(hartid: usize) {
     if let Err(error) = fs::shutdown() {
         log::error!("Ext4 shutdown failed: {:?}", error);
     }
-    shutdown();
+    hal::shutdown();
 }
 
 // 副核入口，正常运行不会到达；保留以满足 define_entry! 两入口签名

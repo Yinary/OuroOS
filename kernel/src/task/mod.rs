@@ -296,8 +296,12 @@ pub fn run(baseline: (usize, usize)) {
     // 走到这里 = idle 判定全部退出，dead 已回收
     // 自检：帧守恒——全部任务退出后帧统计必须回到任务时代前的基线，
     // 覆盖内核栈与用户地址空间的回收（每次启动）
+    if let Err(e) = crate::fs::cache::flush(None) {
+        log::error!("shared page writeback pending at task exit: {:?}", e);
+    }
+    let (total, free) = mm::frame::stats();
     assert_eq!(
-        mm::frame::stats(),
+        (total, free + crate::fs::cache::retained_frames()),
         baseline,
         "frame conservation violated after all tasks exited"
     );

@@ -126,6 +126,15 @@ pub(super) fn self_test() {
     );
 }
 
+fn access_fault(error: user_access::AccessError, fallback: UserFaultKind) -> UnalignedError {
+    UnalignedError::Fault(match error {
+        user_access::AccessError::FileFault => UserFaultKind::FileBusError,
+        user_access::AccessError::FileIo => UserFaultKind::FileIoError,
+        user_access::AccessError::OutOfMemory => UserFaultKind::UserFaultOom,
+        user_access::AccessError::Fault => fallback,
+    })
+}
+
 fn decode(ins: u32) -> Option<Operation> {
     let op10 = ins >> 22;
     let op8 = ins >> 24;
@@ -167,7 +176,7 @@ pub fn emulate_unaligned(
 ) -> Result<(), UnalignedError> {
     let mut ins = [0u8; 4];
     user_access::copy_user_instruction(space, frame.era, &mut ins)
-        .map_err(|_| UnalignedError::Fault(UserFaultKind::InstructionPageFault))?;
+        .map_err(|err| access_fault(err, UserFaultKind::InstructionPageFault))?;
     let ins = u32::from_le_bytes(ins);
     let op = decode(ins).ok_or(UnalignedError::Unsupported)?;
     let rd = (ins & 0x1f) as usize;
@@ -179,7 +188,7 @@ pub fn emulate_unaligned(
         Operation::Load { width, signed } => {
             let mut bytes = [0u8; 8];
             user_access::copy_from_user(space, addr, &mut bytes[..width])
-                .map_err(|_| UnalignedError::Fault(UserFaultKind::LoadPageFault))?;
+                .map_err(|err| access_fault(err, UserFaultKind::LoadPageFault))?;
             let value = match (width, signed) {
                 (2, true) => i16::from_le_bytes([bytes[0], bytes[1]]) as i64 as usize,
                 (2, false) => u16::from_le_bytes([bytes[0], bytes[1]]) as usize,
@@ -197,7 +206,7 @@ pub fn emulate_unaligned(
         Operation::Store { width } => {
             let value = if rd == 0 { 0 } else { frame.regs[rd] };
             user_access::copy_to_user(space, addr, &(value as u64).to_le_bytes()[..width])
-                .map_err(|_| UnalignedError::Fault(UserFaultKind::StorePageFault))?;
+                .map_err(|err| access_fault(err, UserFaultKind::StorePageFault))?;
         }
     }
     frame.era = next_pc;
