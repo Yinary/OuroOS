@@ -266,8 +266,9 @@ impl FilePage {
         }
         Ok(child)
     }
-    pub(super) fn writeback_start(&self) -> Option<(u32, usize)> {
-        matches!(self.mode, Mode::Shared { writable: true }).then_some((self.file.ino, self.offset))
+    /// 同步入口不区分共享映射是否可写；只读映射也要让后端决定错误。
+    pub(super) fn sync_start(&self) -> (u32, usize) {
+        (self.file.ino, self.offset)
     }
 }
 fn map_io(error: Errno) -> MapError {

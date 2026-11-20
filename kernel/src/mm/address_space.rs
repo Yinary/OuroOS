@@ -331,12 +331,7 @@ impl UserAddressSpace {
         if !matches!(kind, AreaKind::Anonymous | AreaKind::Heap | AreaKind::Stack) {
             return Err(MapError::InvalidPermissions);
         }
-        let in_stack = self.areas.iter().any(|a| {
-            a.kind == AreaKind::Stack
-                && a.start <= start
-                && end <= a.end
-                && start >= USER_STACK_BOTTOM
-        });
+        let in_stack = self.stack_covers(start, end);
         if end > GUARD_BOTTOM
             && !in_stack
             && !(kind == AreaKind::Stack && start >= USER_STACK_BOTTOM)
@@ -380,12 +375,7 @@ impl UserAddressSpace {
             true,
             Self::chargeable(AreaKind::Anonymous, false, flags),
         )?;
-        let in_stack = self.areas.iter().any(|a| {
-            a.kind == AreaKind::Stack
-                && a.start <= start
-                && end <= a.end
-                && start >= USER_STACK_BOTTOM
-        });
+        let in_stack = self.stack_covers(start, end);
         if end > GUARD_BOTTOM && !in_stack {
             return Err(MapError::HitsStack);
         }
@@ -406,6 +396,9 @@ impl UserAddressSpace {
         for p in &self.pages {
             if start <= p.va && p.va < end {
                 self.pt.borrow_mut().unmap(p.va);
+                if let Backing::File(file) = &p.frame {
+                    file.discard();
+                }
             }
         }
         self.pages.retain(|p| p.va < start || p.va >= end);
@@ -875,9 +868,8 @@ impl UserAddressSpace {
             let length = area.end.min(end) - first;
             let page = self.page_at(first).ok_or(Errno::Fault)?;
             if let Backing::File(file) = &page.frame {
-                if let Some((ino, offset)) = file.writeback_start() {
-                    crate::fs::sync_mapping(ino, offset, length)?;
-                }
+                let (ino, offset) = file.sync_start();
+                crate::fs::sync_mapping(ino, offset, length)?;
             }
         }
         Ok(())
@@ -916,6 +908,25 @@ impl UserAddressSpace {
         self.lock_onfault = on_fault;
         self.coalesce();
         Ok(())
+    }
+
+    /// 请求区间是否完全由现有用户栈 VMA 覆盖。
+    fn stack_covers(&self, start: usize, end: usize) -> bool {
+        if start < USER_STACK_BOTTOM {
+            return false;
+        }
+        let mut cursor = start;
+        for area in self
+            .areas
+            .iter()
+            .filter(|a| a.kind == AreaKind::Stack && a.start < end && start < a.end)
+        {
+            if area.start > cursor {
+                break;
+            }
+            cursor = cursor.max(area.end);
+        }
+        cursor >= end
     }
 
     /// 精确地址映射的冲突检测，全程由同一个可变地址空间借用保护。
