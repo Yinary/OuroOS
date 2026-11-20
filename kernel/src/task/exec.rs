@@ -73,15 +73,7 @@ pub fn stack(
     user_access::copy_to_user(space, sp + execfn.len(), &[0]).map_err(|_| Errno::TooBig)?;
     let execfn_ptr = sp;
 
-    // AT_RANDOM 必须是真实熵：熵源未播种时 exec 失败（旧现场保留），
-    // 禁止假报随机性
-    if !crate::entropy::ready() {
-        return Err(Errno::NoMem);
-    }
-    let Some(random) = crate::entropy::exec_random() else {
-        // 熵流耗尽（理论上 64 GiB 随机数之后）：按熵源失效处理
-        return Err(Errno::NoMem);
-    };
+    let random = require_random(crate::entropy::exec_random())?;
     sp = sp.checked_sub(random.len()).ok_or(Errno::TooBig)?;
     user_access::copy_to_user(space, sp, &random).map_err(|_| Errno::TooBig)?;
     let random_ptr = sp;
@@ -312,4 +304,14 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
     }
     *frame = next;
     Ok(())
+}
+
+fn require_random(random: Option<[u8; 16]>) -> Result<[u8; 16], Errno> {
+    random.ok_or(Errno::Io)
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn self_test() {
+    assert_eq!(require_random(None), Err(Errno::Io));
+    assert!(require_random(Some([0; 16])).is_ok());
 }

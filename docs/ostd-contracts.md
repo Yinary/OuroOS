@@ -279,7 +279,7 @@ try_lock 失败即报告“持锁跨调度”。
 | faccessat/faccessat2 | 按路径检查存在性；X_OK 要求文件有任一执行位（无执行位 EACCES），R_OK/W_OK 在无凭证模型下放行；flags 仅接受 AT_EACCESS/AT_SYMLINK_NOFOLLOW，NOFOLLOW 暂与跟随一致 | 无 uid/gid 凭证检查 |
 | fchmod/fchmodat | 保留 07777 权限位（含 setuid/setgid/sticky），类型位由 inode 持有；仅普通文件与目录可改。fchmod 按已打开对象的 inode 身份生效（rename/unlink 后仍有效，管道/procfs FD 返回 ENOENT）；fchmodat 按路径，flags 仅接受 0/AT_SYMLINK_NOFOLLOW（后者暂与跟随一致）；FAT 卷返回 ENOTSUP | chmod(2) 未单独提供（走 fchmodat+AT_FDCWD 等价）；无 UID/GID 属主校验与 ACL |
 | syslog/klogctl | 按 man 2 action 编码：READ(2) 消耗式游标读取、READ_ALL(3) 全量、READ_CLEAR(4) 读后清空、CLEAR(5)、OPEN/CLOSE(0/1) 无操作返回 0、console 开关(6/7)无操作、SET_CONSOLE_LEVEL(8) 仅接受 1..=8 并记录（不变更实际输出）、SIZE_UNREAD(9)/SIZE_BUFFER(10) 返回未读/容量；其余 EINVAL | 日志环上限 8 KiB，只收集显式登记事件（启动报告/终态/panic），无内核分级日志 |
-| getrandom | 设备树 rng-seed 播种 ChaCha20 流（单次请求上限 64 KiB，可失败分配）；flags 仅接受 GRND_NONBLOCK/GRND_RANDOM；无种子时一律 EAGAIN（无合法阻塞唤醒来源），绝不以时间/常量伪造熵 | AT_RANDOM 在无种子时使 exec 失败（不假报随机性） |
+| getrandom | 设备树 rng-seed 播种 ChaCha20 流（单次请求上限 64 KiB，可失败分配）；flags 仅接受 GRND_NONBLOCK/GRND_RANDOM；无种子时一律 EAGAIN（无合法阻塞唤醒来源），绝不以时间/常量伪造熵 | 缺少可信启动熵时 execve 返回 EIO，保留旧映像；启动阶段若因此无法创建任何用户任务，内核同步文件系统并关机。 |
 | ioctl | 仅 /dev/misc/rtc 的 RTC_RD_TIME（cmd 按 unsigned int 截断比较）；其余命令与设备一律 ENOTTY | 终端 TCGETS/TCWINSZ、FIONBIO 等未实现（more 依赖的 isatty 降级为非终端） |
 | read/write/readv/writev | 共用 4 KiB 可失败堆缓冲区，单次分配后复用；向量描述符先复制到内核，最多 1024 项，总长度超过 ssize_t 返回 EINVAL；每次最多搬运 0x7ffff000 字节；遇短传输、EOF 或错误停止，已有进展时返回已完成长度 | 用户缓冲区按页交付，读只推进实际交付的偏移；完整调用持有打开文件锁；OOM 返回 ENOMEM，零长度不分配数据缓冲区 |
 | pread64/pwrite64/preadv/pwritev | 指定独立偏移，不修改共享文件偏移；负偏移 EINVAL，流式对象 ESPIPE；rv64/la64 原始向量定位 ABI 使用完整 pos_l，忽略 pos_h；O_APPEND 下定位写仍追加，与 Linux 已知行为一致 | 不支持 preadv2/pwritev2；Ext4 文件超限 EFBIG 独立于参数过长 E2BIG；部分错误仍按已完成字节数返回 |
@@ -502,6 +502,7 @@ signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综�
 | `make run-rv` / `make run-la` | 默认以 release 内核无盘启动 QEMU，运行七个演示任务（kthread A/B、hello、sched×2、check、ill）；官方原盘判分见下方 test 入口 |
 | `make selftest-rv` / `make selftest-la` | 构建 selftest 内核；启动该产物时启用 debug 断言、lock_debug、LOG=info 及额外 OOM 注入；polyhal #8 需 `-Zub-checks=no` |
 | `make test-rv` / `make test-la` | 官方原盘四组验收（basic/busybox × musl/glibc）：官方 QEMU 命令、原版 judge 判分、每轮干净盘副本；`make test-setup` 准备评测器与原盘 |
+| `tests/file_mapping.rs` | 用仓库固定的 Rust 执行 `rustc --edition=2021 --test tests/file_mapping.rs -o /tmp/ouro-file-mapping && /tmp/ouro-file-mapping`，覆盖缓存写回失败、重试与引用释放。 |
 | `tests/fs_stat.py --metadata` | `make all` 后执行 `python3 tests/fs_stat.py --metadata --output target/fs-validation/metadata`，验证双架构 128/256 字节 inode 的创建掩码、fork/exec、NOW/OMIT、FD/链接时间更新与落盘；只读版本先构建相应 feature，添加 --readonly 并指定独立输出目录，结束后恢复默认内核 |
 | `tests/fs_stat.py --truncate` | 构建后运行；验证双架构 128/256 字节 inode 的缩短、稀疏扩展、零尾部、预分配与索引回收、偏移不变、链接/已删名 FD、父子进程共享映射保护及错误参数；debugfs 独立核对落盘内容并运行 e2fsck/FAT fsck；只读构建增加 --readonly |
 | `tests/fs_stat.py --rename` / `tests/fs_rename_backend.py` | 前者在双架构及两种 inode 大小验证重命名、替换后的旧 FD、目录链接数/父项、扩容、目录引用保护与跨挂载拒绝，运行前后 e2fsck；只读构建另加 --readonly。后者在宿主端逐次注入元数据时间源 EIO，验证替换、插入和扩容后的回滚及 e2fsck，不代表磁盘掉电或所有 I/O 失败验证 |
