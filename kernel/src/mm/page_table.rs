@@ -1,8 +1,9 @@
 //! 可失败的用户页表：根与中间表页有唯一所有权；仅管理用户低半区
-//! （rv 共享内核高半根项，la 内核走 DMW）。
+//! （rv 复制内核高半根项，两架构均共享内核栈窗口根项；la 直映走 DMW）。
 use super::{
     arch,
     frame::{FrameError, OwnedFrame},
+    kstack::WINDOW_ROOT_INDEX,
 };
 use alloc::vec::Vec;
 use polyhal::{
@@ -40,10 +41,15 @@ impl UserPageTable {
     pub(super) fn new() -> Result<Self, FrameError> {
         let root = OwnedFrame::new()?;
         let kernel = super::KERNEL_ROOT.load(core::sync::atomic::Ordering::Relaxed);
+        debug_assert_ne!(kernel, 0, "kernel root must precede user spaces");
         #[cfg(target_arch = "riscv64")]
         for i in 256..512 {
             write(root.addr(), i, read(PhysAddr::new(kernel), i));
         }
+        // 共享窗口 L1 表：后续栈映射只改该表，全部地址空间同时可见。
+        let window = read(PhysAddr::new(kernel), WINDOW_ROOT_INDEX);
+        debug_assert_ne!(window, 0, "kernel stack window root entry missing");
+        write(root.addr(), WINDOW_ROOT_INDEX, window);
         Ok(Self {
             root,
             tables: Vec::new(),

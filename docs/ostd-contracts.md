@@ -24,8 +24,8 @@
 | mm | §1 不变量与失败模型 | `kernel/src/mm/` |
 | polyhal 边界 | §2 可用原语与缺陷 | `third_party/polyhal-trap/` |
 | task | §3 执行、调度、生命周期 | `kernel/src/task/` |
-| syscall | §4 Linux ABI 对照 | `kernel/src/syscall/` |
-| sync | §5 锁模型与锁序 | `kernel/src/sync.rs` |
+| 信号 | §3.4/§3.5/§4.5 投递模型与偏差 | `kernel/src/task/signal.rs`、`kernel/src/sigframe/`、`kernel/src/syscall/signal.rs` |
+| syscall | §4 Linux ABI 对照 | `kernel/src/syscall/` || sync | §5 锁模型与锁序 | `kernel/src/sync.rs` |
 | fs | §6 结构、挂载、偏差 | `kernel/src/fs/`、`kernel/src/drivers/` |
 
 ## 1. mm 契约
@@ -75,8 +75,7 @@
 | region 保留区 | FDT 保留、内核镜像、固件、对齐碎片有类型化来源；HAL 启动占用记 HalBoot |
 | 内核堆 | 固定 8 MiB，TODO 在 `allocator.rs`；mm 元数据 try_reserve |
 | user_access 并发前提 | 单核、内核不可抢占，复制期间无并发 munmap |
-| kstack | 每个任务占用高半区的一个栈槽，底部一页未映射。数据帧连续以支持跨页 DMA；RV 共享根项，LA 使用 PGDH。当前最多 512 个同时存活的任务栈 |
-| ELF | ET_EXEC 静态小端 ELF64；差异见 §4 |
+| kstack | 每栈独占窗口槽（低地址 guard + 8 栈页）；窗口下级表在全部地址空间共享，guard 不映射；rv 复制窗口根项，la 自建仅含窗口项的内核根；数据帧连续以支持跨页 DMA || ELF | ET_EXEC 静态小端 ELF64；差异见 §4 |
 
 ### 1.4 已兑现
 
@@ -87,15 +86,15 @@
 | fork 深拷贝 | `deep_copy`，建成才发布，无 COW |
 | exec 先建后切 | 新空间含 argv/envp/auxv，成功才替换 |
 | 页字节访问收口 | 拥有页复制及 ELF 初始页写入由 mm 封装；`elf.rs`、`fs/cache.rs`、`syscall/memory.rs`、`task/user_task.rs`、`task/exec.rs`、`task/task.rs` 拒绝 `unsafe` |
-| MAP_SHARED 文件页缓存 | `fs/cache.rs`；索引独立持有页，比较有效字节和上次写回基线，失败后可重试。 |
-
+| MAP_SHARED 文件页缓存 | `fs/cache.rs`；索引独立持有页，比较有效字节和上次写回基线，失败后可重试 |
+| 内核栈虚拟窗口 + 底部保护页 | `mm/kstack.rs`；16 GiB 起共享窗口，槽 = guard + 8 栈页，逐页映射，溢出即页错误 |
 ### 1.5 欠账
 
 | 项 | 现状 / 计划 |
 |---|---|
+| 直映硬化 | 直映区 base canary + 去可执行权限；未实现 |
 | 数据页/区域线性扫描 | 区域和页清单均按地址排序，查找走二分；fork/remap 仍逐页遍历 |
-| COW / 通用页缓存 / swap / 远端 TLB | 未做；MAP_SHARED 文件页缓存已实现，不是通用读写页缓存 |
-| 全局堆失败策略 | 8 MiB 固定；pipe 扩容、rsext4 的 `alloc::vec!` 不可失败，可耗尽→panic；需要统一 OOM 策略 |
+| COW / 通用页缓存 / swap / 远端 TLB | 未做；MAP_SHARED 文件页缓存已实现，不是通用读写页缓存 || 全局堆失败策略 | 8 MiB 固定；pipe 扩容、rsext4 的 `alloc::vec!` 不可失败，可耗尽→panic；需要统一 OOM 策略 |
 
 普通文件 readahead(213) 按指定偏移同步预读，单次最多 128 KiB，不推进打开文件的偏移。MADV_FREE 允许立即回收私有匿名页，MADV_POPULATE_READ/WRITE 按实际权限主动触页。
 
@@ -168,7 +167,8 @@ README；不得直接编辑 `~/.cargo/registry`。上游 PR（MIT）待提。
 | 对象 | 内容 | 位置 |
 |---|---|---|
 | Task | 内核栈 + 私有 KContext + 首次入口身体 + pid | 调度器 Box；身体首次取出后为 None |
-| ProcessRecord | 地址空间 + fs + 退出信息 + 父子关系 | 静态 REGISTRY |
+| ProcessRecord | 地址空间 + fs + 退出信息 + 父子关系 + 信号状态 | 静态 REGISTRY |
+| SignalState | 处置表 / pending / blocked / 信息槽 / 备用栈 | `ProcessRecord.signal`；字段按共享侧（处置、pending）与私有侧（blocked、备用栈）分组注释，为线程化预留迁移形状（私有侧届时搬入线程记录） |
 | CURRENT | 当前任务地址（整数存址，绕开裸指针 !Send） | percpu |
 
 Task 与 ProcessRecord 分离是为线程预留；地址空间只住注册表。pid
@@ -186,14 +186,30 @@ CURRENT 记录当前任务地址；调度器的 `current` Box 持有实体，切
 - 终态行积攒到任务时代结束统一输出，不混入用户程序的测试输出；
   积攒预留失败时静默丢弃该行（终态汇总可能缺项，无日志、无计数）——
   降级路径：异常退出可能被掩盖，需失败计数与上报。
-- exit(n) 码为 n；致命异常以 128+11 占位；wait status 见 §4。
+- 终态为 `ExitInfo::{Exited(n), Signaled{sig, fault}}`：exit(n) 为
+  `Exited(n)`；死于信号（kill/默认动作/致命异常映射，见 §4.5）为
+  `Signaled`，fault 携带硬件异常细节供终态报告。wait status 编码：
+  `Exited(n) → (n&255)<<8`、`Signaled{sig} → sig`（WIFSIGNALED/WTERMSIG）；
+  无 core 位（未实现 core dump，见 §4.5）。
+- 子进程退出时向活跃父进程产生 SIGCHLD（槽含 CLD_EXITED/CLD_KILLED、
+  子 pid 与状态）；父处置 IGN 或 SA_NOCLDWAIT 时不产生僵尸，记录即收，
+  运行时间并入父（与收割口径一致）。自动收割不抑制通知：父装 handler
+  时仍照常投递（含 SA_NOCLDWAIT 组合），IGN/DFL-Ign 由处置过滤丢弃；
+  孤儿过继 init 的路径维持即收。
 
 ### 3.5 等待与唤醒
 
-- `Flow::Wait(WaitReason::Deadline/Children/Pipe)`：park 进等待表并
-  切走，保留 syscall PC；醒来重执行重查条件（Mesa 风格）。
-- Deadline 由调度边界按硬件时钟扫描；Children/Pipe 由事件方置无锁
-  原子标志，在调度边界统一消费，避免 fs 在 REGISTRY 内反向取 SCHED。
+- `Flow::Wait(WaitReason::Deadline/Children/Pipe/Signal)`：park 进等待
+  表并切走，保留 syscall PC；醒来重执行重查条件（Mesa 风格）。
+- Deadline 由调度边界按硬件时钟扫描；Children/Pipe/Signal 由事件方置
+  无锁原子标志，在调度边界统一消费，避免 fs 在 REGISTRY 内反向取
+  SCHED。Signal 标志在信号实际入队后置位；drain 持 REGISTRY 一次按
+  "pending & !blocked 非空"精确判定等待者（SCHED→REGISTRY 唯一嵌套点，
+  见 §5），集合外信号假唤醒由唤醒点重查消化，无害。
+- 阻塞 syscall 的信号打断在 park 前后做两次快路径决策（第一次可落
+  睡、睡醒后补一次不落睡重查）：sigsuspend/sigtimedwait/nanosleep 被
+  handler 类信号打断一律以 -EINTR 完成，pipe/wait4 按 SA_RESTART 分
+  重启与 -EINTR；语义规范与偏差见 §4.5。
 - 孵化预留 ready/waiting 各自容纳全部存活任务的容量；集中唤醒不分配。
 - init 在仍有活跃进程时等待 Children 事件，醒后重查条件。
 - 等待表满时 park 退化为就绪让出；就绪空而等待非空时 idle 等时钟；
@@ -202,9 +218,12 @@ CURRENT 记录当前任务地址；调度器的 `current` Box 持有实体，切
 ### 3.6 syscall 框架
 
 内部一律 `Result<_, Errno>`，边界统一转负值。`Flow`（Continue /
-Yield / Wait / Process / Exited）是调用对执行流的全部影响。`Process`
-表示需在 REGISTRY 借用解除后由运行循环处理（fork/exec/wait4/
-nanosleep/times）；非重入锁禁止在 dispatch 锁内调用。
+Yield / Wait / Process / SigReturn / Exited）是调用对执行流的全部
+影响。`Process` 表示需在 REGISTRY 借用解除后由运行循环处理（fork/
+exec/wait4/nanosleep/times/kill/tgkill/sigsuspend/sigtimedwait/
+sigqueueinfo）；`SigReturn` 表示用户现场已从信号帧整体恢复（SEPC 即
+真实返回点），跳过 syscall PC 推进；非重入锁禁止在 dispatch 锁内
+调用。
 
 ### 3.7 锁调试
 
@@ -244,8 +263,8 @@ try_lock 失败即报告“持锁跨调度”。
 |---|---|---|
 | 文件 | getcwd、dup、dup3、fcntl、mkdirat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、readlinkat、statfs、fstatfs、newfstatat、fstat、fsync、statx、umask、utimensat、renameat、renameat2、truncate、ftruncate | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
 | 进程 | exit、nanosleep、sched_yield、times、getpid、getppid、clone、execve、wait4 | `task::process_call` |
-| 内存 | brk、mmap、munmap、mprotect、mremap、mincore、madvise、msync、锁页系列 | `syscall/memory.rs` |
-| 其他 | uname、gettimeofday | `syscall/mod.rs` |
+| 信号 | kill、tgkill、rt_sigaction、rt_sigprocmask、rt_sigpending、rt_sigsuspend、rt_sigtimedwait、rt_sigqueueinfo、sigaltstack、rt_sigreturn | `syscall/signal.rs`、`task/signal.rs`、`sigframe/`（契约与偏差见 §4.5） |
+| 内存 | brk、mmap、munmap、mprotect、mremap、mincore、madvise、msync、锁页系列 | `syscall/memory.rs` || 其他 | uname、gettimeofday | `syscall/mod.rs` |
 | 其余 | 未列出的调用号 | ENOSYS |
 
 ### 4.3 偏差对照
@@ -255,9 +274,8 @@ try_lock 失败即报告“持锁跨调度”。
 | read/write/readv/writev | 共用 4 KiB 可失败堆缓冲区，单次分配后复用；向量描述符先复制到内核，最多 1024 项，总长度超过 ssize_t 返回 EINVAL；每次最多搬运 0x7ffff000 字节；遇短传输、EOF 或错误停止，已有进展时返回已完成长度 | 用户缓冲区按页交付，读只推进实际交付的偏移；完整调用持有打开文件锁；OOM 返回 ENOMEM，零长度不分配数据缓冲区 |
 | pread64/pwrite64/preadv/pwritev | 指定独立偏移，不修改共享文件偏移；负偏移 EINVAL，流式对象 ESPIPE；rv64/la64 原始向量定位 ABI 使用完整 pos_l，忽略 pos_h；O_APPEND 下定位写仍追加，与 Linux 已知行为一致 | 不支持 preadv2/pwritev2；Ext4 文件超限 EFBIG 独立于参数过长 E2BIG；部分错误仍按已完成字节数返回 |
 | fcntl | 支持 F_DUPFD/F_DUPFD_CLOEXEC、F_GETFD/F_SETFD、F_GETFL/F_SETFL；从下界选最低空闲 FD，上限 1024；cloexec 属于描述符，偏移与状态由 dup/fork 共享；打开时的创建标志不保存在共享状态中 | F_SETFL 仅修改 O_APPEND/O_NONBLOCK，访问模式、创建与同步标志不变；请求 O_ASYNC/O_DIRECT/O_NOATIME 返回 EOPNOTSUPP 且不修改状态；未知命令（含锁命令）EINVAL；尚未实现 RLIMIT_NOFILE、O_PATH 专用规则、追加专用 inode 属性检查及强制 O_LARGEFILE |
-| pipe | 容量 64 KiB；读空或空间不足当前分块时等待，O_NONBLOCK 返回 EAGAIN；总长不超过 4 KiB 的 writev 合并后写入，空间不足不写入前缀；更大请求可在分块间返回短写；无读者返回 EPIPE | 无 SIGPIPE；运行期 VecDeque 扩容的不可失败分配仍待处理；复制失败只消费已交付数据 |
-| wait4 | wanted<=0 等任意孩子，>0 指定 pid，<-1 EINVAL；无僵尸则阻塞，无孩子 ECHILD；WNOHANG 支持；status：正常 `(code&255)<<8`，异常 11 | 语义接近；忽略 rusage；无进程组概念 |
-| clone | 仅 flags 恰好为 SIGCHLD(17) 的进程 fork；非零 stack 设置子 SP | 仅为兼容传入栈顶的调用方；不支持线程/共享地址空间 |
+| pipe | 容量 64 KiB；读空或空间不足当前分块时等待，O_NONBLOCK 返回 EAGAIN；总长不超过 4 KiB 的 writev 合并后写入，空间不足不写入前缀；更大请求可在分块间返回短写；无读者返回 EPIPE | SIGPIPE 与 -EPIPE 并行产生同 Linux（§4.5，默认处置下写者死于信号、见不到 EPIPE）；运行期 VecDeque 扩容的不可失败分配仍待处理；复制失败只消费已交付数据 |
+| wait4 | wanted<=0 等任意孩子，>0 指定 pid，<-1 EINVAL；无僵尸则阻塞，无孩子 ECHILD；WNOHANG 支持；status 按 ExitInfo：正常 `(code&255)<<8`、死于信号 `sig` | 语义接近；忽略 rusage；无进程组概念；无 core 位 || clone | 仅 flags 恰好为 SIGCHLD(17) 的进程 fork；非零 stack 设置子 SP | 仅为兼容传入栈顶的调用方；不支持线程/共享地址空间 |
 | execve | argv/envp 各 ≤256 项、单串 ≤4095 字节；字符串总计最多 32 KiB，用户栈默认预留 8 MiB 并逐页填充；auxv 提供 AT_ENTRY、AT_PAGESZ、AT_NULL；程序头表位于可读 PT_LOAD 内时提供 AT_PHDR、AT_PHENT、AT_PHNUM；整镜像读入内核堆 | AT_RANDOM 依赖 HAL 熵源 |
 | nanosleep | 到期返回 0；rem 不回写；相对 now | 语义兼容 |
 | times | tms 四字段来自任务记账；返回启动以来 100Hz tick | 语义兼容 |
@@ -281,7 +299,7 @@ try_lock 失败即报告“持锁跨调度”。
 | unlink/unlinkat | EXT4 unlink 后句柄存活、最后关闭回收；FAT 有句柄时 EBUSY；unlinkat flags 仅 0 | AT_REMOVEDIR 返回 ENOTSUP |
 | getdents64 | fs 层提供目录项与续读位置，EXT4 后端按块解析，syscall 层打包 Linux dirent；单次最多 4KiB；FAT 返回 ENOTSUP | 后端目录块使用可失败堆分配；Linux 目录项打包的 4 KiB 栈缓冲区限制在不内联的 getdents64 函数内，避免普通文件 I/O 承担该栈帧；失败不推进文件偏移 |
 | 路径 | 必须是合法 UTF-8；总长 4096 字节，单分量 255 | 非 UTF-8 文件名不可访问 |
-| 其他 | stdin 读恒 EOF；fd=1/2 直通控制台；sched_yield 轮转后可能立即再次调度；getpid 总成功，getppid 返回注册表 parent | 无信号；孤儿过继 init |
+| 其他 | stdin 读恒 EOF；fd=1/2 直通控制台；sched_yield 轮转后可能立即再次调度；getpid 总成功，getppid 返回注册表 parent | 无信号投递前的旧描述已过时，信号见 §4.5；孤儿过继 init |
 
 文件 I/O 依据：[pread(2)](https://man7.org/linux/man-pages/man2/pread.2.html)、[readv(2)](https://man7.org/linux/man-pages/man2/readv.2.html) 与 [Linux 64 位定位向量 ABI](https://github.com/torvalds/linux/blob/v6.12/fs/read_write.c)。仅核对语义与 ABI，未复制实现代码。
 
@@ -307,12 +325,51 @@ FS 通过 `fs::mapping` 注册 MM 映射钩子：注册后，长度改变先由 
 
 | 类别 | 缺口 |
 |---|---|
-| 基础调用 | clock_gettime(113)、exit_group(94)、ioctl(29)、kill(129)、set_tid_address(96) 等仍 ENOSYS；fcntl 文件锁和异步通知尚未实现 |
-| 信号 | 无投递；EPIPE 不产生 SIGPIPE；SIGSEGV/SIGCHLD 只体现为 wait status |
-| ELF（静态） | busybox 等静态程序的段 vaddr-offset 相位（当前要求 p_vaddr 与 p_offset 都页对齐） |
+| 基础调用 | clock_gettime(113)、exit_group(94)、ioctl(29)、set_tid_address(96) 等仍 ENOSYS；fcntl 文件锁和异步通知尚未实现 |
+| 信号残余 | 停止/继续状态机、RT 排队、core 位等偏差与欠账集中登记 §4.5 || ELF（静态） | busybox 等静态程序的段 vaddr-offset 相位（当前要求 p_vaddr 与 p_offset 都页对齐） |
 | ELF（动态） | ET_DYN/PT_INTERP、动态链接（libc-test/glibc 动态）；与静态 busybox 无关 |
 | mm | COW、SIGBUS 用户投递；文件映射扩展；用户页执行禁止（NX） |
 | fs | FAT getdents、句柄缓存与重命名；link/symlink/chmod/目录删除；EXT4 日志重放 |
+
+### 4.5 信号契约
+
+**范围**：kill/tgkill、rt_sigaction/procmask/pending/sigsuspend/
+sigtimedwait/sigqueueinfo/sigaltstack/sigreturn(139) 全链路；SIGCHLD
+（子退出）、SIGPIPE（pipe 无读者写入）、SIGSEGV/SIGILL/SIGBUS/SIGTRAP
+（致命异常映射）三类内核内产生源；handler 建帧投递（sa_mask/siginfo/
+浮点现场/备用栈）、EINTR 与 SA_RESTART、fork 继承与 execve 重置。
+
+**投递模型**：回用户态唯一路径（任务运行循环）为投递检查点，每次至多
+一个信号；阻塞 syscall 在 park 前后两次快路径决策（第二次不落睡，处理
+睡中到达的信号）。产生统一经过滤：blocked 照常入队（屏蔽信号排队不丢）、
+IGN 或 DFL 且默认动作属 Ign/Cont 静默丢弃。同步（硬件）信号走 force：
+处置 IGN 重置 DFL、解除本信号屏蔽、必入队——防止装 IGN 的程序陷入无限
+陷阱循环。帧内嵌 sigreturn stub（rv64 `li a7,139;ecall`、la64
+`li.w a7,139;syscall 0`，本内核无 vDSO）；布局与魔数经 Linux UAPI 对照
+与交叉 gcc offsetof 实测核验。sigsuspend 的帧屏蔽集为换入前旧集合
+（Linux saved_sigmask），syscall 未完成时检查点先补 -EINTR 再建帧。
+
+**偏差**（对照 Linux/POSIX）：
+
+| 项 | 偏差 |
+|---|---|
+| sa_flags | SA_NODEFER 恒加本信号位；SA_RESETHAND/SA_NOCLDSTOP 存而不执行；SA_ONSTACK 已生效（其余输入模式见 sigaltstack 行） |
+| sigaltstack | 单进程无 per-thread；MINSIGSTKSZ 不查（size=0 即禁用）；SS_ONSTACK/AUTODISARM 输入 EINVAL；rt_sigreturn 不回改登记（Linux restore_altstack 会）；登记区间不可表达返回 EFAULT，SA_ONSTACK 运行时溢出防护未做 |
+| IGN 冲刷 | rt_sigaction 转 IGN/DFL-Ign 时无条件清 pending；Linux flush_sigqueue_mask 仅冲刷未屏蔽部分（被屏蔽后设 IGN 再解蔽，本实现信号丢失、Linux 保留） |
+| sigtimedwait | 等待集按 `set ∩ 未屏蔽` 判定（Linux 睡眠期临时放宽 blocked，可等"blocked 且在集"信号） |
+| sigqueueinfo | RT 信号无排队（位图合并语义）；保留码 si_value 经 addr 槽落位 |
+| 终止与 core | 无 core dump：Core 类信号死亡恒 CLD_KILLED，wait status 无 0x80 位（Linux CLD_DUMPED + WCOREDUMP） |
+| 同步信号 si_code | 固定 SEGV_MAPERR/ILL_ILLOPC/BUS_ADRALN/TRAP_BRKPT，未细分 ACCERR/ADRERR；la handler 期间 FPU 异常回投 SIGFPE（fcsr_pending）未实现 |
+| stub | 无 vDSO，stub 内嵌帧内，无 icache flush（QEMU 语义一致）；rt_sigreturn badframe 按 force_sigsegv 式收敛（处置复位、不重试投递；Linux force_sig 在装 SIGSEGV handler 时可循环） |
+| kill 族 | 无权限检查（无 uid）；pid<0 一律 EINVAL（无进程组，含 -1 广播）；pid==0 近似为调用者自身；tgkill 要求 tgid==tid（Linux tgid 不匹配返回 ESRCH） |
+| sigpending/sigsetsize | rt_sigpending sigsetsize 收紧为 ==8（Linux 允许 ≤8） |
+| nanosleep | rem 仅被打断时回写（正常完成不回写，沿用原契约行） |
+
+**欠账**（下一里程碑）：停止/继续状态机（SIGSTOP/SIGTSTP/SIGCONT、
+Stopped 态、wait4 WUNTRACED/WCONTINUED——libc-test 前必须）；进程组/
+会话/TTY（交互作业控制前置）；RT 信号排队；setitimer/SIGALRM；
+signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综合
+自测（两架构，不入库）；libc-test 信号用例待接入。
 
 ## 5. sync 锁模型
 
@@ -320,7 +377,7 @@ FS 通过 `fs::mapping` 注册 MM 映射钩子：注册后，长度改变先由 
 |---|---|
 | 前提 | 任务时代内核态关中断；单核无合法持锁等待；lock_debug 下 try_lock 失败即报告 bug |
 | 检查 | DebugMutex 的 percpu 持锁深度及切换入口零深度检查始终启用；lock_debug 额外跟踪锁名/获取点（`#[track_caller]`） |
-| 锁序 | SCHED→FRAME；REGISTRY→{FRAME, EXIT_REPORTS, 打开文件 Handle, ROOT/MOUNTS/PAGES}；Handle→{ROOT, MOUNTS, PAGES}；PAGES→{ROOT, MOUNTS}；ROOT/MOUNTS→DISKS |
+| 锁序 | SCHED→FRAME；REGISTRY→{FRAME, EXIT_REPORTS, 打开文件 Handle, ROOT/MOUNTS/PAGES}；Handle→{ROOT, MOUNTS, PAGES}；PAGES→{ROOT, MOUNTS}；ROOT/MOUNTS→DISKS；SCHED→REGISTRY（信号唤醒 drain 唯一嵌套点，反向路径已核查不存在） |
 | 反向 | 任何路径不得反向持有；fs/drivers 的 `spin::Mutex` 不受 DebugMutex 深度检查保护 |
 | 唤醒 | 事件方不直接取 SCHED；用无锁原子标志，在调度边界消费 |
 | 锁外析构 | 退出路径的 space/fs Drop 在 REGISTRY 锁外完成；exec 目前是例外 |

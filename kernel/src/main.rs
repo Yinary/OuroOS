@@ -15,6 +15,7 @@ mod fs;
 mod hal;
 mod lang_items;
 mod mm;
+mod sigframe;
 mod sync;
 mod syscall;
 mod task;

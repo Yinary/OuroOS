@@ -76,17 +76,6 @@ pub enum UserFaultKind {
     AddressNotAligned,
 }
 
-impl UserFaultKind {
-    /// 当前默认致命异常的 wait 状态（尚无用户信号处理器）。
-    pub fn signal(self) -> u32 {
-        match self {
-            Self::FileBusError | Self::FileIoError => 7,
-            Self::UserFaultOom => 9,
-            _ => 11,
-        }
-    }
-}
-
 /// 一次用户态异常的信息。
 #[derive(Debug, Clone, Copy)]
 pub struct UserFault {

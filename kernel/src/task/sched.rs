@@ -23,9 +23,7 @@ use super::{
     ExitInfo,
 };
 
-/// 当前任务地址（0 = idle）。以整数存址而不是裸指针：percpu 槽要求
-/// 内容可跨“线程”声明安全，裸指针 !Send 会被静态拒收（与进程注册表
-/// 的单核凭证同理，见 mm::address_space::LocalSpace）。
+/// 当前任务地址（0 = idle）。以整数存址以满足 percpu 槽的 Send 要求。
 /// 单核 + 内核关中断下仅被调度器与当前任务自身访问。
 #[polyhal::percpu]
 static CURRENT: Cell<usize> = Cell::new(0);
@@ -34,6 +32,7 @@ static CURRENT: Cell<usize> = Cell::new(0);
 /// 在下一次调度边界统一消费。避免 fs 层在 REGISTRY 锁内反向取 SCHED。
 static WAKE_CHILDREN: AtomicBool = AtomicBool::new(false);
 static WAKE_PIPES: AtomicBool = AtomicBool::new(false);
+static WAKE_SIGNALS: AtomicBool = AtomicBool::new(false);
 
 /// 请求唤醒等待子进程的任务（子进程退出时调用）。
 pub fn request_children_wake() {
@@ -43,6 +42,11 @@ pub fn request_children_wake() {
 /// 请求唤醒 pipe 等待者（pipe 读/写/对端关闭时调用）。
 pub fn request_pipe_wake() {
     WAKE_PIPES.store(true, Ordering::Release);
+}
+
+/// 请求唤醒有可投递信号的等待任务（信号实际入队后调用）。
+pub fn request_signal_wake() {
+    WAKE_SIGNALS.store(true, Ordering::Release);
 }
 
 /// 读取当前任务指针（调用方保证处于任务上下文）。
@@ -134,7 +138,7 @@ impl Scheduler {
         #[cfg(debug_assertions)]
         assert_eq!(
             crate::mm::frame::stats().1,
-            free_before + dead_count * (crate::config::KSTACK_PAGES + 1),
+            free_before + dead_count * crate::config::KSTACK_PAGES,
             "exited task stacks were not fully reclaimed"
         );
     }
@@ -142,28 +146,41 @@ impl Scheduler {
     /// 消费事件唤醒标志，把匹配的等待者搬回就绪表。
     fn drain_wake_requests(&mut self) {
         if WAKE_CHILDREN.swap(false, Ordering::AcqRel) {
-            self.move_waiting(|r| matches!(r, WaitReason::Children));
+            self.move_waiting(|_, r| matches!(r, WaitReason::Children));
         }
         if WAKE_PIPES.swap(false, Ordering::AcqRel) {
-            self.move_waiting(|r| matches!(r, WaitReason::Pipe | WaitReason::PollUntil(_)));
+            self.move_waiting(|_, r| matches!(r, WaitReason::Pipe | WaitReason::PollUntil(_)));
+        }
+        if WAKE_SIGNALS.swap(false, Ordering::AcqRel) {
+            // 信号唤醒：持 REGISTRY 锁按可投递性搬回等待者（锁序
+            // SCHED→REGISTRY，见 docs/ostd-contracts.md §5）。
+            let reg = super::REGISTRY.lock();
+            self.move_waiting(|task, _| {
+                reg.records.iter().any(|r| {
+                    r.pid == task.pid
+                        && r.exit.is_none()
+                        && r.signal.pending() & !r.signal.blocked() != 0
+                })
+            });
         }
     }
 
     /// 到期扫描：Deadline 已到的等待者搬回就绪表。
     fn wake_expired(&mut self) {
         let now = polyhal::timer::current_time();
-        self.move_waiting(|r| match r {
+        self.move_waiting(|_, r| match r {
             WaitReason::Deadline(d) | WaitReason::PollUntil(d) => now >= *d,
             _ => false,
         });
     }
 
-    fn move_waiting(&mut self, f: impl Fn(&WaitReason) -> bool) {
+    /// 把谓词匹配的等待任务搬回就绪表；谓词可按任务与其等待原因联合判定。
+    fn move_waiting(&mut self, f: impl Fn(&Task, &WaitReason) -> bool) {
         // 自检：每次集中唤醒前，就绪表足以容纳全部等待任务。
         debug_assert!(self.ready.capacity() >= self.ready.len() + self.waiting.len());
         let mut i = 0;
         while i < self.waiting.len() {
-            if f(&self.waiting[i].1) {
+            if f(&self.waiting[i].0, &self.waiting[i].1) {
                 let (task, _) = self.waiting.swap_remove(i);
                 self.ready.push_back(task);
             } else {
@@ -300,8 +317,8 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
     };
     log::debug!("task '{}' (pid {}) exiting", name, pid);
     // 登记退出信息并释放地址空间：UserAddressSpace 的 Drop 会先切回
-    // 内核页表（若仍活动）再释放数据页/页表页。此刻仍在自己的内核栈上，
-    // 内核栈经直映访问，不受页表切换影响。锁序 REGISTRY → FRAME。
+    // 内核根（若仍活动）再释放数据页/页表页。此刻仍在自己的内核栈上；
+    // 窗口映射在内核根与全部用户根中共享，切页表不影响栈访问。锁序 REGISTRY → FRAME。
     registry::record_exit(pid, exit);
     request_children_wake();
     let (from, to) = {
@@ -381,10 +398,8 @@ pub(super) fn run_loop() {
 
 /// 上下文切换的唯一出口。from/to 指向稳定的堆或静态 KContext。
 fn switch_context(from: *mut KContext, to: *const KContext) {
-    // SAFETY:
-    // - from/to 均指向 Box<Task> 内或 static 的 KContext，调度期间不移动；
+    // SAFETY: from/to 指向 Box<Task> 内或 static 的 KContext，调度期间不移动；
     // - 两指针可指向同一实例（只有自己可让时），保存后恢复同组寄存器；
-    // - 单核、关中断执行，无并发进入；调度器锁已在调用前释放，
-    //   切入的任务可以再次取锁。
+    // - 单核、关中断执行，无并发进入；调度器锁在调用前已释放。
     unsafe { crate::hal::context_switch(from, to) }
 }

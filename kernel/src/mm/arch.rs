@@ -23,6 +23,21 @@ pub(super) fn switch(root: usize) {
     }
     TLB::flush_all();
 }
+/// 内核栈窗口可写入的内核根表：rv 使用已切换的内核根，la 新建仅含
+/// 窗口项的根表并切换（内核代码/数据经 DMW，不依赖根表内容）。
+pub(super) fn kernel_root_for_window() -> PhysAddr {
+    #[cfg(target_arch = "riscv64")]
+    {
+        PhysAddr::new(current())
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let root = super::frame::frame_alloc(1).expect("kernel stack window: root OOM");
+        root.clear_len(polyhal::pagetable::PAGE_SIZE);
+        switch(root.raw());
+        root
+    }
+}
 #[cfg(target_arch = "riscv64")]
 pub(super) fn table(pa: PhysAddr) -> usize {
     (pa.raw() >> 2) | 1
@@ -30,6 +45,17 @@ pub(super) fn table(pa: PhysAddr) -> usize {
 #[cfg(target_arch = "loongarch64")]
 pub(super) fn table(pa: PhysAddr) -> usize {
     pa.raw()
+}
+/// 内核数据页叶表项：可读写、非用户；rv 不含 X，la 沿用现有权限编码。
+pub(super) fn kernel_leaf(pa: PhysAddr) -> usize {
+    #[cfg(target_arch = "riscv64")]
+    {
+        (pa.raw() >> 2) | 1 | 2 | 4 | 32 | 64 | 128
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        pa.raw() | 1 | (1 << 4) | 2 | (1 << 8)
+    }
 }
 #[cfg(target_arch = "riscv64")]
 pub(super) fn address(pte: usize) -> PhysAddr {
@@ -99,13 +125,9 @@ pub(super) fn flags(pte: usize) -> F {
     f
 }
 
-// 依据 LoongArch Reference Manual Vol.1 §5.4、§7.5 独立实现 4 KiB 软件填充。
-// https://loongson.github.io/LoongArch-Documentation/LoongArch-Vol1-EN.html
-// QEMU 10.0.2 的 LDPTE 会丢弃 NR/NX，高位权限通过普通 LD.D 完整送入 CSR。
-// 这是通用页表填充路径，不根据程序/测例选择行为；不支持大页。
-// SAVE3(0x33) 专用于保存 t1，PolyHAL 0.4.0 仅占用 SAVE0..2；升级 HAL 须复核。
-// SAFETY: refill 在直接寻址、关闭中断下运行，表页由活动空间持有；只读取
-// 页对齐的三层表，空表产生无效 TLB 项；t0/t1 都保存恢复，不使用用户栈。
+// 4 KiB 软件 TLB refill（LoongArch 手册 Vol.1 §5.4/§7.5，通用路径不支持
+// 大页，SAVE3 存 t1、升级 PolyHAL 须复核）。
+// SAFETY: 直寻址、关中断，表页由活动空间持有，空表产生无效项，t0/t1 保存恢复，不用用户栈。
 #[cfg(target_arch = "loongarch64")]
 core::arch::global_asm!(
     r#"

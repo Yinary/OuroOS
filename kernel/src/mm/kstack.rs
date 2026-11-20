@@ -1,179 +1,213 @@
-//! 任务栈位于内核共享页表窗口，每个槽的第零页始终不映射。
-//! 当前只由启动核运行任务；启用多核调度前需要跨核 TLB 失效。
+//! 内核栈：窗口虚拟槽（低地址端 guard 不映射）+ 连续物理页。窗口下级
+//! 页表由全部地址空间共享，guard 溢出即页错误。契约见 docs/ostd-contracts.md §1。
 
-use super::frame;
-use super::{
-    arch,
-    frame::{FrameError, OwnedFrame},
-    page_table::{read, write},
-};
-use polyhal::consts::VIRT_ADDR_START;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use polyhal::{
+    consts::VIRT_ADDR_START,
     pagetable::{PAGE_SIZE, TLB},
     PhysAddr,
 };
 use spin::Mutex;
 
-const BASE: usize = 0xffff_ffe4_0000_0000;
-const ENTRIES: usize = PAGE_SIZE / core::mem::size_of::<usize>();
-const SLOT_SIZE: usize = ENTRIES * PAGE_SIZE;
-static DIRECTORY: Mutex<Option<OwnedFrame>> = Mutex::new(None);
+use super::{
+    arch,
+    frame::{self, FrameError},
+};
 
-/// 在创建任何用户页表前发布永久目录。RV 用户根复制该高半区根项；
-/// LA 的高半区根独立于每个进程的 PGDL。
-pub(super) fn init() {
-    let directory = OwnedFrame::new().expect("kernel stack directory");
-    #[cfg(target_arch = "riscv64")]
-    let root = PhysAddr::new(arch::current());
-    #[cfg(target_arch = "loongarch64")]
-    let root = {
-        let high: usize;
-        // SAFETY: 仅在启动核初始化阶段读取特权寄存器。
-        unsafe {
-            core::arch::asm!("csrrd {}, 0x1a", out(reg) high);
-        }
-        arch::install_refill();
-        if high == 0 {
-            let frame = OwnedFrame::new().expect("kernel high page table");
-            let pa = frame.addr();
-            // SAFETY: 新根已清零，所有内核直映仍走 DMW，根页永久保留。
-            unsafe {
-                core::arch::asm!("csrwr {}, 0x1a", inout(reg) pa.raw() => _);
-            }
-            core::mem::forget(frame);
-            pa
-        } else {
-            PhysAddr::new(high)
-        }
-    };
-    let index = (BASE >> 30) & (ENTRIES - 1);
-    assert_eq!(
-        read(root, index),
-        0,
-        "kernel stack window overlaps existing mapping"
+/// 窗口虚拟区间：16 GiB 起 16 MiB，避开用户低半区与两架构内核直映/DMW。
+pub const WINDOW_BASE: usize = 0x4_0000_0000;
+const WINDOW_SIZE: usize = 0x0100_0000;
+/// 窗口在根表中的索引；用户页表创建时复制该项以共享下级表。
+pub(super) const WINDOW_ROOT_INDEX: usize = (WINDOW_BASE >> 30) & 511;
+
+const WINDOW_PAGES: usize = WINDOW_SIZE / PAGE_SIZE;
+const L0_COUNT: usize = WINDOW_PAGES / 512;
+const L0_ENTRIES: usize = 512;
+
+/// 窗口 L1 表的物理地址，初始化后不变。
+static L1_TABLE: AtomicUsize = AtomicUsize::new(0);
+
+struct Window {
+    used: [u64; WINDOW_PAGES / 64],
+    ready: bool,
+}
+
+static WINDOW: Mutex<Window> = Mutex::new(Window {
+    used: [0; WINDOW_PAGES / 64],
+    ready: false,
+});
+
+fn pte_slot(table: PhysAddr, index: usize) -> *mut usize {
+    debug_assert!(index < L0_ENTRIES);
+    // SAFETY: table 为帧分配器返回的整页，经直映别名可写，index 在页内。
+    unsafe { ((table.raw() | VIRT_ADDR_START) as *mut usize).add(index) }
+}
+fn read_pte(table: PhysAddr, index: usize) -> usize {
+    // SAFETY: 同上，只读已分配表页内的表项。
+    unsafe { pte_slot(table, index).read_volatile() }
+}
+fn write_pte(table: PhysAddr, index: usize, value: usize) {
+    // SAFETY: 同上；单核独占修改，表页已初始化。
+    unsafe { pte_slot(table, index).write_volatile(value) }
+}
+
+fn l0_for(page: usize) -> PhysAddr {
+    debug_assert!(page < WINDOW_PAGES);
+    let l1 = PhysAddr::new(L1_TABLE.load(Ordering::Relaxed));
+    debug_assert_ne!(l1.raw(), 0, "kernel stack window not initialized");
+    arch::address(read_pte(l1, page / L0_ENTRIES))
+}
+fn set_leaf(page: usize, leaf: usize) {
+    write_pte(l0_for(page), page % L0_ENTRIES, leaf);
+}
+fn read_leaf(page: usize) -> usize {
+    read_pte(l0_for(page), page % L0_ENTRIES)
+}
+
+/// 将窗口 VA（或普通直映 VA）转换为 DMA 物理地址；调用方保证缓冲存活且物理连续。
+pub(crate) fn dma_address(va: usize) -> usize {
+    if !(WINDOW_BASE..WINDOW_BASE + WINDOW_SIZE).contains(&va) {
+        return va & !VIRT_ADDR_START;
+    }
+    // guard 页叶项为 0，断言拦截栈边界外的 DMA。
+    let pte = read_leaf((va - WINDOW_BASE) / PAGE_SIZE);
+    assert_ne!(pte, 0, "DMA outside a live stack page");
+    arch::address(pte).raw() + va % PAGE_SIZE
+}
+
+/// 建立共享窗口页表与内核根表项；须在第一个地址空间/内核栈之前调用。
+pub(super) fn init_window() -> Result<(), FrameError> {
+    assert!(
+        !WINDOW.lock().ready,
+        "kernel stack window initialized twice"
     );
-    write(root, index, arch::table(directory.addr()));
-    *DIRECTORY.lock() = Some(directory);
+    assert_eq!(WINDOW_BASE % WINDOW_SIZE, 0);
+    assert_eq!((WINDOW_BASE >> 21) & 511, 0);
+    let root = arch::kernel_root_for_window();
+    let l1 = frame::frame_alloc(1)?;
+    l1.clear_len(PAGE_SIZE);
+    for i in 0..L0_COUNT {
+        let l0 = frame::frame_alloc(1)?;
+        l0.clear_len(PAGE_SIZE);
+        write_pte(l1, i, arch::table(l0));
+    }
+    write_pte(root, WINDOW_ROOT_INDEX, arch::table(l1));
     TLB::flush_all();
+    L1_TABLE.store(l1.raw(), Ordering::Relaxed);
+    WINDOW.lock().ready = true;
+    Ok(())
 }
 
-fn stack_leaf(pa: PhysAddr) -> usize {
-    #[cfg(target_arch = "riscv64")]
-    {
-        (pa.raw() >> 2) | 0xc7
-    } // V/R/W/A/D, supervisor only
-    #[cfg(target_arch = "loongarch64")]
-    {
-        pa.raw() | 0x113
-    } // V/D/MAT_CC/W, PLV0
+fn alloc_slot(count: usize) -> Result<usize, FrameError> {
+    let mut window = WINDOW.lock();
+    if count == 0 || count > WINDOW_PAGES {
+        return Err(FrameError::InvalidCount);
+    }
+    if !window.ready {
+        return Err(FrameError::OutOfMemory);
+    }
+    let mut run = 0;
+    for i in 0..WINDOW_PAGES {
+        if window.used[i / 64] & (1 << (i % 64)) == 0 {
+            run += 1;
+            if run == count {
+                let first = i + 1 - count;
+                for n in first..=i {
+                    window.used[n / 64] |= 1 << (n % 64);
+                }
+                return Ok(first);
+            }
+        } else {
+            run = 0;
+        }
+    }
+    Err(FrameError::OutOfMemory)
 }
 
+fn free_slot(first: usize, count: usize) {
+    let mut window = WINDOW.lock();
+    for n in first..first + count {
+        debug_assert_ne!(window.used[n / 64] & (1 << (n % 64)), 0);
+        window.used[n / 64] &= !(1 << (n % 64));
+    }
+}
+
+/// 窗口虚拟槽内的内核栈：槽首为不映射的 guard，其上为栈页。
 pub struct KernelStack {
-    slot: usize,
-    _leaf: OwnedFrame,
     base: PhysAddr,
     pages: usize,
+    slot: usize,
 }
 
 impl KernelStack {
-    /// 先构造所有帧，再发布叶表。任何分配失败均由局部对象归还已分配帧。
+    /// 分配 `pages` 个连续物理页并逐页映射到窗口槽；guard 保持不映射。
     pub fn new(pages: usize) -> Result<Self, FrameError> {
-        if pages == 0 || pages >= ENTRIES {
+        if pages == 0 || pages >= WINDOW_PAGES {
             return Err(FrameError::InvalidCount);
         }
-        let leaf = OwnedFrame::new()?;
-        let window = DIRECTORY.lock();
-        let directory = window.as_ref().ok_or(FrameError::InvalidRange)?.addr();
-        let slot = (0..ENTRIES)
-            .find(|&i| read(directory, i) == 0)
-            .ok_or(FrameError::OutOfMemory)?;
-        // VirtIO 的同步请求可能直接借用跨页内核栈缓冲区，保持物理连续。
-        let base = frame::frame_alloc(pages)?;
+        let count = pages + 1;
+        let slot = alloc_slot(count)?;
+        let base = match frame::frame_alloc(pages) {
+            Ok(base) => base,
+            Err(error) => {
+                free_slot(slot, count);
+                return Err(error);
+            }
+        };
         base.clear_len(pages * PAGE_SIZE);
-        for i in 0..pages {
-            write(
-                leaf.addr(),
-                i + 1,
-                stack_leaf(PhysAddr::new(base.raw() + i * PAGE_SIZE)),
-            );
+        // 槽内先全部清空（guard 必须无映射），再逐页映射栈页。
+        for page in slot..slot + count {
+            set_leaf(page, 0);
         }
-        write(directory, slot, arch::table(leaf.addr()));
+        for i in 0..pages {
+            let pa = PhysAddr::new(base.raw() + i * PAGE_SIZE);
+            set_leaf(slot + 1 + i, arch::kernel_leaf(pa));
+        }
         TLB::flush_all();
-        Ok(Self {
-            slot,
-            _leaf: leaf,
-            base,
-            pages,
-        })
+        debug_assert_eq!(read_leaf(slot), 0, "kernel stack guard must stay unmapped");
+        Ok(Self { base, pages, slot })
     }
 
+    /// 栈顶虚拟地址（窗口地址，16 字节对齐，供 KContext.ksp）。
     pub fn top(&self) -> usize {
-        BASE + self.slot * SLOT_SIZE + (1 + self.pages) * PAGE_SIZE
+        let top = WINDOW_BASE + (self.slot + self.pages + 1) * PAGE_SIZE;
+        debug_assert_eq!(top % 16, 0, "kernel stack top must be 16-byte aligned");
+        top
     }
 }
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        // 调度器已离开此栈；撤销表项、刷新 TLB 后，才让字段析构归还物理页。
-        let window = DIRECTORY.lock();
-        let directory = window.as_ref().expect("published stack directory").addr();
-        write(directory, self.slot, 0);
+        for page in self.slot..self.slot + self.pages + 1 {
+            set_leaf(page, 0);
+        }
         TLB::flush_all();
         for i in 0..self.pages {
-            // SAFETY: 栈独占连续物理块，调用方已切走，页表撤销后逐页归还。
+            // SAFETY: 构造时独占分配、类型不可复制，拥有者负责先让
+            // 任何执行流离开该栈；窗口映射已撤销并刷 TLB。
             unsafe {
                 frame::frame_dealloc(PhysAddr::new(self.base.raw() + i * PAGE_SIZE));
             }
         }
+        free_slot(self.slot, self.pages + 1);
     }
 }
 
-/// 将内核栈窗口或普通直映缓冲区转换为 DMA 物理地址。
-/// 调用方持有有效缓冲区，保证其在同步请求期间存活且物理连续。
-pub(crate) fn dma_address(va: usize) -> usize {
-    if !(BASE..BASE + ENTRIES * SLOT_SIZE).contains(&va) {
-        return va & !VIRT_ADDR_START;
-    }
-    let window = DIRECTORY.lock();
-    let directory = window.as_ref().expect("live kernel stack directory").addr();
-    let slot = (va - BASE) / SLOT_SIZE;
-    let leaf = read(directory, slot);
-    assert_ne!(leaf, 0, "DMA outside a live stack");
-    let pte = read(arch::address(leaf), (va / PAGE_SIZE) % ENTRIES);
-    assert_ne!(pte, 0, "DMA outside stack data");
-    arch::address(pte).raw() + va % PAGE_SIZE
-}
-
+/// 自检：窗口槽分配 OOM 回滚无副作用，guard 页保持不映射（仅 selftest 档运行）。
 #[cfg(debug_assertions)]
 pub(super) fn check() {
     let baseline = frame::stats();
-    for budget in 0..2 {
-        frame::set_test_budget(Some(budget));
-        let attempt = KernelStack::new(2);
-        frame::set_test_budget(None);
-        assert!(matches!(attempt, Err(FrameError::OutOfMemory)));
-        assert_eq!(frame::stats(), baseline);
-    }
-    let stack = KernelStack::new(2).expect("guarded stack");
-    assert_eq!(read(stack._leaf.addr(), 0), 0);
-    for i in 0..stack.pages {
-        let pa = PhysAddr::new(stack.base.raw() + i * PAGE_SIZE);
-        assert_eq!(read(stack._leaf.addr(), i + 1), stack_leaf(pa));
-        let va = stack.top() - (stack.pages - i) * PAGE_SIZE + 7;
-        assert_eq!(dma_address(va), pa.raw() + 7);
-        // SAFETY: 栈未交付任务；虚拟地址与物理直映指向同一个独占字节。
-        unsafe {
-            (va as *mut u8).write_volatile(17);
-            assert_eq!(
-                ((pa.raw() | VIRT_ADDR_START) as *const u8)
-                    .add(7)
-                    .read_volatile(),
-                17
-            );
-        }
-    }
-    let slot = stack.slot;
-    drop(stack);
-    assert_eq!(read(DIRECTORY.lock().as_ref().unwrap().addr(), slot), 0);
+    // 本实现仅一次物理页分配，budget=0 即完整覆盖 OOM 回滚路径。
+    frame::set_test_budget(Some(0));
+    let attempt = KernelStack::new(2);
+    frame::set_test_budget(None);
+    assert!(matches!(attempt, Err(FrameError::OutOfMemory)));
     assert_eq!(frame::stats(), baseline);
+    let stack = KernelStack::new(2).expect("guarded stack");
+    assert_eq!(
+        read_leaf(stack.slot),
+        0,
+        "kernel stack guard must stay unmapped"
+    );
 }

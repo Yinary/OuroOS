@@ -15,10 +15,7 @@ use super::{sched, user_task};
 /// 进程标识；由注册表分配，递增不复用。
 pub type Pid = usize;
 
-/// 任务的执行身体。
-///
-/// 用户身体携带初始 TrapFrame，首次入口时移到本任务内核栈；不用 Box
-/// 包裹，避免增加孵化的分配失败路径。
+/// 任务的执行身体。用户身体携带初始 TrapFrame，首次入口时移到本任务内核栈。
 #[allow(clippy::large_enum_variant)]
 pub enum TaskBody {
     /// 内核任务：入口函数运行在自己的内核栈上，返回即退出（码 0）。
@@ -42,12 +39,14 @@ pub enum TaskState {
 /// 子进程退出唤醒全部 Children 等待者。
 #[derive(Clone, Copy, Debug)]
 pub enum WaitReason {
-    /// 绝对截止时间（nanosleep）。
+    /// 绝对截止时间（nanosleep / rt_sigtimedwait）。
     Deadline(core::time::Duration),
     /// 等待子进程退出（waitpid 无可收割孩子）。
     Children,
     /// 等待任意 pipe 可读/可写。
     Pipe,
+    /// 等待任意可投递信号（rt_sigsuspend），仅经 WAKE_SIGNALS 通道唤醒。
+    Signal,
     /// ppoll 同时等待管道变化或截止时间。
     PollUntil(core::time::Duration),
 }
