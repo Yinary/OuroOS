@@ -143,6 +143,40 @@ pub(crate) fn resize_inode(ino: u32, old: usize, new: usize) {
     pages.retain(|(id, off, page)| *id != ino || (*off < new && page.strong_count() != 0));
 }
 
+/// 写回指定文件偏移范围内的驻留共享页。
+#[cfg(not(feature = "rsext4-readonly"))]
+#[allow(dead_code)] // MM msync 在后续 PR 接入
+pub(crate) fn sync_span(ino: u32, offset: usize, length: usize) -> Result<(), Errno> {
+    let end = offset.checked_add(length).ok_or(Errno::Invalid)?;
+    for (id, off, page) in PAGES.lock().iter() {
+        if *id != ino || *off < offset || *off >= end {
+            continue;
+        }
+        if let Some(page) = page.upgrade() {
+            if page.is_valid() {
+                page.write_back()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 仅使文件偏移范围内相交的共享页失效；范围外的页保持原状。
+#[allow(dead_code)] // MM msync 在后续 PR 接入
+pub(crate) fn invalidate_range(ino: u32, offset: usize, length: usize) -> Result<(), Errno> {
+    let end = offset.checked_add(length).ok_or(Errno::Invalid)?;
+    let mut pages = PAGES.lock();
+    for (id, off, page) in pages.iter() {
+        if *id == ino && *off < end && offset < *off + 4096 {
+            if let Some(page) = page.upgrade() {
+                page.invalidate();
+            }
+        }
+    }
+    pages.retain(|(id, off, _)| *id != ino || *off >= end || *off + 4096 <= offset);
+    Ok(())
+}
+
 /// 截断前使某 inode 的旧共享页失效，后续不再写回；索引立即移除。
 #[allow(dead_code)] // msync/后续范围失效入口
 pub(crate) fn invalidate_inode(ino: u32) {
