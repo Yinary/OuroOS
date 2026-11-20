@@ -984,9 +984,11 @@ impl UserAddressSpace {
                 frame => frame.addr().is_some(),
             });
         }
-        Ok(self
-            .pending
-            .borrow()
+        let pending = self.pending.borrow();
+        if pending.last().is_none_or(|p| p.va < page_va) {
+            return Ok(false);
+        }
+        Ok(pending
             .iter()
             .find(|p| p.va == page_va)
             .is_some_and(|p| match &p.frame {

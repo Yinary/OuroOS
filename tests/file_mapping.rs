@@ -128,6 +128,8 @@ fn page_cache_roundtrip() {
     cache::sync_inode(1).unwrap();
     assert_eq!(DISK.lock().data[0], 97);
     drop(page);
+    assert!(cache::resident(1, 0));
+    cache::flush(None).unwrap();
     assert!(!cache::resident(1, 0));
     assert_eq!(DISK.lock().refs, 0);
 }
@@ -144,6 +146,7 @@ fn resize_zeroes_tail_and_expands() {
     DISK.lock().data.truncate(4);
     cache::resize_inode(1, 4096, 4);
     drop(page);
+    cache::flush(None).unwrap();
     assert_eq!(DISK.lock().data, [33, 11, 11, 11]);
 
     let page = cache::page(1, 0).unwrap();
@@ -154,7 +157,38 @@ fn resize_zeroes_tail_and_expands() {
         assert_eq!((page.addr() as *const u8).add(6).read(), 0);
     }
     drop(page);
-    assert_eq!(DISK.lock().data, [33, 11, 11, 11, 0, 0, 0, 0]);
     cache::flush(None).unwrap();
+    assert_eq!(DISK.lock().data, [33, 11, 11, 11, 0, 0, 0, 0]);
     assert_eq!(cache::retained_frames(), 0);
+}
+
+#[test]
+fn flush_retries_after_writeback_failure() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    DISK.lock().data = vec![0; 4096];
+    let page = cache::page(1, 0).unwrap();
+    // SAFETY: page 拥有整页，单线程测试独占。
+    unsafe {
+        (page.addr() as *mut u8).write(42);
+    }
+    drop(page);
+    DISK.lock().fail = true;
+    assert!(cache::flush(None).is_err());
+    assert!(cache::resident(1, 0));
+    DISK.lock().fail = false;
+    cache::flush(None).unwrap();
+    assert_eq!(DISK.lock().data[0], 42);
+    assert!(!cache::resident(1, 0));
+}
+
+#[test]
+fn read_only_sparse_page_does_not_write() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    DISK.lock().data = vec![0; 4096];
+    DISK.lock().writes = 0;
+    let page = cache::page(1, 0).unwrap();
+    drop(page);
+    cache::flush(None).unwrap();
+    assert_eq!(DISK.lock().writes, 0);
+    assert!(!cache::resident(1, 0));
 }
