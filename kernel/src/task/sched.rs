@@ -317,8 +317,8 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
     };
     log::debug!("task '{}' (pid {}) exiting", name, pid);
     // 登记退出信息并释放地址空间：UserAddressSpace 的 Drop 会先切回
-    // 内核页表（若仍活动）再释放数据页/页表页。此刻仍在自己的内核栈上，
-    // 内核栈经直映访问，不受页表切换影响。锁序 REGISTRY → FRAME。
+    // 内核根（若仍活动）再释放数据页/页表页。此刻仍在自己的内核栈上；
+    // 窗口映射在内核根与全部用户根中共享，切页表不影响栈访问。锁序 REGISTRY → FRAME。
     registry::record_exit(pid, exit);
     request_children_wake();
     let (from, to) = {

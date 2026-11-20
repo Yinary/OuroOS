@@ -23,6 +23,21 @@ pub(super) fn switch(root: usize) {
     }
     TLB::flush_all();
 }
+/// 内核栈窗口可写入的内核根表：rv 使用已切换的内核根，la 新建仅含
+/// 窗口项的根表并切换（内核代码/数据经 DMW，不依赖根表内容）。
+pub(super) fn kernel_root_for_window() -> PhysAddr {
+    #[cfg(target_arch = "riscv64")]
+    {
+        PhysAddr::new(current())
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let root = super::frame::frame_alloc(1).expect("kernel stack window: root OOM");
+        root.clear_len(polyhal::pagetable::PAGE_SIZE);
+        switch(root.raw());
+        root
+    }
+}
 #[cfg(target_arch = "riscv64")]
 pub(super) fn table(pa: PhysAddr) -> usize {
     (pa.raw() >> 2) | 1
@@ -30,6 +45,17 @@ pub(super) fn table(pa: PhysAddr) -> usize {
 #[cfg(target_arch = "loongarch64")]
 pub(super) fn table(pa: PhysAddr) -> usize {
     pa.raw()
+}
+/// 内核数据页叶表项：可读写、非用户；rv 不含 X，la 沿用现有权限编码。
+pub(super) fn kernel_leaf(pa: PhysAddr) -> usize {
+    #[cfg(target_arch = "riscv64")]
+    {
+        (pa.raw() >> 2) | 1 | 2 | 4 | 32 | 64 | 128
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        pa.raw() | 1 | (1 << 4) | 2 | (1 << 8)
+    }
 }
 #[cfg(target_arch = "riscv64")]
 pub(super) fn address(pte: usize) -> PhysAddr {
