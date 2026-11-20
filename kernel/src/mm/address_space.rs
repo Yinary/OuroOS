@@ -331,10 +331,12 @@ impl UserAddressSpace {
         if !matches!(kind, AreaKind::Anonymous | AreaKind::Heap | AreaKind::Stack) {
             return Err(MapError::InvalidPermissions);
         }
-        let in_stack = self
-            .areas
-            .iter()
-            .any(|a| a.kind == AreaKind::Stack && a.start < end && start < a.end);
+        let in_stack = self.areas.iter().any(|a| {
+            a.kind == AreaKind::Stack
+                && a.start <= start
+                && end <= a.end
+                && start >= USER_STACK_BOTTOM
+        });
         if end > GUARD_BOTTOM
             && !in_stack
             && !(kind == AreaKind::Stack && start >= USER_STACK_BOTTOM)
@@ -378,10 +380,12 @@ impl UserAddressSpace {
             true,
             Self::chargeable(AreaKind::Anonymous, false, flags),
         )?;
-        let in_stack = self
-            .areas
-            .iter()
-            .any(|a| a.kind == AreaKind::Stack && a.start < end && start < a.end);
+        let in_stack = self.areas.iter().any(|a| {
+            a.kind == AreaKind::Stack
+                && a.start <= start
+                && end <= a.end
+                && start >= USER_STACK_BOTTOM
+        });
         if end > GUARD_BOTTOM && !in_stack {
             return Err(MapError::HitsStack);
         }
@@ -843,33 +847,6 @@ impl UserAddressSpace {
         Ok(())
     }
 
-    /// 仅撤销区间内的文件页；私有匿名内容与区间外页保持不变。
-    fn invalidate_file_range(
-        &mut self,
-        start: usize,
-        count: usize,
-    ) -> Result<(), crate::syscall::Errno> {
-        use crate::syscall::Errno;
-        let end = end_of(start, count).map_err(|_| Errno::NoMem)?;
-        for page in &self.pages {
-            if page.va < start || page.va >= end {
-                continue;
-            }
-            if let Backing::File(file) = &page.frame {
-                self.pt.borrow_mut().unmap(page.va);
-                if let Some((ino, offset)) = file.writeback_start() {
-                    crate::fs::cache::invalidate_range(ino, offset, PAGE_SIZE)
-                        .map_err(|_| Errno::NoMem)?;
-                }
-                file.discard();
-            }
-        }
-        self.pages
-            .retain(|p| !(start <= p.va && p.va < end && matches!(p.frame, Backing::File(_))));
-        super::fence_icache();
-        Ok(())
-    }
-
     /// 同步完整映射区间内的可写共享文件页，复用文件系统已有写回入口。
     pub fn sync_range(
         &mut self,
@@ -887,26 +864,6 @@ impl UserAddressSpace {
                 .any(|a| a.start < end && start < a.end && a.locked)
         {
             return Err(Errno::Busy);
-        }
-        // MS_INVALIDATE：先同步请求范围，再仅失效文件页，保留私有匿名页。
-        if invalidate {
-            for area in self
-                .areas
-                .iter()
-                .filter(|a| a.kind == AreaKind::File && a.start < end && start < a.end)
-            {
-                let first = area.start.max(start);
-                let last = area.end.min(end);
-                let page = self.page_at(first).ok_or(Errno::Fault)?;
-                if let Backing::File(file) = &page.frame {
-                    if let Some((ino, offset)) = file.writeback_start() {
-                        let length = last - first;
-                        crate::fs::sync_mapping(ino, offset, length)?;
-                    }
-                }
-            }
-            self.invalidate_file_range(start, count)?;
-            return Ok(());
         }
         // 每个文件 VMA 内页偏移连续；只同步用户指定区间对应的文件页。
         for area in self
@@ -984,11 +941,9 @@ impl UserAddressSpace {
                 frame => frame.addr().is_some(),
             });
         }
-        let pending = self.pending.borrow();
-        if pending.last().is_none_or(|p| p.va < page_va) {
-            return Ok(false);
-        }
-        Ok(pending
+        Ok(self
+            .pending
+            .borrow()
             .iter()
             .find(|p| p.va == page_va)
             .is_some_and(|p| match &p.frame {

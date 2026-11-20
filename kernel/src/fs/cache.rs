@@ -165,6 +165,7 @@ pub(crate) fn resize_inode(ino: u32, old: usize, new: usize) {
 }
 
 /// 仅使文件偏移范围内相交的共享页失效；范围外的页保持原状。
+#[allow(dead_code)] // 保留范围失效入口
 pub(crate) fn invalidate_range(ino: u32, offset: usize, length: usize) -> Result<(), Errno> {
     let end = offset.checked_add(length).ok_or(Errno::Invalid)?;
     let mut pages = PAGES.lock();
@@ -227,19 +228,44 @@ pub(super) fn sync_inode(ino: u32) -> Result<(), Errno> {
 /// 将所有仍被缓存持有的页写回；失败时保留页，供后续重试。
 pub(crate) fn flush(ino: Option<u32>) -> Result<(), Errno> {
     let mut pages = PAGES.lock();
+    let mut first_error = None;
     for (id, _, page) in pages.iter() {
         if ino.is_some_and(|want| *id != want) || !page.is_valid() {
             continue;
         }
-        page.write_back()?;
-        if Arc::strong_count(page) == 1 {
-            page.mark_clean();
+        page.clean.store(false, Ordering::Release);
+        match page.write_back() {
+            Ok(()) if Arc::strong_count(page) == 1 => page.mark_clean(),
+            Ok(()) => {}
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
         }
     }
     pages.retain(|(id, _, page)| {
-        ino.is_some_and(|want| *id != want) || Arc::strong_count(page) != 1
+        ino.is_some_and(|want| *id != want)
+            || Arc::strong_count(page) != 1
+            || !page.clean.load(Ordering::Acquire)
     });
-    Ok(())
+    first_error.map_or(Ok(()), Err)
+}
+
+/// 没有外部映射时尝试写回并回收；失败则保留页供 flush 重试。
+pub(crate) fn release_idle(ino: u32, offset: usize) {
+    let mut pages = PAGES.lock();
+    let Some(index) = pages
+        .iter()
+        .position(|(id, off, page)| *id == ino && *off == offset && page.is_valid())
+    else {
+        return;
+    };
+    if Arc::strong_count(&pages[index].2) != 1 {
+        return;
+    }
+    if pages[index].2.write_back().is_ok() {
+        pages[index].2.mark_clean();
+        pages.swap_remove(index);
+    }
 }
 
 /// 仍被缓存持有的页帧数（任务退出帧守恒自检用）。

@@ -80,13 +80,16 @@ pub(super) fn install_hooks() {
     fs::mapping::register(&MAPPING_HOOKS);
 }
 
-/// 清理已无驻留页的 inode 组，避免历史 inode 长期占用登记表。
-pub(crate) fn compact() {
+/// 清理目标 inode 的空登记组，避免每次解除映射都扫描全部 inode。
+pub(crate) fn compact_ino(ino: u32) {
     let mut groups = RESIDENT.lock();
-    for group in groups.iter_mut() {
+    if let Ok(index) = groups.binary_search_by_key(&ino, |group| group.ino) {
+        let group = &mut groups[index];
         group.pages.retain(|p| p.strong_count() != 0);
+        if group.pages.is_empty() {
+            groups.remove(index);
+        }
     }
-    groups.retain(|group| !group.pages.is_empty());
 }
 
 /// 与打开描述符无关的 inode 引用。
@@ -205,8 +208,10 @@ impl FilePage {
         })
     }
     pub(super) fn discard(&self) {
+        let ino = self.file.ino;
         self.data.borrow_mut().take();
-        compact();
+        crate::fs::cache::release_idle(ino, self.offset);
+        compact_ino(ino);
     }
     pub(super) fn addr(&self) -> Option<PhysAddr> {
         self.data.borrow().as_ref().map(|p| p.data.addr())

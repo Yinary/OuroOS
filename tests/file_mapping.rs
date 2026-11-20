@@ -71,6 +71,7 @@ struct Disk {
     refs: usize,
     writes: usize,
     fail: bool,
+    write_fail: bool,
 }
 static TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
@@ -79,6 +80,7 @@ static DISK: Mutex<Disk> = Mutex::new(Disk {
     refs: 0,
     writes: 0,
     fail: false,
+    write_fail: false,
 });
 
 pub(crate) fn try_arc<T>(value: T) -> Result<Arc<T>, Errno> {
@@ -108,7 +110,7 @@ pub(crate) fn read_raw(_: u32, at: usize, data: &mut [u8]) -> Result<usize, Errn
 fn write_raw(_: u32, at: usize, data: &[u8]) -> Result<usize, Errno> {
     let mut d = DISK.lock();
     d.writes += 1;
-    if d.fail {
+    if d.fail || d.write_fail {
         return Err(Errno::Io);
     }
     d.data[at..at + data.len()].copy_from_slice(data);
@@ -172,10 +174,10 @@ fn flush_retries_after_writeback_failure() {
         (page.addr() as *mut u8).write(42);
     }
     drop(page);
-    DISK.lock().fail = true;
+    DISK.lock().write_fail = true;
     assert!(cache::flush(None).is_err());
     assert!(cache::resident(1, 0));
-    DISK.lock().fail = false;
+    DISK.lock().write_fail = false;
     cache::flush(None).unwrap();
     assert_eq!(DISK.lock().data[0], 42);
     assert!(!cache::resident(1, 0));
