@@ -319,7 +319,6 @@ IGN 或 DFL 且默认动作属 Ign/Cont 静默丢弃。同步（硬件）信号�
 | sa_flags | SA_NODEFER 恒加本信号位；SA_RESETHAND/SA_NOCLDSTOP 存而不执行；SA_ONSTACK 已生效（其余输入模式见 sigaltstack 行） |
 | sigaltstack | 单进程无 per-thread；MINSIGSTKSZ 不查（size=0 即禁用）；SS_ONSTACK/AUTODISARM 输入 EINVAL；rt_sigreturn 不回改登记（Linux restore_altstack 会）；备用栈溢出防护未做 |
 | IGN 冲刷 | rt_sigaction 转 IGN/DFL-Ign 时无条件清 pending；Linux flush_sigqueue_mask 仅冲刷未屏蔽部分（被屏蔽后设 IGN 再解蔽，本实现信号丢失、Linux 保留） |
-| sigsuspend | 等待中仅因临时 mask 而可投递的信号，返回后仍被旧 mask 屏蔽、延后投递（Linux 以换入 mask 出队先跑 handler） |
 | sigtimedwait | 等待集按 `set ∩ 未屏蔽` 判定（Linux 睡眠期临时放宽 blocked，可等"blocked 且在集"信号） |
 | sigqueueinfo | RT 信号无排队（位图合并语义）；保留码 si_value 经 addr 槽落位 |
 | 终止与 core | 无 core dump：Core 类信号死亡恒 CLD_KILLED，wait status 无 0x80 位（Linux CLD_DUMPED + WCOREDUMP） |

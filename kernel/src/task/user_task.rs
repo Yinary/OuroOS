@@ -227,6 +227,7 @@ pub fn user_task_entry() -> ! {
                                     &mut sleep_deadline,
                                     &mut sigsuspend_saved,
                                     &mut timedwait,
+                                    &mut wait_uncompleted,
                                 ),
                                 Flow::Wait(reason) => ProcessResult::Wait(reason),
                                 Flow::SigReturn => ProcessResult::Restored,
@@ -388,6 +389,19 @@ fn delivery_verdict(sig: u8, slot: SigInfoSlot, d: SignalDisposition) -> Option<
             fault: slot.fault,
         }),
         DefaultAction::Ign | DefaultAction::Cont | DefaultAction::Stop => None,
+    }
+}
+
+/// 信号是否具有投递后果：用户 handler，或 DFL 且默认动作 Term/Core；
+/// SIG_IGN 与 DFL 的 Ign/Cont/Stop 类无后果。
+fn has_consequence(sig: u8, d: SignalDisposition) -> bool {
+    if d.handler == SIG_DFL {
+        matches!(
+            default_action(sig),
+            DefaultAction::Term | DefaultAction::Core
+        )
+    } else {
+        d.handler != SIG_IGN
     }
 }
 
@@ -560,13 +574,14 @@ fn process_call(
     sleep_deadline: &mut Option<core::time::Duration>,
     sigsuspend_saved: &mut Option<SignalSet>,
     timedwait: &mut Option<(SignalSet, core::time::Duration)>,
+    wait_uncompleted: &mut bool,
 ) -> ProcessResult {
     let args = frame.args();
     let nr = frame[TrapFrameArgs::SYSCALL];
     let result: Result<usize, Errno> = match nr {
         sysnr::RT_SIGSUSPEND => {
-            // rt_sigsuspend(2)：换入新屏蔽集合并睡到有可投递信号；
-            // 有 handler 时以 -EINTR 完成（偏差登记 docs/ostd-contracts.md §4.5）。
+            // rt_sigsuspend(2)：换入新屏蔽集合，睡到出现有后果的信号；
+            // handler/DFL-Term/Core 以 -EINTR 完成并留给检查点处置。
             if sigsuspend_saved.is_none() {
                 // 首次：读 mask（剥 KILL/STOP）→ 存旧集合 → 换入 → 等。
                 if args[1] != SIGSETSIZE {
@@ -591,14 +606,37 @@ fn process_call(
                     }
                 }
             } else {
-                // 防御性兜底：恢复换入前的旧集合，以 -EINTR 完成。
-                if let Some(old) = sigsuspend_saved.take() {
+                // 重入决策：Ign/Cont/Stop 类信号锁内消费丢弃后继续查；
+                // 有后果的信号保留，以 -EINTR 完成，交检查点投递/终止。
+                let consequence = {
                     let mut reg = REGISTRY.lock();
-                    if let Some(rec) = reg.records.iter_mut().find(|r| r.pid == parent) {
-                        rec.signal.setmask(old);
+                    let rec = reg
+                        .records
+                        .iter_mut()
+                        .find(|r| r.pid == parent)
+                        .expect("user task unregistered");
+                    loop {
+                        let blocked = rec.signal.blocked();
+                        let Some((sig, _)) = rec.signal.peek_deliverable(blocked) else {
+                            break false;
+                        };
+                        if has_consequence(sig, rec.signal.disposition(sig)) {
+                            break true;
+                        }
+                        // 无后果：不当投递，消费丢弃（同 Linux get_signal）。
+                        rec.signal
+                            .take_deliverable(blocked)
+                            .expect("peeked signal still deliverable");
                     }
+                };
+                if consequence {
+                    // PC 由 Done 路径推进，检查点不再补完成。
+                    *wait_uncompleted = false;
+                    Err(Errno::Interrupted)
+                } else {
+                    // 无可投递信号：保留 saved 与临时 mask，重新挂起。
+                    return ProcessResult::Wait(WaitReason::Signal);
                 }
-                Err(Errno::Interrupted)
             }
         }
         sysnr::RT_SIGTIMEDWAIT => {
