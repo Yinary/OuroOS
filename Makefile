@@ -47,6 +47,25 @@ KERNEL_FEATURES = $(if $(strip $(FEATURES)),--features "$(strip $(FEATURES))")
 QEMU_RV ?= qemu-system-riscv64
 QEMU_LA ?= qemu-system-loongarch64
 
+# 离线构建（评测环境无外网，ENVIRONMENT.md：禁止在线下载、隐藏目录会被
+# 评测机过滤）：第三方依赖以 vendor.tar.xz 归档随仓库提交（cargo vendor
+# 产物；crate 内 .cargo-checksum.json 等点开头文件会被 Clone 过滤，必须
+# 归档交付），make all 解压并把 CARGO_HOME 指到仓库内非隐藏目录（官方
+# 注意事项：.cargo 需改名后在 Makefile 恢复）。
+VENDOR_ARCHIVE := vendor.tar.xz
+CARGO_HOME := $(CURDIR)/.cargo-home
+
+$(CARGO_HOME)/config.toml: cargo-vendor-config.toml | vendor/.extracted
+	@mkdir -p $(dir $@)
+	@cp $< $@
+
+vendor/.extracted: $(VENDOR_ARCHIVE)
+	tar xJf $<
+	@touch $@
+
+$(VENDOR_ARCHIVE): vendor/.cargo-checksum.json
+	tar cJf $@ vendor
+
 .PHONY: all kernel-rv kernel-la build build-rv build-la \
 	build-user-rv build-user-la selftest-rv selftest-la clippy clippy-rv clippy-la fmt \
 	run run-rv run-la basic-bin basic-disk run-basic run-basic-rv run-basic-la \
@@ -62,15 +81,15 @@ kernel-rv: build-user-rv build-rv
 kernel-la: build-user-la build-la
 	cp $(BIN_LA) kernel-la
 
-build-user-rv:
+build-user-rv: $(CARGO_HOME)/config.toml vendor/.extracted
 	CARGO_TARGET_DIR=target cargo build --manifest-path $(USER_CRATE)/Cargo.toml \
 		$(USER_BUILD_STD) --release --target $(TARGET_RV)
 
-build-user-la:
+build-user-la: $(CARGO_HOME)/config.toml vendor/.extracted
 	$(RUSTFLAGS_LA) CARGO_TARGET_DIR=target cargo build --manifest-path $(USER_CRATE)/Cargo.toml \
 		$(USER_BUILD_STD) --release --target $(TARGET_LA)
 
-build-rv:
+build-rv: $(CARGO_HOME)/config.toml vendor/.extracted
 	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/hello \
 	OUROOS_CHECK_ELF=target/$(TARGET_RV)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_RV)/$(USER_REL)/sched \
@@ -78,7 +97,7 @@ build-rv:
 	OUROOS_INIT_ELF=target/$(TARGET_RV)/$(USER_REL)/official_init \
 	LOG=$(LOG) cargo build $(BUILD_STD) --release --target $(TARGET_RV) $(KERNEL_FEATURES)
 
-build-la:
+build-la: $(CARGO_HOME)/config.toml vendor/.extracted
 	$(RUSTFLAGS_LA) \
 	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/hello \
 	OUROOS_CHECK_ELF=target/$(TARGET_LA)/$(USER_REL)/check \
