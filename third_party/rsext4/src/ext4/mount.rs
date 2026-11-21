@@ -277,7 +277,9 @@ impl Ext4FileSystem {
 
                 let j_sb = JournalSuperBllockS::from_disk_bytes(&journal_data);
 
-                // OuroOS patch: the writer emits only classic, featureless JBD2 tags.
+                // OuroOS patch: 描述符格式按盘上 journal 特性选择写入端——
+                // 无特性时写 classic tag；64bit + checksum_v3 时写 16 字节 v3
+                // tag（累积 crc32c + 描述符块尾校验）。其余特性组合仍拒绝。
                 if !options.replay_journal {
                     if j_sb.s_header.h_magic != JBD2_MAGIC
                         || j_sb.s_header.h_blocktype != JBD2_BLOCKTYPE_SUPERBLOCK_V2
@@ -289,9 +291,23 @@ impl Ext4FileSystem {
                     {
                         return Err(Ext4Error::corrupted());
                     }
-                    if needs_recovery || j_sb.s_start != 0 || j_sb.s_errno != 0
-                        || j_sb.s_feature_compat != 0 || j_sb.s_feature_incompat != 0
+                    let incompat = j_sb.s_feature_incompat;
+                    let has_64bit = incompat & JBD2_FEATURE_INCOMPAT_64BIT != 0;
+                    let v3_csum = incompat & JBD2_FEATURE_INCOMPAT_CSUM_V3 != 0;
+                    // 写入端只支持两种布局：无特性 classic（8B tag+UUID）与
+                    // 64bit+csum_v3（16B tag3）。"仅 64BIT 无 v3" 需要 classic
+                    // tag 附带 4B 高块号扩展，恢复端按 classic 8B 步进会从
+                    // 错误偏移解释 tag/UUID，必须精确拒绝。
+                    if needs_recovery
+                        || j_sb.s_start != 0
+                        || j_sb.s_errno != 0
+                        || j_sb.s_feature_compat != 0
                         || j_sb.s_feature_ro_compat != 0
+                        || incompat
+                            & !(JBD2_FEATURE_INCOMPAT_64BIT | JBD2_FEATURE_INCOMPAT_CSUM_V3)
+                            != 0
+                        || (has_64bit && !v3_csum)
+                        || (v3_csum && j_sb.s_checksum_type != JBD2_CRC32C_CHKSUM)
                     {
                         return Err(Ext4Error::unsupported());
                     }

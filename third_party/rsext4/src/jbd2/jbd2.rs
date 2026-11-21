@@ -10,6 +10,7 @@ use crate::{
     checksum::jbd2_update_superblock_checksum,
     config::*,
     crc32c::crc32c::ext4_superblock_has_metadata_csum,
+    crc32c::{crc32c_append, crc32c_init},
     disknode::*,
     endian::*,
     error::*,
@@ -394,14 +395,52 @@ impl JBD2DEVSYSTEM {
         let mut desc_buffer = commit_buffer()?;
         let mut payload_buffer = commit_buffer()?;
         let mut commit_buffer = commit_buffer()?;
+        // 按盘上 journal 特性选择描述符格式：checksum_v3 用 16 字节 tag3（块尾
+        // 带整块 crc32c，无 UUID），否则沿用 classic 8 字节 tag + 首 tag 后 UUID。
+        // OuroOS patch: v3 tag 写入支持官方 pre-20250615 盘的 journal 格式。
+        let use_v3 = self.has_incompat_feature(JBD2_FEATURE_INCOMPAT_CSUM_V3);
+        let has_64bit = self.has_incompat_feature(JBD2_FEATURE_INCOMPAT_64BIT);
+        // OuroOS patch: classic(8B)+64bit 高块号扩展组合的写入未实现且恢复
+        // 端不兼容；该组合在挂载准入已被拒绝，此处为纵深防御。
+        if !use_v3 && has_64bit {
+            return Err(Ext4Error::unsupported());
+        }
+        let tag_size = if use_v3 { JBD2_TAG3_SIZE } else { JBD2_TAG_SIZE };
+        // 首个 tag（两种版本）之后都带 16B UUID；v3 另有块尾校验字段
+        let fixed_size = JBD2_DESCRIPTOR_HEADER_SIZE
+            + JBD2_UUID_SIZE
+            + if use_v3 {
+                core::mem::size_of::<Jbd2JournalBlockTail>()
+            } else {
+                0
+            };
         let tags_end = self
             .commit_queue
             .len()
-            .checked_mul(JBD2_TAG_SIZE)
-            .and_then(|n| n.checked_add(JBD2_DESCRIPTOR_HEADER_SIZE + JBD2_UUID_SIZE))
+            .checked_mul(tag_size)
+            .and_then(|n| n.checked_add(fixed_size))
             .ok_or_else(Ext4Error::invalid_input)?;
-        if tags_end > BLOCK_SIZE {
+        if tags_end > BLOCK_SIZE || (use_v3 && self.commit_queue.len() > JBD2_BUFFER_MAX) {
             return Err(Ext4Error::invalid_input());
+        }
+
+        // OuroOS patch: v3 tag 校验按 Linux v6.12 fs/jbd2/commit.c 逐块独立
+        // 计算：seed = crc32c(~0, journal UUID)，tag csum =
+        // crc32c(crc32c(seed, be32(tid)), 转义后载荷)。前块的校验不带入
+        // 下一块；恢复端 do_one_pass 按同一公式核对。
+        let csum_seed = crc32c_append(crc32c_init(), &self.jbd2_super_block.s_uuid);
+        let seq_be = tid.to_be_bytes();
+        let mut tag_checksums = [0u32; JBD2_BUFFER_MAX];
+        if use_v3 {
+            for (idx, update) in self.commit_queue.iter().enumerate() {
+                payload_buffer.copy_from_slice(&update.1[..]);
+                if payload_buffer[..4] == JBD2_MAGIC.to_be_bytes() {
+                    payload_buffer[..4].fill(0);
+                }
+                let mut csum = crc32c_append(csum_seed, &seq_be);
+                csum = crc32c_append(csum, &payload_buffer);
+                tag_checksums[idx] = csum;
+            }
         }
 
         // Build the descriptor block in memory first.
@@ -416,41 +455,84 @@ impl JBD2DEVSYSTEM {
         let mut first_tag = true;
         // Emit one tag per metadata block queued for this transaction.
         for (idx, update) in self.commit_queue.iter().enumerate() {
-            // Metadata blocks that begin with the journal magic must be escaped
-            // so replay never mistakes them for journal headers.
-            let mut tag = JournalBlockTagS {
-                t_blocknr: update.0.to_u32()?,
-                t_checksum: 0,
-                t_flags: 0,
-            };
+            let is_last = idx == self.commit_queue.len() - 1;
             // OuroOS patch: on-disk JBD2 magic is big-endian.
-            let magic: u32 = u32::from_be_bytes(update.1[0..4].try_into().unwrap());
-            if magic == JBD2_MAGIC {
-                tag.t_flags |= JOURNAL_ESCAPE;
-                debug!("[JBD2 commit] escaping metadata block that begins with journal magic");
-            }
+            let escaped = update.1[..4] == JBD2_MAGIC.to_be_bytes();
+            if use_v3 {
+                let block = update.0.raw();
+                let mut tag = JournalBlockTag3S {
+                    t_blocknr: block as u32,
+                    // v3 与 classic 共用 UUID 协议（fs/jbd2/commit.c 写循环
+                    // 与 recovery.c 的 tagp 推进均不看 csum 版本）：首 tag 后
+                    // 跟 16B journal UUID，后续 tag 置 SAME_UUID。
+                    t_flags: if !first_tag {
+                        u32::from(JBD2_FLAG_SAME_UUID)
+                    } else {
+                        0
+                    },
+                    t_blocknr_high: if has_64bit { (block >> 32) as u32 } else { 0 },
+                    t_checksum: tag_checksums[idx],
+                };
+                if escaped {
+                    tag.t_flags |= u32::from(JOURNAL_ESCAPE);
+                    debug!("[JBD2 commit] escaping metadata block that begins with journal magic");
+                }
+                if is_last {
+                    tag.t_flags |= u32::from(JBD2_FLAG_LAST_TAG);
+                }
+                debug!(
+                    "[JBD2 commit] tid={} tag_idx={} t_blocknr=0x{:x} t_flags=0x{:x} csum=0x{:08x}",
+                    tid, idx, block, tag.t_flags, tag.t_checksum,
+                );
+                tag.to_disk_bytes(&mut desc_buffer[current_offset..current_offset + JBD2_TAG3_SIZE]);
+                current_offset += JBD2_TAG3_SIZE;
+                if first_tag {
+                    desc_buffer[current_offset..current_offset + JBD2_UUID_SIZE]
+                        .copy_from_slice(&self.jbd2_super_block.s_uuid);
+                    current_offset += JBD2_UUID_SIZE;
+                    first_tag = false;
+                }
+            } else {
+                // Metadata blocks that begin with the journal magic must be escaped
+                // so replay never mistakes them for journal headers.
+                let mut tag = JournalBlockTagS {
+                    t_blocknr: update.0.to_u32()?,
+                    t_checksum: 0,
+                    t_flags: 0,
+                };
+                if escaped {
+                    tag.t_flags |= JOURNAL_ESCAPE;
+                    debug!("[JBD2 commit] escaping metadata block that begins with journal magic");
+                }
+                if is_last {
+                    tag.t_flags |= JBD2_FLAG_LAST_TAG;
+                }
+                if !first_tag {
+                    tag.t_flags |= JBD2_FLAG_SAME_UUID;
+                }
+                debug!(
+                    "[JBD2 commit] tid={} tag_idx={} t_blocknr={} t_flags=0x{:x}",
+                    tid, idx, tag.t_blocknr, tag.t_flags,
+                );
+                tag.to_disk_bytes(&mut desc_buffer[current_offset..current_offset + JBD2_TAG_SIZE]);
+                current_offset += JBD2_TAG_SIZE;
 
-            if idx == self.commit_queue.len() - 1 {
-                tag.t_flags |= JBD2_FLAG_LAST_TAG;
+                if first_tag {
+                    desc_buffer[current_offset..current_offset + JBD2_UUID_SIZE]
+                        .copy_from_slice(&self.jbd2_super_block.s_uuid);
+                    current_offset += JBD2_UUID_SIZE;
+                    first_tag = false;
+                }
             }
+        }
 
-            if !first_tag {
-                tag.t_flags |= JBD2_FLAG_SAME_UUID;
-            }
-
-            debug!(
-                "[JBD2 commit] tid={} tag_idx={} t_blocknr={} t_flags=0x{:x}",
-                tid, idx, tag.t_blocknr, tag.t_flags,
-            );
-            tag.to_disk_bytes(&mut desc_buffer[current_offset..current_offset + JBD2_TAG_SIZE]);
-            current_offset += JBD2_TAG_SIZE;
-
-            if first_tag {
-                desc_buffer[current_offset..current_offset + JBD2_UUID_SIZE]
-                    .copy_from_slice(&self.jbd2_super_block.s_uuid);
-                current_offset += JBD2_UUID_SIZE;
-                first_tag = false;
-            }
+        // v3 描述符块尾 4 字节写整块 crc32c（该字段清零后、从 seed 起计算，
+        // 与 Linux jbd2_descriptor_block_csum_set 一致）。
+        if use_v3 {
+            let tail = BLOCK_SIZE - core::mem::size_of::<Jbd2JournalBlockTail>();
+            desc_buffer[tail..BLOCK_SIZE].fill(0);
+            let crc = crc32c_append(csum_seed, &desc_buffer);
+            desc_buffer[tail..BLOCK_SIZE].copy_from_slice(&crc.to_be_bytes());
         }
 
         // Persist the descriptor first.
@@ -474,6 +556,18 @@ impl JBD2DEVSYSTEM {
         // checkpoint still leaves a valid committed transaction in the journal
         // for replay on the next mount.
 
+        // OuroOS patch: commit 块落盘之前，先把 journal 超级块持久化为
+        // "本事务待重放"（s_start = 描述符相对块 = s_first，s_sequence = tid），
+        // 保证 commit 块一旦写到盘上、任意时刻断电，标准恢复端都能看到这条
+        // 已提交事务。此前实现仅在 checkpoint 完成后才更新 sb（s_start 写 0），
+        // commit 与 checkpoint 之间的窗口内盘上 sb 仍为"日志空"，已提交事务
+        // 会被恢复端整体跳过。崩溃发生在本次 sb 写与 commit 块之间时：恢复端
+        // 读到描述符但无 commit 块，不应用任何内容，无部分重放风险。
+        self.jbd2_super_block.s_start = self.jbd2_super_block.s_first;
+        self.jbd2_super_block.s_sequence = tid;
+        self.write_journal_superblock_with_mapping(block_dev, journal_blocks)?;
+        block_dev.flush()?;
+
         let commit_block = CommitHeader {
             h_header: JournalHeaderS {
                 h_magic: JBD2_MAGIC,
@@ -489,6 +583,12 @@ impl JBD2DEVSYSTEM {
         };
 
         commit_block.to_disk_bytes(&mut commit_buffer);
+        // OuroOS patch: v2/v3 的 commit 块整体校验（jbd2_commit_block_csum_set）：
+        // h_chksum_type/size/[0] 清零后整块 crc32c(seed, 4096) 写入 h_chksum[0]。
+        if use_v3 {
+            let crc = crc32c_append(csum_seed, &commit_buffer);
+            commit_buffer[16..20].copy_from_slice(&crc.to_be_bytes());
+        }
         let commit_block_id = self.set_next_log_block_with_mapping(block_dev, journal_blocks)?;
         debug!("[JBD2 commit] tid={tid} commit_block_id={commit_block_id} (absolute)");
         block_dev.write(&commit_buffer, commit_block_id, 1)?;
