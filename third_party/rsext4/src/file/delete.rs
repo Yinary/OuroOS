@@ -255,10 +255,17 @@ fn try_remove_dentry_in_block<B: BlockDevice>(
 ) -> Ext4Result<bool> {
     let superblock = &fs.superblock;
     let mut removed = false;
-    fs.datablock_cache.modify(block_dev, phys, |data| {
-        removed =
-            remove_dentry_in_dir_block(superblock, parent_ino_num, parent_inode, data, name_bytes);
-    })?;
+    // OuroOS patch: 目录块经日志事务（与插入同路径），不直写 home
+    fs.datablock_cache
+        .modify_via_journal(block_dev, phys, |data| {
+            removed = remove_dentry_in_dir_block(
+                superblock,
+                parent_ino_num,
+                parent_inode,
+                data,
+                name_bytes,
+            );
+        })?;
     Ok(removed)
 }
 

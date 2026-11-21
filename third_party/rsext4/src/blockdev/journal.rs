@@ -189,6 +189,35 @@ impl<B: BlockDevice> Jbd2Dev<B> {
         Ok(())
     }
 
+    /// OuroOS patch: 把一块给定数据作为元数据更新入 JBD2 队列（不立即
+    /// 写 home 块），与队列中已有项构成同一事务；队列满时自动提交。
+    /// 目录事务原子性依赖此路径（见 docs/ostd-contracts.md §6）。
+    pub fn queue_metadata_data(
+        &mut self,
+        block_id: AbsoluteBN,
+        data: &[u8; BLOCK_SIZE],
+    ) -> Ext4Result<()> {
+        self.refresh_pending_held_update();
+        let Some(system) = self.system.as_mut() else {
+            // 日志未初始化（无日志卷）：把调用者给出的块内容直写 home，
+            // 并使 held 缓存同步为新内容（write_block 会复用 held 旧内容，
+            // 不得使用）
+            return self.inner.write_blocks(data, block_id, 1);
+        };
+        let updates = Jbd2Update(block_id, alloc::boxed::Box::new(*data));
+        let committed = Self::enqueue_journal_update(
+            system,
+            self.inner.device_mut(),
+            &self.journal_blocks,
+            updates,
+        )?;
+        self.inner.acknowledge_journaled_block(block_id);
+        if committed {
+            self.inner.invalidate_cache()?;
+        }
+        Ok(())
+    }
+
     /// Commits all buffered journal transactions during unmount.
     pub fn umount_commit(&mut self) -> Ext4Result<()> {
         if !self.journal_use {
