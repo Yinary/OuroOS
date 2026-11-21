@@ -1,9 +1,11 @@
-//! 受限的 ELF64 加载器：仅静态 ET_EXEC（ELF64/小端/架构匹配），
-//! 逐字段边界检查解析，不把文件字节重解释为结构体引用。
+//! 受限的 ELF64 加载器：静态 ET_EXEC 与带装载基址的 ET_DYN
+//! （ELF64/小端/架构匹配），逐字段边界检查解析，不把文件字节重解释为
+//! 结构体引用。PT_INTERP 请求由调用方（exec）装载解释器并构造初栈。
 //! 支持范围与 Linux 差异见 docs/ostd-contracts.md §4。
 
 #![deny(unsafe_code)]
 
+use alloc::string::String;
 use polyhal::pagetable::{MappingFlags, PAGE_SIZE};
 
 use crate::mm::{address_space::UserAddressSpace, fence_icache};
@@ -17,14 +19,14 @@ pub enum ElfError {
     Truncated,
     /// 魔数 / class / 数据序 / 版本不符合 ELF64 小端
     BadIdent,
-    /// 只支持 ET_EXEC（2）：静态固定地址可执行文件
+    /// e_type 不是 ET_EXEC（2）或 ET_DYN（3）
     BadType,
     /// e_machine 与当前目标架构不匹配
     BadMachine,
     /// 程序头表越界或 e_phentsize 不是 ELF64 标准值 56
     BadProgramHeaders,
-    /// 存在 PT_INTERP：需要动态解释器，不支持
-    Dynamic,
+    /// PT_INTERP 参数非法（越界、无 NUL 结尾、非 UTF-8 或出现多个）
+    BadInterp,
     /// PT_LOAD 参数非法（范围、对齐、filesz/memsz）
     BadSegment,
     /// 不同段落到同一页（页级权限无法表达，拒绝而不是覆盖）
@@ -43,12 +45,21 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 
 const ET_EXEC: u16 = 2;
+const ET_DYN: u16 = 3;
 /// riscv64 的 e_machine；loongarch64 为 EM_LOONGARCH = 258。
 /// polyhal 未提供按目标架构取值的常量，这里只能按架构选择。
 #[cfg(target_arch = "riscv64")]
 const EM_CURRENT: u16 = 243;
 #[cfg(target_arch = "loongarch64")]
 const EM_CURRENT: u16 = 258;
+
+/// ET_DYN 主映像的装载基址。取 1 MiB 而非 Linux 的 TASK_SIZE/3*2 高位布局：
+/// 高位基址是 Linux 的 ASLR 策略而非 ABI 要求，且官方测例把 brk 返回值按
+/// 32 位 int 处理，高位堆地址在 Linux 上同样使其失效；1 MiB 同时避开 0 页，
+/// 空指针解引用仍然缺页。
+pub fn et_dyn_base() -> usize {
+    0x10_0000
+}
 
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
@@ -93,34 +104,88 @@ fn read_u64(buf: &[u8], off: usize) -> u64 {
 }
 
 /// 已校验的程序入口及位于可读 LOAD 段内的程序头表。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageInfo {
+    /// 用户入口（已加装载基址）
     pub entry: usize,
+    /// 程序头表位置（AT_PHDR/AT_PHENT/AT_PHNUM，已加装载基址）；
+    /// 仅当程序头表整体落在某个可读 LOAD 段内时给出。
     pub headers: Option<(usize, usize, usize)>,
+    /// 本映像的装载基址（ET_EXEC 为 0，供 AT_BASE 使用）
+    pub base: usize,
+    /// PT_INTERP 请求的解释器绝对路径（仅主映像解析；解释器不允许嵌套请求）
+    pub interp: Option<String>,
 }
 
-/// 解析并把 ELF 加载进 `space`，返回入口虚拟地址。
+/// 只解析 ELF 头，取出 PT_INTERP 请求的解释器路径（不触达地址空间）。
+/// 供 exec 在持有注册表借用时预读解释器文件。
+pub fn interp_path(elf: &[u8]) -> Result<Option<String>, ElfError> {
+    parse_header(elf).map(|(_, interp)| interp)
+}
+
+/// 解析并把主映像 ELF 加载进 `space`，返回入口与 auxv 所需信息。
 ///
+/// ET_EXEC 使用固定地址（基址 0）；ET_DYN 以 [`et_dyn_base`] 为装载基址。
 /// BSS（memsz > filesz 的部分）依赖 [`UserAddressSpace::map_alloc`]
 /// 返回已清零的页，无需显式清零。加载完成后执行指令缓存同步。
 pub fn load_elf(space: &mut UserAddressSpace, elf: &[u8]) -> Result<ImageInfo, ElfError> {
+    let (e_type, interp) = parse_header(elf)?;
+    let bias = match e_type {
+        ET_EXEC => 0,
+        ET_DYN => et_dyn_base(),
+        _ => return Err(ElfError::BadType),
+    };
     let mut staged = UserAddressSpace::new().map_err(map_error)?;
-    let entry = load_image(&mut staged, elf)?;
+    let info = load_image(&mut staged, elf, bias, interp)?;
     space.install_image(staged).map_err(map_error)?;
     fence_icache();
-    Ok(entry)
+    Ok(info)
 }
 
-fn map_error(e: crate::mm::address_space::MapError) -> ElfError {
-    use crate::mm::address_space::MapError;
-    match e {
-        MapError::OutOfMemory => ElfError::OutOfMemory,
-        MapError::Overlap => ElfError::SegmentOverlap,
-        _ => ElfError::MapFailed,
+/// 在已构造的地址空间内装载解释器映像（响应主映像的 PT_INTERP）。
+///
+/// 解释器自身的 ET_EXEC 使用固定地址；ET_DYN 在栈保护区下方寻找空洞
+/// 作为装载基址，避免与主映像或栈冲突。返回值供 AT_BASE 与初次 PC 使用。
+pub fn load_interp(space: &mut UserAddressSpace, elf: &[u8]) -> Result<ImageInfo, ElfError> {
+    let (e_type, interp) = parse_header(elf)?;
+    if interp.is_some() {
+        // 解释器再请求解释器不符合 ELF/ABI，直接拒绝
+        return Err(ElfError::BadInterp);
     }
+    let bias = match e_type {
+        ET_EXEC => 0,
+        ET_DYN => {
+            // 放置约束（审查 R5d）：bias 须对齐全部段有效的最大 p_align，
+            // 且实际区间 [bias+min_vaddr, bias+min_vaddr+span] 整体落在
+            // 空洞内。找洞时多留 align 页余量，取"洞尾 - 映像跨度"向下
+            // 对齐为 bias；起点 = bias+min ≥ 洞头由余量严格保证（推导：
+            // align_down(H+A-min,A)+min ≥ H+1），非零最低 vaddr 或大
+            // 对齐映像都不会把段起点移出已检查范围。
+            let (min_vaddr, pages, align) = image_span(elf)?;
+            let align = align.max(PAGE_SIZE);
+            let top = crate::mm::address_space::USER_TOP;
+            let slack = align / PAGE_SIZE;
+            let hole = space
+                .find_free(top - 0x1000_0000, pages + slack)
+                .map_err(map_error)?;
+            let span_bytes = pages * PAGE_SIZE;
+            let hole_end = hole + (pages + slack) * PAGE_SIZE;
+            hole_end
+                .checked_sub(min_vaddr)
+                .and_then(|end| end.checked_sub(span_bytes))
+                .map(|x| x & !(align - 1))
+                .ok_or(ElfError::MapFailed)?
+        }
+        _ => return Err(ElfError::BadType),
+    };
+    let info = load_image(space, elf, bias, None)?;
+    fence_icache();
+    Ok(info)
 }
 
-fn load_image(space: &mut UserAddressSpace, elf: &[u8]) -> Result<ImageInfo, ElfError> {
+/// 头部公共校验：魔数、class、e_type、e_machine、程序头表边界。
+/// 返回 (e_type, PT_INTERP 路径)。
+fn parse_header(elf: &[u8]) -> Result<(u16, Option<String>), ElfError> {
     if elf.len() < 64 {
         return Err(ElfError::Truncated);
     }
@@ -135,13 +200,12 @@ fn load_image(space: &mut UserAddressSpace, elf: &[u8]) -> Result<ImageInfo, Elf
     if read_u32(elf, 20) != 1 || read_u16(elf, 52) != 64 {
         return Err(ElfError::BadIdent);
     }
-    if e_type != ET_EXEC {
+    if e_type != ET_EXEC && e_type != ET_DYN {
         return Err(ElfError::BadType);
     }
     if e_machine != EM_CURRENT {
         return Err(ElfError::BadMachine);
     }
-    let e_entry = read_u64(elf, 24) as usize;
     let e_phoff = read_u64(elf, 32) as usize;
     let e_phentsize = read_u16(elf, 54);
     let e_phnum = read_u16(elf, 56);
@@ -161,17 +225,94 @@ fn load_image(space: &mut UserAddressSpace, elf: &[u8]) -> Result<ImageInfo, Elf
         return Err(ElfError::BadProgramHeaders);
     }
 
+    let mut interp = None;
+    for i in 0..phnum {
+        let ph = e_phoff + i * PHENTSIZE as usize;
+        if read_u32(elf, ph) == PT_INTERP {
+            if interp.is_some() {
+                return Err(ElfError::BadInterp);
+            }
+            let offset = read_u64(elf, ph + 8) as usize;
+            let filesz = read_u64(elf, ph + 32) as usize;
+            let end = offset.checked_add(filesz).ok_or(ElfError::BadInterp)?;
+            if filesz < 2 || end > elf.len() || elf[end - 1] != 0 {
+                return Err(ElfError::BadInterp);
+            }
+            let text =
+                core::str::from_utf8(&elf[offset..end - 1]).map_err(|_| ElfError::BadInterp)?;
+            if text.is_empty() || text.contains('\0') {
+                return Err(ElfError::BadInterp);
+            }
+            let mut path = String::new();
+            path.try_reserve(text.len())
+                .map_err(|_| ElfError::BadInterp)?;
+            path.push_str(text);
+            interp = Some(path);
+        }
+    }
+    Ok((e_type, interp))
+}
+
+/// ET_DYN 映像所有 PT_LOAD 段合计占据的页数（用于寻找装载空洞）。
+/// ET_DYN 映像的跨度信息：最低 PT_LOAD 起址、占据页数、全部段中
+/// 有效的最大 p_align（装载基址需满足该对齐）。
+fn image_span(elf: &[u8]) -> Result<(usize, usize, usize), ElfError> {
+    let e_phoff = read_u64(elf, 32) as usize;
+    let phnum = read_u16(elf, 56) as usize;
+    let mut min: Option<usize> = None;
+    let mut max = 0usize;
+    let mut align = PAGE_SIZE;
+    for i in 0..phnum {
+        let ph = e_phoff + i * PHENTSIZE as usize;
+        if read_u32(elf, ph) != PT_LOAD {
+            continue;
+        }
+        let vaddr = read_u64(elf, ph + 16) as usize;
+        let memsz = read_u64(elf, ph + 40) as usize;
+        let p_align = read_u64(elf, ph + 48) as usize;
+        let end = vaddr.checked_add(memsz).ok_or(ElfError::BadSegment)?;
+        min = Some(min.map_or(vaddr, |m| m.min(vaddr)));
+        max = max.max(end);
+        if p_align.is_power_of_two() && p_align > 1 {
+            align = align.max(p_align);
+        }
+    }
+    let min = min.ok_or(ElfError::BadSegment)?;
+    let pages = max.div_ceil(PAGE_SIZE) - min / PAGE_SIZE;
+    Ok((min, pages.max(1), align))
+}
+
+fn map_error(e: crate::mm::address_space::MapError) -> ElfError {
+    use crate::mm::address_space::MapError;
+    match e {
+        MapError::OutOfMemory => ElfError::OutOfMemory,
+        MapError::Overlap => ElfError::SegmentOverlap,
+        _ => ElfError::MapFailed,
+    }
+}
+
+/// 把映像按装载基址 `bias` 装入 `space`（不新建地址空间）。
+fn load_image(
+    space: &mut UserAddressSpace,
+    elf: &[u8],
+    bias: usize,
+    interp: Option<String>,
+) -> Result<ImageInfo, ElfError> {
+    let e_entry = read_u64(elf, 24) as usize;
+    let e_phoff = read_u64(elf, 32) as usize;
+    let phnum = read_u16(elf, 56) as usize;
+    let phend = e_phoff + phnum * PHENTSIZE as usize;
+
     for i in 0..phnum {
         let ph = e_phoff + i * PHENTSIZE as usize;
         let p_type = read_u32(elf, ph);
-        match p_type {
-            PT_INTERP => return Err(ElfError::Dynamic),
-            PT_LOAD => load_segment(space, elf, ph)?,
-            // PT_NOTE / PT_GNU_* 等与加载无关，忽略
-            _ => continue,
+        if p_type == PT_LOAD {
+            load_segment(space, elf, ph, bias)?;
         }
+        // PT_INTERP 已在 parse_header 收集；PT_NOTE / PT_GNU_* 等与加载无关
     }
 
+    let entry = e_entry.checked_add(bias).ok_or(ElfError::EntryInvalid)?;
     let entry_in_segment = (0..phnum).any(|i| {
         let ph = e_phoff + i * PHENTSIZE as usize;
         let start = read_u64(elf, ph + 16) as usize;
@@ -185,20 +326,18 @@ fn load_image(space: &mut UserAddressSpace, elf: &[u8]) -> Result<ImageInfo, Elf
         return Err(ElfError::EntryInvalid);
     }
     // 入口必须落在可执行的用户映射中
-    let Some((_, flags)) = space.translate(e_entry) else {
+    let Some((_, flags)) = space.translate(entry) else {
         return Err(ElfError::EntryInvalid);
     };
     if !flags.contains(MappingFlags::U)
         || !space
             .areas()
             .iter()
-            .any(|a| a.start <= e_entry && e_entry < a.end && a.flags.contains(MappingFlags::X))
+            .any(|a| a.start <= entry && entry < a.end && a.flags.contains(MappingFlags::X))
     {
         return Err(ElfError::EntryInvalid);
     }
 
-    // 代码页经内核别名写入、用户在用户地址取指，需同步指令缓存
-    fence_icache();
     let headers = (0..phnum).find_map(|i| {
         let ph = e_phoff + i * PHENTSIZE as usize;
         let offset = read_u64(elf, ph + 8) as usize;
@@ -211,16 +350,28 @@ fn load_image(space: &mut UserAddressSpace, elf: &[u8]) -> Result<ImageInfo, Elf
         {
             return None;
         }
-        Some((va.checked_add(e_phoff - offset)?, PHENTSIZE as usize, phnum))
+        Some((
+            va.checked_add(bias)?.checked_add(e_phoff - offset)?,
+            PHENTSIZE as usize,
+            phnum,
+        ))
     });
     Ok(ImageInfo {
-        entry: e_entry,
+        entry,
         headers,
+        base: bias,
+        interp,
     })
 }
 
 /// 加载单个 PT_LOAD 段（`ph` 为该程序头在文件内的偏移）。
-fn load_segment(space: &mut UserAddressSpace, elf: &[u8], ph: usize) -> Result<(), ElfError> {
+/// `bias` 为装载基址，加到每个虚拟地址上；相位检查针对文件原始值。
+fn load_segment(
+    space: &mut UserAddressSpace,
+    elf: &[u8],
+    ph: usize,
+    bias: usize,
+) -> Result<(), ElfError> {
     let p_flags = read_u32(elf, ph + 4);
     let p_offset = read_u64(elf, ph + 8) as usize;
     let p_vaddr = read_u64(elf, ph + 16) as usize;
@@ -236,8 +387,9 @@ fn load_segment(space: &mut UserAddressSpace, elf: &[u8], ph: usize) -> Result<(
     if file_end > elf.len() {
         return Err(ElfError::BadSegment);
     }
+    let vaddr = p_vaddr.checked_add(bias).ok_or(ElfError::BadSegment)?;
     // 用户范围与栈保护检查（含溢出）
-    UserAddressSpace::check_user_span(p_vaddr, p_memsz).map_err(|_| ElfError::BadSegment)?;
+    UserAddressSpace::check_user_span(vaddr, p_memsz).map_err(|_| ElfError::BadSegment)?;
     if p_vaddr % PAGE_SIZE != p_offset % PAGE_SIZE
         || (p_align > 1 && (!p_align.is_power_of_two() || p_vaddr % p_align != p_offset % p_align))
     {
@@ -248,15 +400,15 @@ fn load_segment(space: &mut UserAddressSpace, elf: &[u8], ph: usize) -> Result<(
     }
 
     let flags = segment_flags(p_flags);
-    let page_start = p_vaddr / PAGE_SIZE * PAGE_SIZE;
-    let mem_end = p_vaddr.checked_add(p_memsz).ok_or(ElfError::BadSegment)?;
-    let file_va_end = p_vaddr.checked_add(p_filesz).ok_or(ElfError::BadSegment)?;
-    for vaddr in (page_start..mem_end).step_by(PAGE_SIZE) {
-        space.map_alloc(vaddr, flags).map_err(map_error)?;
-        let begin = vaddr.max(p_vaddr);
-        let end = (vaddr + PAGE_SIZE).min(file_va_end);
+    let page_start = vaddr / PAGE_SIZE * PAGE_SIZE;
+    let mem_end = vaddr.checked_add(p_memsz).ok_or(ElfError::BadSegment)?;
+    let file_va_end = vaddr.checked_add(p_filesz).ok_or(ElfError::BadSegment)?;
+    for page in (page_start..mem_end).step_by(PAGE_SIZE) {
+        space.map_alloc(page, flags).map_err(map_error)?;
+        let begin = page.max(vaddr);
+        let end = (page + PAGE_SIZE).min(file_va_end);
         if begin < end {
-            let file_off = p_offset + (begin - p_vaddr);
+            let file_off = p_offset + (begin - vaddr);
             space
                 .init_elf_page(begin, &elf[file_off..file_off + end - begin])
                 .map_err(map_error)?;
