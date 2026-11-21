@@ -6,6 +6,11 @@ pub const KERNEL_NAME: &str = "OuroOS";
 /// 版本号，取自 Cargo.toml
 pub const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// uname(2) 的 release 字段。按 Linux 惯例给出 "数字版本-标识" 形式：
+/// glibc 等用户空间在启动时解析该字段做最低内核版本检查，纯项目版本号
+/// （如 0.1.0）会被判为过旧的内核而拒绝启动。
+pub const KERNEL_RELEASE: &str = "6.1.0-OuroOS";
+
 /// 当前架构名（编译期确定）
 pub const ARCH_NAME: &str = match () {
     #[cfg(target_arch = "riscv64")]
