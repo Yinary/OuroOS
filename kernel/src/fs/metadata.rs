@@ -32,6 +32,19 @@ pub(crate) struct Metadata {
 
 /// 按 inode 取得后端元数据，失败返回后端错误。
 pub(super) fn metadata(ino: u32) -> Result<Metadata, Errno> {
+    // procfs 虚拟节点（/proc、/proc/<pid>、/dev/*）无后端 inode，按统一
+    // stat 结果合成，避免 resolve 逐分量解析时把虚拟节点当 ext4 处理
+    if ino >= super::procfs::MISC_DIR || super::procfs::pid_ino_parts(ino).is_some() {
+        let (mode, size, links, _) = super::stat(ino)?;
+        return Ok(Metadata {
+            ino: ino as u64,
+            mode,
+            links: u32::from(links),
+            size,
+            block_size: 4096,
+            ..Default::default()
+        });
+    }
     if ino & FAT_INODE != 0 {
         fat::metadata(ino)
     } else {

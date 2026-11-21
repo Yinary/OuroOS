@@ -39,7 +39,7 @@ fn contains(parent: &str, path: &str) -> bool {
             .is_some_and(|s| s.starts_with('/'))
 }
 
-fn directory_busy(path: &str) -> bool {
+pub(crate) fn directory_busy(path: &str) -> bool {
     DIRECTORIES
         .lock()
         .iter()
@@ -65,6 +65,16 @@ enum Kind {
         _directory: Option<Arc<DirectoryPath>>,
     },
     MemInfo(String),
+    /// /dev/null：读 EOF、写全收（见 fs::procfs::DEVNULL）
+    DevNull,
+    /// /dev/misc/rtc：仅支持 ioctl 的 RTC 查询设备
+    Rtc,
+    /// /dev 下的块设备节点：按节点登记的 (盘, 分区) 通用块访问
+    DevBlk {
+        disk: usize,
+        start: usize,
+        len: u64,
+    },
 }
 /// 共享偏移、打开标志和文件资源的持有者。
 pub(crate) struct OpenFile {
@@ -104,6 +114,9 @@ pub struct Context {
     cwd: Arc<DirectoryPath>,
     fds: Vec<Option<Descriptor>>,
     umask: u16,
+    /// 本进程最近一次 execve 的绝对路径（/proc/self/exe 的目标，proc(5)）。
+    /// 内核内嵌启动的程序没有盘上路径，保持为空串。
+    exe_path: String,
 }
 fn string(s: &str) -> Result<String, Errno> {
     let mut result = String::new();
@@ -130,6 +143,7 @@ impl Context {
             cwd: directory_path(string("/")?)?,
             fds,
             umask: 0o022,
+            exe_path: String::new(),
         })
     }
     /// fork 复制描述符表，保留共享偏移。
@@ -141,7 +155,13 @@ impl Context {
             cwd: self.cwd.clone(),
             fds,
             umask: self.umask,
+            exe_path: self.exe_path.clone(),
         })
+    }
+    /// 记录最近一次 execve 的绝对路径（供 /proc/self/exe 解析）。
+    /// 接收调用方已分配好的 String：本方法处于 exec 提交段，无失败路径。
+    pub(crate) fn set_exe_path_owned(&mut self, value: String) {
+        self.exe_path = value;
     }
     /// 设置创建权限掩码，仅保存权限位并返回旧值。
     pub(crate) fn set_umask(&mut self, mask: usize) -> usize {
@@ -496,6 +516,16 @@ impl Context {
 
     /// 打开只读 /proc/meminfo 快照。
     pub(crate) fn open_meminfo(&mut self, flags: usize, cloexec: bool) -> Result<usize, Errno> {
+        self.open_proc_text(super::procfs::meminfo()?, flags, cloexec)
+    }
+
+    /// 打开任意 procfs 只读文本快照（meminfo/mounts/pid 文件共用）。
+    pub(crate) fn open_proc_text(
+        &mut self,
+        text: String,
+        flags: usize,
+        cloexec: bool,
+    ) -> Result<usize, Errno> {
         if flags & (3 | 0x200) != 0 {
             return Err(Errno::ReadOnly);
         }
@@ -503,7 +533,104 @@ impl Context {
             return Err(Errno::NotDir);
         }
         let file = OpenFile {
-            kind: Kind::MemInfo(super::procfs::meminfo()?),
+            kind: Kind::MemInfo(text),
+            offset: 0,
+            flags: flags & !OPEN_CREATION_FLAGS,
+        };
+        self.install(fs::try_arc(Mutex::new(file))?, cloexec)
+    }
+
+    /// 打开 /dev/null：读恒 EOF、写全部接收并丢弃。
+    pub(crate) fn open_devnull(&mut self, flags: usize, cloexec: bool) -> Result<usize, Errno> {
+        self.open_special(Kind::DevNull, flags, cloexec)
+    }
+
+    /// fchmod(2)（fd, mode）：按已打开对象的 inode 身份改权限位，
+    /// rename/unlink 后仍有效；非 inode FD 返回 ENOENT（fd 无权限位语义）。
+    pub(crate) fn fchmod_fd(
+        &self,
+        fd: usize,
+        mode: usize,
+        space: &crate::mm::address_space::UserAddressSpace,
+    ) -> Result<usize, Errno> {
+        let handle = self.get(fd)?;
+        let (ino, path) = {
+            let f = handle.lock();
+            let Kind::Inode { ino, path, .. } = &f.kind else {
+                return Err(Errno::NoEntry);
+            };
+            (*ino, path.clone())
+        };
+        super::chmod_apply(path.as_str(), ino, mode, space)
+    }
+
+    /// ioctl(2) 的设备分派：当前仅 RTC 设备支持 RTC_RD_TIME（读硬件
+    /// 墙上时钟，按 linux/rtc.h 的 struct rtc_time 九个 int 拷贝到用户
+    /// 缓冲）；其余命令与设备一律 ENOTTY，不假装成功。
+    pub(crate) fn ioctl(
+        &self,
+        fd: usize,
+        cmd: usize,
+        arg: usize,
+        space: &crate::mm::address_space::UserAddressSpace,
+    ) -> Result<usize, Errno> {
+        // _IOR('p', 0x09, struct rtc_time)：32 位方向/大小/类型/序号编码
+        const RTC_RD_TIME: usize = 0x8024_7009;
+        let file = self.get(fd)?;
+        let f = file.lock();
+        // ioctl(2) 的 cmd 是 unsigned int：部分 libc（如 musl）把负的 int
+        // 常量符号扩展到 64 位寄存器，比较前统一截断为 32 位
+        if !matches!(f.kind, Kind::Rtc) || (cmd as u32) as usize != RTC_RD_TIME {
+            return Err(Errno::InappropriateIoctl);
+        }
+        let Some(secs) = crate::drivers::rtc::read_utc_seconds() else {
+            return Err(Errno::Io);
+        };
+        let tm = crate::drivers::rtc::epoch_to_tm(secs);
+        let mut bytes = [0u8; 36];
+        for (i, word) in tm.iter().enumerate() {
+            bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        crate::mm::user_access::copy_to_user(space, arg, &bytes).map_err(|_| Errno::Fault)?;
+        Ok(0)
+    }
+
+    /// 打开 /dev/misc/rtc：RTC 查询设备，ioctl(RTC_RD_TIME) 读时间。
+    pub(crate) fn open_rtc(&mut self, flags: usize, cloexec: bool) -> Result<usize, Errno> {
+        self.open_special(Kind::Rtc, flags, cloexec)
+    }
+
+    /// 打开 /dev 下注册的块设备节点：通用块访问（读/写按分区边界）。
+    pub(crate) fn open_devblk(
+        &mut self,
+        disk: usize,
+        start: usize,
+        len: u64,
+        flags: usize,
+        cloexec: bool,
+    ) -> Result<usize, Errno> {
+        if flags & 0x10000 != 0 {
+            return Err(Errno::NotDir);
+        }
+        if flags & 0xc00 != 0 {
+            // O_APPEND|O_DIRECT 未支持（块访问按 offset 语义）
+            return Err(Errno::Invalid);
+        }
+        let file = OpenFile {
+            kind: Kind::DevBlk { disk, start, len },
+            offset: 0,
+            flags: flags & !OPEN_CREATION_FLAGS,
+        };
+        self.install(fs::try_arc(Mutex::new(file))?, cloexec)
+    }
+
+    /// 打开无数据的字符设备（flags 只保留打开方式，无创建位）。
+    fn open_special(&mut self, kind: Kind, flags: usize, cloexec: bool) -> Result<usize, Errno> {
+        if flags & 0x10000 != 0 {
+            return Err(Errno::NotDir);
+        }
+        let file = OpenFile {
+            kind,
             offset: 0,
             flags: flags & !OPEN_CREATION_FLAGS,
         };
@@ -623,7 +750,22 @@ impl OpenFile {
     /// 返回打开对象的属性快照；管道与控制台提供合成属性。
     pub(crate) fn metadata(&self) -> Result<fs::Metadata, Errno> {
         match &self.kind {
-            Kind::Inode { ino, .. } => fs::metadata::metadata(*ino),
+            Kind::Inode { ino, .. } => {
+                // procfs 虚拟节点（/proc、/dev/*、pid 派生）无后端 inode
+                // 元数据，直接按统一 stat 结果合成
+                if *ino >= super::procfs::MISC_DIR || super::procfs::pid_ino_parts(*ino).is_some() {
+                    let (mode, size, links, _) = fs::stat(*ino)?;
+                    return Ok(fs::Metadata {
+                        ino: *ino as u64,
+                        mode,
+                        links: u32::from(links),
+                        size,
+                        block_size: 4096,
+                        ..Default::default()
+                    });
+                }
+                fs::metadata::metadata(*ino)
+            }
             Kind::MemInfo(text) => Ok(fs::Metadata {
                 ino: super::procfs::MEMINFO as u64,
                 mode: 0o100444,
@@ -689,6 +831,18 @@ impl OpenFile {
                 2 => text.len(),
                 _ => return Err(Errno::Invalid),
             },
+            Kind::DevNull | Kind::Rtc => match whence {
+                0 => 0,
+                1 => self.offset,
+                2 => 0,
+                _ => return Err(Errno::Invalid),
+            },
+            Kind::DevBlk { len, .. } => match whence {
+                0 => 0usize,
+                1 => self.offset,
+                2 => *len as usize,
+                _ => return Err(Errno::Invalid),
+            },
             _ => return Err(Errno::SeekPipe),
         };
         let offset = base as i128 + delta as i128;
@@ -731,6 +885,8 @@ impl OpenFile {
                 crate::task::sched::request_pipe_wake();
                 Ok(delivered)
             }
+            Kind::DevNull | Kind::Rtc => Ok(0),
+            Kind::DevBlk { .. } => Ok(0), // 设备块读走专用路径（见 read_devblk）
             Kind::MemInfo(text) => {
                 let bytes = text.as_bytes().get(self.offset..).unwrap_or(&[]);
                 let count = data.len().min(bytes.len());
@@ -805,6 +961,16 @@ impl OpenFile {
         deliver: impl FnOnce(&[u8]) -> Result<usize, Errno>,
     ) -> Result<usize, Errno> {
         self.check_type(first)?;
+        if let Kind::DevBlk { disk, start, len } = &self.kind {
+            // 块设备节点：分区起点+fd 偏移经驱动通用读
+            let off = start + offset;
+            if offset.saturating_add(data.len()) > *len as usize {
+                return Err(Errno::Range);
+            }
+            crate::drivers::read_bytes(*disk, off, data).map_err(|_| Errno::Io)?;
+            let delivered = deliver(&data[..data.len()])?;
+            return Ok(delivered);
+        }
         if let Kind::MemInfo(text) = &self.kind {
             let bytes = text.as_bytes().get(offset..).unwrap_or(&[]);
             let count = data.len().min(bytes.len());
@@ -829,6 +995,17 @@ impl OpenFile {
     /// 写给定位置且不改变共享偏移；O_APPEND 沿用 Linux 的追加行为。
     pub(crate) fn write_at(&self, offset: usize, data: &[u8], first: bool) -> Result<usize, Errno> {
         self.check_type(first)?;
+        if let Kind::DevBlk { disk, start, len } = &self.kind {
+            let off = start + offset;
+            if offset.saturating_add(data.len()) > *len as usize {
+                return Err(Errno::Range);
+            }
+            crate::drivers::write_bytes(*disk, off, data).map_err(|_| Errno::Io)?;
+            return Ok(data.len());
+        }
+        if matches!(self.kind, Kind::DevNull | Kind::Rtc) {
+            return Ok(data.len());
+        }
         let ino = match self.kind {
             Kind::Inode { ino, .. } => ino,
             _ => return Err(Errno::SeekPipe),
@@ -861,10 +1038,28 @@ fn nonblock_or_wait(flags: usize) -> Errno {
 }
 /// 按进程工作目录读取可执行文件，返回独立内核镜像。
 pub fn executable(ctx: &Context, path: &str) -> Result<Vec<u8>, Errno> {
+    // /proc/self/exe 指向当前进程的可执行文件（proc(5)）；execve 与
+    // open 共用该重写。没有盘上可执行路径（内核内嵌程序）时按 ENOENT。
+    let redirected;
+    let path = if path == "/proc/self/exe" {
+        if ctx.exe_path.is_empty() {
+            return Err(Errno::NoEntry);
+        }
+        redirected = ctx.exe_path.clone();
+        &redirected
+    } else {
+        path
+    };
     let ino = fs::lookup(&ctx.path((-100isize) as usize, path)?)?;
     let (mode, len, _, _) = fs::stat(ino)?;
     if mode & 0xf000 != 0x8000 {
         return Err(Errno::Invalid);
+    }
+    // execve(2) 语义：目标必须是普通文件且任一执行位为 1（无凭证模型
+    // 下所有调用者等同 root，root 也要求任一 x 位）；拒绝时 EACCES。
+    // ELF、#! 脚本与其解释器都经本入口，校验统一覆盖。
+    if mode & 0o111 == 0 {
+        return Err(Errno::Access);
     }
     let len = usize::try_from(len).map_err(|_| Errno::NoMem)?;
     let mut data = Vec::new();
@@ -906,6 +1101,8 @@ pub(crate) fn poll(
                 Kind::Input => 0x41 & requested,
                 Kind::Output => 0x104 & requested,
                 Kind::Inode { .. } | Kind::MemInfo(_) => 0x145 & requested,
+                // /dev/null 与 rtc 永远可读（EOF）可写；块节点同
+                Kind::DevNull | Kind::Rtc | Kind::DevBlk { .. } => 0x145 & requested,
                 Kind::Pipe { pipe, reading } => {
                     let p = pipe.lock();
                     if *reading {

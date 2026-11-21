@@ -90,6 +90,13 @@ pub fn dispatch(
             fs::fat::mount(&source, &target)?;
             Ok(0)
         }
+        sysnr::FACCESSAT => faccessat(ctx, space, a),
+        sysnr::FCHMOD => fchmod(ctx, space, a),
+        sysnr::FCHMODAT => fchmodat(ctx, space, a),
+        sysnr::MKNODAT => mknodat(ctx, space, a),
+        sysnr::FACCESSAT2 => faccessat2(ctx, space, a),
+        sysnr::IOCTL => ioctl(ctx, space, a),
+
         sysnr::UMOUNT2 => {
             if a[1] != 0 {
                 return Err(Errno::NotSupported);
@@ -99,11 +106,23 @@ pub fn dispatch(
             Ok(0)
         }
         sysnr::UNLINKAT => {
-            if a[2] != 0 {
+            if a[2] & !0x200 != 0 {
                 return Err(Errno::NotSupported);
             }
             let path = ctx.path(a[0], &user_string(space, a[1])?)?;
             let ino = fs::lookup(&path)?;
+            if a[2] & 0x200 != 0 {
+                // AT_REMOVEDIR（rmdir(2)）：仅空目录，被 cwd/目录 FD/挂载点
+                // 引用时 EBUSY；错误码先行，避免误删后再回滚
+                if fs::stat(ino)?.0 & 0xf000 != 0x4000 {
+                    return Err(Errno::NotDir);
+                }
+                if crate::fs::context::directory_busy(&path) || fs::contains_mount(&path) {
+                    return Err(Errno::Busy);
+                }
+                fs::rmdir(&path, ino)?;
+                return Ok(0);
+            }
             let (p, name) = parent(&path)?;
             fs::unlink(p, ino, name)?;
             Ok(0)
@@ -142,6 +161,31 @@ pub fn dispatch(
             let path = ctx.path(a[0], &user_string(space, a[1])?)?;
             if path == "/proc/meminfo" {
                 return ctx.open_meminfo(a[2], a[2] & 0x80000 != 0);
+            }
+            if path == "/proc/mounts" {
+                let text = fs::procfs_text(&path)?;
+                return ctx.open_proc_text(text, a[2], a[2] & 0x80000 != 0);
+            }
+            if let Some(rest) = path.strip_prefix("/proc/") {
+                if rest
+                    .split_once('/')
+                    .is_some_and(|(_, f)| f == "stat" || f == "cmdline")
+                {
+                    let text = fs::procfs_text(&path)?;
+                    return ctx.open_proc_text(text, a[2], a[2] & 0x80000 != 0);
+                }
+            }
+            if path == "/dev/null" {
+                return ctx.open_devnull(a[2], a[2] & 0x80000 != 0);
+            }
+            if path == "/dev/misc/rtc" {
+                return ctx.open_rtc(a[2], a[2] & 0x80000 != 0);
+            }
+            if let Some((disk, part)) = fs::lookup_blk_node(&path) {
+                if let Ok((start, len)) = crate::drivers::partition(disk, part) {
+                    return ctx.open_devblk(disk, start, len as u64, a[2], a[2] & 0x80000 != 0);
+                }
+                return Err(Errno::NoDevice);
             }
             let ino = match fs::lookup(&path) {
                 Ok(ino) => {
@@ -695,4 +739,90 @@ fn encode_statx(m: &fs::Metadata) -> [u8; 256] {
         out[offset + 4..offset + 8].copy_from_slice(&minor.to_ne_bytes());
     }
     out
+}
+/// faccessat(2)（dirfd, path, mode, 无 flags）：glibc 在某些版本会把
+/// 第 4 寄存器残留为任意值，raw 入口不得读取第 4 参数（否则非零残留
+/// 被误判为非法 flags，RV glibc which 即因此失败）。
+fn faccessat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
+    access_check_common(ctx, space, a, true)
+}
+
+/// faccessat2(2)（dirfd, path, mode, flags）：flags 接受 AT_EACCESS(0x200)/
+/// AT_SYMLINK_NOFOLLOW(0x100)；AT_EACCESS 在无凭证模型下与默认等价。
+fn faccessat2(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
+    access_check_common(ctx, space, a, false)
+}
+
+/// access 系列共用主体；`raw` 为 true 时忽略第 4 参数（faccessat 的 ABI）。
+fn access_check_common(
+    ctx: &Context,
+    space: &UserAddressSpace,
+    a: [usize; 6],
+    raw: bool,
+) -> Result<usize, Errno> {
+    if !raw && a[3] & !0x300 != 0 {
+        return Err(Errno::Invalid);
+    }
+    let path = ctx.path(a[0], &user_string(space, a[1])?)?;
+    let ino = fs::lookup(&path)?;
+    let (st_mode, ..) = fs::stat(ino)?;
+    let mode = a[2];
+    if mode & !0x7 != 0 {
+        return Err(Errno::Invalid);
+    }
+    if mode & 1 != 0 && st_mode & 0o111 == 0 {
+        return Err(Errno::Access);
+    }
+    Ok(0)
+}
+
+/// fchmod(2)（fd, mode）：按已打开对象改权限位。fd 以 inode 身份生效，
+/// rename/unlink 后仍有效；目标无后备 inode（管道/procfs）时 ENOENT。
+fn fchmod(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
+    ctx.fchmod_fd(a[0], a[1], space)
+}
+
+/// fchmodat(2)（dirfd, path, mode, flags）：按路径改权限位。flags 仅接受
+/// 0（AT_SYMLINK_NOFOLLOW 对符号链接 chmod 在 POSIX 中未定义，暂与跟随
+/// 一致，登记契约偏差表）；FAT 卷返回 ENOTSUP。
+fn fchmodat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
+    if a[3] & !0x100 != 0 {
+        return Err(Errno::Invalid);
+    }
+    let path = ctx.path(a[0], &user_string(space, a[1])?)?;
+    let ino = fs::lookup(&path)?;
+    apply_chmod(path.as_str(), ino, a[2])
+}
+
+/// chmod 公共实现：mode 保留 07777（含 setuid/setgid/sticky），类型位由
+/// inode 持有；仅普通文件与目录可改。
+fn apply_chmod(path: &str, ino: u32, mode: usize) -> Result<usize, Errno> {
+    let (cur_mode, ..) = fs::stat(ino)?;
+    if cur_mode & 0xf000 != 0x8000 && cur_mode & 0xf000 != 0x4000 {
+        return Err(Errno::Invalid); // 仅普通文件与目录可 chmod
+    }
+    fs::chmod_by_ino(ino, path, mode as u16 & 0o7777)?;
+    Ok(0)
+}
+
+/// mknodat(2)：当前仅支持 S_IFBLK 块设备节点注册（授权清单在用户态
+/// 启动器中维护）。节点登记真实 (盘, 分区) 身份（minor = 盘<<4|分区，
+/// major 须为 254），供 mount 与通用块访问解析；同名返回 EEXIST，目标
+/// 分区不存在返回 ENODEV。S_IFCHR/S_IFIFO/S_IFSOCK 未支持返回 EOPNOTSUPP。
+fn mknodat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
+    // mknodat(dirfd, pathname, mode, dev)：mode 在 a[2]
+    let mode = a[2];
+    if mode & 0xf000 != 0o060000 {
+        return Err(Errno::NotSupported); // 非 S_IFBLK
+    }
+    let path = ctx.path(a[0], &user_string(space, a[1])?)?;
+    if !path.starts_with("/dev/") {
+        return Err(Errno::Invalid); // 设备节点必须在 /dev 下
+    }
+    fs::mknod_blk(&path, mode, a[3] as u64)?;
+    Ok(0)
+}
+/// ioctl(2)：转发到 FD 层按设备类型分派（见 Context::ioctl）。
+fn ioctl(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
+    ctx.ioctl(a[0], a[1], a[2], space)
 }
