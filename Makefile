@@ -63,8 +63,7 @@ vendor/.extracted: $(VENDOR_ARCHIVE)
 	tar xJf $<
 	@touch $@
 
-$(VENDOR_ARCHIVE): vendor/.cargo-checksum.json
-	tar cJf $@ vendor
+# 更新归档（本机有网时）：cargo vendor vendor && tar cJf vendor.tar.xz vendor
 
 .PHONY: all kernel-rv kernel-la build build-rv build-la \
 	build-user-rv build-user-la selftest-rv selftest-la clippy clippy-rv clippy-la fmt \
@@ -232,13 +231,10 @@ test-la: check-qemu kernel-la
 # 评测辅助盘（官方 harness 检测到提交目录的 disk.img/disk-la.img 时自动挂
 # 为第二块盘；本内核设备命名让分区盘优先编号，/dev/vda2 即其 FAT32 分区，
 # mount 测例由此真实挂载）。同一内容两架构通用。
-disk.img: tests/make_official_disk.py
-	$(PYTHON) tests/make_official_disk.py disk.img
-
-disk-la.img: tests/make_official_disk.py
-	$(PYTHON) tests/make_official_disk.py disk-la.img
-
-official-disks: disk.img disk-la.img
+# 辅助盘模板（tests/official-disk-template.img.xz，64 MiB MBR+FAT32，
+# 由 make_official_disk.py 离线生成一次后归档）：评测机无需 mkfs.vfat
+disk.img disk-la.img: tests/official-disk-template.img.xz
+	xz -dc $< > $@
 
 # ---------- 测试入口（收拢 scripts/tests 调用）----------
 # 自建盘回归：历届遗留的 FS 语义门禁（元数据/截断/重命名/定位 IO/FD），
