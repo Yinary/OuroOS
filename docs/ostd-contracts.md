@@ -499,8 +499,8 @@ signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综�
 
 | 入口 | 内容 |
 |---|---|
-| `make run-rv` / `make run-la` | release 七任务验收（kthread A/B、hello、sched×2、check、ill），末尾帧守恒与逐进程汇总 |
-| `make selftest-rv` / `make selftest-la` | debug 断言 + lock_debug + LOG=info；额外 OOM 注入与调试锁检查；polyhal #8 需 `-Zub-checks=no` |
+| `make run-rv` / `make run-la` | 默认以 release 内核无盘启动 QEMU，运行七个演示任务（kthread A/B、hello、sched×2、check、ill）；官方原盘判分见下方 test 入口 |
+| `make selftest-rv` / `make selftest-la` | 构建 selftest 内核；启动该产物时启用 debug 断言、lock_debug、LOG=info 及额外 OOM 注入；polyhal #8 需 `-Zub-checks=no` |
 | `make test-rv` / `make test-la` | 官方原盘四组验收（basic/busybox × musl/glibc）：官方 QEMU 命令、原版 judge 判分、每轮干净盘副本；`make test-setup` 准备评测器与原盘 |
 | `tests/fs_stat.py --metadata` | `make all` 后执行 `python3 tests/fs_stat.py --metadata --output target/fs-validation/metadata`，验证双架构 128/256 字节 inode 的创建掩码、fork/exec、NOW/OMIT、FD/链接时间更新与落盘；只读版本先构建相应 feature，添加 --readonly 并指定独立输出目录，结束后恢复默认内核 |
 | `tests/fs_stat.py --truncate` | 构建后运行；验证双架构 128/256 字节 inode 的缩短、稀疏扩展、零尾部、预分配与索引回收、偏移不变、链接/已删名 FD、父子进程共享映射保护及错误参数；debugfs 独立核对落盘内容并运行 e2fsck/FAT fsck；只读构建增加 --readonly |
