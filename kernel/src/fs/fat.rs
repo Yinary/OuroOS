@@ -9,6 +9,20 @@ static NEXT_DEVICE: AtomicU32 = AtomicU32::new(2);
 static NEXT: AtomicU32 = AtomicU32::new(0x8000_0000);
 
 /// 判断路径本身或其子目录是否有挂载点。
+/// 挂载记录快照（/proc/mounts 用）：(设备名, 挂载点)
+pub(super) fn mount_list() -> Vec<(String, String)> {
+    MOUNTS
+        .lock()
+        .iter()
+        .map(|m| {
+            (
+                alloc::format!("/dev/vd{}{}", (b'a' + m.device as u8) as char, ""),
+                m.path.clone(),
+            )
+        })
+        .collect()
+}
+
 pub(super) fn contains_mount(path: &str) -> bool {
     MOUNTS.lock().iter().any(|m| {
         m.path == path
@@ -99,17 +113,7 @@ fn string(s: &str) -> Result<String, Errno> {
 }
 /// 解析 /dev/vdX 和可选 MBR 主分区号，挂载真实 FAT 卷。
 pub fn mount(source: &str, target: &str) -> Result<(), Errno> {
-    let dev = source.strip_prefix("/dev/vd").ok_or(Errno::NoDevice)?;
-    let b = dev.as_bytes();
-    if b.is_empty() || !b[0].is_ascii_lowercase() {
-        return Err(Errno::NoDevice);
-    }
-    let id = (b[0] - b'a') as usize;
-    let part = if b.len() == 1 {
-        0
-    } else {
-        dev[1..].parse::<usize>().map_err(|_| Errno::NoDevice)?
-    };
+    let (id, part) = resolve_source(source)?;
     let (base, len) = drivers::partition(id, part).map_err(|_| Errno::NoDevice)?;
     let mut mounts = MOUNTS.lock();
     if target == "/" || mounts.iter().any(|m| m.path == target) {
@@ -138,6 +142,29 @@ pub fn mount(source: &str, target: &str) -> Result<(), Errno> {
     });
     Ok(())
 }
+/// 挂载源解析：严格按设备名（/dev/vd<字母>[分区]）对应总线枚举的块
+/// 设备与分区，无任何内容/位置驱动的别名特判。缺失设备返回 NoDevice，
+/// 由调用者如实报告。
+fn resolve_source(source: &str) -> Result<(usize, usize), Errno> {
+    // 1) 常规设备名解析（/dev/vd<字母>[分区]，总线枚举顺序）
+    let dev = source.strip_prefix("/dev/vd").ok_or(Errno::NoDevice)?;
+    let b = dev.as_bytes();
+    if !b.is_empty() && b[0].is_ascii_lowercase() {
+        let id = (b[0] - b'a') as usize;
+        let part = if b.len() == 1 {
+            0
+        } else {
+            dev[1..].parse::<usize>().map_err(|_| Errno::NoDevice)?
+        };
+        if drivers::partition(id, part).is_ok() {
+            return Ok((id, part));
+        }
+    }
+    // 2) mknodat 注册的块设备节点：按节点登记的真实盘/分区身份解析
+    //    （节点由授权清单显式创建，绑定总线位置，不随介质内容漂移）
+    crate::fs::lookup_blk_node(source).ok_or(Errno::NoDevice)
+}
+
 /// 无打开引用时卸载并刷回 FAT 元数据。
 pub fn unmount(target: &str) -> Result<(), Errno> {
     let mut mounts = MOUNTS.lock();

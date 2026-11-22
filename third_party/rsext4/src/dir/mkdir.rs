@@ -163,7 +163,8 @@ fn create_directory<B: BlockDevice>(
 
         // Initialize `.` and `..` through modify_new so mutations are persisted
         // in the cache entry rather than on a detached clone.
-        fs.datablock_cache.modify_new(device, data_block, |data| {
+        // OuroOS patch: 新目录块经日志事务（. .. 入队与 inode/位图同事务）
+        fs.datablock_cache.modify_new_via_journal(device, data_block, |data| {
             let dot_name = b".";
             let dot_rec_len = Ext4DirEntry2::entry_len(dot_name.len() as u8);
             let dot = Ext4DirEntry2::new(

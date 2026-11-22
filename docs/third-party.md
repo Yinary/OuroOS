@@ -16,3 +16,22 @@
 本地 JBD2 栈占用补丁：提交临时块改为预先可失败分配的堆缓冲，复用单个 payload，避免多块数组叠加；版本与协议不变，详见 rsext4 README。
 
 LoongArch 关机使用 PolyHAL 0.4.0（MIT）中 QEMU virt GED 的寄存器地址和关机值，等待循环位于 `kernel/src/hal.rs`。
+
+## 本轮官方盘适配涉及的第三方补丁（2026-11-21）
+
+- `third_party/rsext4`（Apache-2.0，rsext4 0.8.1）新增补丁：
+  - JBD2 写入端 checksum_v3 支持：16 字节 v3 tag（64bit 块号 + 逐块
+    crc32c(uuid_seed + be32(seq) + 载荷)）、描述符块尾与 commit 块校验、
+    首个 tag 后的 journal UUID 与后续 SAME_UUID 协议、commit 块落盘前
+    先持久化 journal 超级块（s_start/s_sequence）使已提交事务在任意断电
+    时刻可被标准工具重放。补丁标记 `// OuroOS patch:` 见
+    `src/jbd2/jbd2.rs` 与 `src/ext4/mount.rs`。参考语义来源：
+    Linux v6.12 `fs/jbd2/{commit,recovery,journal,checkpoint}.c`
+    （GPL-2.0，仅对照行为，未复制代码）。
+  - 已知缺陷（上游设计，未在本轮修改）：目录块经 datablock_cache 以
+    非 metadata 标记直写 home 块、绕过 JBD2（data=writeback 式）。断电
+    窗口可留下指向未分配 inode 的目录项，标准 e2fsck 会清理并返回一致
+    状态（本轮断电实验已验证）。
+- BoarOS（GPL-2.0，github/gitlab 同期参赛作品）仅参考其公开文档中的
+  思路与测例勘误（辅助盘分区布局、解释器别名路径、LA musl 调度包装
+  ENOSYS 等事实），未复制任何代码。

@@ -8,6 +8,7 @@ extern crate alloc;
 
 mod allocator;
 mod config;
+mod dmesg;
 mod drivers;
 mod elf;
 mod entropy;
@@ -78,7 +79,7 @@ fn rust_main(hartid: usize) {
     }
 
     // 自检（heap/帧分配/trap/时钟）全部通过
-    println!(
+    let boot_line = alloc::format!(
         "{} v{} · {} · boot hart {} · {} cpus · boot ok",
         config::KERNEL_NAME,
         config::KERNEL_VERSION,
@@ -86,6 +87,8 @@ fn rust_main(hartid: usize) {
         hartid,
         get_cpu_num()
     );
+    println!("{}", boot_line);
+    dmesg::append(&boot_line);
 
     // 任务时代基线：全部任务退出后帧统计必须回到这里（帧守恒断言）
     let baseline = mm::frame::stats();
@@ -103,6 +106,16 @@ fn rust_main(hartid: usize) {
         &[("test", user_images::TEST_ELF)]
     } else if let Some(image) = disk_init.as_ref() {
         &[("basic-init", image.as_slice())]
+    } else if fs::mounted() {
+        // 根卷已挂载但盘上没有 /init（官方原盘布局）：启动内置用户态
+        // 启动器，由它建立解释器/shell 布局并运行盘上的官方组脚本
+        if user_images::INIT_ELF.is_empty() {
+            println!("[boot] 根卷无 /init 且未内嵌启动器（脱离 Makefile 构建），跳过用户程序");
+            task::spawn_demo_kthreads();
+            &[]
+        } else {
+            &[("official-init", user_images::INIT_ELF)]
+        }
     } else {
         task::spawn_demo_kthreads();
         &[

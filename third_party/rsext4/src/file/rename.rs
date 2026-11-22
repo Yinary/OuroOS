@@ -99,7 +99,8 @@ fn replace_entry<B: BlockDevice>(
     let inode = fs.get_inode_by_num(dev, parent)?;
     let data = fs.datablock_cache.get_or_load(dev, block)?;
     let offset = entry_offset(&data.data, name.as_bytes())?;
-    fs.datablock_cache.modify(dev, block, |data| {
+    // OuroOS patch: 目录块经日志事务
+    fs.datablock_cache.modify_via_journal(dev, block, |data| {
         data[offset..offset + 4].copy_from_slice(&ino.raw().to_le_bytes());
         data[offset + 7] = kind;
         update_ext4_dirblock_csum32(&fs.superblock, parent.raw(), inode.i_generation, data);

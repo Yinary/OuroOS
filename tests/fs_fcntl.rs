@@ -1,7 +1,7 @@
 //! 基础 fcntl 回归；验证 FD 独立标志、共享状态、编号分配及 fork/exec。
 #![no_std]
 #![no_main]
-use hello::{define_user_entry, sys_exit, sys_write, syscall3, syscall6};
+use user::{define_user_entry, sys_exit, sys_write, syscall3, syscall6};
 const CWD: usize = (-100isize) as usize;
 fn check(ok: bool, line: u32) {
     if !ok {

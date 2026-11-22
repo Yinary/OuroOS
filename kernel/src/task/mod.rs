@@ -80,6 +80,85 @@ static REGISTRY: DebugMutex<Registry> = DebugMutex::new(
 static EXIT_REPORTS: DebugMutex<Vec<(Pid, &'static str, ExitInfo)>> =
     DebugMutex::new("EXIT_REPORTS", Vec::new());
 
+/// procfs 的独立进程快照表：Task 在注册/退出/收割的提交点同步维护，
+/// FS 读路径只取本表（不回调 REGISTRY——syscall 分发已持有该锁，
+/// 重入会自旋死锁）。锁序 REGISTRY → PROC_TABLE 单向（见契约 §5）。
+pub(crate) struct ProcEntry {
+    pub pid: u32,
+    pub name: &'static str,
+    /// execve 提交后的真实 argv（NUL 分隔、末尾 NUL）；未 exec 过为 None
+    pub cmdline: Option<alloc::vec::Vec<u8>>,
+    /// b'R' 用户任务运行中 / b'S' 内核任务 / b'Z' 已退出未收割
+    pub state: u8,
+    pub ppid: u32,
+}
+static PROC_TABLE: DebugMutex<alloc::vec::Vec<ProcEntry>> =
+    DebugMutex::new("PROC_TABLE", alloc::vec::Vec::new());
+
+/// 注册段预留一个快照条目（可失败段调用；提交段的 push 不会再分配）。
+pub(crate) fn proc_table_reserve() -> Result<(), crate::syscall::Errno> {
+    PROC_TABLE
+        .lock()
+        .try_reserve(1)
+        .map_err(|_| crate::syscall::Errno::NoMem)
+}
+
+/// 提交段写入快照条目（预留已成功，push 不再分配）。
+pub(crate) fn proc_table_push(pid: Pid, name: &'static str, ppid: Pid, user: bool) {
+    let state = if user { b'R' } else { b'S' };
+    PROC_TABLE.lock().push(ProcEntry {
+        pid: pid as u32,
+        name,
+        cmdline: None,
+        state,
+        ppid: ppid as u32,
+    });
+}
+
+/// execve 发布段更新真实 argv（cmdline）。
+pub(crate) fn proc_table_set_cmdline(pid: Pid, cmdline: alloc::vec::Vec<u8>) {
+    if let Some(e) = PROC_TABLE.lock().iter_mut().find(|e| e.pid as Pid == pid) {
+        e.cmdline = Some(cmdline);
+    }
+}
+
+/// 退出时置僵尸态（EXIT_REPORTS 积攒点调用）。
+pub(crate) fn proc_table_mark_zombie(pid: Pid) {
+    if let Some(e) = PROC_TABLE.lock().iter_mut().find(|e| e.pid as Pid == pid) {
+        e.state = b'Z';
+    }
+}
+
+/// 收割时移除快照（wait 收割 / 孤儿即收 / 父退出清理，均在 REGISTRY 段）。
+pub(crate) fn proc_table_remove_all<F: Fn(u32) -> bool>(pred: F) {
+    PROC_TABLE.lock().retain(|e| !pred(e.pid));
+}
+
+/// procfs 快照条目：(pid, 登记名, 状态字符, 父 pid, exec 后 argv)
+pub type ProcRow = (u32, &'static str, u8, u32, Option<alloc::vec::Vec<u8>>);
+
+/// FS 读接口：有界快照（克隆必要字段）。
+pub fn proc_table_snapshot() -> alloc::vec::Vec<ProcRow> {
+    let table = PROC_TABLE.lock();
+    let mut out = alloc::vec::Vec::new();
+    for e in table.iter() {
+        if out.try_reserve_exact(1).is_err() {
+            break; // 分配失败：返回已有部分并丢弃余量（上限 = 表长）
+        }
+        out.push((e.pid, e.name, e.state, e.ppid, e.cmdline.clone()));
+    }
+    out
+}
+
+/// procfs 属性读取：按 pid 查快照（不存在 → None，新打开报 ENOENT）。
+pub fn proc_table_lookup(pid: u32) -> Option<(&'static str, u8, u32, Option<alloc::vec::Vec<u8>>)> {
+    PROC_TABLE
+        .lock()
+        .iter()
+        .find(|e| e.pid == pid)
+        .map(|e| (e.name, e.state, e.ppid, e.cmdline.clone()))
+}
+
 /// 注册表访问（调度器登记退出、用户循环取空间共用）。
 mod registry {
     use super::*;
@@ -130,6 +209,8 @@ mod registry {
                 .find(|r| r.pid == pid)
                 .expect("exiting task is not registered");
             rec.exit = Some(exit);
+            // 快照置僵尸（procfs 可见的存活规则与注册表一致）
+            proc_table_mark_zombie(pid);
             // 积攒终态行；容量不足时丢弃（打印非关键路径）
             {
                 let mut reports = EXIT_REPORTS.lock();
@@ -198,9 +279,18 @@ mod registry {
                 }
             };
             // 孤儿即收：清理已退出孩子及过继 init 的任务，自动收割的记录一并移除。
+            let removed: alloc::vec::Vec<u32> = reg
+                .records
+                .iter()
+                .filter(|r| {
+                    r.parent == pid && r.exit.is_some() || (r.pid == pid && (orphan || auto_reap))
+                })
+                .map(|r| r.pid as u32)
+                .collect();
             reg.records.retain(|r| {
                 !(r.parent == pid && r.exit.is_some() || (r.pid == pid && (orphan || auto_reap)))
             });
+            proc_table_remove_all(|p| removed.contains(&p));
             for child in reg.records.iter_mut().filter(|r| r.parent == pid) {
                 child.parent = init;
             }
@@ -222,6 +312,7 @@ mod registry {
             .iter()
             .position(|r| r.pid == target && r.parent == parent && r.exit.is_some())?;
         let rec = reg.records.remove(i);
+        proc_table_remove_all(|p| p == target as u32);
         Some((
             rec.user_ns.saturating_add(rec.child_user_ns),
             rec.system_ns.saturating_add(rec.child_system_ns),
@@ -246,18 +337,26 @@ mod registry {
     /// 终态报告在退出时积攒，这里统一输出。
     pub fn report_all() {
         for (pid, name, exit) in EXIT_REPORTS.lock().iter() {
-            match exit {
+            let line = match exit {
                 ExitInfo::Exited(code) => {
-                    println!("[task] pid {} ({}): exited with status {}", pid, name, code)
+                    alloc::format!("[task] pid {} ({}): exited with status {}", pid, name, code)
                 }
                 ExitInfo::Signaled { sig, fault } => match fault {
-                    Some(f) => println!(
+                    Some(f) => alloc::format!(
                         "[task] pid {} ({}): killed by {:?} @ {:#x}, pc {:#x}",
-                        pid, name, f.kind, f.info, f.pc
+                        pid,
+                        name,
+                        f.kind,
+                        f.info,
+                        f.pc
                     ),
-                    None => println!("[task] pid {} ({}): killed by signal {}", pid, name, sig),
+                    None => {
+                        alloc::format!("[task] pid {} ({}): killed by signal {}", pid, name, sig)
+                    }
                 },
-            }
+            };
+            println!("{}", line);
+            crate::dmesg::append(&line);
         }
     }
 }
@@ -270,6 +369,7 @@ pub fn spawn_kernel(name: &'static str, entry: fn()) -> Result<Pid, SpawnError> 
     registry::reserve()?;
     sched::reserve_task().map_err(|_| SpawnError::OutOfMemory)?;
     registry::register(pid, name, None);
+    proc_table_push(pid, name, 0, false);
     sched::enqueue(task);
     Ok(pid)
 }

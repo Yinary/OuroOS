@@ -1,7 +1,7 @@
 //! umask 与 utimensat 回归；由 fs_stat.py --metadata 构造磁盘并运行。
 #![no_std]
 #![no_main]
-use hello::{define_user_entry, sys_exit, sys_write, syscall3, syscall6};
+use user::{define_user_entry, sys_exit, sys_write, syscall3, syscall6};
 const CWD: usize = (-100isize) as usize;
 const OMIT: i64 = (1 << 30) - 2;
 const NOW: i64 = OMIT + 1;

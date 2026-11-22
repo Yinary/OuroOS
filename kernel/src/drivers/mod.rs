@@ -1,5 +1,6 @@
 //! VirtIO 块设备与物理 DMA 适配；两个平台的总线枚举集中在此。
 //! 使用 virtio-drivers 0.7.5（MIT），来源见 docs/third-party.md。
+pub mod rtc;
 use crate::mm::frame;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
@@ -60,6 +61,13 @@ unsafe impl Hal for Dma {
         crate::mm::kstack::dma_address(buffer.as_ptr() as *mut u8 as usize)
     }
     unsafe fn unshare(_: usize, _: NonNull<[u8]>, _: BufferDirection) {}
+}
+
+/// 平台 MMIO 寄存器的 32 位易变访问指针。调用前提：pa 位于已映射的
+/// 设备窗口（RV：kernel_pt 的 0x1000_0000 起 2 MiB 大页；LA：DMW0
+/// uncached 窗口），且该寄存器宽度确为 32 位。
+pub(crate) fn mmio_volatile(pa: usize) -> *mut u32 {
+    mmio_address(pa) as *mut u32
 }
 
 fn mmio_address(pa: usize) -> usize {
@@ -242,6 +250,11 @@ pub fn write_bytes(id: usize, offset: usize, data: &[u8]) -> Result<(), Error> {
     }
     Ok(())
 }
+/// 已枚举的块设备数量。
+pub fn disk_count() -> usize {
+    DISKS.lock().len()
+}
+
 /// MBR 主分区的字节范围；编号为 1..=4，整盘用 0。
 pub fn partition(id: usize, number: usize) -> Result<(usize, usize), Error> {
     let total = usize::try_from(capacity(id)?)

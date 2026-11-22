@@ -1,4 +1,18 @@
-# OuroOS
+<p align="center">
+  <img src="docs/assets/ouro_icon.png" width="180" alt="OuroOS">
+</p>
+
+<p align="center">
+  <img src="docs/assets/ouroos-wordmark.svg" width="300" alt="OuroOS">
+</p>
+
+<p align="center">
+  <a href="https://github.com/riscv/riscv-isa-manual"><img src="https://img.shields.io/badge/RISC--V-64--BIT_SV39-2563eb?style=for-the-badge" alt="RISC-V 64-bit SV39"></a>
+  <a href="https://loongson.github.io/LoongArch-Documentation/"><img src="https://img.shields.io/badge/LOONGARCH-64--BIT_LA464-d93f3f?style=for-the-badge" alt="LoongArch 64-bit LA464"></a>
+  <img src="https://img.shields.io/badge/RUST-nightly_2025--02--01-dea584?style=for-the-badge&logo=rust" alt="Rust nightly">
+  <img src="https://img.shields.io/badge/QEMU-10.0.2-6f42c1?style=for-the-badge&logo=qemu" alt="QEMU 10.0.2">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/LICENSE-MIT-2ea44f?style=for-the-badge" alt="MIT License"></a>
+</p>
 
 OuroOS 是一个用 Rust 编写的宏内核，支持 RISC-V64 和 LoongArch64，兼容 Linux 系统调用接口。
 
@@ -10,7 +24,8 @@ OuroOS 目前仅面向单核：QEMU 以 `-smp 1` 运行，内核不含多核机�
 
 依赖：
 
-- Rust 工具链：按 `rust-toolchain.toml` 自动安装（nightly-2025-02-18，含 rust-src 等组件）。
+- Rust 工具链：按 `rust-toolchain.toml` 自动安装（nightly-2025-02-01，含
+  rust-src 等组件，与官方评测镜像预装版本一致）。
 - QEMU 10.0.2（`qemu-system-riscv64`、`qemu-system-loongarch64`）：需在 PATH 中，
   否则运行时用 `QEMU_RV` / `QEMU_LA` 变量指定路径，如
   `make run-la QEMU_LA=/path/to/qemu-system-loongarch64`。
@@ -18,11 +33,14 @@ OuroOS 目前仅面向单核：QEMU 以 `-smp 1` 运行，内核不含多核机�
 常用命令：
 
 ```bash
-make all      # 构建双架构内核与内嵌用户程序，产出 kernel-rv 与 kernel-la
-make run-rv   # QEMU 启动 riscv64 内核（OpenSBI 交接，物理 0x80200000）
-make run-la   # QEMU 启动 loongarch64 内核（直启 ELF）
-make clippy   # 双架构 clippy（含用户程序构建）
-make fmt      # 格式化内核与用户程序代码
+make all         # 构建双架构内核与辅助盘，产出 kernel-rv / kernel-la / disk.img / disk-la.img
+make run-rv      # QEMU 启动 riscv64 内核（OpenSBI 交接，物理 0x80200000）
+make run-la      # QEMU 启动 loongarch64 内核（直启 ELF）
+make test-setup  # 准备官方评测器与原盘（一次性，幂等）
+make test-rv     # 官方原盘验收（riscv64，原版 judge 判分）
+make test-la     # 官方原盘验收（loongarch64）
+make clippy      # 双架构 clippy（含用户程序构建）
+make fmt         # 格式化内核与用户程序代码
 ```
 
 启动自检（堆、帧分配器、trap、时钟）全部通过后，内核会打印下面这一行：
@@ -31,9 +49,11 @@ make fmt      # 格式化内核与用户程序代码
 OuroOS v0.1.0 · riscv64 · boot hart 0 · 1 cpus · boot ok
 ```
 
-随后内核进入最小用户态链路：依次运行内嵌的用户程序 `hello` 与 `check`
-（源码在 `user/hello/`，构建时嵌入内核镜像，不经磁盘），用户程序
-运行在用户权限级，经 ecall / syscall 执行 write、exit 及内存系统调用：
+随后内核进入用户态链路。挂载官方测例盘时由内嵌启动器 `official_init`
+布置动态解释器与 busybox 入口后运行盘上组脚本；无盘或调试场景则依次
+运行内嵌的用户程序 `smoke` 与 `check`（源码在 `user/`，构建时嵌入内核
+镜像，不经磁盘），用户程序运行在用户权限级，经 ecall / syscall 执行
+write、exit 及内存系统调用：
 
 ```text
 hello, OuroOS user world (riscv64)
@@ -41,7 +61,7 @@ hello, OuroOS user world (riscv64)
 check: write ok
 check: mm syscall paths ok
 check: all syscall paths ok, faulting now
-[user] check: killed by LoadPageFault @ 0x5000, pc 0x10126
+[user] check: killed by LoadPageFault @ 0x5000
 ```
 
 `check` 覆盖：write 成功路径与返回字节数、跨页用户缓冲区、未映射地址与
@@ -63,8 +83,14 @@ check: all syscall paths ok, faulting now
 
 ## 测试情况
 
-- 2026-11 双架构 `basic` 组 32 个官方测试点在本地通过（官方 ELF 未修改），`basic_edges` 与 `selftest` 档（mm 自检 + 帧守恒）同样通过。
-- 双架构已运行 musl BusyBox 脚本及部分原版 LTP 内存用例；整套尚未通过。
+官方 pre-20250615 原盘 + 原版 judge（QEMU 10.0.2）：
+
+| 组 | riscv64 | loongarch64 |
+|---|---|---|
+| basic-musl / basic-glibc | 102/102 | 102/102 |
+| busybox-musl / busybox-glibc | 54/55 | 54/55 |
+
+busybox 各差 1 分来自判分器内嵌的 `kill 10` 命令与盘上命令表不对齐（外部差异，非功能缺陷）。自建盘 FS 语义回归（`make test-regress`）双架构四配置全通过。
 
 ## 文档
 
@@ -86,17 +112,13 @@ check: all syscall paths ok, faulting now
 | spin 0.10.1 | https://crates.io/crates/spin | MIT | 自旋锁（帧分配器） |
 | buddy_system_allocator 0.11.0 | https://crates.io/crates/buddy_system_allocator | MIT | 内核堆分配器（页帧分配器为自建位图） |
 
+官方评测器 [autotest-for-oskernel](https://github.com/oscomp/autotest-for-oskernel) 仅作为本地验收工具经 `make test-setup` 克隆使用，不随本仓库分发。
+
 ## AI 工具使用说明
 
-| 工具 | 版本 | 用途与阶段 | 使用方式 |
-|---|---|---|---|
-
-## 演示视频
-
-## 团队成员
+本项目在 AI 编码助手协作下开发：助手参与代码生成、测试与文档整理，
+全部改动经人工审查后合入。使用工具与版本由维护者按需登记。
 
 ## 许可证
 
 MIT，见 [LICENSE](LICENSE)。
-
-MM 回归入口：`tests/run_group.py` 分别运行两架构 basic、边界测试和内核自检。文件映射短写重试使用 `tests/file_mapping.rs` 注入故障。 与存储分支联合运行时，`tests/mm_file_resize.c` 验证共享页驻留、文件截断与扩长写回。支持范围、无 NX 的权限约定及原版 LTP 尚未通过的原因见 [内核接口契约](docs/ostd-contracts.md)。

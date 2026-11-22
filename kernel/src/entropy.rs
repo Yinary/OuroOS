@@ -1,10 +1,17 @@
 //! QEMU /chosen/rng-seed 提供启动熵。每次请求使用不同的 ChaCha20 块；
-//! 不使用时钟或可预测的回退种子。块函数按 RFC 8439 §2.3 实现。
-use core::sync::atomic::{AtomicU64, Ordering};
+//! 块函数按 RFC 8439 §2.3 实现。无种子时本模块进入 NotReady 状态：
+//! getrandom(2) 按 flags 返回 EAGAIN/EINVAL，绝不以时间或常量伪造熵。
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 static STREAM: Mutex<Option<([u32; 8], u32)>> = Mutex::new(None);
-static FALLBACK: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+/// 启动三段检查（FDT 有值 → 初始化成功）的对外可见状态
+static READY: AtomicBool = AtomicBool::new(false);
+
+/// 熵源是否已成功播种（getrandom 的就绪语义与 AT_RANDOM 判断用）。
+pub(crate) fn ready() -> bool {
+    READY.load(Ordering::Relaxed)
+}
 
 pub(crate) fn init() {
     let Ok(dt) = polyhal::mem::get_fdt() else {
@@ -27,15 +34,30 @@ pub(crate) fn init() {
         *w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
     }
     *STREAM.lock() = Some((key, 0));
+    READY.store(true, Ordering::Relaxed);
 }
 
-pub(crate) fn exec_random() -> [u8; 16] {
+/// 为 getrandom(2) 生成随机字节：按 16 字节块取熵拼接，尾部截断；
+/// 任一块取熵失败（流耗尽）返回假，调用方转为 EAGAIN。
+pub(crate) fn fill_random(out: &mut [u8]) -> bool {
+    for chunk in out.chunks_mut(16) {
+        let Some(block) = exec_random() else {
+            return false;
+        };
+        chunk.copy_from_slice(&block[..chunk.len()]);
+    }
+    true
+}
+
+pub(crate) fn exec_random() -> Option<[u8; 16]> {
     let mut stream = STREAM.lock();
-    let Some((key, counter)) = stream.as_mut() else {
-        return fallback();
-    };
+    let (key, counter) = stream.as_mut()?;
     let n = *counter;
-    *counter = n.checked_add(1).unwrap_or(0);
+    // 计数器回绕意味着密钥流重放，必须拒绝而不是继续复用
+    if n == u32::MAX {
+        return None;
+    }
+    *counter = n + 1;
     let mut x = [0u32; 16];
     x[..4].copy_from_slice(&[0x61707865, 0x3320646e, 0x79622d32, 0x6b206574]);
     x[4..12].copy_from_slice(key);
@@ -59,23 +81,7 @@ pub(crate) fn exec_random() -> [u8; 16] {
     for (i, part) in bytes.chunks_exact_mut(4).enumerate() {
         part.copy_from_slice(&x[i].wrapping_add(initial[i]).to_le_bytes());
     }
-    bytes
-}
-
-/// 没有可用启动熵时仍提供不可预测性较弱的 AT_RANDOM，避免阻断所有 exec。
-fn fallback() -> [u8; 16] {
-    let mut x = polyhal::timer::current_time().as_nanos() as u64
-        ^ FALLBACK.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed);
-    let mut out = [0u8; 16];
-    for chunk in out.chunks_exact_mut(8) {
-        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = x;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^= z >> 31;
-        chunk.copy_from_slice(&z.to_le_bytes());
-    }
-    out
+    Some(bytes)
 }
 
 fn quarter(x: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {

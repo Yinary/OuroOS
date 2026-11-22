@@ -1,7 +1,7 @@
 //! 文件状态、容量与链接查询回归；由 fs_stat.py 生成已知属性的磁盘。
 #![no_std]
 #![no_main]
-use hello::{define_user_entry, sys_exit, sys_write, syscall3, syscall6};
+use user::{define_user_entry, sys_exit, sys_write, syscall3, syscall6};
 const CWD: usize = (-100isize) as usize;
 #[derive(Default, Clone, Copy)]
 #[repr(C)]

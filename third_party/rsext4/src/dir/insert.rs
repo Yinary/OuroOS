@@ -173,7 +173,8 @@ pub fn insert_dir_entry<B: BlockDevice>(
 
     if let Some(modified_block) = modified_phys {
         // Publish the modified directory block before subsequent lookup.
-        fs.datablock_cache.flush(device, modified_block)?;
+        // OuroOS patch: 目录块入 JBD2 队列（目录事务原子性），不直写 home
+        fs.datablock_cache.flush_via_journal(device, modified_block)?;
         // The hash tree is stale after insertion; force subsequent lookups
         // through the authoritative linear directory scan.
         if parent_inode.i_flags & Ext4Inode::EXT4_INDEX_FL != 0 {
@@ -254,7 +255,8 @@ pub fn insert_dir_entry<B: BlockDevice>(
 
     // Immediately write the new directory block to disk so it is visible
     // to subsequent lookups.
-    fs.datablock_cache.flush(device, new_block)?;
+    // OuroOS patch: 同上，新目录块走同一事务
+    fs.datablock_cache.flush_via_journal(device, new_block)?;
 
     // Clear the hash-tree index flag: the hash tree is stale after
     // adding a directory entry, and forcing linear scan guarantees

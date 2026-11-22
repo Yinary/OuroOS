@@ -14,6 +14,8 @@ static ROOT: Mutex<Option<Volume>> = Mutex::new(None);
 const WRITABLE: bool = !cfg!(feature = "rsext4-readonly");
 
 struct Partition {
+    /// 所在块设备号（drivers 的 DISKS 下标）
+    disk: usize,
     start: usize,
     len: usize,
     time_base: i64,
@@ -57,7 +59,7 @@ impl BlockDevice for Partition {
     fn read(&mut self, dst: &mut [u8], block: AbsoluteBN, count: u32) -> Ext4Result<()> {
         let range = self.range(block, count)?;
         let dst = dst.get_mut(..range.len()).ok_or_else(Ext4Error::io)?;
-        drivers::read_bytes(0, range.start, dst).map_err(|_| Ext4Error::io())
+        drivers::read_bytes(self.disk, range.start, dst).map_err(|_| Ext4Error::io())
     }
 
     fn write(&mut self, data: &[u8], block: AbsoluteBN, count: u32) -> Ext4Result<()> {
@@ -66,12 +68,12 @@ impl BlockDevice for Partition {
         }
         let range = self.range(block, count)?;
         let data = data.get(..range.len()).ok_or_else(Ext4Error::io)?;
-        drivers::write_bytes(0, range.start, data).map_err(|_| Ext4Error::io())
+        drivers::write_bytes(self.disk, range.start, data).map_err(|_| Ext4Error::io())
     }
 
     fn flush(&mut self) -> Ext4Result<()> {
         if WRITABLE {
-            drivers::flush(0).map_err(|_| Ext4Error::io())?;
+            drivers::flush(self.disk).map_err(|_| Ext4Error::io())?;
         }
         Ok(())
     }
@@ -100,23 +102,52 @@ impl BlockDevice for Partition {
     }
 }
 
+/// 根卷是否已成功挂载（供启动入口区分"无盘"与"有盘无 /init"）。
+pub fn mounted() -> bool {
+    ROOT.lock().is_some()
+}
+
 /// 挂载盘首分区或整盘的 4 KiB 块 Ext4；无磁盘时允许继续启动。
 pub(super) fn init() -> Result<(), Errno> {
-    let whole = match drivers::partition(0, 0) {
-        Ok(range) => range,
-        Err(drivers::Error::NoDevice) => return Ok(()),
-        Err(_) => return Err(Errno::Io),
-    };
-    let (start, len) = match drivers::partition(0, 1) {
-        Ok(range) => range,
-        Err(drivers::Error::Range) => whole,
-        Err(_) => return Err(Errno::Io),
-    };
+    let count = drivers::disk_count();
+    if count == 0 {
+        return Ok(());
+    }
+    // 扫描式根卷选择：每块盘先试 MBR 分区 1..=4、再试整盘，取第一个
+    // 可挂载的 Ext4 卷。设备命名约定见 drivers（分区盘优先编号），根卷
+    // 语义是"第一个可挂载的 Ext4"，与设备名无绑定。
+    let mut last = Errno::Io;
+    for id in 0..count {
+        for part in [1, 2, 3, 4, 0] {
+            let Ok((start, len)) = drivers::partition(id, part) else {
+                continue;
+            };
+            match try_mount(id, start, len) {
+                Ok(()) => {
+                    ROOT_DISK_ID.store(id, core::sync::atomic::Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(e) => last = e,
+            }
+        }
+    }
+    Err(last)
+}
+
+/// Ext4 根卷所在的设备号（/proc/mounts 的设备名用），由 init 成功时记录。
+static ROOT_DISK_ID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// 根卷设备的 vda 式名字（vd + 小写字母）。
+pub(super) fn root_disk_name() -> char {
+    (b'a' + ROOT_DISK_ID.load(core::sync::atomic::Ordering::Relaxed) as u8) as char
+}
+
+fn try_mount(id: usize, start: usize, len: usize) -> Result<(), Errno> {
     if len < BLOCK_SIZE {
         return Err(Errno::Invalid);
     }
     let mut sb = [0; 1024];
-    drivers::read_bytes(0, start + 1024, &mut sb).map_err(|_| Errno::Io)?;
+    drivers::read_bytes(id, start + 1024, &mut sb).map_err(|_| Errno::Io)?;
     // 超级块中的 magic 和 log_block_size。
     if sb[56..58] != [0x53, 0xef] || sb[24..28] != [2, 0, 0, 0] {
         return Err(Errno::Invalid);
@@ -157,6 +188,7 @@ pub(super) fn init() -> Result<(), Errno> {
     }
     // 当前无 RTC，从卷上次写入时间起算。
     let partition = Partition {
+        disk: id,
         start,
         len,
         time_base: i64::from(u32at(48)),
@@ -540,6 +572,54 @@ pub(super) fn unmount() -> Result<(), Errno> {
         *root = None;
     }
     Ok(())
+}
+
+/// chmod(2) 底层：按 inode 身份更新权限位（保留类型位），经日志事务
+/// 提交。path 用于日志队列定位；`ino` 为权威身份，与 path 解析结果
+/// 不一致时拒绝（防 fd 身份与路径漂移后改错对象）。
+pub fn chmod_by_ino(ino: u32, path: &str, mode: u16) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    // ino 身份校验：与 path 解析结果不一致时拒绝（防 fd 与路径漂移）
+    if access(|v| {
+        InodeNumber::new(ino).and_then(|num| v.fs.get_inode_by_num(&mut v.device, num).map(|_| ()))
+    })
+    .is_err()
+    {
+        return Err(Errno::NoEntry);
+    }
+    access(|v| {
+        rsext4::metadata::chmod(&mut v.device, &mut v.fs, path, mode).inspect_err(|e| {
+            if matches!(e.code, rsext4::Errno::EIO | rsext4::Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })
+    })
+}
+
+/// 删除空目录（rmdir 语义）：非目录 ENOTDIR、非空 ENOTEMPTY；目录项与
+/// inode 立即回收，有进程打开该目录时拒绝（EBUSY，见契约偏差）。
+pub(super) fn rmdir(path: &str, ino: u32) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        if v.opens.iter().any(|&(id, _)| id == ino) {
+            return Err(Ext4Error::new(rsext4::Errno::EBUSY));
+        }
+        let ino_num = InodeNumber::new(ino)?;
+        let mut inode = v.fs.get_inode_by_num(&mut v.device, ino_num)?;
+        if !inode.is_dir() {
+            return Err(Ext4Error::not_dir());
+        }
+        if !rsext4::file::is_dir_empty(&mut v.fs, &mut v.device, &mut inode)? {
+            return Err(Ext4Error::new(rsext4::Errno::ENOTEMPTY));
+        }
+        // 目标已确认是空目录，delete_dir 只做这一层的目录项与 inode 回收
+        rsext4::file::delete_dir(&mut v.fs, &mut v.device, path)?;
+        Ok(())
+    })
 }
 
 /// 移除普通文件名；没有链接和打开引用时回收 inode。
