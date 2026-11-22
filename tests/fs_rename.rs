@@ -1,7 +1,7 @@
 //! renameat/renameat2 回归；验证目录项、打开引用及错误路径。
 #![no_std]
 #![no_main]
-use hello::{define_user_entry, sys_exit, sys_write, syscall3, syscall6};
+use user::{define_user_entry, sys_exit, sys_write, syscall3, syscall6};
 const CWD: usize = (-100isize) as usize;
 fn check(ok: bool, line: u32) {
     if !ok {

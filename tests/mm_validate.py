@@ -125,7 +125,7 @@ for arch, prefix in [("rv", "riscv64-linux-musl-"), ("la", "loongarch64-linux-mu
         run([prefix + "objcopy", "-O", "binary", "-j", ".text", stem + ".o", stem + ".bin"], stem + "-binary")
 run(["make", "all", "LOG=info"], "build")
 for arch, target in [("rv", "riscv64gc-unknown-none-elf"), ("la", "loongarch64-unknown-none")]:
-    env = dict(os.environ, LOG="info", OUROOS_HELLO_ELF=f"target/{target}/release/hello", OUROOS_CHECK_ELF=f"target/{target}/release/check")
+    env = dict(os.environ, LOG="info", OUROOS_HELLO_ELF=f"target/{target}/release/smoke", OUROOS_CHECK_ELF=f"target/{target}/release/check")
     if arch == "la": env["RUSTFLAGS"] = "-Zunstable-options -C target-feature=-lsx,-lasx"
     run(["cargo", "rustc", "-p", "kernel", "-Z", "build-std=core,alloc", "--release", "--target", target, "--", "-C", "debug-assertions=yes"], arch + "-guarded-build", env)
     run([os.environ.get("QEMU_RV" if arch == "rv" else "QEMU_LA", "qemu-system-" + ("riscv64" if arch == "rv" else "loongarch64")), "--version"], arch + "-qemu-version")

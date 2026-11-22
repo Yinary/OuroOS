@@ -18,8 +18,8 @@ def main():
     out = ROOT / "target/fs-validation" / ("fcntl-readonly" if args.readonly else "fcntl")
     out.mkdir(parents=True, exist_ok=True)
     user = out / "user"
-    shutil.copytree(ROOT / "user/hello", user, dirs_exist_ok=True, ignore=shutil.ignore_patterns("target"))
-    shutil.copyfile(ROOT / "tests/fs_fcntl.rs", user / "src/bin/hello.rs")
+    shutil.copytree(ROOT / "user", user, dirs_exist_ok=True, ignore=shutil.ignore_patterns("target"))
+    shutil.copyfile(ROOT / "tests/fs_fcntl.rs", user / "src/bin/smoke.rs")
     shutil.copyfile(ROOT / "tests/fs_fcntl_exec.rs", user / "src/bin/check.rs")
     payload = out / "payload"
     payload.write_bytes(b"abcdefgh")
@@ -34,7 +34,7 @@ def main():
         with image.open("wb") as stream:
             stream.truncate(32 * 1024 * 1024)
         run(["mkfs.ext4", "-q", "-F", "-b", "4096", str(image)], out / f"{short}-mkfs.log")
-        commands = [f'write "{out / "user-target" / target / "release/hello"}" /init', f'write "{payload}" /io-data']
+        commands = [f'write "{out / "user-target" / target / "release/smoke"}" /init', f'write "{payload}" /io-data']
         commands.append(f'write "{out / "user-target" / target / "release/check"}" /after-exec')
         if args.readonly:
             commands.append(f'write "{payload}" /readonly')

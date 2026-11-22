@@ -10,7 +10,7 @@
 #![no_std]
 #![no_main]
 
-use hello::{define_user_entry, sys_exit, sys_write, syscall3, syscall6};
+use user::{define_user_entry, sys_exit, sys_write, syscall3, syscall6};
 
 // asm-generic 64 位系统调用号（riscv64 / loongarch64 通用 UAPI）
 const SYS_OPENAT: usize = 56;

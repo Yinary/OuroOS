@@ -12,7 +12,7 @@
 
 use core::hint::black_box;
 
-use hello::{define_user_entry, sys_exit, sys_getpid, sys_sched_yield, sys_write};
+use user::{define_user_entry, sys_exit, sys_getpid, sys_sched_yield, sys_write};
 
 /// 忙循环轮数
 const ROUNDS: usize = 6;

@@ -16,7 +16,7 @@
 #![no_std]
 #![no_main]
 
-use hello::{define_user_entry, sys_exit, sys_write, sys_write_raw, syscall3};
+use user::{define_user_entry, sys_exit, sys_write, sys_write_raw, syscall3};
 
 /// Linux errno（负值形式，见 errno-base.h）
 const EFAULT: isize = -14;
@@ -33,7 +33,7 @@ const KERNEL_ADDR: usize = 0xffff_ffc0_8000_0000;
 const KERNEL_ADDR: usize = 0x9000_0001_0000_0000;
 
 /// 跨页缓冲区：链接脚本把它垫在页起点 + 3/4 页处，2048 字节内容横跨
-/// 页边界（见 user/hello/linker.lds 的 .data.cross）。
+/// 页边界（见 user/linker.lds 的 .data.cross）。
 #[link_section = ".data.cross"]
 #[used]
 static CROSS: [u8; 2048] = [b'.'; 2048];
@@ -48,7 +48,7 @@ fn expect(got: isize, want: isize) {
 /// 用户主函数（由 _start 调用，不返回）
 #[no_mangle]
 extern "C" fn ouro_main() -> ! {
-    if hello::sys_readahead(usize::MAX, 0, 1) != EBADF {
+    if user::sys_readahead(usize::MAX, 0, 1) != EBADF {
         sys_exit(1);
     }
     let msg: &[u8] = b"check: write ok\n";
@@ -72,11 +72,8 @@ extern "C" fn ouro_main() -> ! {
     expect(syscall3(SYS_BOGUS, 0, 0, 0), ENOSYS);
 
     mm_checks();
-    expect(
-        hello::sys_mmap(0x5000, 4096, 3, 0x32, usize::MAX, 0),
-        0x5000,
-    );
-    expect(hello::sys_munmap(0x5000, 4096), 0);
+    expect(user::sys_mmap(0x5000, 4096, 3, 0x32, usize::MAX, 0), 0x5000);
+    expect(user::sys_munmap(0x5000, 4096), 0);
     // 前置检查全部通过；随后故意访问未映射地址（0x5000），
     // 预期内核报告用户异常并终止本次运行，控制流不应回到这里
     sys_write(1, b"check: all syscall paths ok, faulting now\n");
@@ -87,7 +84,7 @@ extern "C" fn ouro_main() -> ! {
 
 /// 覆盖内存 syscall 错误、固定替换和权限；末尾非法访存仍由既有流程检查。
 fn mm_checks() {
-    use hello::{sys_brk, sys_mmap, sys_mprotect, sys_munmap};
+    use user::{sys_brk, sys_mmap, sys_mprotect, sys_munmap};
     let base = sys_brk(0);
     expect(sys_brk(base + 4097) as isize, (base + 4097) as isize);
     // SAFETY: brk 已成功扩展两页，字节指针仅在映射有效时使用。

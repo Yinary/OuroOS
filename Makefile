@@ -5,7 +5,7 @@
 #   kernel-rv — riscv64 内核
 #   kernel-la — loongarch64 内核
 #
-# 构建顺序：先构建用户程序（user/hello，独立于内核 workspace），
+# 构建顺序：先构建用户程序（user/，独立于内核 workspace），
 # 再构建内核；内核 build.rs 通过环境变量拿到用户 ELF 并内嵌。
 #
 # QEMU 加载方式：
@@ -23,7 +23,7 @@ USER_REL  := release
 
 # 用户程序 crate（独立 workspace，与内核共用 target/ 目录，
 # cargo clean 可一并清理）
-USER_CRATE := user/hello
+USER_CRATE := user
 
 # loongarch64 的发行版预编译 libcore 含 LSX 向量指令（基线仅 +f,+d），运行时会触发
 # Disable 异常；且 polyhal-boot 只开 FPE。用 build-std 从源码自编 core/alloc，
@@ -47,6 +47,24 @@ KERNEL_FEATURES = $(if $(strip $(FEATURES)),--features "$(strip $(FEATURES))")
 QEMU_RV ?= qemu-system-riscv64
 QEMU_LA ?= qemu-system-loongarch64
 
+# 离线构建（评测环境无外网，ENVIRONMENT.md：禁止在线下载、隐藏目录会被
+# 评测机过滤）：第三方依赖以 vendor.tar.xz 归档随仓库提交（cargo vendor
+# 产物；crate 内 .cargo-checksum.json 等点开头文件会被 Clone 过滤，必须
+# 归档交付），make all 解压并把 CARGO_HOME 指到仓库内非隐藏目录（官方
+# 注意事项：.cargo 需改名后在 Makefile 恢复）。
+VENDOR_ARCHIVE := vendor.tar.xz
+CARGO_HOME := $(CURDIR)/.cargo-home
+
+$(CARGO_HOME)/config.toml: cargo-vendor-config.toml | vendor/.extracted
+	@mkdir -p $(dir $@)
+	@cp $< $@
+
+vendor/.extracted: $(VENDOR_ARCHIVE)
+	tar xJf $<
+	@touch $@
+
+# 更新归档（本机有网时）：cargo vendor vendor && tar cJf vendor.tar.xz vendor
+
 .PHONY: all kernel-rv kernel-la build build-rv build-la \
 	build-user-rv build-user-la selftest-rv selftest-la clippy clippy-rv clippy-la fmt \
 	run run-rv run-la basic-bin basic-disk run-basic run-basic-rv run-basic-la \
@@ -62,25 +80,25 @@ kernel-rv: build-user-rv build-rv
 kernel-la: build-user-la build-la
 	cp $(BIN_LA) kernel-la
 
-build-user-rv:
+build-user-rv: $(CARGO_HOME)/config.toml vendor/.extracted
 	CARGO_TARGET_DIR=target cargo build --manifest-path $(USER_CRATE)/Cargo.toml \
 		$(USER_BUILD_STD) --release --target $(TARGET_RV)
 
-build-user-la:
+build-user-la: $(CARGO_HOME)/config.toml vendor/.extracted
 	$(RUSTFLAGS_LA) CARGO_TARGET_DIR=target cargo build --manifest-path $(USER_CRATE)/Cargo.toml \
 		$(USER_BUILD_STD) --release --target $(TARGET_LA)
 
-build-rv:
-	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/hello \
+build-rv: $(CARGO_HOME)/config.toml vendor/.extracted
+	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/smoke \
 	OUROOS_CHECK_ELF=target/$(TARGET_RV)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_RV)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_RV)/$(USER_REL)/ill \
 	OUROOS_INIT_ELF=target/$(TARGET_RV)/$(USER_REL)/official_init \
 	LOG=$(LOG) cargo build $(BUILD_STD) --release --target $(TARGET_RV) $(KERNEL_FEATURES)
 
-build-la:
+build-la: $(CARGO_HOME)/config.toml vendor/.extracted
 	$(RUSTFLAGS_LA) \
-	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/hello \
+	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/smoke \
 	OUROOS_CHECK_ELF=target/$(TARGET_LA)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_LA)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_LA)/$(USER_REL)/ill \
@@ -100,7 +118,7 @@ UB_CHECKS_OFF := RUSTFLAGS="-Zunstable-options -Zub-checks=no"
 UB_CHECKS_OFF_LA := RUSTFLAGS="-Zunstable-options -C target-feature=-lsx,-lasx -Zub-checks=no"
 selftest-rv: build-user-rv
 	$(UB_CHECKS_OFF) \
-	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/hello \
+	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/smoke \
 	OUROOS_CHECK_ELF=target/$(TARGET_RV)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_RV)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_RV)/$(USER_REL)/ill \
@@ -108,7 +126,7 @@ selftest-rv: build-user-rv
 
 selftest-la: build-user-la
 	$(UB_CHECKS_OFF_LA) \
-	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/hello \
+	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/smoke \
 	OUROOS_CHECK_ELF=target/$(TARGET_LA)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_LA)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_LA)/$(USER_REL)/ill \
@@ -116,7 +134,7 @@ selftest-la: build-user-la
 
 # ---------- 静态检查 ----------
 clippy-rv: build-user-rv
-	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/hello \
+	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/smoke \
 	OUROOS_CHECK_ELF=target/$(TARGET_RV)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_RV)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_RV)/$(USER_REL)/ill \
@@ -125,7 +143,7 @@ clippy-rv: build-user-rv
 
 clippy-la: build-user-la
 	$(RUSTFLAGS_LA) \
-	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/hello \
+	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/smoke \
 	OUROOS_CHECK_ELF=target/$(TARGET_LA)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_LA)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_LA)/$(USER_REL)/ill \
@@ -201,7 +219,7 @@ JUDGE_DIR    ?= $(HOME)/os-contest-ref/autotest-for-oskernel/kernel/judge
 IMAGES_DIR   ?= sdcard/pre-20250615
 OFF_TIMEOUT  ?= 600
 
-# 组范围在 user/hello/src/bin/official_init.rs 里按行注释调整（默认四组全跑）
+# 组范围在 user/src/bin/official_init.rs 里按行注释调整（默认四组全跑）
 test-rv: check-qemu kernel-rv
 	$(PYTHON) tests/run_official.py rv --images-dir $(IMAGES_DIR) \
 		--judge-dir $(JUDGE_DIR) --output $(OFFICIAL_OUT) --timeout $(OFF_TIMEOUT)
@@ -213,13 +231,10 @@ test-la: check-qemu kernel-la
 # 评测辅助盘（官方 harness 检测到提交目录的 disk.img/disk-la.img 时自动挂
 # 为第二块盘；本内核设备命名让分区盘优先编号，/dev/vda2 即其 FAT32 分区，
 # mount 测例由此真实挂载）。同一内容两架构通用。
-disk.img: tests/make_official_disk.py
-	$(PYTHON) tests/make_official_disk.py disk.img
-
-disk-la.img: tests/make_official_disk.py
-	$(PYTHON) tests/make_official_disk.py disk-la.img
-
-official-disks: disk.img disk-la.img
+# 辅助盘模板（tests/official-disk-template.img.xz，64 MiB MBR+FAT32，
+# 由 make_official_disk.py 离线生成一次后归档）：评测机无需 mkfs.vfat
+disk.img disk-la.img: tests/official-disk-template.img.xz
+	xz -dc $< > $@
 
 # ---------- 测试入口（收拢 scripts/tests 调用）----------
 # 自建盘回归：历届遗留的 FS 语义门禁（元数据/截断/重命名/定位 IO/FD），
