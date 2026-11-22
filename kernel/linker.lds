@@ -50,15 +50,20 @@ SECTIONS
         egot = .;
     }
 
+    /* 段间距 4K 对齐，保持各段 paddr == vaddr */
+    . = ALIGN(4K);
+
     /* polyhal ctor 表（CtorType 系统初始化链） */
-    ph_init : AT(egot - VIRT_BASE + PHYS_BASE) {
+    ph_init : AT(ALIGN(egot, 4K) - VIRT_BASE + PHYS_BASE) {
         sph_init = .;
         KEEP(*(ph_init .ph_init))
         . = ALIGN(8);
         eph_init = .;
     }
 
-    .data : AT(eph_init - VIRT_BASE + PHYS_BASE) {
+    . = ALIGN(4K);
+
+    .data : AT(ALIGN(eph_init, 4K) - VIRT_BASE + PHYS_BASE) {
         _sdata = .;
         . = ALIGN(4K);
         *(.data.boot_page_table)

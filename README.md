@@ -33,26 +33,43 @@ OuroOS v0.1.0 · riscv64 · boot hart 0 · 1 cpus · boot ok
 
 随后内核进入最小用户态链路：依次运行内嵌的用户程序 `hello` 与 `check`
 （源码在 `user/hello/`，构建时嵌入内核镜像，不经磁盘），用户程序
-运行在用户权限级，经 ecall / syscall 执行 write 与 exit：
+运行在用户权限级，经 ecall / syscall 执行 write、exit 及内存系统调用：
 
 ```text
 hello, OuroOS user world (riscv64)
 [user] hello: exited with status 0
 check: write ok
+check: mm syscall paths ok
 check: all syscall paths ok, faulting now
-[user] check: killed by LoadPageFault @ 0x5000, pc 0x100e8
+[user] check: killed by LoadPageFault @ 0x5000, pc 0x10126
 ```
 
 `check` 覆盖：write 成功路径与返回字节数、跨页用户缓冲区、未映射地址与
 内核高地址缓冲区（EFAULT）、错误 fd（EBADF）、未实现系统调用（ENOSYS），
-以及用户态非法访存被内核报告并终止。两个程序运行结束后内核统一关机。
+以及 brk/mmap/munmap/mprotect 的成功、固定替换、权限与错误路径，
+最后验证用户态非法访存被内核报告并终止。所有任务结束后内核统一关机。
+
+## 内存系统调用范围
+
+| 编号 | 名称 | 已支持与限制 |
+|---|---|---|
+| 213 | readahead | 普通文件按偏移预读，最多 128 KiB，保留文件游标 |
+| 214 | brk | 查询、扩展、收缩；失败返回原 break，物理页按首次访问分配 |
+| 222 | mmap | 私有与共享匿名、文件映射、MAP_FIXED 事务替换；访问整个位于 EOF 外的页按 SIGBUS 终止 |
+| 215 | munmap | 起址必须页对齐，长度向上取整，允许空洞；零长度拒绝 |
+| 226 | mprotect | 支持修改读写权限和 PROT_NONE；可访问页实际可执行，写保护由页表执行 |
+
+可访问页实际允许执行，PROT_WRITE 蕴含 PROT_READ。每个任务拥有带未映射保护页的内核栈。支持 mremap、mincore、madvise、msync 和锁页调用，细节见内存契约。fork 深拷贝私有驻留页，TLB 刷新限于当前核。
 
 ## 测试情况
 
-- 2026-10 本仓库尚在起步阶段，未接入官方测例；上述用户程序验证为本地
-  `make run-rv` / `make run-la`（QEMU 9.2.1 / 10.0.2）实测结果。
+- 2026-11 双架构 `basic` 组 32 个官方测试点在本地通过（官方 ELF 未修改），`basic_edges` 与 `selftest` 档（mm 自检 + 帧守恒）同样通过。
+- 双架构已运行 musl BusyBox 脚本及部分原版 LTP 内存用例；整套尚未通过。
 
 ## 文档
+
+- [ostd 契约与已知缺陷](docs/ostd-contracts.md)
+- [第三方与借鉴代码登记](docs/third-party.md)
 
 ## 第三方代码声明
 
@@ -61,10 +78,13 @@ check: all syscall paths ok, faulting now
 | PolyHAL 0.4.0 | https://github.com/Byte-OS/polyhal | MIT | 硬件抽象层 |
 | PolyHAL example | https://github.com/Byte-OS/polyhal example 目录 | MIT | 改编了 `kernel/build.rs`、`kernel/linker.lds`、`kernel/src/mm/frame.rs` |
 | polyhal-boot 0.4.0 | https://crates.io/crates/polyhal-boot | MIT | 双架构早期汇编入口与早期初始化（多核拉起路径本项目不使用） |
-| polyhal-trap 0.4.0 | https://crates.io/crates/polyhal-trap | MIT | 双架构中断/异常初始化与分发 |
+| polyhal-trap 0.4.0 | https://github.com/Byte-OS/polyhal | MIT | 双架构中断/异常初始化与分发；vendor 至 `third_party/polyhal-trap` 并打本地补丁（清单见其 README） |
+| virtio-drivers 0.7.5 | https://github.com/rcore-os/virtio-drivers | MIT | 块设备驱动；自写 DMA 与 MMIO/PCI 适配 |
+| rsext4 0.8.1 | https://crates.io/crates/rsext4/0.8.1 | Apache-2.0 | Ext4 后端，vendor 于 `third_party/rsext4` |
+| rust-fatfs（锁定 revision） | https://github.com/rafalh/rust-fatfs | MIT | FAT 挂载与文件读写 |
 | log 0.4.34 | https://crates.io/crates/log | MIT OR Apache-2.0 | 分级日志 |
 | spin 0.10.1 | https://crates.io/crates/spin | MIT | 自旋锁（帧分配器） |
-| buddy_system_allocator 0.11.0 | https://crates.io/crates/buddy_system_allocator | MIT | 内核堆与页帧 buddy 分配器 |
+| buddy_system_allocator 0.11.0 | https://crates.io/crates/buddy_system_allocator | MIT | 内核堆分配器（页帧分配器为自建位图） |
 
 ## AI 工具使用说明
 
@@ -78,3 +98,5 @@ check: all syscall paths ok, faulting now
 ## 许可证
 
 MIT，见 [LICENSE](LICENSE)。
+
+MM 回归入口：`tests/run_group.py` 分别运行两架构 basic、边界测试和内核自检。文件映射短写重试使用 `tests/file_mapping.rs` 注入故障。 与存储分支联合运行时，`tests/mm_file_resize.c` 验证共享页驻留、文件截断与扩长写回。支持范围、无 NX 的权限约定及原版 LTP 尚未通过的原因见 [内核接口契约](docs/ostd-contracts.md)。

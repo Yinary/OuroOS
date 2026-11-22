@@ -2,12 +2,11 @@
 //! 逐字段边界检查解析，不把文件字节重解释为结构体引用。
 //! 支持范围与 Linux 差异见 docs/ostd-contracts.md §4。
 
+#![deny(unsafe_code)]
+
 use polyhal::pagetable::{MappingFlags, PAGE_SIZE};
 
-use crate::mm::{
-    address_space::{phys_to_kernel_vaddr, UserAddressSpace, USER_BASE},
-    fence_icache,
-};
+use crate::mm::{address_space::UserAddressSpace, fence_icache};
 
 /// 加载失败原因
 #[derive(Debug)]
@@ -93,11 +92,35 @@ fn read_u64(buf: &[u8], off: usize) -> u64 {
     ])
 }
 
+/// 已校验的程序入口及位于可读 LOAD 段内的程序头表。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageInfo {
+    pub entry: usize,
+    pub headers: Option<(usize, usize, usize)>,
+}
+
 /// 解析并把 ELF 加载进 `space`，返回入口虚拟地址。
 ///
 /// BSS（memsz > filesz 的部分）依赖 [`UserAddressSpace::map_alloc`]
 /// 返回已清零的页，无需显式清零。加载完成后执行指令缓存同步。
-pub fn load_elf(space: &mut UserAddressSpace, elf: &[u8]) -> Result<usize, ElfError> {
+pub fn load_elf(space: &mut UserAddressSpace, elf: &[u8]) -> Result<ImageInfo, ElfError> {
+    let mut staged = UserAddressSpace::new().map_err(map_error)?;
+    let entry = load_image(&mut staged, elf)?;
+    space.install_image(staged).map_err(map_error)?;
+    fence_icache();
+    Ok(entry)
+}
+
+fn map_error(e: crate::mm::address_space::MapError) -> ElfError {
+    use crate::mm::address_space::MapError;
+    match e {
+        MapError::OutOfMemory => ElfError::OutOfMemory,
+        MapError::Overlap => ElfError::SegmentOverlap,
+        _ => ElfError::MapFailed,
+    }
+}
+
+fn load_image(space: &mut UserAddressSpace, elf: &[u8]) -> Result<ImageInfo, ElfError> {
     if elf.len() < 64 {
         return Err(ElfError::Truncated);
     }
@@ -109,6 +132,9 @@ pub fn load_elf(space: &mut UserAddressSpace, elf: &[u8]) -> Result<usize, ElfEr
     }
     let e_type = read_u16(elf, 16);
     let e_machine = read_u16(elf, 18);
+    if read_u32(elf, 20) != 1 || read_u16(elf, 52) != 64 {
+        return Err(ElfError::BadIdent);
+    }
     if e_type != ET_EXEC {
         return Err(ElfError::BadType);
     }
@@ -146,6 +172,18 @@ pub fn load_elf(space: &mut UserAddressSpace, elf: &[u8]) -> Result<usize, ElfEr
         }
     }
 
+    let entry_in_segment = (0..phnum).any(|i| {
+        let ph = e_phoff + i * PHENTSIZE as usize;
+        let start = read_u64(elf, ph + 16) as usize;
+        let size = read_u64(elf, ph + 40) as usize;
+        read_u32(elf, ph) == PT_LOAD
+            && read_u32(elf, ph + 4) & 1 != 0
+            && start <= e_entry
+            && start.checked_add(size).is_some_and(|end| e_entry < end)
+    });
+    if !entry_in_segment {
+        return Err(ElfError::EntryInvalid);
+    }
     // 入口必须落在可执行的用户映射中
     let Some((_, flags)) = space.translate(e_entry) else {
         return Err(ElfError::EntryInvalid);
@@ -161,7 +199,24 @@ pub fn load_elf(space: &mut UserAddressSpace, elf: &[u8]) -> Result<usize, ElfEr
 
     // 代码页经内核别名写入、用户在用户地址取指，需同步指令缓存
     fence_icache();
-    Ok(e_entry)
+    let headers = (0..phnum).find_map(|i| {
+        let ph = e_phoff + i * PHENTSIZE as usize;
+        let offset = read_u64(elf, ph + 8) as usize;
+        let va = read_u64(elf, ph + 16) as usize;
+        let size = read_u64(elf, ph + 32) as usize;
+        if read_u32(elf, ph) != PT_LOAD
+            || read_u32(elf, ph + 4) & 4 == 0
+            || offset > e_phoff
+            || phend > offset.checked_add(size)?
+        {
+            return None;
+        }
+        Some((va.checked_add(e_phoff - offset)?, PHENTSIZE as usize, phnum))
+    });
+    Ok(ImageInfo {
+        entry: e_entry,
+        headers,
+    })
 }
 
 /// 加载单个 PT_LOAD 段（`ph` 为该程序头在文件内的偏移）。
@@ -171,6 +226,7 @@ fn load_segment(space: &mut UserAddressSpace, elf: &[u8], ph: usize) -> Result<(
     let p_vaddr = read_u64(elf, ph + 16) as usize;
     let p_filesz = read_u64(elf, ph + 32) as usize;
     let p_memsz = read_u64(elf, ph + 40) as usize;
+    let p_align = read_u64(elf, ph + 48) as usize;
 
     if p_filesz > p_memsz {
         return Err(ElfError::BadSegment);
@@ -182,12 +238,9 @@ fn load_segment(space: &mut UserAddressSpace, elf: &[u8], ph: usize) -> Result<(
     }
     // 用户范围与栈保护检查（含溢出）
     UserAddressSpace::check_user_span(p_vaddr, p_memsz).map_err(|_| ElfError::BadSegment)?;
-    if p_vaddr < USER_BASE {
-        return Err(ElfError::BadSegment);
-    }
-    // 我们按 4KiB 页映射：虚拟地址必须页对齐；文件偏移只在段含文件
-    // 内容时要求页对齐（纯 BSS 段 filesz=0，无偏移约束）
-    if p_vaddr % PAGE_SIZE != 0 || (p_filesz > 0 && p_offset % PAGE_SIZE != 0) {
+    if p_vaddr % PAGE_SIZE != p_offset % PAGE_SIZE
+        || (p_align > 1 && (!p_align.is_power_of_two() || p_vaddr % p_align != p_offset % p_align))
+    {
         return Err(ElfError::BadSegment);
     }
     if p_memsz == 0 {
@@ -195,30 +248,95 @@ fn load_segment(space: &mut UserAddressSpace, elf: &[u8], ph: usize) -> Result<(
     }
 
     let flags = segment_flags(p_flags);
-    let pages = p_memsz.div_ceil(PAGE_SIZE);
-    for i in 0..pages {
-        let vaddr = p_vaddr + i * PAGE_SIZE;
-        // 页级重叠拒绝：map_alloc 检查目标页是否已有映射
-        let paddr = space.map_alloc(vaddr, flags).map_err(|e| match e {
-            crate::mm::address_space::MapError::OutOfMemory => ElfError::OutOfMemory,
-            crate::mm::address_space::MapError::Overlap => ElfError::SegmentOverlap,
-            _ => ElfError::MapFailed,
-        })?;
-        // 复制文件内容（BSS 部分依赖新页已清零）
-        let file_off = p_offset + i * PAGE_SIZE;
-        let copy_len = p_filesz.saturating_sub(i * PAGE_SIZE).min(PAGE_SIZE);
-        if copy_len > 0 {
-            let dst = phys_to_kernel_vaddr(paddr);
-            // SAFETY: paddr 是刚为本段分配并清零的物理页；copy_len 由
-            // p_filesz（已做文件边界检查）限定，源与目标都不越界。
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    elf.as_ptr().add(file_off),
-                    dst as *mut u8,
-                    copy_len,
-                );
-            }
+    let page_start = p_vaddr / PAGE_SIZE * PAGE_SIZE;
+    let mem_end = p_vaddr.checked_add(p_memsz).ok_or(ElfError::BadSegment)?;
+    let file_va_end = p_vaddr.checked_add(p_filesz).ok_or(ElfError::BadSegment)?;
+    for vaddr in (page_start..mem_end).step_by(PAGE_SIZE) {
+        space.map_alloc(vaddr, flags).map_err(map_error)?;
+        let begin = vaddr.max(p_vaddr);
+        let end = (vaddr + PAGE_SIZE).min(file_va_end);
+        if begin < end {
+            let file_off = p_offset + (begin - p_vaddr);
+            space
+                .init_elf_page(begin, &elf[file_off..file_off + end - begin])
+                .map_err(map_error)?;
         }
     }
     Ok(())
+}
+
+/// 合成 ELF 验证页内偏移、BSS、输入拒绝与逐点帧耗尽回滚。
+#[cfg(debug_assertions)]
+pub(crate) fn self_test() {
+    use crate::mm::{
+        frame,
+        user_access::{copy_from_user, copy_to_user},
+    };
+    use polyhal::pagetable::MappingFlags as F;
+    let baseline = frame::stats();
+    let mut bytes = alloc::vec![0u8; 0x1223];
+    bytes[..7].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1]);
+    bytes[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+    bytes[18..20].copy_from_slice(&EM_CURRENT.to_le_bytes());
+    bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+    bytes[24..32].copy_from_slice(&0x10123u64.to_le_bytes());
+    bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+    bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+    bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+    bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+    bytes[64..68].copy_from_slice(&PT_LOAD.to_le_bytes());
+    bytes[68..72].copy_from_slice(&7u32.to_le_bytes());
+    for (off, value) in [
+        (72, 0x123u64),
+        (80, 0x10123),
+        (96, 0x1100),
+        (104, 0x2100),
+        (112, 4096),
+    ] {
+        bytes[off..off + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes[0x123..].fill(0x5a);
+    let mut success = false;
+    for budget in 0..24 {
+        let mut space = UserAddressSpace::new().expect("ELF test space");
+        space.map_alloc(0x40000, F::URW).expect("ELF sentinel");
+        copy_to_user(&space, 0x40000, &[0x33]).expect("sentinel write");
+        let before = frame::stats();
+        frame::set_test_budget(Some(budget));
+        let result = load_elf(&mut space, &bytes);
+        frame::set_test_budget(None);
+        let mut value = [0];
+        copy_from_user(&space, 0x40000, &mut value).expect("sentinel read");
+        assert_eq!(value, [0x33]);
+        if result.is_ok() {
+            for (va, expected) in [
+                (0x10000, 0),
+                (0x10123, 0x5a),
+                (0x11000, 0x5a),
+                (0x11222, 0x5a),
+                (0x11223, 0),
+                (0x12222, 0),
+            ] {
+                copy_from_user(&space, va, &mut value).expect("ELF bytes");
+                assert_eq!(value, [expected]);
+            }
+            success = true;
+            break;
+        }
+        assert!(matches!(result, Err(ElfError::OutOfMemory)));
+        assert_eq!(frame::stats(), before);
+        assert!(space.translate(0x10000).is_none());
+    }
+    assert!(success);
+    for (offset, replacement) in [(72, u64::MAX), (104, u64::MAX), (112, 3), (24, 0x10000)] {
+        let mut bad = bytes.clone();
+        bad[offset..offset + 8].copy_from_slice(&replacement.to_le_bytes());
+        let mut space = UserAddressSpace::new().expect("bad ELF test");
+        let before = frame::stats();
+        assert!(load_elf(&mut space, &bad).is_err());
+        assert!(space.areas().is_empty());
+        assert_eq!(frame::stats(), before);
+    }
+    assert_eq!(frame::stats(), baseline);
+    log::info!("elf: offset, BSS, bounds and OOM rollback passed");
 }

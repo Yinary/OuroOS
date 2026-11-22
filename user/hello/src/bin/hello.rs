@@ -23,6 +23,20 @@ extern "C" fn ouro_main() -> ! {
         // write 返回字节数不符：以非零状态退出
         sys_exit(1);
     }
+    let p = hello::sys_mmap(0, 4096, 3, 0x22, usize::MAX, 0);
+    if p < 0 {
+        sys_exit(2);
+    }
+    // SAFETY: mmap 成功返回独占匿名页；解除映射后不再访问。
+    unsafe {
+        (p as *mut u8).write_volatile(0x5a);
+        if (p as *const u8).read_volatile() != 0x5a {
+            sys_exit(3);
+        }
+    }
+    if hello::sys_munmap(p as usize, 4096) != 0 {
+        sys_exit(4);
+    }
     sys_exit(0);
 }
 

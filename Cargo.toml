@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["kernel"]
+exclude = ["third_party/rsext4"]
 
 # 本地 vendor 的 polyhal-trap（修复 EscapeReason 有损、la 未分类异常 panic、
 # la 缺 from_user；修改清单见 third_party/polyhal-trap/README.md 与

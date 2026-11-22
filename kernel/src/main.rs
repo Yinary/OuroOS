@@ -1,14 +1,21 @@
 //! OuroOS 内核入口
 #![no_std]
+#![feature(allocator_api)]
+#![feature(naked_functions)]
 #![no_main]
 
 extern crate alloc;
 
 mod allocator;
 mod config;
+mod drivers;
 mod elf;
+mod entropy;
+mod fs;
+mod hal;
 mod lang_items;
 mod mm;
+mod sigframe;
 mod sync;
 mod syscall;
 mod task;
@@ -22,7 +29,7 @@ use core::{
 
 use polyhal::{
     common::get_cpu_num,
-    instruction::{ebreak, shutdown},
+    instruction::ebreak,
     irq::IRQ,
     println,
     timer::{current_time, set_next_timer},
@@ -48,6 +55,11 @@ pub static BREAK_TICKS: AtomicUsize = AtomicUsize::new(0);
 fn rust_main(hartid: usize) {
     allocator::init();
     mm::init();
+    entropy::init();
+    #[cfg(all(debug_assertions, target_arch = "loongarch64"))]
+    trap::self_test_unaligned();
+    drivers::init().expect("block device initialization failed");
+    fs::init().expect("root filesystem initialization failed");
     // 自检：trap 回调链路——断点必须恰好送达一次（每次启动）
     ebreak();
     assert_eq!(
@@ -56,8 +68,7 @@ fn rust_main(hartid: usize) {
         "trap self-check failed: breakpoint not delivered"
     );
 
-    // 打开中断并启动第一个 tick；孵化阶段须保持此稳态
-    // （rv TrapFrame sstatus 前提，见 docs/ostd-contracts.md §3）
+    // 打开中断并启动第一个 tick。
     IRQ::int_enable();
     set_next_timer(current_time() + Duration::from_millis(config::TICK_MS));
 
@@ -79,16 +90,30 @@ fn rust_main(hartid: usize) {
     // 任务时代基线：全部任务退出后帧统计必须回到这里（帧守恒断言）
     let baseline = mm::frame::stats();
 
-    // 孵化须在 task::run 关中断之前（契约"孵化时机"）
+    // 孵化用户任务。
     task::init();
-    task::spawn_demo_kthreads();
-    for (name, elf) in [
-        ("hello", user_images::HELLO_ELF),
-        ("sched", user_images::SCHED_ELF),
-        ("sched", user_images::SCHED_ELF),
-        ("check", user_images::CHECK_ELF),
-        ("ill", user_images::ILL_ELF),
-    ] {
+    let disk_init = if user_images::TEST_ELF.is_empty() {
+        fs::context::Context::new()
+            .ok()
+            .and_then(|ctx| fs::context::executable(&ctx, "/init").ok())
+    } else {
+        None
+    };
+    let images: &[(&str, &[u8])] = if !user_images::TEST_ELF.is_empty() {
+        &[("test", user_images::TEST_ELF)]
+    } else if let Some(image) = disk_init.as_ref() {
+        &[("basic-init", image.as_slice())]
+    } else {
+        task::spawn_demo_kthreads();
+        &[
+            ("hello", user_images::HELLO_ELF),
+            ("sched", user_images::SCHED_ELF),
+            ("sched", user_images::SCHED_ELF),
+            ("check", user_images::CHECK_ELF),
+            ("ill", user_images::ILL_ELF),
+        ]
+    };
+    for &(name, elf) in images {
         match task::spawn_user(name, elf) {
             Ok(pid) => println!("[task] spawned {} as pid {}", name, pid),
             // 空镜像（脱离 Makefile 构建时）或加载失败：报告后继续
@@ -103,7 +128,11 @@ fn rust_main(hartid: usize) {
 
     // 进入任务时代：关中断、跑调度器到全部退出、汇总并断言帧守恒
     task::run(baseline);
-    shutdown();
+    #[cfg(not(feature = "rsext4-readonly"))]
+    if let Err(error) = fs::shutdown() {
+        log::error!("Ext4 shutdown failed: {:?}", error);
+    }
+    hal::shutdown();
 }
 
 // 副核入口，正常运行不会到达；保留以满足 define_entry! 两入口签名

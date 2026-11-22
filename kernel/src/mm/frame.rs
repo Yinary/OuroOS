@@ -1,6 +1,6 @@
 //! 物理页所有权与帧分配：位图、区域内首次适配，运行期零堆依赖。
 use alloc::vec::Vec;
-use polyhal::{pagetable::PAGE_SIZE, PhysAddr};
+use polyhal::{consts::VIRT_ADDR_START, pagetable::PAGE_SIZE, PhysAddr};
 use spin::Mutex;
 
 /// 物理页或管理元数据不足，以及非法申请。
@@ -32,10 +32,28 @@ static ALLOCATOR: Mutex<Allocator> = Mutex::new(Allocator {
     budget: None,
 });
 
+fn direct_map_addr(pa: PhysAddr) -> usize {
+    pa.raw() | VIRT_ADDR_START
+}
+
 /// 已登记总页数与当前空闲页数；统计与分配在同一把锁内更新。
 pub fn stats() -> (usize, usize) {
     let a = ALLOCATOR.lock();
     (a.total, a.free)
+}
+
+/// 供 procfs 读取的帧统计快照，单位 KiB；未包含永久保留区。
+pub struct MemorySnapshot {
+    pub total_kib: usize,
+    pub free_kib: usize,
+}
+
+pub fn memory_snapshot() -> MemorySnapshot {
+    let (total, free) = stats();
+    MemorySnapshot {
+        total_kib: total * (PAGE_SIZE / 1024),
+        free_kib: free * (PAGE_SIZE / 1024),
+    }
 }
 
 /// 登记经过 region 层排除保留区的页对齐区间；只允许启动主核调用。
@@ -151,6 +169,63 @@ impl OwnedFrame {
     /// 借用物理地址，不转移释放责任。
     pub fn addr(&self) -> PhysAddr {
         self.pa
+    }
+    /// 从所拥有的页复制字节到内核缓冲区；越过页边界返回 InvalidRange。
+    pub fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), FrameError> {
+        if offset > PAGE_SIZE || out.len() > PAGE_SIZE - offset {
+            return Err(FrameError::InvalidRange);
+        }
+        // SAFETY: self 持有一整页已分配物理内存；边界已检查，单核内核操作期间
+        // 用户态停止，且只借用调用方缓冲区，不创建共享页的 Rust 引用。
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (direct_map_addr(self.pa) + offset) as *const u8,
+                out.as_mut_ptr(),
+                out.len(),
+            );
+        }
+        Ok(())
+    }
+    /// 从内核缓冲区写入所拥有的页；越过页边界返回 InvalidRange。
+    pub fn write(&self, offset: usize, data: &[u8]) -> Result<(), FrameError> {
+        if offset > PAGE_SIZE || data.len() > PAGE_SIZE - offset {
+            return Err(FrameError::InvalidRange);
+        }
+        // SAFETY: self 持有一整页已分配物理内存；边界已检查，单核内核操作期间
+        // 用户态停止，且只借用调用方缓冲区，不创建共享页的 Rust 引用。
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                (direct_map_addr(self.pa) + offset) as *mut u8,
+                data.len(),
+            );
+        }
+        Ok(())
+    }
+    /// 清零页内半开区间；边界裁剪到本页，空区间无副作用。
+    pub(crate) fn clear_range(&self, start: usize, end: usize) {
+        let end = end.min(PAGE_SIZE);
+        if start < end {
+            // SAFETY: self 持有整页，start < end <= PAGE_SIZE，用户态已暂停。
+            unsafe {
+                core::ptr::write_bytes(
+                    (direct_map_addr(self.pa) + start) as *mut u8,
+                    0,
+                    end - start,
+                );
+            }
+        }
+    }
+    /// 将另一拥有页复制到本页；传入自身也合法。
+    pub fn copy_from(&self, source: &OwnedFrame) {
+        // SAFETY: 两个 OwnedFrame 在复制期间均持有已分配页；copy 允许传入同一页。
+        unsafe {
+            core::ptr::copy(
+                direct_map_addr(source.pa) as *const u8,
+                direct_map_addr(self.pa) as *mut u8,
+                PAGE_SIZE,
+            );
+        }
     }
 }
 impl Drop for OwnedFrame {

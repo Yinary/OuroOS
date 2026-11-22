@@ -17,6 +17,8 @@ pub enum TrapType {
     Timer,
     /// 事件已在 HAL 内部消化（如 la 非对齐模拟成功），恢复执行，非异常。
     Absorbed,
+    /// loongarch64 用户非对齐访问，由 OS 经用户地址空间安全模拟。
+    AddressNotAligned(usize),
     /// 未分类异常（loongarch64 为 ecode<<16|esubcode）：用户态→终止任务，内核态→内核 bug。
     Unhandled(usize),
     Unknown,

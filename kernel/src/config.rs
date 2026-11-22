@@ -25,5 +25,5 @@ pub const TICK_MS: u64 = 100;
 /// 启动自检需要收到的 tick 数
 pub const BOOT_TICKS: usize = 3;
 
-/// 每个任务的内核栈页数（4 页 = 16 KiB，无保护页，欠账见 docs/ostd-contracts.md §1）。
-pub const KSTACK_PAGES: usize = 4;
+/// 每个任务的内核栈页数（8 页 = 32 KiB，另有低地址 guard 页；见 docs/ostd-contracts.md §1）。
+pub const KSTACK_PAGES: usize = 8;
