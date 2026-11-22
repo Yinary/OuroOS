@@ -1,8 +1,6 @@
-//! 平台 RTC（墙上时钟）读取：供 hwclock 的 RTC_RD_TIME 查询。
-//! RV：QEMU virt 的 Goldfish RTC（MMIO 0x101000，读 TIME_LOW 锁存
-//! TIME_HIGH，64 位纳秒计数，QEMU -rtc base=utc 时为 UTC 纪元值）。
-//! LA：LS7A TOY 计数器（0x100d_0100，使能位 0x900；年字段在 0x30，
-//! 月/日/时/分/秒打包在 0x2c，读两次一致才接受，避免跨秒拼接）。
+//! 平台 RTC 墙上时钟读取（hwclock 的 RTC_RD_TIME）。
+//! RV：Goldfish RTC @0x101000（LOW 锁存 HIGH，64 位纳秒，UTC 纪元）。
+//! LA：LS7A TOY @0x100d_0100（年@0x30、月日时分秒@0x2c，双读一致防跨秒）。
 
 /// 读硬件 RTC 并换算为 UTC 纪元秒；无设备或读数无效时返回 None。
 pub fn read_utc_seconds() -> Option<i64> {

@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
-"""官方原盘正式验收：按官方评测器同款 QEMU 命令运行原盘镜像，串口交由
-原版 judge 脚本判分。
-
-判分协议与 autotest-for-oskernel kernel/run.py::parse_serial_out_new 一致：
-串口按 `#### OS COMP TEST GROUP START <组> ####` / `#### ... END ...` 分段，
-组内行写入 judge_<组>.py 的 stdin，judge 输出 JSON 分数；从未启动的组同样
-以空输入调用 judge 计 0 分。本脚本不改动任何评分逻辑，只补充完整性诊断
-（超时、缺组、重复组、截断、judge 失败）。
-
-原盘只读保存：每次运行把镜像复制成干净副本再交给 QEMU，写入不回原文件。
+"""官方原盘验收：官方 QEMU 命令启动，串口按组标记喂原版 judge 判分
+（协议与 autotest-for-oskernel run.py 一致），另附超时/缺组/嵌套/截断
+等完整性诊断；原盘只读，运行用干净副本。
 """
 import argparse
 import hashlib
@@ -22,13 +15,30 @@ import sys
 
 GROUP_START = re.compile(r"#### OS COMP TEST GROUP START ([a-zA-Z0-9-]+) ####")
 GROUP_END = re.compile(r"#### OS COMP TEST GROUP END ([a-zA-Z0-9-]+) ####")
-# 官方评测使用 QEMU 10.0.2（LoongArch 带 2025-07 补丁），LA 侧 TLB 行为依赖该版本
 QEMU_VERSION = re.compile(r"version 10\.0\.2\b")
-# 本轮验收的四个目标组
 TARGET_GROUPS = ("basic-musl", "basic-glibc", "busybox-musl", "busybox-glibc")
-# 原盘目录约定：仓库内 sdcard/pre-20250615/（git 忽略），文件名对照官方
-# testsuits-for-oskernel pre-20250615 发布页
 IMAGES_DIR_DEFAULT = pathlib.Path("sdcard") / "pre-20250615"
+# judge 目录搜索链（--judge-dir 显式指定优先；末项为本机历史位置，向后兼容）
+JUDGE_DIR_CANDIDATES = (
+    pathlib.Path(".cache/autotest-for-oskernel/kernel/judge"),
+    pathlib.Path.home() / "os-contest-ref/autotest-for-oskernel/kernel/judge",
+)
+
+
+def resolve_judge_dir(explicit):
+    """定位官方 judge 目录，找不到时给出 make test-setup 指引并退出。"""
+    if explicit:
+        judge = pathlib.Path(explicit)
+        if not judge.is_dir():
+            sys.exit(f"错误：--judge-dir 指定的目录不存在：{judge}")
+        return judge
+    for candidate in JUDGE_DIR_CANDIDATES:
+        if candidate.is_dir():
+            return candidate
+    sys.exit(
+        "错误：找不到官方 judge 目录。先执行 make test-setup 克隆官方评测器，\n"
+        "  或 --judge-dir 指向已有的 judge 目录"
+    )
 
 
 def qemu_binary(arch, override):
@@ -46,11 +56,7 @@ def qemu_binary(arch, override):
 
 
 def qemu_command(qemu, arch, kernel, disk, extra_disk=None):
-    """官方 run_qemu.py 的正式启动命令（含网络设备，保持设备拓扑一致）。
-
-    extra_disk 模拟官方对提交目录 disk.img/disk-la.img 的附加行为：第二块
-    盘按官方第二盘参数挂载（RV 用 mmio bus.1，LA 追加一个 virtio-blk-pci）。
-    """
+    """官方 run_qemu.py 的正式启动命令；extra_disk 对应官方挂第二块盘的行为。"""
     cmd = [qemu, "-kernel", kernel, "-m", "1G", "-nographic",
            "-smp", "1", "-no-reboot", "-rtc", "base=utc",
            "-drive", f"file={disk},if=none,format=raw,id=x0"]
@@ -89,8 +95,7 @@ def judge_groups(judge_dir):
 
 
 def collect_group(judge, group):
-    """收尾一个 judge 子进程：关 stdin、读 JSON、等待退出并核对退出码。
-    非 JSON 输出或非零退出码都抛异常（由调用方记入 judge_errors 并判失败）。"""
+    """收尾 judge 子进程：非 JSON 输出或非零退出码都抛异常判失败。"""
     judge.stdin.close()
     raw = judge.stdout.read().decode()
     result = json.loads(raw)  # 非 JSON 直接抛
@@ -101,11 +106,7 @@ def collect_group(judge, group):
 
 
 def score_serial(judge_dir, serial_path):
-    """按官方协议判分串口日志，返回 (每组分数表, 诊断信息)。
-
-    组状态机：START 开启一组（嵌套 START、无活跃组的 END 均记入
-    anomalies 并使验收失败）；judge 收到的是该组 END 之前的原始行。
-    """
+    """按组标记状态机拆分串口并喂 judge，返回 (分数表, 诊断信息)。"""
     judges = judge_groups(judge_dir)
     results, notes = {}, {
         "groups_seen": {}, "truncated": False, "judge_errors": [],
@@ -183,7 +184,7 @@ def run_arch(arch, args):
     recorded_sha = sha256_of(disk)
     if args.sha256 and args.sha256 != recorded_sha:
         sys.exit(f"错误：镜像 SHA-256 不匹配：期望 {args.sha256}，实际 {recorded_sha}")
-    # 环境检查全部前移到复制之前：QEMU 版本/辅助盘缺失时不会留下 4 GiB 副本
+    # 环境检查前移，避免 QEMU/辅助盘缺失时白留 4 GiB 副本
     qemu = qemu_binary(arch, args.qemu)
     default_extra = pathlib.Path("disk.img" if arch == "rv" else "disk-la.img")
     extra = str(args.extra_disk or default_extra) if (
@@ -232,9 +233,10 @@ def run_arch(arch, args):
                   f"（串口出现 {seen} 次组标记）", flush=True)
         if notes["judge_errors"]:
             print(f"[{arch}] judge 异常：{notes['judge_errors']}", flush=True)
+        print(f"[{arch}] 串口：{out / 'serial.txt'}  判分明细：{out / 'result.json'}",
+              flush=True)
     finally:
-        # 运行副本用完即清（AGENTS §8）：文本证据已随写随落盘，GB 级镜像
-        # 不保留；异常路径（判分崩溃等）同样清理
+        # 运行副本用完即清，异常路径同样
         copy.unlink(missing_ok=True)
     return summary
 
@@ -248,16 +250,14 @@ def main():
                         help="原盘目录，默认 sdcard/pre-20250615/（缺失时含下载指引报错）")
     parser.add_argument("--sha256", help="原盘期望 SHA-256，提供时校验")
     parser.add_argument("--judge-dir", type=pathlib.Path,
-                        default=pathlib.Path.home() /
-                        "os-contest-ref/autotest-for-oskernel/kernel/judge")
+                        help="官方 judge 目录；缺省按搜索链取 .cache 克隆或本机历史位置")
     parser.add_argument("--output", type=pathlib.Path, default=pathlib.Path("target/official"))
     parser.add_argument("--timeout", type=int, default=600, help="QEMU 超时秒数（默认 600）")
     parser.add_argument("--qemu", help="QEMU 可执行文件覆盖（须为 10.0.2）")
     parser.add_argument("--extra-disk", type=pathlib.Path,
                         help="第二块盘（默认取仓库 disk.img / disk-la.img，make all 生成）")
     args = parser.parse_args()
-    if not args.judge_dir.is_dir():
-        sys.exit(f"错误：judge 目录不存在 {args.judge_dir}")
+    args.judge_dir = resolve_judge_dir(args.judge_dir)
 
 
     archs = ["rv", "la"] if args.arch == "both" else [args.arch]
@@ -275,10 +275,7 @@ def main():
         args.kernel = kernel
         statuses.append(run_arch(arch, args))
 
-    # 退出码只反映运行完整性，不把分数当门禁：
-    #   0 = 每个目标组恰出现一次、配对完整、无 panic/超时/QEMU 异常
-    #   1 = 运行不完整（组缺失/重复/嵌套/截断/panic/超时/QEMU 非零返回）
-    #   2 = judge 或基础设施失败
+    # 退出码只反映运行完整性，不把分数当门禁：0 完整、1 运行不完整、2 judge 失败
     exit_code = 0
     for status in statuses:
         if status["judge_errors"]:

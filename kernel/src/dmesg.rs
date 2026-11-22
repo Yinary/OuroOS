@@ -1,6 +1,5 @@
-//! 内核日志环：供 syslog(2)/klogctl 读取（dmesg 等）。
-//! 收集启动报告、任务终态与 panic 行这些真实内核事件；polyhal 的
-//! logger 输出不经过这里，log 分级宏的内容不进入 dmesg。
+//! 内核日志环：收集启动报告、任务终态与 panic 行，供 syslog(2)/klogctl
+//! 读取；log 分级宏的串口输出不经过这里。
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -13,15 +12,13 @@ pub(crate) const CAP: usize = 8 * 1024;
 static RING: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// 消耗式读游标（syslog READ 语义；READ_ALL/CLEAR 之外推进）
 static CURSOR: AtomicUsize = AtomicUsize::new(0);
-/// syslog SET_CONSOLE_LEVEL 记录的请求级别（1..=8）；本内核串口直通，
-/// 该值不改变实际输出（登记契约偏差）
+/// syslog SET_CONSOLE_LEVEL 记录的请求级别（1..=8）；串口直通，不改变输出
 static CONSOLE_LEVEL: AtomicU8 = AtomicU8::new(7);
 
 /// 追加一行日志（自动补换行）
 pub fn append(line: &str) {
     let mut ring = RING.lock();
-    // 预留失败直接丢弃本行并返回：环有 CAP 硬上限，截旧腾新的路径也
-    // 需要 reserve 成功；绝不在未预留成功时 push/extend
+    // 预留失败直接丢弃本行，绝不未预留成功就 push/extend
     if ring.try_reserve(line.len() + 1).is_err() {
         return;
     }
@@ -37,9 +34,8 @@ pub fn append(line: &str) {
     CURSOR.store(cur.saturating_sub(overflow.min(cur)), Ordering::Relaxed);
 }
 
-/// 消耗式读取（SYSLOG_ACTION_READ）分两段：peek 返回游标起的未读内容
-/// 与新游标位置（不推进）；调用方把内容成功交付给用户后以 commit 推进。
-/// 分配失败返回 None（转 ENOMEM）。历史窗口按环上限自然淘汰。
+/// 消耗式读取第一步：返回未读内容与新游标位置（不推进），交付成功后调
+/// read_consume_commit 推进。分配失败返回 None（转 ENOMEM）。
 pub fn read_consume_peek(max: usize) -> Option<(String, usize)> {
     let ring = RING.lock();
     let cur = CURSOR.load(Ordering::Relaxed).min(ring.len());
@@ -78,8 +74,7 @@ pub fn capacity() -> usize {
     CAP
 }
 
-/// 全部日志文本（SYSLOG_ACTION_READ_ALL）：可失败分配，失败返回 None
-/// （调用方转 ENOMEM），不再忽略 try_reserve。
+/// 全部日志文本（SYSLOG_ACTION_READ_ALL），失败返回 None（转 ENOMEM）。
 pub fn read_all() -> Option<String> {
     let ring = RING.lock();
     let mut out = String::new();

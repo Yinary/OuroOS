@@ -783,8 +783,7 @@ fn fchmod(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usiz
 }
 
 /// fchmodat(2)（dirfd, path, mode, flags）：按路径改权限位。flags 仅接受
-/// 0（AT_SYMLINK_NOFOLLOW 对符号链接 chmod 在 POSIX 中未定义，暂与跟随
-/// 一致，登记契约偏差表）；FAT 卷返回 ENOTSUP。
+/// 0 / AT_SYMLINK_NOFOLLOW（后者暂与跟随一致）；FAT 卷返回 ENOTSUP。
 fn fchmodat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
     if a[3] & !0x100 != 0 {
         return Err(Errno::Invalid);
@@ -805,10 +804,8 @@ fn apply_chmod(path: &str, ino: u32, mode: usize) -> Result<usize, Errno> {
     Ok(0)
 }
 
-/// mknodat(2)：当前仅支持 S_IFBLK 块设备节点注册（授权清单在用户态
-/// 启动器中维护）。节点登记真实 (盘, 分区) 身份（minor = 盘<<4|分区，
-/// major 须为 254），供 mount 与通用块访问解析；同名返回 EEXIST，目标
-/// 分区不存在返回 ENODEV。S_IFCHR/S_IFIFO/S_IFSOCK 未支持返回 EOPNOTSUPP。
+/// mknodat(2)：仅支持 S_IFBLK 节点注册（授权清单在用户态启动器维护），
+/// 登记 (盘, 分区) 身份供 mount 与通用块访问解析；其余类型 EOPNOTSUPP。
 fn mknodat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
     // mknodat(dirfd, pathname, mode, dev)：mode 在 a[2]
     let mode = a[2];

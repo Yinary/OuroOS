@@ -357,10 +357,7 @@ pub fn dispatch(
             Flow::Continue
         }
         sysnr::BRK => {
-            let ret = space.brk(a0);
-            // TODO(yinary): 临时调试日志，定位 basic brk 未推进后删除
-            log::debug!("brk(req={:#x}) -> {:#x}", a0, ret);
-            cx[TrapFrameArgs::RET] = ret;
+            cx[TrapFrameArgs::RET] = space.brk(a0);
             Flow::Continue
         }
         sysnr::MUNMAP
@@ -453,11 +450,9 @@ pub fn dispatch(
         | sysnr::EXECVE
         | sysnr::WAIT4 => Flow::Process,
         sysnr::GETRANDOM => {
-            // getrandom(2)：熵源来自设备树 rng-seed 播种的 ChaCha20 流。
-            // flags 只认 GRND_NONBLOCK(1)/GRND_RANDOM(2)（RANDOM 在本实现
-            // 中与默认等价）；无种子时 NONBLOCK 返回 EAGAIN、阻塞请求同样
-            // 返回 EAGAIN（没有合法的阻塞唤醒来源，见契约偏差表）；未知
-            // flags EINVAL。用户指针先可失败分配，再写回。
+            // getrandom(2)：flags 只认 NONBLOCK(1)/RANDOM(2)（后者与默认
+            // 等价）；无种子或熵流耗尽一律 EAGAIN（无合法阻塞唤醒来源），
+            // 未知 flags EINVAL
             let ret = if a1 > 0x1_0000 || a1 > isize::MAX as usize {
                 // 单次 64 KiB 上限：避免用户以超大 len 逼出大额内核分配
                 Err(Errno::Invalid)
@@ -485,12 +480,8 @@ pub fn dispatch(
             Flow::Continue
         }
         sysnr::SYSLOG => {
-            // syslog(2)/klogctl 按 man 2 的 action 编码：0/1 打开关闭（无
-            // 资源句柄，返回 0）、2 READ（消耗式游标读取）、3 READ_ALL、
-            // 4 READ_CLEAR（读后清空）、5 CLEAR、6/7 console 开关（本内核
-            // 串口直通，无操作返回 0）、8 SET_CONSOLE_LEVEL（仅接受
-            // 1..=8，记录但不变更实际输出，登记契约偏差）、9 SIZE_UNREAD、
-            // 10 SIZE_BUFFER。其余 action EINVAL。
+            // syslog(2)/klogctl 按 man 2 的 action 编码分发到 dmesg 环；
+            // 0/1、6/7 无实际设备句柄，返回 0（串口直通）
             // 交付到用户缓冲的公共尾段；环分配失败转 ENOMEM
             let deliver = |t: Option<alloc::string::String>, n_limit: usize| {
                 let t = t.ok_or(Errno::NoMem)?;

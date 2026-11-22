@@ -556,13 +556,10 @@ impl JBD2DEVSYSTEM {
         // checkpoint still leaves a valid committed transaction in the journal
         // for replay on the next mount.
 
-        // OuroOS patch: commit 块落盘之前，先把 journal 超级块持久化为
-        // "本事务待重放"（s_start = 描述符相对块 = s_first，s_sequence = tid），
-        // 保证 commit 块一旦写到盘上、任意时刻断电，标准恢复端都能看到这条
-        // 已提交事务。此前实现仅在 checkpoint 完成后才更新 sb（s_start 写 0），
-        // commit 与 checkpoint 之间的窗口内盘上 sb 仍为"日志空"，已提交事务
-        // 会被恢复端整体跳过。崩溃发生在本次 sb 写与 commit 块之间时：恢复端
-        // 读到描述符但无 commit 块，不应用任何内容，无部分重放风险。
+        // OuroOS patch: commit 块落盘前先把 journal 超级块持久化为"本事务
+        // 待重放"（s_start=s_first, s_sequence=tid）：否则 commit 与 checkpoint
+        // 之间断电时盘上 sb 仍标"日志空"，已提交事务被恢复端跳过；sb 写后
+        // commit 前断电则恢复端见描述符无 commit 块，不应用，无部分重放风险。
         self.jbd2_super_block.s_start = self.jbd2_super_block.s_first;
         self.jbd2_super_block.s_sequence = tid;
         self.write_journal_superblock_with_mapping(block_dev, journal_blocks)?;

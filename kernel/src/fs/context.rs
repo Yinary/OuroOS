@@ -1055,9 +1055,8 @@ pub fn executable(ctx: &Context, path: &str) -> Result<Vec<u8>, Errno> {
     if mode & 0xf000 != 0x8000 {
         return Err(Errno::Invalid);
     }
-    // execve(2) 语义：目标必须是普通文件且任一执行位为 1（无凭证模型
-    // 下所有调用者等同 root，root 也要求任一 x 位）；拒绝时 EACCES。
-    // ELF、#! 脚本与其解释器都经本入口，校验统一覆盖。
+    // execve(2)：任一执行位为 1 才可执行（无凭证模型等同 root，root 同样
+    // 要求 x 位）；ELF、#! 脚本与其解释器统一走本入口
     if mode & 0o111 == 0 {
         return Err(Errno::Access);
     }

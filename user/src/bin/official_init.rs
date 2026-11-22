@@ -1,11 +1,6 @@
-//! 官方盘用户态启动器：盘上没有 /init 时由内核内嵌启动。
-//!
-//! 职责（全部通过通用文件系统系统调用完成，不感知具体测例内容）：
-//! 1. 读取 basic 程序 ELF 头里的 PT_INTERP 请求，把所需动态解释器从
-//!    盘上 libc 目录复制到它请求的绝对路径（如 /lib/ld-linux-*.so.1）；
-//! 2. 用复制建立统一的 /bin/sh 与 /busybox 入口；
-//! 3. 依序在各 libc 目录（/musl、/glibc）中用 `busybox sh <脚本>` 显式
-//!    解释官方外层脚本；组标记与全部输出由脚本与被测程序自行产生。
+//! 官方盘用户态启动器：盘上无 /init 时由内核内嵌启动。安装 basic 程序
+//! PT_INTERP 请求的动态解释器，建立 /bin/sh、/busybox 入口，再用 busybox
+//! sh 显式解释官方外层脚本；全部经通用文件系统调用完成，不感知测例内容。
 
 #![no_std]
 #![no_main]
@@ -30,9 +25,7 @@ const O_WRONLY: usize = 1;
 const O_CREAT: usize = 0o100;
 const O_TRUNC: usize = 0o1000;
 const SIGCHLD: usize = 17;
-/// ELF64 程序头里的 PT_INTERP
 
-/// openat(2)：创建时（O_CREAT）带 mode 参数（第 4 参），其余传 0
 fn sys_openat(path: &[u8], flags: usize, mode: usize) -> isize {
     syscall6(
         SYS_OPENAT,
@@ -52,7 +45,7 @@ fn sys_mkdir(path: &[u8]) -> isize {
     syscall3(SYS_MKDIRAT, AT_FDCWD, path.as_ptr() as usize, 0o755)
 }
 
-/// 报告错误后继续/终止：正式配置下失败必须可见，不允许静默跳过
+/// 打印错误后 exit(1)
 fn fail(msg: &[u8]) -> ! {
     sys_write(2, msg);
     sys_exit(1)
@@ -123,12 +116,8 @@ fn cp(src: &[u8], dst: &[u8]) -> bool {
     true
 }
 
-/// 一次性建立运行布局：解释器、/bin/sh、/busybox。
-/// 解释器按 ELF PT_INTERP 请求的绝对路径放置，来源依次尝试各 libc 目录。
-/// 解释器与 applet 的授权安装清单（构建期常量，非运行时探测）：
-/// (安装目标绝对路径, 盘上来源绝对路径)。目标 = PT_INTERP 声明的绝对
-/// 路径；来源 = 对应 libc 目录内的真实文件。逐条复制并检查结果，失败
-/// 记录在串口。
+/// 授权安装清单（构建期常量，非运行时探测）：(目标绝对路径, 盘上来源)。
+/// 目标 = basic 程序 PT_INTERP 声明的路径，来源 = 对应 libc 目录内文件。
 static INSTALL_LIST: &[(&[u8], &[u8])] = &[
     // RV glibc 解释器（basic 程序 PT_INTERP 声明）
     (
@@ -169,7 +158,7 @@ fn mkdir_p(dst: &[u8]) {
         dir[i] = 0;
         let r = sys_mkdir(&dir[..i + 1]);
         if r < 0 && r != -17 {
-            return; // 父目录创建失败：安装清单中断（后续项也会失败，可见）
+            return;
         }
     }
 }
@@ -183,15 +172,12 @@ fn prepare_layout() {
             sys_write(1, dst);
             note(b"\n");
         } else {
-            // 复制失败必须可见（不静默）：依赖该文件的组会如实失败
             note(b"[official-init] install FAILED for ");
             sys_write(1, dst);
             note(b"\n");
         }
     }
     note(b"[official-init] install list end\n");
-    // 评测别名节点：为官方 mount 测例的 /dev/vda2 建立指向辅助盘 FAT32
-    // 分区的真实块设备节点（用户态授权清单，内核按节点身份解析挂载）
     for (path, mode, dev) in NODE_ALLOWLIST {
         let r = syscall6(
             SYS_MKNODAT,
@@ -202,7 +188,6 @@ fn prepare_layout() {
             sys_write(1, path);
             note(b"\n");
         } else if r != -17 {
-            // EEXIST 视为已创建；其他失败必须可见
             note(b"[official-init] mknod failed for ");
             sys_write(1, path);
             note(b"\n");
@@ -210,9 +195,8 @@ fn prepare_layout() {
     }
 }
 
-/// 在 `libc_dir` 中以 `busybox sh <script>` 显式解释外层脚本，等待完成。
-/// shebang 行由 shell 当作注释；脚本内的组标记与全部输出由其自身产生。
-fn run_script(libc_dir: &[u8], dir_len: usize, script: &[u8]) {
+/// 在 `libc_dir` 中执行 `busybox sh -c <cmd>` 并等待完成。
+fn run_script(libc_dir: &[u8], dir_len: usize, cmd: &[u8]) {
     if syscall3(SYS_CHDIR, libc_dir.as_ptr() as usize, 0, 0) < 0 {
         fail(b"[official-init] chdir libc dir failed\n");
     }
@@ -224,6 +208,7 @@ fn run_script(libc_dir: &[u8], dir_len: usize, script: &[u8]) {
     }
     let argv0 = b"busybox\0";
     let argv1 = b"sh\0";
+    let argv2 = b"-c\0";
     let env = [b"PATH=/bin:/musl:/glibc\0".as_ptr() as usize, 0];
     let mut status = 0usize;
     let pid = syscall3(SYS_CLONE, SIGCHLD, 0, 0);
@@ -234,7 +219,8 @@ fn run_script(libc_dir: &[u8], dir_len: usize, script: &[u8]) {
         let argv = [
             argv0.as_ptr() as usize,
             argv1.as_ptr() as usize,
-            script.as_ptr() as usize,
+            argv2.as_ptr() as usize,
+            cmd.as_ptr() as usize,
             0,
         ];
         let _ = syscall6(
@@ -248,7 +234,7 @@ fn run_script(libc_dir: &[u8], dir_len: usize, script: &[u8]) {
                 0,
             ],
         );
-        // execve 失败必须可见：打印后以 127 退出（shell 约定的"命令未找到"）
+        // 127 = shell 约定的"命令未找到"
         sys_write(2, b"[official-init] execve busybox failed\n");
         sys_exit(127)
     }
@@ -256,7 +242,6 @@ fn run_script(libc_dir: &[u8], dir_len: usize, script: &[u8]) {
         SYS_WAIT4,
         [pid as usize, &mut status as *mut usize as usize, 0, 0, 0, 0],
     );
-    // wait 失败或子进程异常退出都必须可见，不静默继续下一组
     if wr < 0 {
         note(b"[official-init] wait4 failed\n");
     } else if status != 0 {
@@ -295,21 +280,16 @@ fn run_script(libc_dir: &[u8], dir_len: usize, script: &[u8]) {
     }
 }
 
-/// 授权清单：官方盘 basic/run-all.sh 发布为 0644，无法直接 exec
-///（execve 需任一执行位）。对**运行副本**按本清单补执行位——仅改
-/// 模式、不改内容与脚本逻辑，前后模式在串口可见；合规性由团队确认。
+/// 授权对运行副本的 run-all.sh 补执行位（盘上发布为 0644，exec 需 x 位）。
 const CHMOD_ALLOWLIST: &[&[u8]] = &[b"/musl/basic/run-all.sh\0", b"/glibc/basic/run-all.sh\0"];
 
-/// 评测别名节点授权条目：(节点路径, S_IFBLK|0644, 设备号)。设备号编码
-/// glibc makedev(major, minor)：major=254（本内核块设备空间），minor =
-/// (盘号<<4)|分区号 —— 辅助盘 disk.img 恒为总线第二块（盘 1）且其分区 2
-/// 为 FAT32（构建期布局，见 tests/make_official_disk.py）。
+/// 评测别名节点：(节点路径, S_IFBLK|0644, 设备号)。设备号按 glibc
+/// makedev 编码：major=254（本内核块设备空间），minor=(盘<<4)|分区——
+/// 辅助盘恒为总线第二块（盘 1）分区 2（FAT32，见 make_official_disk.py）。
 const NODE_ALLOWLIST: &[(&[u8], usize, usize)] =
     &[(b"/dev/vda2\0", 0o060640, (254 << 8) | ((1 << 4) | 2))];
 
 fn grant_exec_bit(path: &[u8]) {
-    // 前后模式记录：清单文件固定发布为 0644，fchmodat 成功即为
-    // 0644→0755；失败必须可见
     let r = syscall6(
         SYS_FCHMODAT,
         [AT_FDCWD, path.as_ptr() as usize, 0o755, 0, 0, 0],
@@ -325,7 +305,6 @@ fn grant_exec_bit(path: &[u8]) {
     note(b"\n");
 }
 
-/// 用户主函数（由 _start 调用，不返回）
 #[no_mangle]
 extern "C" fn ouro_main() -> ! {
     note(b"[official-init] preparing runtime layout\n");
@@ -333,31 +312,24 @@ extern "C" fn ouro_main() -> ! {
     for path in CHMOD_ALLOWLIST {
         grant_exec_bit(path);
     }
-    // 评测别名节点：为官方 mount 测例的 /dev/vda2 建立指向辅助盘 FAT32
-    // 分区的真实块设备节点（用户态授权清单，内核按节点身份解析挂载）。
-    // EEXIST 视为已创建；其他失败必须可见。
-    for (path, mode, dev) in NODE_ALLOWLIST {
-        let r = syscall6(
-            SYS_MKNODAT,
-            [AT_FDCWD, path.as_ptr() as usize, *mode, *dev, 0, 0],
-        );
-        if r == 0 {
-            note(b"[official-init] node created: ");
-            sys_write(1, path);
-            note(b"\n");
-        } else if r != -17 {
-            note(b"[official-init] mknod failed for ");
-            sys_write(1, path);
-            note(b"\n");
-        }
-    }
-    // 官方组范围：注释掉不关心的行即可跳过该组；组脚本在盘上对应目录。
-    // 其余组（lmbench/ltp/iozone/netperf/lua/iperf/cyclictest 等）依赖尚未
-    // 实现的能力，需要时在此追加对应 run_script 行。
-    run_script(b"/musl\0", 5, b"basic_testcode.sh\0");
-    run_script(b"/musl\0", 5, b"busybox_testcode.sh\0");
-    run_script(b"/glibc\0", 6, b"basic_testcode.sh\0");
-    run_script(b"/glibc\0", 6, b"busybox_testcode.sh\0");
+    // 测例选择：取消注释即启用。第 3 参是 sh -c 命令串（组脚本用 `. ./`）
+    run_script(b"/musl\0", 5, b". ./basic_testcode.sh\0");
+    run_script(b"/musl\0", 5, b". ./busybox_testcode.sh\0");
+    run_script(b"/glibc\0", 6, b". ./basic_testcode.sh\0");
+    run_script(b"/glibc\0", 6, b". ./busybox_testcode.sh\0");
+    //
+    // 其余组（依赖尚未实现的能力，按需启用；ltp/unixbench/lmbench 耗时分钟级）：
+    // run_script(b"/musl\0", 5, b"./cyclictest_testcode.sh\0");
+    // run_script(b"/musl\0", 5, b"./iozone_testcode.sh\0");
+    // run_script(b"/musl\0", 5, b"./iperf_testcode.sh\0");
+    // run_script(b"/musl\0", 5, b"./libcbench_testcode.sh\0");
+    // run_script(b"/musl\0", 5, b"./libctest_testcode.sh\0");
+    // run_script(b"/musl\0", 5, b"./lmbench_testcode.sh\0");
+    // run_script(b"/musl\0", 5, b"./ltp_testcode.sh\0");
+    // run_script(b"/musl\0", 5, b"./lua_testcode.sh\0");
+    // run_script(b"/musl\0", 5, b"./netperf_testcode.sh\0");
+    // run_script(b"/musl\0", 5, b"./unixbench_testcode.sh\0");
+    //（glibc 份把第 1 参换为 b"/glibc\0"、长度换 6）
     note(b"[official-init] all groups finished\n");
     sys_exit(0)
 }

@@ -47,11 +47,8 @@ KERNEL_FEATURES = $(if $(strip $(FEATURES)),--features "$(strip $(FEATURES))")
 QEMU_RV ?= qemu-system-riscv64
 QEMU_LA ?= qemu-system-loongarch64
 
-# 离线构建（评测环境无外网，ENVIRONMENT.md：禁止在线下载、隐藏目录会被
-# 评测机过滤）：第三方依赖以 vendor.tar.xz 归档随仓库提交（cargo vendor
-# 产物；crate 内 .cargo-checksum.json 等点开头文件会被 Clone 过滤，必须
-# 归档交付），make all 解压并把 CARGO_HOME 指到仓库内非隐藏目录（官方
-# 注意事项：.cargo 需改名后在 Makefile 恢复）。
+# 离线构建：依赖以 vendor.tar.xz 随仓库提交（crate 内点开头文件会被
+# 评测机 Clone 过滤，必须归档交付），构建时解压、CARGO_HOME 指向仓库内目录
 VENDOR_ARCHIVE := vendor.tar.xz
 CARGO_HOME := $(CURDIR)/.cargo-home
 
@@ -211,13 +208,27 @@ run-basic-la: kernel-la
 run-basic: run-basic-rv run-basic-la
 
 # ---------- 官方原盘验收 ----------
-# make all 后一键验收：原盘放 sdcard/pre-20250615/（git 忽略；从官方 release
-# 下载解压），辅助盘由 all 生成并被官方 harness 语义挂载。判分为原版 judge。
-#   make test-rv / make test-la
+# 原盘放 sdcard/pre-20250615/（git 忽略，官方 release 下载），判分为原版 judge
 OFFICIAL_OUT ?= target/official
-JUDGE_DIR    ?= $(HOME)/os-contest-ref/autotest-for-oskernel/kernel/judge
+JUDGE_DIR    ?= .cache/autotest-for-oskernel/kernel/judge
 IMAGES_DIR   ?= sdcard/pre-20250615
 OFF_TIMEOUT  ?= 600
+AUTOTEST_REPO = https://github.com/oscomp/autotest-for-oskernel
+
+# 一次性准备：克隆官方评测器到 .cache/（git 忽略），缺原盘时给出下载命令
+.PHONY: test-setup
+test-setup:
+	@if [ -d "$(JUDGE_DIR)" ]; then \
+		echo "评测器已就绪：$(JUDGE_DIR)"; \
+	else \
+		git clone --depth 1 $(AUTOTEST_REPO) .cache/autotest-for-oskernel; \
+	fi
+	@for f in $(IMAGES_DIR)/sdcard-rv.img $(IMAGES_DIR)/sdcard-la.img; do \
+		if [ ! -f "$$f" ]; then \
+			echo "缺原盘 $$f，下载并解压（约 1.6GB）："; \
+			echo "  wget -c https://github.com/oscomp/testsuits-for-oskernel/releases/download/pre-20250615/`basename $$f`.gz -O $$f.gz && gzip -d $$f.gz"; \
+		fi; \
+	done
 
 # 组范围在 user/src/bin/official_init.rs 里按行注释调整（默认四组全跑）
 test-rv: check-qemu kernel-rv
@@ -228,18 +239,13 @@ test-la: check-qemu kernel-la
 	$(PYTHON) tests/run_official.py la --images-dir $(IMAGES_DIR) \
 		--judge-dir $(JUDGE_DIR) --output $(OFFICIAL_OUT) --timeout $(OFF_TIMEOUT)
 
-# 评测辅助盘（官方 harness 检测到提交目录的 disk.img/disk-la.img 时自动挂
-# 为第二块盘；本内核设备命名让分区盘优先编号，/dev/vda2 即其 FAT32 分区，
-# mount 测例由此真实挂载）。同一内容两架构通用。
-# 辅助盘模板（tests/official-disk-template.img.xz，64 MiB MBR+FAT32，
-# 由 make_official_disk.py 离线生成一次后归档）：评测机无需 mkfs.vfat
+# 辅助盘（官方 harness 自动挂为第二块盘，mount 测例的真实 FAT32 分区）；
+# 模板由 make_official_disk.py 生成一次后归档，评测机无需 mkfs.vfat
 disk.img disk-la.img: tests/official-disk-template.img.xz
 	xz -dc $< > $@
 
-# ---------- 测试入口（收拢 scripts/tests 调用）----------
-# 自建盘回归：历届遗留的 FS 语义门禁（元数据/截断/重命名/定位 IO/FD），
-# 验证 JBD2 v3 等存储改动不破坏 classic journal 路径；官方盘不覆盖此语义。
-# 依赖 PATH 中的 QEMU 10.0.2（官方评测版本；缺失时 make check-qemu 给出指引）
+# ---------- 测试入口 ----------
+# 自建盘 FS 语义回归：验证存储改动不破坏 classic journal 路径
 check-qemu:
 	@for q in qemu-system-riscv64 qemu-system-loongarch64; do \
 		v=$$($$q --version 2>/dev/null | head -1); \
@@ -254,7 +260,6 @@ test-regress: check-qemu
 #   tests/fs_io.py、tests/fs_fcntl.py、tests/mm_validate.py（低频，按需手跑）
 
 # 全量门禁：构建 + 格式检查 + clippy + 官方盘验收 + 自建盘回归
-# （fs_stat 内部会重跑 make all；官方盘耗时约 2~3 分钟/架构，回归约 8 分钟）
 fmt-check:
 	cargo fmt -p kernel -- --check
 	cargo fmt --manifest-path $(USER_CRATE)/Cargo.toml --all -- --check
@@ -291,6 +296,7 @@ help:
 	@echo "make run-la     - QEMU 启动 loongarch64 内核"
 	@echo "make run        - 两个架构依次启动"
 	@echo "make run-basic-rv/la  - 挂盘整组跑官方 basic（需 BASIC_SRC=<官方测例源码路径>）"
+	@echo "make test-setup  - 准备官方评测器与原盘（一次性，幂等）"
 	@echo "make test-rv / test-la  - 官方原盘验收（原盘在 sdcard/pre-20250615/，git 忽略）"
 	@echo "make test-regress      - 自建盘 FS 语义回归（历届门禁，需 QEMU 10.0.2）"
 	@echo "make fmt-check         - 格式检查（不改动文件）"
