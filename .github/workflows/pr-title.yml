@@ -1,13 +1,12 @@
-# 检查 PR 标题格式，规则见 CONTRIBUTING.md 第 4、6 节。
-# 合入方式是 squash，PR 标题会成为 main 上的 commit 标题，所以在这里把关。
+# 工作 PR 和发布 PR 的标题约定见 CONTRIBUTING.md 第 4、6 节。
 name: PR 标题检查
 
 on:
   pull_request:
+    branches: [dev, main]
     types: [opened, edited, synchronize, reopened]
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   pr-title:
@@ -15,28 +14,27 @@ jobs:
     steps:
       - name: 检查标题
         env:
-          # 标题通过环境变量传入，不直接拼进脚本，防止标题里的特殊字符被当成命令执行
           TITLE: ${{ github.event.pull_request.title }}
+          BASE: ${{ github.event.pull_request.base.ref }}
           LC_ALL: C.UTF-8
         run: |
-          types='feat|fix|perf|refactor|docs|test|build|ci|chore|style|revert'
-          # 与 CONTRIBUTING.md 第 6 节的 scope 列表保持一致，新增 scope 时两处一起改
-          scopes='arch|hal|mm|task|sched|syscall|signal|fs|vfs|net|ipc|drivers|sync|boot|build|test|docs'
-
-          if [[ ! "$TITLE" =~ ^($types)\(($scopes)\):\ (.+)$ ]]; then
-            echo "::error::标题格式应为 <type>(<scope>): <简述>，当前为：$TITLE"
-            echo "type 可选：${types//|/ }"
-            echo "scope 可选：${scopes//|/ }"
-            exit 1
+          if [[ "$BASE" == main ]]; then
+            pattern='^release: '
+            format='release: <阶段说明>'
+          else
+            types='feat|fix|perf|refactor|docs|test|build|ci|chore|style|revert'
+            scope='[a-z][a-z0-9]*(-[a-z0-9]+)*'
+            pattern="^($types)(\\($scope\\))?: "
+            format='<type>(<scope>): <简述> 或 <type>: <简述>'
           fi
 
-          summary="${BASH_REMATCH[3]}"
-          if (( ${#summary} > 50 )); then
-            echo "::error::简述不超过 50 字，当前 ${#summary} 字"
+          if [[ ! "$TITLE" =~ $pattern ]]; then
+            echo "::error::标题格式应为 $format"
             exit 1
           fi
-          if [[ "$summary" =~ [。.]$ ]]; then
-            echo "::error::简述末尾不加句号"
+          summary=${TITLE#*: }
+          if (( ${#summary} == 0 || ${#summary} > 50 )) ||
+             [[ "$summary" =~ ^[[:space:]]|[[:space:]。.]$ ]]; then
+            echo "::error::简述须为 1 到 50 个字符，首尾不留空白，末尾不加句号"
             exit 1
           fi
-          echo "标题格式正确"

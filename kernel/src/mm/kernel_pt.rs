@@ -98,8 +98,11 @@ unsafe fn init_rv() {
     write_table(&root, 256 + (gi_base >> 30), img_l1.raw());
     fill_root_tail(&root, gi_base + GIB, ram_top);
 
-    // QEMU virt 的 UART 与 VirtIO MMIO，只有内核可读写。
+    // QEMU virt 的 MMIO 设备区，只有内核可读写：低位 2 MiB（UART
+    // 0x100000、Goldfish RTC 0x101000）与 VirtIO 槽 0x1000_0000 起各
+    // 一张大页。
     let io_l1 = frame::frame_alloc(1).expect("kernel MMIO table: OOM");
+    write_leaf(&io_l1, 0, 0, V | R | W | A | D | G);
     write_leaf(
         &io_l1,
         0x1000_0000 >> 21,
@@ -128,6 +131,7 @@ unsafe fn init_rv() {
     // 大页区与无效区
     check(ram_top - PAGE_SIZE, V | R | W | X | A | D | G);
     check(0x1000_0000, V | R | W | A | D | G); // MMIO
+    check(0x101_000, V | R | W | A | D | G); // Goldfish RTC
     assert_eq!(leaf_at(root, text), None); // 无恒等窗口
 
     BOOT_PT.store(arch::current(), core::sync::atomic::Ordering::Relaxed);

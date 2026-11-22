@@ -4,7 +4,7 @@
 #![no_std]
 #![no_main]
 
-use hello::{define_user_entry, sys_exit, sys_write};
+use user::{define_user_entry, sys_exit, sys_write};
 
 /// 触发致命陷阱（不返回）。
 #[cfg(target_arch = "riscv64")]

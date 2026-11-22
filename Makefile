@@ -5,7 +5,7 @@
 #   kernel-rv — riscv64 内核
 #   kernel-la — loongarch64 内核
 #
-# 构建顺序：先构建用户程序（user/hello，独立于内核 workspace），
+# 构建顺序：先构建用户程序（user/，独立于内核 workspace），
 # 再构建内核；内核 build.rs 通过环境变量拿到用户 ELF 并内嵌。
 #
 # QEMU 加载方式：
@@ -23,7 +23,7 @@ USER_REL  := release
 
 # 用户程序 crate（独立 workspace，与内核共用 target/ 目录，
 # cargo clean 可一并清理）
-USER_CRATE := user/hello
+USER_CRATE := user
 
 # loongarch64 的发行版预编译 libcore 含 LSX 向量指令（基线仅 +f,+d），运行时会触发
 # Disable 异常；且 polyhal-boot 只开 FPE。用 build-std 从源码自编 core/alloc，
@@ -47,12 +47,28 @@ KERNEL_FEATURES = $(if $(strip $(FEATURES)),--features "$(strip $(FEATURES))")
 QEMU_RV ?= qemu-system-riscv64
 QEMU_LA ?= qemu-system-loongarch64
 
+# 离线构建：依赖以 vendor.tar.xz 随仓库提交（crate 内点开头文件会被
+# 评测机 Clone 过滤，必须归档交付），构建时解压、CARGO_HOME 指向仓库内目录
+VENDOR_ARCHIVE := vendor.tar.xz
+CARGO_HOME := $(CURDIR)/.cargo-home
+
+$(CARGO_HOME)/config.toml: cargo-vendor-config.toml | vendor/.extracted
+	@mkdir -p $(dir $@)
+	@cp $< $@
+
+vendor/.extracted: $(VENDOR_ARCHIVE)
+	tar xJf $<
+	@touch $@
+
+# 更新归档（本机有网时）：cargo vendor vendor && tar cJf vendor.tar.xz vendor
+
 .PHONY: all kernel-rv kernel-la build build-rv build-la \
 	build-user-rv build-user-la selftest-rv selftest-la clippy clippy-rv clippy-la fmt \
 	run run-rv run-la basic-bin basic-disk run-basic run-basic-rv run-basic-la \
+	test-rv test-la test-regress fmt-check test \
 	run-case-rv run-case-la clean help
 
-all: kernel-rv kernel-la
+all: kernel-rv kernel-la disk.img disk-la.img
 
 # 先构建用户程序，内核构建时通过环境变量内嵌对应架构的 ELF
 kernel-rv: build-user-rv build-rv
@@ -61,27 +77,29 @@ kernel-rv: build-user-rv build-rv
 kernel-la: build-user-la build-la
 	cp $(BIN_LA) kernel-la
 
-build-user-rv:
+build-user-rv: $(CARGO_HOME)/config.toml vendor/.extracted
 	CARGO_TARGET_DIR=target cargo build --manifest-path $(USER_CRATE)/Cargo.toml \
 		$(USER_BUILD_STD) --release --target $(TARGET_RV)
 
-build-user-la:
+build-user-la: $(CARGO_HOME)/config.toml vendor/.extracted
 	$(RUSTFLAGS_LA) CARGO_TARGET_DIR=target cargo build --manifest-path $(USER_CRATE)/Cargo.toml \
 		$(USER_BUILD_STD) --release --target $(TARGET_LA)
 
-build-rv:
-	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/hello \
+build-rv: $(CARGO_HOME)/config.toml vendor/.extracted
+	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/smoke \
 	OUROOS_CHECK_ELF=target/$(TARGET_RV)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_RV)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_RV)/$(USER_REL)/ill \
+	OUROOS_INIT_ELF=target/$(TARGET_RV)/$(USER_REL)/official_init \
 	LOG=$(LOG) cargo build $(BUILD_STD) --release --target $(TARGET_RV) $(KERNEL_FEATURES)
 
-build-la:
+build-la: $(CARGO_HOME)/config.toml vendor/.extracted
 	$(RUSTFLAGS_LA) \
-	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/hello \
+	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/smoke \
 	OUROOS_CHECK_ELF=target/$(TARGET_LA)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_LA)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_LA)/$(USER_REL)/ill \
+	OUROOS_INIT_ELF=target/$(TARGET_LA)/$(USER_REL)/official_init \
 	LOG=$(LOG) cargo build $(BUILD_STD) --release --target $(TARGET_LA) $(KERNEL_FEATURES)
 
 # selftest：selftest 档（release 优化 + debug 断言）+ 调试锁，
@@ -97,7 +115,7 @@ UB_CHECKS_OFF := RUSTFLAGS="-Zunstable-options -Zub-checks=no"
 UB_CHECKS_OFF_LA := RUSTFLAGS="-Zunstable-options -C target-feature=-lsx,-lasx -Zub-checks=no"
 selftest-rv: build-user-rv
 	$(UB_CHECKS_OFF) \
-	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/hello \
+	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/smoke \
 	OUROOS_CHECK_ELF=target/$(TARGET_RV)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_RV)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_RV)/$(USER_REL)/ill \
@@ -105,7 +123,7 @@ selftest-rv: build-user-rv
 
 selftest-la: build-user-la
 	$(UB_CHECKS_OFF_LA) \
-	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/hello \
+	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/smoke \
 	OUROOS_CHECK_ELF=target/$(TARGET_LA)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_LA)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_LA)/$(USER_REL)/ill \
@@ -113,18 +131,20 @@ selftest-la: build-user-la
 
 # ---------- 静态检查 ----------
 clippy-rv: build-user-rv
-	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/hello \
+	OUROOS_HELLO_ELF=target/$(TARGET_RV)/$(USER_REL)/smoke \
 	OUROOS_CHECK_ELF=target/$(TARGET_RV)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_RV)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_RV)/$(USER_REL)/ill \
+	OUROOS_INIT_ELF=target/$(TARGET_RV)/$(USER_REL)/official_init \
 	LOG=$(LOG) cargo clippy $(BUILD_STD) --release --target $(TARGET_RV) $(KERNEL_FEATURES)
 
 clippy-la: build-user-la
 	$(RUSTFLAGS_LA) \
-	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/hello \
+	OUROOS_HELLO_ELF=target/$(TARGET_LA)/$(USER_REL)/smoke \
 	OUROOS_CHECK_ELF=target/$(TARGET_LA)/$(USER_REL)/check \
 	OUROOS_SCHED_ELF=target/$(TARGET_LA)/$(USER_REL)/sched \
 	OUROOS_ILL_ELF=target/$(TARGET_LA)/$(USER_REL)/ill \
+	OUROOS_INIT_ELF=target/$(TARGET_LA)/$(USER_REL)/official_init \
 	LOG=$(LOG) cargo clippy $(BUILD_STD) --release --target $(TARGET_LA) $(KERNEL_FEATURES)
 
 clippy: clippy-rv clippy-la
@@ -187,6 +207,65 @@ run-basic-la: kernel-la
 
 run-basic: run-basic-rv run-basic-la
 
+# ---------- 官方原盘验收 ----------
+# 原盘放 sdcard/pre-20250615/（git 忽略，官方 release 下载），判分为原版 judge
+OFFICIAL_OUT ?= target/official
+JUDGE_DIR    ?= .cache/autotest-for-oskernel/kernel/judge
+IMAGES_DIR   ?= sdcard/pre-20250615
+OFF_TIMEOUT  ?= 600
+AUTOTEST_REPO = https://github.com/oscomp/autotest-for-oskernel
+
+# 一次性准备：克隆官方评测器到 .cache/（git 忽略），缺原盘时给出下载命令
+.PHONY: test-setup
+test-setup:
+	@if [ -d "$(JUDGE_DIR)" ]; then \
+		echo "评测器已就绪：$(JUDGE_DIR)"; \
+	else \
+		git clone --depth 1 $(AUTOTEST_REPO) .cache/autotest-for-oskernel; \
+	fi
+	@for f in $(IMAGES_DIR)/sdcard-rv.img $(IMAGES_DIR)/sdcard-la.img; do \
+		if [ ! -f "$$f" ]; then \
+			echo "缺原盘 $$f，下载并解压（约 1.6GB）："; \
+			echo "  wget -c https://github.com/oscomp/testsuits-for-oskernel/releases/download/pre-20250615/`basename $$f`.gz -O $$f.gz && gzip -d $$f.gz"; \
+		fi; \
+	done
+
+# 组范围在 user/src/bin/official_init.rs 里按行注释调整（默认四组全跑）
+test-rv: check-qemu kernel-rv
+	$(PYTHON) tests/run_official.py rv --images-dir $(IMAGES_DIR) \
+		--judge-dir $(JUDGE_DIR) --output $(OFFICIAL_OUT) --timeout $(OFF_TIMEOUT)
+
+test-la: check-qemu kernel-la
+	$(PYTHON) tests/run_official.py la --images-dir $(IMAGES_DIR) \
+		--judge-dir $(JUDGE_DIR) --output $(OFFICIAL_OUT) --timeout $(OFF_TIMEOUT)
+
+# 辅助盘（官方 harness 自动挂为第二块盘，mount 测例的真实 FAT32 分区）；
+# 模板由 make_official_disk.py 生成一次后归档，评测机无需 mkfs.vfat
+disk.img disk-la.img: tests/official-disk-template.img.xz
+	xz -dc $< > $@
+
+# ---------- 测试入口 ----------
+# 自建盘 FS 语义回归：验证存储改动不破坏 classic journal 路径
+check-qemu:
+	@for q in qemu-system-riscv64 qemu-system-loongarch64; do \
+		v=$$($$q --version 2>/dev/null | head -1); \
+		case "$$v" in *10.0.2*) ;; *) echo "错误：$$q 须为官方评测版本 10.0.2"\
+			"（当前：$${v:-未找到}）。安装后确保在 PATH，或 make QEMU=$$绝对路径 …"; exit 1;; esac; done
+
+test-regress: check-qemu
+	$(PYTHON) tests/fs_stat.py
+
+# 官方盘回归的只读构建变体与注入实验保持原入口不变：
+#   tests/fs_stat.py --readonly、tests/fs_rename_backend.py、
+#   tests/fs_io.py、tests/fs_fcntl.py、tests/mm_validate.py（低频，按需手跑）
+
+# 全量门禁：构建 + 格式检查 + clippy + 官方盘验收 + 自建盘回归
+fmt-check:
+	cargo fmt -p kernel -- --check
+	cargo fmt --manifest-path $(USER_CRATE)/Cargo.toml --all -- --check
+
+test: check-qemu all fmt-check clippy test-rv test-la test-regress
+
 # 单用例调试：测例 ELF 经 OUROOS_TEST_ELF 内嵌内核直接运行，不走盘上 /init；
 # 盘挂 snapshot，运行写入不落盘。内核取 target/ 下的构建产物。
 run-case-rv:
@@ -217,6 +296,11 @@ help:
 	@echo "make run-la     - QEMU 启动 loongarch64 内核"
 	@echo "make run        - 两个架构依次启动"
 	@echo "make run-basic-rv/la  - 挂盘整组跑官方 basic（需 BASIC_SRC=<官方测例源码路径>）"
+	@echo "make test-setup  - 准备官方评测器与原盘（一次性，幂等）"
+	@echo "make test-rv / test-la  - 官方原盘验收（原盘在 sdcard/pre-20250615/，git 忽略）"
+	@echo "make test-regress      - 自建盘 FS 语义回归（历届门禁，需 QEMU 10.0.2）"
+	@echo "make fmt-check         - 格式检查（不改动文件）"
+	@echo "make test              - 全量门禁：all + fmt-check + clippy + 官方盘 + 回归"
 	@echo "make run-case-rv/la CASE=<用例名> - 单用例内嵌调试（盘写入不落盘）"
 	@echo "make clippy     - 双架构 clippy（含用户程序构建）"
 	@echo "make selftest-rv/la - selftest 档构建（debug 断言 + 调试锁 + LOG=info）"

@@ -26,8 +26,8 @@ pub mod sysnr {
     pub const GETCWD: usize = 17;
     pub const DUP: usize = 23;
     pub const DUP3: usize = 24;
-    pub const FCNTL: usize = 25;
     pub const IOCTL: usize = 29;
+    pub const FCNTL: usize = 25;
     pub const MKDIRAT: usize = 34;
     pub const UNLINKAT: usize = 35;
     pub const RENAMEAT: usize = 38;
@@ -84,6 +84,13 @@ pub mod sysnr {
     pub const GETPID: usize = 172;
     pub const GETPPID: usize = 173;
     pub const GETTIMEOFDAY: usize = 169;
+    pub const FACCESSAT: usize = 48;
+    pub const FCHMODAT: usize = 53;
+    pub const MKNODAT: usize = 296;
+    pub const FCHMOD: usize = 52;
+    pub const SYSLOG: usize = 116;
+    pub const GETRANDOM: usize = 278;
+    pub const FACCESSAT2: usize = 439;
     pub const CLONE: usize = 220;
     pub const EXECVE: usize = 221;
     pub const WAIT4: usize = 260;
@@ -110,6 +117,8 @@ pub enum Errno {
     /// EPERM: 操作不被允许。
     Perm,
     Access,
+    /// ENOTTY：fd 不支持该 ioctl 命令
+    InappropriateIoctl,
     NoChild,
     NoProcess,
     SeekPipe,
@@ -158,6 +167,7 @@ impl Errno {
         match self {
             Self::Perm => 1,
             Self::Access => 13,
+            Self::InappropriateIoctl => 25,
             Self::NoChild => 10,
             Self::NoProcess => 3,
             Self::SeekPipe => 29,
@@ -260,6 +270,12 @@ pub fn dispatch(
         | sysnr::FSYNC
         | sysnr::UTIMENSAT
         | sysnr::UMASK
+        | sysnr::FACCESSAT
+        | sysnr::FACCESSAT2
+        | sysnr::FCHMODAT
+        | sysnr::FCHMOD
+        | sysnr::MKNODAT
+        | sysnr::IOCTL
         | sysnr::STATX => {
             let ret = self::fs::dispatch(
                 nr,
@@ -433,13 +449,100 @@ pub fn dispatch(
         | sysnr::CLONE
         | sysnr::EXECVE
         | sysnr::WAIT4 => Flow::Process,
+        sysnr::GETRANDOM => {
+            // getrandom(2)：flags 只认 NONBLOCK(1)/RANDOM(2)（后者与默认
+            // 等价）；无种子或熵流耗尽一律 EAGAIN（无合法阻塞唤醒来源），
+            // 未知 flags EINVAL
+            let ret = if a1 > 0x1_0000 || a1 > isize::MAX as usize {
+                // 单次 64 KiB 上限：避免用户以超大 len 逼出大额内核分配
+                Err(Errno::Invalid)
+            } else if a2 & !0x3 != 0 {
+                Err(Errno::Invalid)
+            } else if !crate::entropy::ready() {
+                Err(Errno::Again)
+            } else {
+                let mut buf = alloc::vec::Vec::new();
+                if buf.try_reserve_exact(a1).is_err() {
+                    Err(Errno::NoMem)
+                } else {
+                    buf.resize(a1, 0);
+                    if crate::entropy::fill_random(&mut buf) {
+                        user_access::copy_to_user(space, a0, &buf)
+                            .map(|_| a1)
+                            .map_err(|_| Errno::Fault)
+                    } else {
+                        // 熵流耗尽：与无种子同为 EAGAIN（不重放、不伪造）
+                        Err(Errno::Again)
+                    }
+                }
+            };
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        sysnr::SYSLOG => {
+            // syslog(2)/klogctl 按 man 2 的 action 编码分发到 dmesg 环；
+            // 0/1、6/7 无实际设备句柄，返回 0（串口直通）
+            // 交付到用户缓冲的公共尾段；环分配失败转 ENOMEM
+            let deliver = |t: Option<alloc::string::String>, n_limit: usize| {
+                let t = t.ok_or(Errno::NoMem)?;
+                let n = n_limit.min(t.len());
+                user_access::copy_to_user(space, a1, t.as_bytes()[..n].as_ref())
+                    .map(|_| n)
+                    .map_err(|_| Errno::Fault)
+            };
+            let ret = match a0 {
+                0 | 1 => Ok(0),
+                2 => {
+                    // READ：先交付成功再推进游标（交付失败游标不动，
+                    // 下次 READ 重取同一段）
+                    let Some((text, new_cursor)) = crate::dmesg::read_consume_peek(a2) else {
+                        return {
+                            cx[TrapFrameArgs::RET] = to_abi(Err(Errno::NoMem));
+                            Flow::Continue
+                        };
+                    };
+                    let n = text.len().min(a2);
+                    let delivered =
+                        user_access::copy_to_user(space, a1, text.as_bytes()[..n].as_ref())
+                            .map(|_| n)
+                            .map_err(|_| Errno::Fault);
+                    if delivered.is_ok() {
+                        crate::dmesg::read_consume_commit(new_cursor);
+                    }
+                    delivered
+                }
+                3 => deliver(crate::dmesg::read_all(), a2),
+                4 => {
+                    // READ_CLEAR：先交付，成功后才清空（失败不清）
+                    let r = deliver(crate::dmesg::read_all(), a2);
+                    if r.is_ok() {
+                        crate::dmesg::clear();
+                    }
+                    r
+                }
+                5 => {
+                    crate::dmesg::clear();
+                    Ok(0)
+                }
+                6 | 7 => Ok(0),
+                8 if (1..=8).contains(&a1) => {
+                    crate::dmesg::set_console_level(a1 as u8);
+                    Ok(0)
+                }
+                9 => Ok(crate::dmesg::unread()),
+                10 => Ok(crate::dmesg::capacity()),
+                _ => Err(Errno::Invalid),
+            };
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
         sysnr::UNAME | sysnr::GETTIMEOFDAY => {
             let ret = if nr == sysnr::UNAME {
                 let mut data = [0u8; 390];
                 for (i, text) in [
                     crate::config::KERNEL_NAME,
                     "ouro",
-                    crate::config::KERNEL_VERSION,
+                    crate::config::KERNEL_RELEASE,
                     crate::config::KERNEL_NAME,
                     crate::config::ARCH_NAME,
                     "local",

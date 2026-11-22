@@ -23,3 +23,11 @@ OuroOS 随库维护以下补丁。
 Cargo 清单移除了随上游测试程序提供的目标。内核默认启用读写，通过 `rsext4-readonly` 选择只读模式。
 
 可写构建挂载干净的无日志卷或使用经典格式内部 JBD2 的干净卷。它支持在线性目录中创建文件和目录，以及按偏移写入、任意长度截断和删除普通文件。`fsync` 先写回文件的共享页，再同步卷缓存并提交日志事务。外部日志、扩展日志特性和需要重放的镜像会被拒绝。重命名支持普通移动和 NOREPLACE；在用目录由 OuroOS 返回 EBUSY。独立目录删除和日志重放待后续接入。
+- JBD2 checksum_v3 写入。挂载时放行 journal 特性 64bit + checksum_v3（crc32c
+  类型强制），描述符按 16 字节 v3 tag 写入（64bit 块号、逐块
+  crc32c(uuid_seed + be32(seq) + 载荷) 校验、首 tag 后 journal UUID 与后续
+  SAME_UUID），描述符块尾与 commit 块整体校验；commit 块落盘前先持久化
+  journal 超级块（s_start/s_sequence），保证已提交事务在任意断电时刻可被
+  标准工具重放；未支持特性组合仍拒绝。已知上游缺陷：目录块经数据块缓存
+  直写 home 块、绕过日志（data=writeback 式），断电窗口可留下指向未分配
+  inode 的目录项，标准 e2fsck 会清理。

@@ -70,11 +70,11 @@ def main():
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     user = out / "user"
-    shutil.copytree(ROOT / "user/hello", user, dirs_exist_ok=True,
+    shutil.copytree(ROOT / "user", user, dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns("target"))
     program = ("fs_truncate.rs" if args.truncate else "fs_rename.rs" if args.rename
                else "fs_metadata.rs" if args.metadata else "fs_stat.rs")
-    shutil.copyfile(ROOT / "tests" / program, user / "src/bin/hello.rs")
+    shutil.copyfile(ROOT / "tests" / program, user / "src/bin/smoke.rs")
     if args.metadata:
         shutil.copyfile(ROOT / "tests/fs_metadata_exec.rs", user / "src/bin/check.rs")
     payload = out / "payload"
@@ -91,7 +91,7 @@ def main():
     ]:
         env = dict(os.environ, RUSTFLAGS=flags, CARGO_TARGET_DIR=str(out / "user-target"))
         run(["timeout", "180", "cargo", "build", "--manifest-path", str(user / "Cargo.toml"),
-             "-Z", "build-std=core", "--release", "--target", target, *(["--bins"] if args.metadata else ["--bin", "hello"])],
+             "-Z", "build-std=core", "--release", "--target", target, *(["--bins"] if args.metadata else ["--bin", "smoke"])],
             out / f"{short}-user-build.log", env=env)
         for inode_size in (256, 128):
             stem = f"{short}-{inode_size}"
@@ -102,7 +102,7 @@ def main():
                 out / f"{stem}-mkfs.log")
             commands = ["mkdir /meta", "mkdir /meta/sub", "mkdir /mnt",
                         "cd /meta", "mknod char c 1 3", "cd /",
-                        f'write "{out / "user-target" / target / "release/hello"}" /init',
+                        f'write "{out / "user-target" / target / "release/smoke"}" /init',
                         f'write "{payload}" /meta/data', f'write "{empty}" /meta/large',
                         f'write "{expected_capacity}" /fs-expected',
                         "set_inode_field /meta/large size 4294967303",

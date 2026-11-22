@@ -50,12 +50,13 @@ fn gen_linker_script() -> io::Result<()> {
 }
 
 /// 内嵌镜像描述：(环境变量, 文件名, 生成的静态符号名)
-const IMAGES: [(&str, &str, &str); 5] = [
+const IMAGES: [(&str, &str, &str); 6] = [
     ("OUROOS_TEST_ELF", "test", "TEST_ELF"),
     ("OUROOS_HELLO_ELF", "hello", "HELLO_ELF"),
     ("OUROOS_CHECK_ELF", "check", "CHECK_ELF"),
     ("OUROOS_SCHED_ELF", "sched", "SCHED_ELF"),
     ("OUROOS_ILL_ELF", "ill", "ILL_ELF"),
+    ("OUROOS_INIT_ELF", "official-init", "INIT_ELF"),
 ];
 
 /// 复制用户 ELF 到 OUT_DIR 并生成 user_images.rs。

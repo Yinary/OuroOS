@@ -1,7 +1,7 @@
 //! 定位和向量 I/O 回归；由 fs_io.py 生成镜像并运行。
 #![no_std]
 #![no_main]
-use hello::{define_user_entry, sys_exit, sys_write, syscall3, syscall6};
+use user::{define_user_entry, sys_exit, sys_write, syscall3, syscall6};
 const CWD: usize = (-100isize) as usize;
 #[derive(Clone, Copy)]
 #[repr(C)]

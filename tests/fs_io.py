@@ -18,8 +18,8 @@ def main():
     out = ROOT / "target/fs-validation" / ("iov-readonly" if args.readonly else "iov")
     out.mkdir(parents=True, exist_ok=True)
     user = out / "user"
-    shutil.copytree(ROOT / "user/hello", user, dirs_exist_ok=True, ignore=shutil.ignore_patterns("target"))
-    shutil.copyfile(ROOT / "tests/fs_io.rs", user / "src/bin/hello.rs")
+    shutil.copytree(ROOT / "user", user, dirs_exist_ok=True, ignore=shutil.ignore_patterns("target"))
+    shutil.copyfile(ROOT / "tests/fs_io.rs", user / "src/bin/smoke.rs")
     payload = out / "payload"
     payload.write_bytes(b"abcdefgh")
     for arch, short, target, flags, machine, device in [
@@ -28,12 +28,12 @@ def main():
     ]:
         env = dict(os.environ, RUSTFLAGS=flags, CARGO_TARGET_DIR=str(out / "user-target"))
         run(["timeout", "180", "cargo", "build", "--manifest-path", str(user / "Cargo.toml"),
-             "-Z", "build-std=core", "--release", "--target", target, "--bin", "hello"], out / f"{short}-user.log", env=env)
+             "-Z", "build-std=core", "--release", "--target", target, "--bin", "smoke"], out / f"{short}-user.log", env=env)
         image = out / f"{short}.img"
         with image.open("wb") as stream:
             stream.truncate(32 * 1024 * 1024)
         run(["mkfs.ext4", "-q", "-F", "-b", "4096", str(image)], out / f"{short}-mkfs.log")
-        commands = [f'write "{out / "user-target" / target / "release/hello"}" /init', f'write "{payload}" /io-data']
+        commands = [f'write "{out / "user-target" / target / "release/smoke"}" /init', f'write "{payload}" /io-data']
         if args.readonly:
             commands.append(f'write "{payload}" /readonly')
         script = out / f"{short}-populate"

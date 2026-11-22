@@ -1,18 +1,12 @@
-//! sched：调度验证程序（无文件系统阶段的负载生成器）。
-//!
-//! 行为：打印 pid → 循环打印轮次，每轮之间 sched_yield() → exit(0)。
-//! 两个本程序实例并行孵化时，内核输出应出现两 pid 的交错轮次
-//! （协作让出立即生效）；轮内忙循环足够长时还能观察到时钟抢占
-//! （时间片在用户态逃逸点判定，见 task 契约）。
-//!
-//! 忙循环用 black_box 防止被优化掉。
+//! sched：调度验证负载——打印 pid 与轮次，每轮 sched_yield()；
+//! 双实例并行应见交错轮次，忙循环跨时钟 tick 时应见抢占。
 
 #![no_std]
 #![no_main]
 
 use core::hint::black_box;
 
-use hello::{define_user_entry, sys_exit, sys_getpid, sys_sched_yield, sys_write};
+use user::{define_user_entry, sys_exit, sys_getpid, sys_sched_yield, sys_write};
 
 /// 忙循环轮数
 const ROUNDS: usize = 6;

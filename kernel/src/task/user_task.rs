@@ -58,8 +58,8 @@ pub fn spawn_user(name: &'static str, elf: &[u8]) -> Result<Pid, SpawnError> {
     arg0.try_reserve_exact(name.len())
         .map_err(|_| SpawnError::OutOfMemory)?;
     arg0.push_str(name);
-    let sp =
-        super::exec::stack(&space, &[arg0], &[], entry).map_err(|_| SpawnError::OutOfMemory)?;
+    let sp = super::exec::stack(&space, &[arg0], &[], &entry, None, name)
+        .map_err(|_| SpawnError::OutOfMemory)?;
     frame[TrapFrameArgs::SP] = sp;
     let task = Task::new_user(pid, name, frame).map_err(|_| SpawnError::OutOfMemory)?;
 
@@ -67,6 +67,7 @@ pub fn spawn_user(name: &'static str, elf: &[u8]) -> Result<Pid, SpawnError> {
     let task = Box::try_new(task).map_err(|_| SpawnError::OutOfMemory)?;
     super::registry::reserve()?;
     sched::reserve_task().map_err(|_| SpawnError::OutOfMemory)?;
+    super::proc_table_reserve().map_err(|_| SpawnError::OutOfMemory)?;
     // —— 提交段：此后不再失败 ——
     super::registry::register(pid, name, Some(crate::mm::address_space::LocalSpace(space)));
     {
@@ -76,6 +77,12 @@ pub fn spawn_user(name: &'static str, elf: &[u8]) -> Result<Pid, SpawnError> {
             r.parent = super::INIT_PID.load(core::sync::atomic::Ordering::Relaxed);
         }
     }
+    super::proc_table_push(
+        pid,
+        name,
+        super::INIT_PID.load(core::sync::atomic::Ordering::Relaxed),
+        true,
+    );
     sched::enqueue(task);
     Ok(pid)
 }
@@ -901,7 +908,18 @@ fn process_call(
             Ok(()) => return ProcessResult::Replaced,
             Err(e) => Err(e),
         },
-        sysnr::CLONE => fork_user(parent, frame, args[0], args[1]),
+        // clone(2) 的 child_tid 参数序是架构 ABI 的一部分：RV64 为
+        // (flags, stack, ptid, tls, ctid)，LA64 为 (flags, stack, ptid,
+        // ctid, tls)（对照两架构 clone.s 与 Linux fork.c 的拷贝语义）。
+        // 归一化为具名参数后再进通用 fork。
+        sysnr::CLONE => {
+            #[cfg(target_arch = "riscv64")]
+            let (tls, child_tid) = (args[3], args[4]);
+            #[cfg(target_arch = "loongarch64")]
+            let (child_tid, tls) = (args[3], args[4]);
+            let _ = tls; // 本内核不支持 CLONE_SET_TLS，参数仅按 ABI 接收
+            fork_user(parent, frame, args[0], args[1], child_tid)
+        }
         sysnr::WAIT4 => {
             // wait4(2)：wanted <= 0 等任意孩子（无进程组概念，0 与 -1
             // 等价）；>0 指定 pid；其余负值 EINVAL。无可收割孩子时挂起，
@@ -1152,11 +1170,24 @@ fn kill_or_tgkill(parent: Pid, nr: usize, args: [usize; 6]) -> Result<usize, Err
     .map(|_| 0)
 }
 /// 创建独立地址空间的子进程，保留父现场，子进程从下一条指令返回零。
-fn fork_user(parent: Pid, frame: &TrapFrame, flags: usize, stack: usize) -> Result<usize, Errno> {
-    if flags & !255 != 0 || flags & 255 != 17 {
+/// fork(2)/clone(2) 支持的标志：退出信号必须是 SIGCHLD（纯进程 fork），
+/// 另接受 NPTL fork 使用的 CLONE_CHILD_CLEARTID/CLONE_CHILD_SETTID（仅对
+/// 子进程生效；见 clone(2)），其余标志（线程/共享）不支持。
+const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
+const CLONE_CHILD_SETTID: usize = 0x0100_0000;
+
+fn fork_user(
+    parent: Pid,
+    frame: &TrapFrame,
+    flags: usize,
+    stack: usize,
+    child_tid: usize,
+) -> Result<usize, Errno> {
+    let allowed = 17 | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID;
+    if flags & !allowed != 0 || flags & 0xff != 17 {
         return Err(Errno::Invalid);
     }
-    let space = {
+    let mut space = {
         let reg = REGISTRY.lock();
         let source = reg
             .records
@@ -1184,10 +1215,27 @@ fn fork_user(parent: Pid, frame: &TrapFrame, flags: usize, stack: usize) -> Resu
         child_frame[TrapFrameArgs::SP] = stack;
     }
     let pid = super::registry::alloc_pid();
+    // CLONE_CHILD_SETTID：在子进程地址空间写入其 tid；CLONE_CHILD_CLEARTID：
+    // 子进程退出时清零该地址（退出路径已按 clear_child_tid 处理）。
+    if flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 && child_tid != 0 {
+        if flags & CLONE_CHILD_SETTID != 0 {
+            // 写入经 user_access 完成，目标是子进程自身的用户内存；地址来自
+            // 父进程参数，子进程尚未运行，无并发访问。
+            let _ = crate::mm::user_access::copy_to_user(
+                &space,
+                child_tid,
+                &(pid as u32).to_ne_bytes(),
+            );
+        }
+        if flags & CLONE_CHILD_CLEARTID != 0 {
+            space.clear_child_tid = child_tid;
+        }
+    }
     let task = Task::new_user(pid, "child", child_frame).map_err(|_| Errno::NoMem)?;
     let task = Box::try_new(task).map_err(|_| Errno::NoMem)?;
     super::registry::reserve().map_err(|_| Errno::NoMem)?;
     sched::reserve_task().map_err(|_| Errno::NoMem)?;
+    super::proc_table_reserve().map_err(|_| Errno::NoMem)?;
     super::registry::register(
         pid,
         "child",
@@ -1217,6 +1265,7 @@ fn fork_user(parent: Pid, frame: &TrapFrame, flags: usize, stack: usize) -> Resu
             child.fs = Some(fs);
         }
     }
+    super::proc_table_push(pid, "child", parent, true);
     sched::enqueue(task);
     Ok(pid)
 }

@@ -1,7 +1,7 @@
 //! exec 后验证 FD_CLOEXEC 与未关闭描述符的共享状态。
 #![no_std]
 #![no_main]
-use hello::{define_user_entry, sys_exit, sys_write, syscall3};
+use user::{define_user_entry, sys_exit, sys_write, syscall3};
 #[no_mangle]
 extern "C" fn ouro_main() -> ! {
     let mut byte = [0];

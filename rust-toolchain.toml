@@ -1,5 +1,7 @@
 [toolchain]
-channel = "nightly-2025-02-18"
+# 官方评测镜像预装版本（os-contest-image Dockerfile:86-136，含 rust-src/rustfmt/
+# clippy/llvm-tools-preview 与双架构 target，逐项匹配零下载）；评测环境禁在线下载
+channel = "nightly-2025-02-01"
 profile = "minimal"
 components = [
     "rust-src",

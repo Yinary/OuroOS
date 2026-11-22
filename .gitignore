@@ -21,3 +21,12 @@ notes/
 *.swp
 .DS_Store
 Thumbs.db
+
+__pycache__/
+
+# 官方评测器本地克隆与下载缓存（make test-setup 生成）
+.cache/
+
+# vendor 解压产物与运行时 CARGO_HOME（构建时由 vendor.tar.xz 生成）
+vendor/
+.cargo-home/

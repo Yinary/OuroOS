@@ -530,6 +530,76 @@ impl DataBlockCache {
         Ok(())
     }
 
+    /// OuroOS patch: 目录块修改的统一入口——应用修改后立即把**当前版本**
+    /// 入 JBD2 队列，cache 条目标记干净。目录块的待提交版本只存在于日志
+    /// 队列（单一所有权），evict/flush_all 不再直写旧版或新版，消除
+    /// "插入后删除/重命名/正常卸载"的悬空目录项窗口。
+    pub fn modify_via_journal<B, F>(
+        &self,
+        block_dev: &mut Jbd2Dev<B>,
+        block_num: AbsoluteBN,
+        f: F,
+    ) -> Ext4Result<()>
+    where
+        B: BlockDevice,
+        F: FnOnce(&mut [u8]),
+    {
+        self.get_or_load_mut(block_dev, block_num)?;
+        let snapshot = {
+            let mut inner = self.inner.lock();
+            let cached = inner
+                .cache
+                .get_mut(&block_num)
+                .ok_or(Ext4Error::corrupted())?;
+            f(&mut cached.data);
+            let mut snapshot = alloc::vec::Vec::with_capacity(BLOCK_SIZE);
+            snapshot.extend_from_slice(&cached.data[..]);
+            snapshot
+        };
+        // 锁外入队：块数据与 cache 中的一致（单一最新版本）
+        let arr: &[u8; BLOCK_SIZE] = snapshot
+            .as_slice()
+            .try_into()
+            .map_err(|_| Ext4Error::corrupted())?;
+        block_dev.queue_metadata_data(block_num, arr)?;
+        self.inner.lock().mark_flushed(&[(block_num, 0)]);
+        Ok(())
+    }
+
+    /// OuroOS patch: 新分配块的创建+修改+入队（同 modify_via_journal）。
+    pub fn modify_new_via_journal<B, F>(
+        &self,
+        block_dev: &mut Jbd2Dev<B>,
+        block_num: AbsoluteBN,
+        f: F,
+    ) -> Ext4Result<()>
+    where
+        B: BlockDevice,
+        F: FnOnce(&mut [u8]),
+    {
+        let _ = self.create_new(block_dev, block_num)?;
+        self.modify_via_journal(block_dev, block_num, f)
+    }
+
+    /// OuroOS patch: 把脏块数据入 JBD2 队列（目录事务原子性）：不直写
+    /// home 块，与同事务的 inode/位图一起经日志提交与 checkpoint。
+    pub fn flush_via_journal<B: BlockDevice>(
+        &self,
+        block_dev: &mut Jbd2Dev<B>,
+        block_num: AbsoluteBN,
+    ) -> Ext4Result<()> {
+        let (dirty_block, _block_size) = self.inner.lock().block_for_flush(block_num);
+        if let Some((generation, data)) = dirty_block {
+            let arr: &[u8; BLOCK_SIZE] = data
+                .as_slice()
+                .try_into()
+                .map_err(|_| Ext4Error::corrupted())?;
+            block_dev.queue_metadata_data(block_num, arr)?;
+            self.inner.lock().mark_flushed(&[(block_num, generation)]);
+        }
+        Ok(())
+    }
+
     /// Invalidate one cached block without flushing it.
     pub fn invalidate(&self, block_num: AbsoluteBN) {
         self.inner.lock().cache.remove(&block_num);
