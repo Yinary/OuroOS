@@ -302,7 +302,7 @@ try_lock 失败即报告“持锁跨调度”。
 | fsync | EXT4 写回该 inode 的共享页并同步 rsext4 缓存/日志 | FAT 返回 ENOTSUP |
 | mount | fstype 接受 vfat/fat；源设备 `/dev/vd<小写字母>[0-4]`（无后缀或 0 为整盘）；flags 必须 0，data 忽略；/proc/mounts 报告根卷（按实际设备号命名）与 FAT 挂载记录 | 仅 MBR 主分区；不限于 a-d |
 | 设备命名与根卷 | 设备号按总线枚举顺序分配，无内容特征重排；Ext4 根卷为扫描式选择：每盘先试分区 1..4 再试整盘，取第一个可挂载的 Ext4。官方 mount 测例写死的 `/dev/vda2`（辅助盘 FAT32 分区）由用户态启动器按授权清单 mknodat 建立块设备节点（major 254，minor=(盘<<4)\|分区，见 §6.3），内核按节点登记的真实设备身份解析挂载 | 设备节点是内核注册表条目而非文件系统实体；根卷语义与设备名无绑定；辅助盘由官方 harness 自动挂为第二块盘 |
-| mmap | 匿名与文件均支持 PRIVATE/SHARED；文件整页在 EOF 外允许建图，直接访问按 SIGBUS 终止；MAP_FIXED 事务替换 | 最后不足一页的尾部补零且不回写；MAP_FIXED 可覆盖用户栈；flags 白名单 |
+| mmap | 匿名与文件均支持 PRIVATE/SHARED；文件整页在 EOF 外允许建图，直接访问按 SIGBUS 终止；MAP_FIXED 事务替换 | 最后不足一页的尾部补零且不回写；MAP_FIXED 可覆盖用户栈；flags 白名单，MAP_DENYWRITE 与 MAP_EXECUTABLE 按 Linux 忽略 |
 | mprotect | 支持 PROT_NONE 和 R/W/X 组合；W 隐含 R，只读 FD 建立的共享映射禁止提升写权限（EACCES） | 两架构无 NX；VMA 记录请求权限，页表执行写保护，可访问页实际带 X |
 | brk/munmap | brk 失败返回原 break；munmap 起址页对齐、长度向上取整、允许空洞 | 均无按需分页；brk 立即分配/释放物理页 |
 | ELF | ET_EXEC 固定地址与 ET_DYN（装载基址 0x10_0000：官方 basic 是 intptr_t 为 32 位 int 的无重定位 PIE，Linux 高位 ELF_ET_DYN_BASE 布局下其 brk 断言同样无法通过；低位基址同时保持空指针缺页）；段相位要求 p_vaddr 与 p_offset 按页同余且按 p_align 同余（不要求各自页对齐，busybox 第二段 offset/vaddr 均非对齐但同余）；PT_INTERP 支持；不同 PT_LOAD 落到同一用户页仍拒绝 | 无 NX，PT_GNU_* 忽略；AT_PHDR 要求程序头表在首个可读 PT_LOAD 内 |
