@@ -70,11 +70,21 @@ pub fn spawn_user(name: &'static str, elf: &[u8]) -> Result<Pid, SpawnError> {
     super::proc_table_reserve().map_err(|_| SpawnError::OutOfMemory)?;
     // —— 提交段：此后不再失败 ——
     super::registry::register(pid, name, Some(crate::mm::address_space::LocalSpace(space)));
+    let (init_pgid, init_sid) = {
+        let reg = REGISTRY.lock();
+        let init = super::INIT_PID.load(core::sync::atomic::Ordering::Relaxed);
+        match reg.records.iter().find(|r| r.pid == init) {
+            Some(r) => (r.pgid, r.sid),
+            None => (init, init),
+        }
+    };
     {
         let mut reg = REGISTRY.lock();
         if let Some(r) = reg.records.iter_mut().find(|r| r.pid == pid) {
             r.fs = Some(fs);
             r.parent = super::INIT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            r.pgid = init_pgid;
+            r.sid = init_sid;
         }
     }
     super::proc_table_push(
@@ -921,19 +931,34 @@ fn process_call(
             fork_user(parent, frame, args[0], args[1], child_tid)
         }
         sysnr::WAIT4 => {
-            // wait4(2)：wanted <= 0 等任意孩子（无进程组概念，0 与 -1
-            // 等价）；>0 指定 pid；其余负值 EINVAL。无可收割孩子时挂起，
-            // 无孩子 ECHILD。收割即从注册表删除（生命周期见 mod.rs）。
-            // 可请求停止、恢复事件；当前没有产生这两种状态的信号接口。
+            // wait4(2)：pid > 0 指定孩子，-1 等任意孩子，0 等本进程组，
+            // 其余负值等进程组 -pid 的孩子；无可收割孩子时挂起，无孩子 ECHILD。
+            // 收割即从注册表删除；可请求停止、恢复事件，当前不产生这两种状态。
             if args[2] & !(1 | 2 | 8) != 0 {
                 Err(Errno::Invalid)
             } else {
                 let wanted = args[0] as i32;
-                if wanted < -1 {
-                    Err(Errno::Invalid)
+                if wanted == i32::MIN {
+                    Err(Errno::NoChild)
                 } else {
+                    let caller_pgid = REGISTRY
+                        .lock()
+                        .records
+                        .iter()
+                        .find(|r| r.pid == parent)
+                        .map_or(0, |r| r.pgid);
+                    let wanted_pgid = (-(wanted as i64)) as usize;
                     let matches = |r: &super::ProcessRecord| {
-                        r.parent == parent && (wanted <= 0 || r.pid == wanted as usize)
+                        r.parent == parent
+                            && if wanted == -1 {
+                                true
+                            } else if wanted == 0 {
+                                r.pgid == caller_pgid
+                            } else if wanted < -1 {
+                                r.pgid == wanted_pgid
+                            } else {
+                                r.pid == wanted as usize
+                            }
                     };
                     let (ready, has_children, status, reaped_pid) = {
                         let reg = REGISTRY.lock();
@@ -1001,6 +1026,10 @@ fn process_call(
                 }
             }
         }
+        sysnr::SETPGID => set_pg_id(parent, args),
+        sysnr::GETPGID => get_pg_or_sid(parent, args[0], false),
+        sysnr::GETSID => get_pg_or_sid(parent, args[0], true),
+        sysnr::SETSID => set_sid(parent),
         sysnr::KILL | sysnr::TGKILL => kill_or_tgkill(parent, nr, args),
         _ => Err(Errno::NoSys),
     };
@@ -1123,8 +1152,8 @@ fn queue_info(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
     .map(|_| 0)
 }
 
-/// kill(2)/tgkill(2)：解析目标与信号并发送。pid>0 为目标，
-/// pid==0 为自身，pid<0 为 EINVAL；sig==0 仅做存在性检查。
+/// kill(2)/tgkill(2)：解析目标与信号并发送。pid>0 为目标进程，
+/// pid==0 为调用者所在进程组，pid<0 为进程组或全体进程；sig==0 仅查存在性。
 /// 偏差登记 docs/ostd-contracts.md §4.5。
 fn kill_or_tgkill(parent: Pid, nr: usize, args: [usize; 6]) -> Result<usize, Errno> {
     let (pid_arg, sig_arg) = if nr == sysnr::KILL {
@@ -1138,36 +1167,136 @@ fn kill_or_tgkill(parent: Pid, nr: usize, args: [usize; 6]) -> Result<usize, Err
         }
         (args[1], args[2])
     };
-    // pid_t 为 32 位：截断后再按符号解释，兼容寄存器零扩展/符号扩展。
-    let pid = pid_arg as u32 as i32;
-    if pid < 0 {
-        return Err(Errno::Invalid);
-    }
-    let target = if pid == 0 { parent } else { pid as usize };
     // 负信号按 u32 解释为大值，落入 EINVAL。
     let sig = sig_arg as u32;
     if sig > 64 {
         return Err(Errno::Invalid);
     }
-    if sig == 0 {
-        let exists = REGISTRY
-            .lock()
+    // pid_t 为 32 位：截断后再按符号解释，兼容寄存器零扩展/符号扩展。
+    let pid = pid_arg as u32 as i32;
+    if pid == i32::MIN {
+        return Err(Errno::NoProcess);
+    }
+    let slot = SigInfoSlot {
+        // kill(2) 恒 SI_USER(=0)；tgkill 发内核保留码 SI_TKILL。
+        code: if nr == sysnr::KILL { 0 } else { SI_TKILL },
+        pid: parent as u32,
+        ..Default::default()
+    };
+    let mut reg = REGISTRY.lock();
+    let caller_pgid = reg
+        .records
+        .iter()
+        .find(|r| r.pid == parent)
+        .map(|r| r.pgid)
+        .ok_or(Errno::NoProcess)?;
+    let init = super::INIT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut hits = 0usize;
+    for r in reg.records.iter_mut() {
+        if r.exit.is_some() {
+            continue;
+        }
+        let matched = if pid > 0 {
+            r.pid == pid as usize
+        } else if pid == 0 {
+            r.pgid == caller_pgid
+        } else if pid == -1 {
+            r.pid != init && r.pid != parent
+        } else {
+            r.pgid == -(pid as i64) as usize
+        };
+        if matched {
+            hits += 1;
+            if sig != 0 {
+                r.signal.generate(sig as u8, slot);
+            }
+        }
+    }
+    if hits == 0 {
+        Err(Errno::NoProcess)
+    } else {
+        Ok(0)
+    }
+}
+
+fn set_pg_id(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let pgid = args[1] as u32 as i32;
+    if pgid < 0 {
+        return Err(Errno::Invalid);
+    }
+    let pid = args[0] as u32 as i32;
+    if pid < 0 {
+        return Err(Errno::NoProcess);
+    }
+    let target = if pid == 0 { parent } else { pid as usize };
+    let mut reg = REGISTRY.lock();
+    let target_index = reg
+        .records
+        .iter()
+        .position(|r| r.pid == target)
+        .ok_or(Errno::NoProcess)?;
+    let target_sid = reg.records[target_index].sid;
+    if target != parent {
+        if reg.records[target_index].parent != parent {
+            return Err(Errno::NoProcess);
+        }
+        let caller_sid = reg
             .records
             .iter()
-            .any(|r| r.pid == target && r.exit.is_none());
-        return if exists { Ok(0) } else { Err(Errno::NoProcess) };
+            .find(|r| r.pid == parent)
+            .map(|r| r.sid)
+            .ok_or(Errno::NoProcess)?;
+        if target_sid != caller_sid {
+            return Err(Errno::Perm);
+        }
+        if reg.records[target_index].did_exec {
+            return Err(Errno::Access);
+        }
     }
-    send_signal(
-        target,
-        sig as u8,
-        SigInfoSlot {
-            // kill(2) 恒 SI_USER(=0)；tgkill 发内核保留码 SI_TKILL。
-            code: if nr == sysnr::KILL { 0 } else { SI_TKILL },
-            pid: parent as u32,
-            ..Default::default()
-        },
-    )
-    .map(|_| 0)
+    if target_sid == reg.records[target_index].pid {
+        return Err(Errno::Perm);
+    }
+    let pgid = if pgid == 0 { target } else { pgid as usize };
+    if pgid != target
+        && !reg
+            .records
+            .iter()
+            .any(|r| r.pgid == pgid && r.sid == target_sid)
+    {
+        return Err(Errno::Perm);
+    }
+    reg.records[target_index].pgid = pgid;
+    Ok(0)
+}
+
+fn get_pg_or_sid(parent: Pid, pid_arg: usize, want_sid: bool) -> Result<usize, Errno> {
+    let pid = pid_arg as u32 as i32;
+    if pid < 0 {
+        return Err(Errno::NoProcess);
+    }
+    let target = if pid == 0 { parent } else { pid as usize };
+    let reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter()
+        .find(|r| r.pid == target)
+        .ok_or(Errno::NoProcess)?;
+    Ok(if want_sid { rec.sid } else { rec.pgid })
+}
+
+fn set_sid(parent: Pid) -> Result<usize, Errno> {
+    let mut reg = REGISTRY.lock();
+    if reg.records.iter().any(|r| r.pgid == parent) {
+        return Err(Errno::Perm);
+    }
+    let rec = reg
+        .records
+        .iter_mut()
+        .find(|r| r.pid == parent)
+        .ok_or(Errno::NoProcess)?;
+    rec.pgid = parent;
+    rec.sid = parent;
+    Ok(parent)
 }
 /// 创建独立地址空间的子进程，保留父现场，子进程从下一条指令返回零。
 /// fork(2)/clone(2) 支持的标志：退出信号必须是 SIGCHLD（纯进程 fork），
@@ -1259,10 +1388,13 @@ fn fork_user(
                 }
                 core::cmp::Ordering::Equal => {}
             }
+            let (pgid, sid) = (reg.records[pi].pgid, reg.records[pi].sid);
             // 子进程继承备用栈，pending/info 清零。
             let child = &mut reg.records[ci];
             child.parent = parent;
             child.fs = Some(fs);
+            child.pgid = pgid;
+            child.sid = sid;
         }
     }
     super::proc_table_push(pid, "child", parent, true);

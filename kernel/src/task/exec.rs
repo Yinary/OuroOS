@@ -304,6 +304,7 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
     // —— 提交段：发布备齐对象，无分配、无失败路径 ——
     rec.space = Some(LocalSpace(space));
     rec.signal.reset_for_exec();
+    rec.did_exec = true;
     crate::task::proc_table_set_cmdline(pid, cmdline);
     if let Some(ctx) = rec.fs.as_mut() {
         context::close_exec(ctx);

@@ -80,6 +80,10 @@ pub mod sysnr {
     pub const RT_SIGRETURN: usize = 139;
     pub const TIMES: usize = 153;
     pub const SET_TID_ADDRESS: usize = 96;
+    pub const SETPGID: usize = 154;
+    pub const GETPGID: usize = 155;
+    pub const GETSID: usize = 156;
+    pub const SETSID: usize = 157;
     pub const UNAME: usize = 160;
     pub const GETPID: usize = 172;
     pub const GETPPID: usize = 173;
@@ -448,7 +452,11 @@ pub fn dispatch(
         | sysnr::GETPPID
         | sysnr::CLONE
         | sysnr::EXECVE
-        | sysnr::WAIT4 => Flow::Process,
+        | sysnr::WAIT4
+        | sysnr::SETPGID
+        | sysnr::GETPGID
+        | sysnr::GETSID
+        | sysnr::SETSID => Flow::Process,
         sysnr::GETRANDOM => {
             // getrandom(2)：flags 只认 NONBLOCK(1)/RANDOM(2)（后者与默认
             // 等价）；无种子或熵流耗尽一律 EAGAIN（无合法阻塞唤醒来源），

@@ -168,7 +168,7 @@ README；不得直接编辑 `~/.cargo/registry`。上游 PR（MIT）待提。
 | 对象 | 内容 | 位置 |
 |---|---|---|
 | Task | 内核栈 + 私有 KContext + 首次入口身体 + pid | 调度器 Box；身体首次取出后为 None |
-| ProcessRecord | 地址空间 + fs + 退出信息 + 父子关系 + 信号状态 | 静态 REGISTRY |
+| ProcessRecord | 地址空间 + fs + 退出信息 + 父子关系 + 进程组与会话 + 信号状态 | 静态 REGISTRY |
 | SignalState | 处置表 / pending / blocked / 信息槽 / 备用栈 | `ProcessRecord.signal`；字段按共享侧（处置、pending）与私有侧（blocked、备用栈）分组注释，为线程化预留迁移形状（私有侧届时搬入线程记录） |
 | CURRENT | 当前任务地址（整数存址，绕开裸指针 !Send） | percpu |
 
@@ -263,7 +263,7 @@ try_lock 失败即报告“持锁跨调度”。
 | 组 | 调用 | 实现 |
 |---|---|---|
 | 文件 | getcwd、dup、dup3、fcntl、mkdirat、mknodat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、readlinkat、readahead、statfs、fstatfs、newfstatat、fstat、fsync、statx、umask、utimensat、renameat、renameat2、truncate、ftruncate、fchmodat、fchmod | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
-| 进程 | exit、nanosleep、sched_yield、times、getpid、getppid、clone、execve、wait4 | `task::process_call` |
+| 进程 | exit、nanosleep、sched_yield、times、getpid、getppid、setpgid、getpgid、setsid、getsid、clone、execve、wait4 | `task::process_call` |
 | 访问检查/日志 | faccessat、faccessat2、syslog(klogctl) | `syscall/fs.rs`、`dmesg.rs` |
 | 设备/随机 | ioctl(29)（仅 RTC 设备的 RTC_RD_TIME，其余 ENOTTY）、getrandom(278) | `fs::context::ioctl`、`drivers/rtc.rs`、`entropy::fill_random` |
 | 信号 | kill、tgkill、rt_sigaction、rt_sigprocmask、rt_sigpending、rt_sigsuspend、rt_sigtimedwait、rt_sigqueueinfo、sigaltstack、rt_sigreturn | `syscall/signal.rs`、`task/signal.rs`、`sigframe/`（契约与偏差见 §4.5） |
@@ -285,7 +285,8 @@ try_lock 失败即报告“持锁跨调度”。
 | pread64/pwrite64/preadv/pwritev | 指定独立偏移，不修改共享文件偏移；负偏移 EINVAL，流式对象 ESPIPE；rv64/la64 原始向量定位 ABI 使用完整 pos_l，忽略 pos_h；O_APPEND 下定位写仍追加，与 Linux 已知行为一致 | 不支持 preadv2/pwritev2；Ext4 文件超限 EFBIG 独立于参数过长 E2BIG；部分错误仍按已完成字节数返回 |
 | fcntl | 支持 F_DUPFD/F_DUPFD_CLOEXEC、F_GETFD/F_SETFD、F_GETFL/F_SETFL；从下界选最低空闲 FD，上限 1024；cloexec 属于描述符，偏移与状态由 dup/fork 共享；打开时的创建标志不保存在共享状态中 | F_SETFL 仅修改 O_APPEND/O_NONBLOCK，访问模式、创建与同步标志不变；请求 O_ASYNC/O_DIRECT/O_NOATIME 返回 EOPNOTSUPP 且不修改状态；未知命令（含锁命令）EINVAL；尚未实现 RLIMIT_NOFILE、O_PATH 专用规则、追加专用 inode 属性检查及强制 O_LARGEFILE |
 | pipe | 容量 64 KiB；读空或空间不足当前分块时等待，O_NONBLOCK 返回 EAGAIN；总长不超过 4 KiB 的 writev 合并后写入，空间不足不写入前缀；更大请求可在分块间返回短写；无读者返回 EPIPE | SIGPIPE 与 -EPIPE 并行产生同 Linux（§4.5，默认处置下写者死于信号、见不到 EPIPE）；运行期 VecDeque 扩容的不可失败分配仍待处理；复制失败只消费已交付数据 |
-| wait4 | wanted<=0 等任意孩子，>0 指定 pid，<-1 EINVAL；无僵尸则阻塞，无孩子 ECHILD；WNOHANG 支持；status 按 ExitInfo：正常 `(code&255)<<8`、死于信号 `sig` | 语义接近；忽略 rusage；无进程组概念；无 core 位 |
+| wait4 | pid>0 指定孩子，-1 等任意孩子，0 等本进程组的孩子，<-1 等进程组 -pid 的孩子；无僵尸则阻塞，无孩子 ECHILD；WNOHANG 支持；status 按 ExitInfo：正常 `(code&255)<<8`、死于信号 `sig` | 语义接近；忽略 rusage；无 core 位 |
+| setpgid/getpgid/setsid/getsid | fork 继承进程组与会话，exec 保留；setpgid 只能作用于自身或尚未 exec 的同会话孩子，目标组须在同一会话，会话首领不能改组；setsid 以调用者为首领建立新会话与新进程组，调用者已是进程组首领时 EPERM | 无控制终端；孤儿进程组向停止成员发 SIGHUP/SIGCONT 的规则未实现；/proc/<pid>/stat 的 pgrp 与 session 字段仍为 0 |
 | clone | 进程 fork：退出信号必须 SIGCHLD，另接受 NPTL fork 使用的 CLONE_CHILD_CLEARTID/CLONE_CHILD_SETTID（仅对子进程生效，tid 写入与退出清零见 clone(2)）；非零 stack 设置子 SP | 不支持线程/CLONE_VM 等共享地址空间；无 CLONE_PARENT_SETTID |
 | execve | argv/envp 各 ≤256 项、单串 ≤4095 字节；字符串总计最多 32 KiB；auxv 提供 AT_PHDR/PHENT/PHNUM、AT_BASE、AT_ENTRY、AT_PAGESZ、AT_RANDOM、AT_EXECFN、AT_UID/EUID/GID/EGID、AT_SECURE、AT_CLKTCK、AT_HWCAP、AT_FLAGS；ELF 支持 ET_EXEC 与 ET_DYN（装载基址固定 1 MiB，见 ELF 行）；PT_INTERP 请求的解释器缺失返回 ENOENT 并保留旧现场；`#!` 脚本按 binfmt_script 转交解释器（嵌套 ≤4 层，超限 ELOOP）；执行位统一校验（任一执行位缺失返回 EACCES，execve(2)；官方盘 basic/run-all.sh 为 0644，由用户态启动器按授权清单在运行副本 fchmodat 0755 并记录，见 §6.3 环境准备）；整镜像读入内核堆 | 无 shebang 的非 ELF 返回 ENOEXEC；无 libc 动态库加载（由用户态解释器完成）；AT_EXECFN 为原始路径 |
 | nanosleep | 到期返回 0；rem 不回写；相对 now | 语义兼容 |
@@ -373,13 +374,12 @@ IGN 或 DFL 且默认动作属 Ign/Cont 静默丢弃。同步（硬件）信号�
 | 终止与 core | 无 core dump：Core 类信号死亡恒 CLD_KILLED，wait status 无 0x80 位（Linux CLD_DUMPED + WCOREDUMP） |
 | 同步信号 si_code | 固定 SEGV_MAPERR/ILL_ILLOPC/BUS_ADRALN/TRAP_BRKPT，未细分 ACCERR/ADRERR；la handler 期间 FPU 异常回投 SIGFPE（fcsr_pending）未实现 |
 | stub | 无 vDSO，stub 内嵌帧内，无 icache flush（QEMU 语义一致）；rt_sigreturn badframe 按 force_sigsegv 式收敛（处置复位、不重试投递；Linux force_sig 在装 SIGSEGV handler 时可循环） |
-| kill 族 | 无权限检查（无 uid）；pid<0 一律 EINVAL（无进程组，含 -1 广播）；pid==0 近似为调用者自身；tgkill 要求 tgid==tid（Linux tgid 不匹配返回 ESRCH） |
+| kill 族 | 无权限检查（无 uid）；pid<0 发往进程组 -pid，pid==0 发往调用者所在进程组，pid==-1 发往除 init 与调用者外的全部进程；tgkill 要求 tgid==tid（Linux tgid 不匹配返回 ESRCH） |
 | sigpending/sigsetsize | rt_sigpending sigsetsize 收紧为 ==8（Linux 允许 ≤8） |
 | nanosleep | rem 仅被打断时回写（正常完成不回写，沿用原契约行） |
 
 **欠账**（下一里程碑）：停止/继续状态机（SIGSTOP/SIGTSTP/SIGCONT、
-Stopped 态、wait4 WUNTRACED/WCONTINUED——libc-test 前必须）；进程组/
-会话/TTY（交互作业控制前置）；RT 信号排队；setitimer/SIGALRM；
+Stopped 态、wait4 WUNTRACED/WCONTINUED——libc-test 前必须）；控制终端与作业控制信号；RT 信号排队；setitimer/SIGALRM；
 signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综合
 自测（两架构，不入库）；libc-test 信号用例待接入。
 
