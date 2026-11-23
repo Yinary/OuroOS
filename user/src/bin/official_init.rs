@@ -154,7 +154,7 @@ static INSTALL_LIST: &[(&[u8], &[u8])] = &[
 /// 逐级创建 `dst` 的父目录；已存在不算失败。
 fn mkdir_p(dst: &[u8]) {
     let dlen = cstr_len(dst);
-    for i in (0..dlen).rev() {
+    for i in 0..dlen {
         if dst[i] != b'/' || i == 0 {
             continue;
         }
