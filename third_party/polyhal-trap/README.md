@@ -23,4 +23,5 @@
   5. la 非对齐异常改交 OS；原 `trap/loongarch64/unaligned.rs` 整数
      访存模拟范围迁至 `kernel/src/trap/unaligned.rs`，经用户地址空间
      权限检查与复制执行，原裸地址模拟器已移除。
+  6. rv/la 用户断点保留故障 PC 供 SIGTRAP 处理程序读取。内核断点按指令长度继续。
 - 升级提示：polyhal-trap 版本更新时，须按上述清单逐条回归或重放补丁。

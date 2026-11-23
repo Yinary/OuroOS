@@ -377,6 +377,10 @@ pub fn user_task_entry() -> ! {
                         }
                         let (kind, info) =
                             trap::fatal_fault(fatal).expect("fatal_fault covers fatal traps");
+                        let info = match kind {
+                            trap::UserFaultKind::Breakpoint => frame[TrapFrameArgs::SEPC],
+                            _ => info,
+                        };
                         // force 投递同上：由下一轮循环顶检查点消费。
                         let (sig, code) = fault_siginfo(kind);
                         force_signal(

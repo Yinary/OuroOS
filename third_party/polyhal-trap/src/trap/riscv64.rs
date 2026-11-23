@@ -41,7 +41,12 @@ fn kernel_callback(context: &mut TrapFrame) -> TrapType {
     let trap_type = match scause.cause().try_into() {
         // 中断异常
         Ok(Trap::Exception(Exception::Breakpoint)) => {
-            context.sepc += 2;
+            // OuroOS 补丁：只推进内核断点，用户断点地址由信号帧保存。
+            if !context.from_user() {
+                // SAFETY: sepc 来自触发断点的内核代码，地址至少按半字对齐。
+                let first = unsafe { (context.sepc as *const u16).read() };
+                context.sepc += if first & 3 == 3 { 4 } else { 2 };
+            }
             TrapType::Breakpoint
         }
         Ok(Trap::Exception(Exception::LoadFault)) => TrapType::LoadPageFault(stval),
