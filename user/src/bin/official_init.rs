@@ -1,6 +1,6 @@
-//! 官方盘用户态启动器：盘上无 /init 时由内核内嵌启动。安装 basic 程序
-//! PT_INTERP 请求的动态解释器，建立 /bin/sh、/busybox 入口，再用 busybox
-//! sh 显式解释官方外层脚本；全部经通用文件系统调用完成，不感知测例内容。
+//! 官方盘用户态启动器：盘上无 /init 时由内核内嵌启动。安装测例请求的动态
+//! 加载器与库，建立 /bin/sh、/busybox 入口，再用 busybox sh 显式解释官方
+//! 外层脚本；全部经通用文件系统调用完成，不感知测例内容。
 
 #![no_std]
 #![no_main]
@@ -117,28 +117,32 @@ fn cp(src: &[u8], dst: &[u8]) -> bool {
 }
 
 /// 授权安装清单（构建期常量，非运行时探测）：(目标绝对路径, 盘上来源)。
-/// 目标 = basic 程序 PT_INTERP 声明的路径，来源 = 对应 libc 目录内文件。
+/// 目标是测例请求的动态加载器及其默认搜索路径下的库，来源是对应 libc 目录内的文件。
 static INSTALL_LIST: &[(&[u8], &[u8])] = &[
-    // RV glibc 解释器（basic 程序 PT_INTERP 声明）
+    // riscv64 glibc 的加载器与库
     (
         b"/lib/ld-linux-riscv64-lp64d.so.1\0",
         b"/glibc/lib/ld-linux-riscv64-lp64d.so.1\0",
     ),
-    // LA glibc 解释器
+    (b"/lib/libc.so.6\0", b"/glibc/lib/libc.so.6\0"),
+    (b"/lib/libm.so.6\0", b"/glibc/lib/libm.so.6\0"),
+    // loongarch64 glibc 的加载器与库，库装在 /usr/lib64
     (
         b"/lib64/ld-linux-loongarch-lp64d.so.1\0",
         b"/glibc/lib/ld-linux-loongarch-lp64d.so.1\0",
     ),
-    // LA musl 解释器（LA musl 动态程序声明）
+    (b"/usr/lib64/libc.so.6\0", b"/glibc/lib/libc.so.6\0"),
+    (b"/usr/lib64/libm.so.6\0", b"/glibc/lib/libm.so.6\0"),
+    // loongarch64 musl 的加载器
     (
         b"/lib64/ld-musl-loongarch-lp64d.so.1\0",
-        b"/musl/lib/ld-musl-loongarch-lp64d.so.1\0",
+        b"/musl/lib/libc.so\0",
     ),
-    // RV musl 解释器
-    (
-        b"/lib/ld-musl-riscv64-lp64d.so.1\0",
-        b"/musl/lib/ld-musl-riscv64-lp64d.so.1\0",
-    ),
+    // riscv64 musl 的两个加载器路径
+    (b"/lib/ld-musl-riscv64-sf.so.1\0", b"/musl/lib/libc.so\0"),
+    (b"/lib/ld-musl-riscv64.so.1\0", b"/musl/lib/libc.so\0"),
+    // musl 加载器默认搜索路径下的 libc.so
+    (b"/lib/libc.so\0", b"/musl/lib/libc.so\0"),
     // shell 与 applet 入口（busybox 按 argv[0] 分派）
     (b"/bin/sh\0", b"/musl/busybox\0"),
     (b"/busybox\0", b"/musl/busybox\0"),
