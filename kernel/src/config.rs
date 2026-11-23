@@ -21,8 +21,8 @@ pub const ARCH_NAME: &str = match () {
     () => "unknown",
 };
 
-/// 内核堆大小：8 MiB（位于内核 .bss，帧分配器已排除内核镜像区域）
-pub const KERNEL_HEAP_SIZE: usize = 0x80_0000;
+/// 内核堆大小：32 MiB（位于内核 .bss，帧分配器已排除内核镜像区域）
+pub const KERNEL_HEAP_SIZE: usize = 0x200_0000;
 
 /// 时钟中断间隔（毫秒）
 pub const TICK_MS: u64 = 100;
