@@ -48,7 +48,7 @@
 - 文件区域可扩展到 EOF 之后，只保留文件身份和页偏移；访问时以文件当前长度判定。关闭 fd、unlink 不丢失映射。共享映射可以通过零旧长度建立别名；等长 DONTUNMAP 保留源区间，源私有匿名页重新取零，文件与共享匿名页按后备取数。不支持跨不同属性区域搬移。
 - `mincore`（232）查询驻留位。文件映射按 inode 和页偏移查询共享缓存，同一文件页的别名可在首次访问前报告驻留。查询本身不会调页。PROT_NONE 仍属于映射。查询空洞返回 ENOMEM，未对齐起点返回 EINVAL，结果缓冲区不可写返回 EFAULT。复制前验证完整结果缓冲区。
 - MAP_SHARED | MAP_ANONYMOUS 使用按页号索引的共享对象，首次访问时分配物理页；fork 保留共享，最后一个映射销毁才释放，固定搬移和收缩保持引用。fork 不为共享页额外分配临时私有页。共享匿名区可以扩展，重叠的别名仍指向同一对象页。
-- 私有匿名 mmap、brk 与文件映射按需分配。用户缺页和内核复制共用 ensure_access；共享匿名也按需分配，ELF 装载页预分配。暂无换出或 COW。
+- 私有匿名 mmap、brk 与文件映射按需分配。用户缺页和内核复制共用 ensure_access；共享匿名也按需分配，ELF 装载页预分配。fork 后，已驻留的私有匿名页、堆页和用户栈页采用写时复制（copy-on-write，COW）。
 - 语义依据：[mremap(2)](https://man7.org/linux/man-pages/man2/mremap.2.html)、[mincore(2)](https://man7.org/linux/man-pages/man2/mincore.2.html)。实现独立编写，未复制 Linux 代码。
 
 ### 1.2 十律
@@ -85,7 +85,7 @@
 |---|---|
 | brk 字节级记账 | `address_space::brk` |
 | mmap 空洞 / MAP_FIXED | `find_free`、`replace_region` 事务替换 |
-| fork 深拷贝 | `deep_copy`，建成才发布，无 COW |
+| fork | `deep_copy` 完成子地址空间后，将父子共享的私有匿名、堆和栈物理页设为只读。首次写入时分配私有副本；只剩一个引用时恢复写权限。 |
 | exec 先建后切 | 新空间含 argv/envp/auxv，成功才替换 |
 | 页字节访问收口 | 拥有页复制及 ELF 初始页写入由 mm 封装；`elf.rs`、`fs/cache.rs`、`syscall/memory.rs`、`task/user_task.rs`、`task/exec.rs`、`task/task.rs` 拒绝 `unsafe` |
 | MAP_SHARED 文件页缓存 | `fs/cache.rs`；索引独立持有页，比较有效字节和上次写回基线，失败后可重试 |
@@ -96,7 +96,7 @@
 |---|---|
 | 直映硬化 | 直映区 base canary + 去可执行权限；未实现 |
 | 数据页/区域线性扫描 | 区域和页清单均按地址排序，查找走二分；fork/remap 仍逐页遍历 |
-| COW / 通用页缓存 / swap / 远端 TLB | 未做；MAP_SHARED 文件页缓存已实现，不是通用读写页缓存 |
+| 通用页缓存 / swap / 远端 TLB | 未做；MAP_SHARED 文件页缓存已实现，不是通用读写页缓存 |
 | 全局堆失败策略 | 8 MiB 固定；pipe 扩容、rsext4 的 `alloc::vec!` 不可失败，可耗尽→panic；需要统一 OOM 策略 |
 
 ## 2. polyhal 边界
@@ -340,7 +340,7 @@ FS 通过 `fs::mapping` 注册 MM 映射钩子：注册后，长度改变先由 
 | 基础调用 | clock_gettime(113)、exit_group(94) 等仍 ENOSYS；fcntl 文件锁和异步通知尚未实现；ioctl 仅支持 RTC_RD_TIME，TCGETS/TCWINSZ 等终端命令返回 ENOTTY |
 | 信号残余 | 停止/继续状态机、RT 排队、core 位等偏差与欠账集中登记 §4.5 |
 | ELF（动态库） | 内核不加载 DT_NEEDED 库（由用户态解释器完成）；libc-test 的 dlopen 等场景待验证 |
-| mm | COW、SIGBUS 用户投递；文件映射扩展；用户页执行禁止（NX） |
+| mm | SIGBUS 用户投递；文件映射扩展；用户页执行禁止（NX） |
 | fs | FAT getdents、句柄缓存与重命名；link/symlink；EXT4 日志重放 |
 
 ### 4.5 信号契约
@@ -558,7 +558,7 @@ msync 按相交 VMA 的文件偏移选择缓存页，再同步 Ext4 后端，失
 
 exec/spawn 从设备树启动熵派生独立的 16 字节，AT_RANDOM 指向新用户栈。静态 LoongArch glibc BusyBox 重定位后使用 mprotect(PROT_READ) 关闭写权限；页表保留执行权限。QEMU 10.0.2 上 `busybox sh -c exit` 成功。设备文件 /dev/zero 的打开和映射仍依赖 VFS。
 
-固定地址映射支持 MAP_FIXED_NOREPLACE（重叠返回 EEXIST，原数据保留）。MAP_LOCKED 使用与 mlockall 相同的限额，在建立映射后尽力预取，不改变未来映射的锁策略；没有交换空间预留账本，MAP_NORESERVE 不额外预留。MAP_POPULATE 在 VMA 建立后尽力预取；与 MAP_NONBLOCK 同用时不预取。未锁定的私有匿名 mremap 扩展只增加虚拟区间。MADV_DONTFORK/DOFORK 控制子进程是否继承该区间；WIPEONFORK/KEEPONFORK 控制私有匿名、堆、栈页在子进程内是否重新取零页。父进程内容不变。共享匿名扩展仅增加虚拟页描述，物理数据页按需分配；私有页 fork 深拷贝，没有实现 COW 或换出。
+固定地址映射支持 MAP_FIXED_NOREPLACE（重叠返回 EEXIST，原数据保留）。MAP_LOCKED 使用与 mlockall 相同的限额，在建立映射后尽力预取，不改变未来映射的锁策略；没有交换空间预留账本，MAP_NORESERVE 不额外预留。MAP_POPULATE 在 VMA 建立后尽力预取；与 MAP_NONBLOCK 同用时不预取。未锁定的私有匿名 mremap 扩展只增加虚拟区间。MADV_DONTFORK/DOFORK 控制子进程是否继承该区间；WIPEONFORK/KEEPONFORK 控制私有匿名、堆、栈页在子进程内是否重新取零页。父进程内容不变。共享匿名扩展仅增加虚拟页描述，物理数据页按需分配；fork 时私有匿名、堆和栈驻留页按写时复制共享。ELF 页和已驻留的私有文件页仍在 fork 时复制；尚无换出。
 
 /proc/meminfo 每次打开保存一次帧分配器统计；Cached 只计文件页缓存的数据帧。MemTotal 为已登记的可分配物理内存；MemAvailable 为 MemFree 的保守估计；交换为零。sysinfo(179) 提供同口径的总量和空闲量，单位 1024 字节；尚未统计负载均值和共享内存用量。procfs 另提供根目录、`/proc/<pid>/`（stat/cmdline/status）与设备节点，枚举来自 Task 维护的独立快照表（§4.3"其他"行）；/proc/mounts 报告根卷与 FAT 挂载。
 

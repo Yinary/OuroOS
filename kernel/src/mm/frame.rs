@@ -1,5 +1,5 @@
 //! 物理页所有权与帧分配：位图、区域内首次适配，运行期零堆依赖。
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use polyhal::{consts::VIRT_ADDR_START, pagetable::PAGE_SIZE, PhysAddr};
 use spin::Mutex;
 
@@ -234,6 +234,41 @@ impl Drop for OwnedFrame {
         unsafe {
             frame_dealloc(self.pa);
         }
+    }
+}
+
+/// 可共享的物理页引用；COW 阶段由多个地址空间共同持有同一页。
+#[derive(Clone)]
+pub struct FrameRef(Arc<OwnedFrame>);
+impl FrameRef {
+    /// 分配并清零一页；Arc 元数据分配失败返回 OOM。
+    pub fn new() -> Result<Self, FrameError> {
+        let frame = OwnedFrame::new()?;
+        Arc::try_new(frame)
+            .map(Self)
+            .map_err(|_| FrameError::OutOfMemory)
+    }
+
+    /// 页表映射使用的物理地址。
+    pub fn addr(&self) -> PhysAddr {
+        self.0.addr()
+    }
+
+    /// 当前共享引用数；1 表示独占。
+    #[allow(dead_code)]
+    pub fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
+
+    /// 将另一页内容复制到本页；传入自身也合法。
+    pub fn copy_from(&self, source: &Self) {
+        self.0.copy_from(&source.0);
+    }
+}
+impl core::ops::Deref for FrameRef {
+    type Target = OwnedFrame;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 

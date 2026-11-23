@@ -326,7 +326,21 @@ pub fn user_task_entry() -> ! {
                             reg.records.iter().find(|r| r.pid == pid)
                                 .and_then(|r| r.space.as_ref())
                                 .ok_or(crate::mm::address_space::MapError::NotMapped)
-                                .and_then(|s| { let space = s.as_space(); if space.translate(addr).is_some() { return Err(crate::mm::address_space::MapError::PermissionDenied); } space.ensure_access(addr, access) })
+                                .and_then(|s| {
+                                    let space = s.as_space();
+                                    if let Some((_, flags)) = space.translate(addr) {
+                                        if flags.contains(access) {
+                                            return Err(
+                                                crate::mm::address_space::MapError::PermissionDenied,
+                                            );
+                                        }
+                                    }
+                                    space.ensure_access(addr, access)?;
+                                    match space.translate(addr) {
+                                        Some((_, flags)) if flags.contains(access) => Ok(()),
+                                        _ => Err(crate::mm::address_space::MapError::PermissionDenied),
+                                    }
+                                })
                         };
                         if result.is_ok() { Action::Continue } else {
                             use crate::mm::address_space::MapError;

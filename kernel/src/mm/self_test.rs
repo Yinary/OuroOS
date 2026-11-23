@@ -1,8 +1,11 @@
 //! 启动期内存不变量自检，不依赖用户程序名/测例参数。
 //! 覆盖页所有权、区间分裂、权限、边界及释放守恒；debug 内核额外逐点注入 OOM。
 use super::{
-    address_space::{phys_to_kernel_vaddr, AreaKind, MapError, UserAddressSpace, USER_TOP},
+    address_space::{
+        phys_to_kernel_vaddr, AreaKind, MapError, UserAddressSpace, USER_STACK_TOP, USER_TOP,
+    },
     frame,
+    kstack::WINDOW_ROOT_START,
     user_access::{copy_from_user, copy_to_user},
 };
 use polyhal::pagetable::{MappingFlags as F, PAGE_SIZE};
@@ -18,6 +21,15 @@ pub(super) fn run() {
     crate::syscall::memory_self_test();
     #[cfg(debug_assertions)]
     crate::task::exec_self_test();
+    #[cfg(debug_assertions)]
+    {
+        let frame = crate::mm::frame::FrameRef::new().expect("frame ref test");
+        assert_eq!(frame.strong_count(), 1);
+        let clone = frame.clone();
+        assert_eq!(frame.strong_count(), 2);
+        drop(clone);
+        assert_eq!(frame.strong_count(), 1);
+    }
     {
         let baseline = frame::stats();
         let mut space = UserAddressSpace::new().expect("lazy root");
@@ -447,4 +459,164 @@ fn user_copy_tests() {
         assert_eq!(after, wide);
     }
     assert_eq!(frame::stats(), baseline);
+
+    {
+        // COW：fork 后先共享同一物理页，写缺页后才分离。
+        let baseline = frame::stats();
+        let mut parent = UserAddressSpace::new().expect("cow root");
+        parent
+            .reserve_region(0x700000, 1, F::URW, AreaKind::Anonymous)
+            .expect("cow parent map");
+        copy_to_user(&parent, 0x700000, &[0x2a]).expect("cow parent initial");
+        let parent_pa = parent.translate(0x700000).expect("cow parent pa").0;
+        let child = parent.deep_copy().expect("cow fork");
+        assert!(!parent
+            .translate(0x700000)
+            .expect("cow parent ro")
+            .1
+            .contains(F::W));
+        assert_eq!(
+            child.translate(0x700000).expect("cow child pa").0,
+            parent_pa
+        );
+        assert!(!child
+            .translate(0x700000)
+            .expect("cow child flags")
+            .1
+            .contains(F::W));
+        copy_to_user(&child, 0x700000, &[0x2b]).expect("cow child write");
+        assert_ne!(
+            child.translate(0x700000).expect("cow child split pa").0,
+            parent_pa
+        );
+        assert!(child
+            .translate(0x700000)
+            .expect("cow child w")
+            .1
+            .contains(F::W));
+        assert!(!parent
+            .translate(0x700000)
+            .expect("cow parent ro")
+            .1
+            .contains(F::W));
+        let mut byte = [0];
+        copy_from_user(&parent, 0x700000, &mut byte).expect("cow parent read");
+        assert_eq!(byte, [0x2a]);
+        copy_from_user(&child, 0x700000, &mut byte).expect("cow child read");
+        assert_eq!(byte, [0x2b]);
+        copy_to_user(&parent, 0x700000, &[0x2c]).expect("cow parent write");
+        assert!(parent
+            .translate(0x700000)
+            .expect("cow parent w")
+            .1
+            .contains(F::W));
+        copy_from_user(&parent, 0x700000, &mut byte).expect("cow parent final");
+        assert_eq!(byte, [0x2c]);
+        drop(child);
+        drop(parent);
+        assert_eq!(frame::stats(), baseline);
+    }
+
+    #[cfg(debug_assertions)]
+    for all in [false, true] {
+        let baseline = frame::stats();
+        let mut parent = UserAddressSpace::new().expect("lock cow root");
+        let va = 0x700000;
+        parent
+            .reserve_region(va, 2, F::URW, AreaKind::Anonymous)
+            .unwrap();
+        copy_to_user(&parent, va, &[42]).unwrap();
+        copy_to_user(&parent, va + PAGE_SIZE, &[43]).unwrap();
+        parent.protect(va + PAGE_SIZE, 1, F::U | F::R).unwrap();
+        let mut child = parent.deep_copy().unwrap();
+        let lock = |space: &mut UserAddressSpace, on_fault: bool| {
+            if all {
+                space.lock_all(if on_fault { 5 } else { 1 })
+            } else {
+                space.lock_range(va, 2, true, on_fault)
+            }
+        };
+        frame::set_test_budget(Some(0));
+        let lazy = lock(&mut child, true);
+        let eager = lock(&mut child, false);
+        frame::set_test_budget(None);
+        assert_eq!(lazy, Ok(()));
+        assert_eq!(eager, Err(MapError::OutOfMemory), "lock must prepare COW");
+        assert_eq!(child.translate(va), parent.translate(va));
+        lock(&mut child, false).expect("retry eager lock");
+        assert_eq!(
+            child.translate(va + PAGE_SIZE),
+            parent.translate(va + PAGE_SIZE)
+        );
+        frame::set_test_budget(Some(0));
+        let written = copy_to_user(&child, va, &[99]);
+        frame::set_test_budget(None);
+        written.expect("write after eager lock");
+        let mut byte = [0];
+        copy_from_user(&parent, va, &mut byte).unwrap();
+        assert_eq!(byte, [42]);
+        drop(child);
+        drop(parent);
+        assert_eq!(frame::stats(), baseline);
+    }
+
+    {
+        // Stack COW：父页在 pending 中共享；父先写必须拆页，子仍持有旧帧。
+        let baseline = frame::stats();
+        let mut parent = UserAddressSpace::new().expect("stack cow root");
+        parent.map_stack().expect("stack map");
+        let va = USER_STACK_TOP - PAGE_SIZE;
+        copy_to_user(&parent, va, &[0x31]).expect("stack initial");
+        let parent_pa = parent.translate(va).expect("stack parent pa").0;
+        let child = parent.deep_copy().expect("stack cow fork");
+        assert_eq!(child.translate(va).expect("stack child pa").0, parent_pa);
+        assert!(!parent
+            .translate(va)
+            .expect("stack parent ro")
+            .1
+            .contains(F::W));
+        assert!(!child
+            .translate(va)
+            .expect("stack child ro")
+            .1
+            .contains(F::W));
+        copy_to_user(&parent, va, &[0x32]).expect("stack parent first write");
+        assert_ne!(
+            parent.translate(va).expect("stack parent split").0,
+            parent_pa
+        );
+        let mut byte = [0];
+        copy_from_user(&child, va, &mut byte).expect("stack child old");
+        assert_eq!(byte, [0x31]);
+        copy_to_user(&child, va, &[0x33]).expect("stack child write");
+        copy_from_user(&child, va, &mut byte).expect("stack child final");
+        assert_eq!(byte, [0x33]);
+        copy_from_user(&parent, va, &mut byte).expect("stack parent final");
+        assert_eq!(byte, [0x32]);
+        drop(child);
+        drop(parent);
+        assert_eq!(frame::stats(), baseline);
+    }
+
+    {
+        // 用户地址入口必须拒绝共享内核栈窗口根项。
+        assert!(UserAddressSpace::check_user_span(WINDOW_ROOT_START, PAGE_SIZE).is_err());
+        let mut space = UserAddressSpace::new().expect("window guard root");
+        assert!(space
+            .reserve_region(WINDOW_ROOT_START, 1, F::URW, AreaKind::Anonymous)
+            .is_err());
+        assert!(space.reserve_fixed(WINDOW_ROOT_START, 1, F::URW).is_err());
+    }
+
+    {
+        // 保留窗口边界：普通映射可紧邻、可跨窗口 munmap，空 ELF 段允许。
+        let start = WINDOW_ROOT_START - PAGE_SIZE;
+        let mut space = UserAddressSpace::new().expect("window edge root");
+        space
+            .reserve_region(start, 1, F::URW, AreaKind::Anonymous)
+            .expect("window edge mapping");
+        assert!(space.unmap(start, 2).is_ok());
+        assert!(UserAddressSpace::check_user_span(WINDOW_ROOT_START + PAGE_SIZE, 0).is_ok());
+        assert!(space.find_free(0, (16usize << 30) / PAGE_SIZE).is_ok());
+    }
 }
