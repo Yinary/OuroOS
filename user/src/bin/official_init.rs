@@ -1,6 +1,6 @@
 //! 官方盘用户态启动器：盘上无 /init 时由内核内嵌启动。安装测例请求的动态
-//! 加载器与库，建立 /bin/sh、/busybox 入口，再用 busybox sh 显式解释官方
-//! 外层脚本；全部经通用文件系统调用完成，不感知测例内容。
+//! 加载器与库，建立 /tmp 等目录和 /bin/sh、/busybox 入口，再用 busybox
+//! sh 显式解释官方外层脚本；全部经通用文件系统调用完成，不感知测例内容。
 
 #![no_std]
 #![no_main]
@@ -146,11 +146,12 @@ static INSTALL_LIST: &[(&[u8], &[u8])] = &[
     // shell 与 applet 入口（busybox 按 argv[0] 分派）
     (b"/bin/sh\0", b"/musl/busybox\0"),
     (b"/busybox\0", b"/musl/busybox\0"),
+    (b"/bin/busybox\0", b"/musl/busybox\0"),
     (b"/bin/ls\0", b"/musl/busybox\0"),
     (b"/bin/sleep\0", b"/musl/busybox\0"),
 ];
 
-/// 逐级创建 `dst` 的父目录（安装清单用）；已存在不算失败。
+/// 逐级创建 `dst` 的父目录；已存在不算失败。
 fn mkdir_p(dst: &[u8]) {
     let dlen = cstr_len(dst);
     for i in (0..dlen).rev() {
@@ -168,6 +169,8 @@ fn mkdir_p(dst: &[u8]) {
 }
 
 fn prepare_layout() {
+    mkdir_p(b"/tmp/\0");
+    mkdir_p(b"/var/tmp/\0");
     note(b"[official-init] install list begin\n");
     for (dst, src) in INSTALL_LIST {
         mkdir_p(dst);
