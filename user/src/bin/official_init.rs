@@ -10,7 +10,7 @@ use user::{define_user_entry, sys_exit, sys_write, syscall3, syscall6};
 // asm-generic 64 位系统调用号（riscv64 / loongarch64 通用 UAPI）
 const SYS_OPENAT: usize = 56;
 const SYS_FCHMODAT: usize = 53;
-const SYS_MKNODAT: usize = 296;
+const SYS_MKNODAT: usize = 33;
 const SYS_CLOSE: usize = 57;
 const SYS_READ: usize = 63;
 const SYS_MKDIRAT: usize = 34;
