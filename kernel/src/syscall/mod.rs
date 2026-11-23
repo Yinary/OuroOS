@@ -80,6 +80,7 @@ pub mod sysnr {
     pub const RT_SIGRETURN: usize = 139;
     pub const TIMES: usize = 153;
     pub const SET_TID_ADDRESS: usize = 96;
+    pub const WAITID: usize = 95;
     pub const SETPGID: usize = 154;
     pub const GETPGID: usize = 155;
     pub const GETSID: usize = 156;
@@ -453,6 +454,7 @@ pub fn dispatch(
         | sysnr::CLONE
         | sysnr::EXECVE
         | sysnr::WAIT4
+        | sysnr::WAITID
         | sysnr::SETPGID
         | sysnr::GETPGID
         | sysnr::GETSID

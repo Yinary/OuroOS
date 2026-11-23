@@ -1029,6 +1029,7 @@ fn process_call(
                 }
             }
         }
+        sysnr::WAITID => return waitid(parent, frame, args),
         sysnr::SETPGID => set_pg_id(parent, args),
         sysnr::GETPGID => get_pg_or_sid(parent, args[0], false),
         sysnr::GETSID => get_pg_or_sid(parent, args[0], true),
@@ -1300,6 +1301,134 @@ fn set_sid(parent: Pid) -> Result<usize, Errno> {
     rec.pgid = parent;
     rec.sid = parent;
     Ok(parent)
+}
+
+fn waitid(parent: Pid, frame: &mut TrapFrame, args: [usize; 6]) -> ProcessResult {
+    const WNOHANG: u32 = 0x1;
+    const WSTOPPED: u32 = 0x2;
+    const WEXITED: u32 = 0x4;
+    const WCONTINUED: u32 = 0x8;
+    const WNOWAIT: u32 = 0x0100_0000;
+    const __WNOTHREAD: u32 = 0x2000_0000;
+    const __WALL: u32 = 0x4000_0000;
+    const __WCLONE: u32 = 0x8000_0000;
+    let allowed =
+        WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | __WNOTHREAD | __WALL | __WCLONE;
+    let idtype = args[0] as u32 as i32;
+    if !(0..=2).contains(&idtype) {
+        frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Invalid));
+        return ProcessResult::Done;
+    }
+    let options = args[3] as u32;
+    if options & !allowed != 0 || options & (WEXITED | WSTOPPED | WCONTINUED) == 0 {
+        frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Invalid));
+        return ProcessResult::Done;
+    }
+    let infop = args[2];
+    let id = args[1] as u32 as usize;
+    let (ready, any) = {
+        let reg = REGISTRY.lock();
+        let caller_pgid = match reg.records.iter().find(|r| r.pid == parent) {
+            Some(r) => r.pgid,
+            None => {
+                frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::NoProcess));
+                return ProcessResult::Done;
+            }
+        };
+        let matches = |r: &super::ProcessRecord| {
+            r.parent == parent
+                && match idtype {
+                    0 => true,
+                    1 => r.pid == id,
+                    _ => r.pgid == if id == 0 { caller_pgid } else { id },
+                }
+        };
+        let ready = reg
+            .records
+            .iter()
+            .position(|r| matches(r) && r.exit.is_some());
+        let any = reg.records.iter().any(matches);
+        let ready = ready.and_then(|i| {
+            let rec = reg.records.get(i)?;
+            Some((
+                rec.pid,
+                rec.exit?,
+                rec.user_ns.saturating_add(rec.child_user_ns),
+                rec.system_ns.saturating_add(rec.child_system_ns),
+            ))
+        });
+        (ready, any)
+    };
+    if let Some((child_pid, exit, user_ns, system_ns)) = ready {
+        let mut data = [0u8; 128];
+        data[0..4].copy_from_slice(&17u32.to_ne_bytes());
+        let (code, status) = match exit {
+            ExitInfo::Exited(n) => (1u32, n as u32 & 255),
+            ExitInfo::Signaled { sig, .. } => (2u32, sig as u32),
+        };
+        data[8..12].copy_from_slice(&code.to_ne_bytes());
+        data[16..20].copy_from_slice(&(child_pid as u32).to_ne_bytes());
+        data[24..28].copy_from_slice(&status.to_ne_bytes());
+        data[32..40].copy_from_slice(&(user_ns / 10_000_000).to_ne_bytes());
+        data[40..48].copy_from_slice(&(system_ns / 10_000_000).to_ne_bytes());
+        if infop != 0 {
+            let copied = REGISTRY
+                .lock()
+                .records
+                .iter()
+                .find(|r| r.pid == parent)
+                .and_then(|r| r.space.as_ref())
+                .is_some_and(|s| {
+                    crate::mm::user_access::copy_to_user(s.as_space(), infop, &data).is_ok()
+                });
+            if !copied {
+                frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Fault));
+                return ProcessResult::Done;
+            }
+        }
+        if options & WNOWAIT == 0 {
+            match super::registry::reap_child(parent, child_pid) {
+                Some((user, system)) => {
+                    let mut reg = REGISTRY.lock();
+                    if let Some(rec) = reg.records.iter_mut().find(|r| r.pid == parent) {
+                        rec.child_user_ns = rec.child_user_ns.saturating_add(user);
+                        rec.child_system_ns = rec.child_system_ns.saturating_add(system);
+                    }
+                }
+                None => {
+                    frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::NoChild));
+                    return ProcessResult::Done;
+                }
+            }
+        }
+        frame[TrapFrameArgs::RET] =
+            crate::syscall::to_abi(Ok(if infop == 0 { child_pid } else { 0 }));
+        return ProcessResult::Done;
+    }
+    if !any {
+        frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::NoChild));
+        return ProcessResult::Done;
+    }
+    if options & WNOHANG != 0 {
+        if infop != 0 {
+            let copied = REGISTRY
+                .lock()
+                .records
+                .iter()
+                .find(|r| r.pid == parent)
+                .and_then(|r| r.space.as_ref())
+                .is_some_and(|s| {
+                    crate::mm::user_access::copy_to_user(s.as_space(), infop, &[0u8; 128]).is_ok()
+                });
+            if !copied {
+                frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Fault));
+                return ProcessResult::Done;
+            }
+        }
+        frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Ok(0));
+        return ProcessResult::Done;
+    }
+    ProcessResult::Wait(WaitReason::Children)
 }
 /// 创建独立地址空间的子进程，保留父现场，子进程从下一条指令返回零。
 /// fork(2)/clone(2) 支持的标志：退出信号必须是 SIGCHLD（纯进程 fork），
