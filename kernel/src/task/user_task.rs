@@ -1031,6 +1031,13 @@ fn process_call(
         }
         sysnr::WAITID => return waitid(parent, frame, args),
         sysnr::GETRUSAGE => get_rusage(parent, args),
+        sysnr::SCHED_GETSCHEDULER => sched_getscheduler(parent, args[0]),
+        sysnr::SCHED_GETPARAM => sched_getparam(parent, args[0], args[1]),
+        sysnr::SCHED_GET_PRIORITY_MAX => sched_priority_limit(args[0], true),
+        sysnr::SCHED_GET_PRIORITY_MIN => sched_priority_limit(args[0], false),
+        sysnr::SCHED_RR_GET_INTERVAL => sched_rr_get_interval(parent, args[0], args[1]),
+        sysnr::SCHED_GETAFFINITY => sched_getaffinity(parent, args[0], args[1], args[2]),
+        sysnr::SCHED_SETAFFINITY => sched_setaffinity(parent, args[0], args[1], args[2]),
         sysnr::SETPGID => set_pg_id(parent, args),
         sysnr::GETPGID => get_pg_or_sid(parent, args[0], false),
         sysnr::GETSID => get_pg_or_sid(parent, args[0], true),
@@ -1458,6 +1465,110 @@ fn get_rusage(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
                 .map_err(|_| Errno::Fault)
         })
         .map(|()| 0)
+}
+
+fn sched_target(parent: Pid, pid_arg: usize) -> Result<usize, Errno> {
+    let pid = pid_arg as u32 as i32;
+    if pid < 0 {
+        return Err(Errno::NoProcess);
+    }
+    Ok(if pid == 0 { parent } else { pid as usize })
+}
+
+fn sched_getscheduler(parent: Pid, pid_arg: usize) -> Result<usize, Errno> {
+    let target = sched_target(parent, pid_arg)?;
+    let reg = REGISTRY.lock();
+    reg.records
+        .iter()
+        .find(|r| r.pid == target)
+        .ok_or(Errno::NoProcess)?;
+    Ok(0)
+}
+
+fn sched_getparam(parent: Pid, pid_arg: usize, param: usize) -> Result<usize, Errno> {
+    if (pid_arg as u32 as i32) < 0 {
+        return Err(Errno::Invalid);
+    }
+    if param == 0 {
+        return Err(Errno::Invalid);
+    }
+    let target = sched_target(parent, pid_arg)?;
+    let reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter()
+        .find(|r| r.pid == target)
+        .ok_or(Errno::NoProcess)?;
+    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    crate::mm::user_access::copy_to_user(space, param, &[0u8; 4]).map_err(|_| Errno::Fault)?;
+    Ok(0)
+}
+
+fn sched_priority_limit(policy_arg: usize, is_max: bool) -> Result<usize, Errno> {
+    let policy = policy_arg as u32 as i32;
+    match policy {
+        1 | 2 => Ok(if is_max { 99 } else { 1 }),
+        0 | 3 | 5 | 6 => Ok(0),
+        _ => Err(Errno::Invalid),
+    }
+}
+
+fn sched_rr_get_interval(parent: Pid, pid_arg: usize, tp: usize) -> Result<usize, Errno> {
+    if (pid_arg as u32 as i32) < 0 {
+        return Err(Errno::Invalid);
+    }
+    let target = sched_target(parent, pid_arg)?;
+    let reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter()
+        .find(|r| r.pid == target)
+        .ok_or(Errno::NoProcess)?;
+    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    let mut data = [0u8; 16];
+    data[8..16].copy_from_slice(&(crate::config::TICK_MS * 1_000_000).to_ne_bytes());
+    crate::mm::user_access::copy_to_user(space, tp, &data).map_err(|_| Errno::Fault)?;
+    Ok(0)
+}
+
+fn sched_getaffinity(parent: Pid, pid_arg: usize, len: usize, mask: usize) -> Result<usize, Errno> {
+    let target = sched_target(parent, pid_arg)?;
+    let reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter()
+        .find(|r| r.pid == target)
+        .ok_or(Errno::NoProcess)?;
+    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    let n = len.min(8);
+    let bits = 1u64.to_ne_bytes();
+    if n > 0 {
+        crate::mm::user_access::copy_to_user(space, mask, &bits[..n]).map_err(|_| Errno::Fault)?;
+    }
+    Ok(n)
+}
+
+fn sched_setaffinity(parent: Pid, pid_arg: usize, len: usize, mask: usize) -> Result<usize, Errno> {
+    let target = sched_target(parent, pid_arg)?;
+    let reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter()
+        .find(|r| r.pid == target)
+        .ok_or(Errno::NoProcess)?;
+    if len == 0 {
+        return Err(Errno::Invalid);
+    }
+    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    let n = len.min(8);
+    let mut data = [0u8; 8];
+    crate::mm::user_access::copy_from_user(space, mask, &mut data[..n])
+        .map_err(|_| Errno::Fault)?;
+    if data[0] & 1 == 0 {
+        Err(Errno::Invalid)
+    } else {
+        Ok(0)
+    }
 }
 /// 创建独立地址空间的子进程，保留父现场，子进程从下一条指令返回零。
 /// fork(2)/clone(2) 支持的标志：退出信号必须是 SIGCHLD（纯进程 fork），
