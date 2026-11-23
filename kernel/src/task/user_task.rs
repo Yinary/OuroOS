@@ -596,8 +596,11 @@ fn park_check_signals(
                 }
                 ParkOutcome::Completed
             }
-            // SA_RESTART：不完成不睡，信号留给循环顶检查点。
-            WaitReason::Pipe | WaitReason::Children if d.flags & SA_RESTART != 0 => {
+            // SA_RESTART：pipe 读写与 wait 的等待不完成不睡，信号留给循环顶检查点。
+            // ppoll 被 handler 信号打断一律以 -EINTR 完成。
+            WaitReason::Pipe | WaitReason::Children
+                if d.flags & SA_RESTART != 0 && frame[TrapFrameArgs::SYSCALL] != sysnr::PPOLL =>
+            {
                 ParkOutcome::Incomplete
             }
             // 其余：完成 syscall 返回 -EINTR；信号留给循环顶检查点。

@@ -210,7 +210,7 @@ CURRENT 记录当前任务地址；调度器的 `current` Box 持有实体，切
 - 阻塞 syscall 的信号打断在 park 前后做两次快路径决策（第一次可落
   睡、睡醒后补一次不落睡重查）：sigsuspend/sigtimedwait/nanosleep 被
   handler 类信号打断一律以 -EINTR 完成，pipe/wait4 按 SA_RESTART 分
-  重启与 -EINTR；语义规范与偏差见 §4.5。
+  重启与 -EINTR，ppoll 不重启；语义规范与偏差见 §4.5。
 - 孵化预留 ready/waiting 各自容纳全部存活任务的容量；集中唤醒不分配。
 - init 在仍有活跃进程时等待 Children 事件，醒后重查条件。
 - 等待表满时 park 退化为就绪让出；就绪空而等待非空时 idle 等时钟；
