@@ -267,8 +267,14 @@ impl FilePage {
         Ok(child)
     }
     /// 同步入口不区分共享映射是否可写；只读映射也要让后端决定错误。
-    pub(super) fn sync_start(&self) -> (u32, usize) {
-        (self.file.ino, self.offset)
+    pub(super) fn writeback_start(&self) -> Option<(u32, usize)> {
+        match self.mode {
+            // 可写后端的同一缓存页也可能由另一个映射修改。
+            Mode::Shared { writable } if writable || !cfg!(feature = "rsext4-readonly") => {
+                Some((self.file.ino, self.offset))
+            }
+            _ => None,
+        }
     }
 }
 fn map_io(error: Errno) -> MapError {

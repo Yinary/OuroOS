@@ -991,7 +991,7 @@ impl UserAddressSpace {
         Ok(())
     }
 
-    /// 同步完整映射区间内的可写共享文件页，复用文件系统已有写回入口。
+    /// 同步完整映射区间内的共享文件页，复用文件系统已有写回入口。
     pub fn sync_range(
         &mut self,
         start: usize,
@@ -1009,6 +1009,7 @@ impl UserAddressSpace {
         {
             return Err(Errno::Busy);
         }
+        // 所有共享别名已使用同一缓存页；同步时保留其身份和私有映射的内容。
         // 每个文件 VMA 内页偏移连续；只同步用户指定区间对应的文件页。
         for area in self
             .areas
@@ -1019,8 +1020,9 @@ impl UserAddressSpace {
             let length = area.end.min(end) - first;
             let page = self.page_at(first).ok_or(Errno::Fault)?;
             if let Backing::File(file) = &*page.backing() {
-                let (ino, offset) = file.sync_start();
-                crate::fs::sync_mapping(ino, offset, length)?;
+                if let Some((ino, offset)) = file.writeback_start() {
+                    crate::fs::sync_mapping(ino, offset, length)?;
+                }
             }
         }
         Ok(())

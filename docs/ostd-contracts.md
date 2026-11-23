@@ -534,7 +534,7 @@ signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综�
 
 mlock/munlock/mlock2 保存区域锁页属性，部分解锁拆分区域，ONFAULT 保持未驻留页延迟分配；普通锁页填充页后才提交锁属性。fork 不继承锁，DONTNEED 拒绝锁页，munmap 解除对应锁。已接入 RLIMIT_MEMLOCK 字节限额；缺少进程凭证模型，不能宣称通过 LTP 的凭证测例。mlockall 支持 CURRENT/FUTURE/ONFAULT，munlockall 同时清除未来策略；fork 不继承未来锁策略。
 
-msync 按相交 VMA 的文件偏移选择缓存页，再同步 Ext4 后端，失败返回后端错误；私有页不回写。最后一个映射释放时若写失败，缓存继续持有页，可在 fsync 或关机前重试。MS_INVALIDATE 遇锁页返回 EBUSY；MS_ASYNC 仍同步等待，FAT 同步仍返回 EOPNOTSUPP。页写入获后端接受与设备持久化是两个阶段。
+msync 按相交 VMA 的文件偏移选择缓存页，再同步 Ext4 后端，失败返回后端错误；私有页不回写。最后一个映射释放时若写失败，缓存继续持有页，可在 fsync 或关机前重试。MS_INVALIDATE 遇锁页返回 EBUSY。成功同步后共享别名继续使用同一缓存页，私有副本保留进程自己的修改。MS_ASYNC 仍同步等待，FAT 同步仍返回 EOPNOTSUPP。页写入获后端接受与设备持久化是两个阶段。
 
 ### 进程内存限额
 

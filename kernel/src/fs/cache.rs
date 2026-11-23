@@ -164,20 +164,6 @@ pub(crate) fn resize_inode(ino: u32, old: usize, new: usize) {
     pages.retain(|(id, off, page)| *id != ino || (*off < new && page.is_valid()));
 }
 
-/// 仅使文件偏移范围内相交的共享页失效；范围外的页保持原状。
-#[allow(dead_code)] // 保留范围失效入口
-pub(crate) fn invalidate_range(ino: u32, offset: usize, length: usize) -> Result<(), Errno> {
-    let end = offset.checked_add(length).ok_or(Errno::Invalid)?;
-    let mut pages = PAGES.lock();
-    for (id, off, page) in pages.iter() {
-        if *id == ino && *off < end && offset < *off + 4096 {
-            page.invalidate();
-        }
-    }
-    pages.retain(|(id, off, _)| *id != ino || *off >= end || *off + 4096 <= offset);
-    Ok(())
-}
-
 /// 截断前使某 inode 的旧共享页失效，后续不再写回；索引立即移除。
 #[allow(dead_code)] // 保留全量失效入口
 pub(crate) fn invalidate_inode(ino: u32) {
