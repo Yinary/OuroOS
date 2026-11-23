@@ -81,6 +81,7 @@ pub mod sysnr {
     pub const TIMES: usize = 153;
     pub const SET_TID_ADDRESS: usize = 96;
     pub const WAITID: usize = 95;
+    pub const GETRUSAGE: usize = 165;
     pub const SETPGID: usize = 154;
     pub const GETPGID: usize = 155;
     pub const GETSID: usize = 156;
@@ -455,6 +456,7 @@ pub fn dispatch(
         | sysnr::EXECVE
         | sysnr::WAIT4
         | sysnr::WAITID
+        | sysnr::GETRUSAGE
         | sysnr::SETPGID
         | sysnr::GETPGID
         | sysnr::GETSID

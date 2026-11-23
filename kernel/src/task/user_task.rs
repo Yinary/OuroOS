@@ -1030,6 +1030,7 @@ fn process_call(
             }
         }
         sysnr::WAITID => return waitid(parent, frame, args),
+        sysnr::GETRUSAGE => get_rusage(parent, args),
         sysnr::SETPGID => set_pg_id(parent, args),
         sysnr::GETPGID => get_pg_or_sid(parent, args[0], false),
         sysnr::GETSID => get_pg_or_sid(parent, args[0], true),
@@ -1429,6 +1430,34 @@ fn waitid(parent: Pid, frame: &mut TrapFrame, args: [usize; 6]) -> ProcessResult
         return ProcessResult::Done;
     }
     ProcessResult::Wait(WaitReason::Children)
+}
+
+fn get_rusage(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let who = args[0] as u32 as i32;
+    let reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter()
+        .find(|r| r.pid == parent)
+        .ok_or(Errno::NoProcess)?;
+    let (user, system) = match who {
+        0 | 1 => (rec.user_ns, rec.system_ns),
+        -1 => (rec.child_user_ns, rec.child_system_ns),
+        _ => return Err(Errno::Invalid),
+    };
+    let mut data = [0u8; 144];
+    data[0..8].copy_from_slice(&(user / 1_000_000_000).to_ne_bytes());
+    data[8..16].copy_from_slice(&((user % 1_000_000_000) / 1000).to_ne_bytes());
+    data[16..24].copy_from_slice(&(system / 1_000_000_000).to_ne_bytes());
+    data[24..32].copy_from_slice(&((system % 1_000_000_000) / 1000).to_ne_bytes());
+    rec.space
+        .as_ref()
+        .ok_or(Errno::NoProcess)
+        .and_then(|s| {
+            crate::mm::user_access::copy_to_user(s.as_space(), args[1], &data)
+                .map_err(|_| Errno::Fault)
+        })
+        .map(|()| 0)
 }
 /// 创建独立地址空间的子进程，保留父现场，子进程从下一条指令返回零。
 /// fork(2)/clone(2) 支持的标志：退出信号必须是 SIGCHLD（纯进程 fork），
