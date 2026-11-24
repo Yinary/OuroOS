@@ -256,6 +256,8 @@ pub enum Flow {
     SigReturn,
     /// 任务已退出，携带退出状态。
     Exited(i32),
+    /// 线程组退出：终止组内全部线程后登记组终态。
+    ExitedGroup(i32),
 }
 
 /// 系统调用分发，返回 Flow。返回值写回 a0，PC 推进与执行流决策由调用方处理。
@@ -386,7 +388,8 @@ pub fn dispatch(
             cx[TrapFrameArgs::RET] = pid;
             Flow::Continue
         }
-        sysnr::EXIT | sysnr::EXIT_GROUP => Flow::Exited(a0 as i32),
+        sysnr::EXIT => Flow::Exited(a0 as i32),
+        sysnr::EXIT_GROUP => Flow::ExitedGroup(a0 as i32),
         sysnr::READAHEAD => {
             cx[TrapFrameArgs::RET] = to_abi(memory::readahead(fs, a0, a1, a2));
             Flow::Continue

@@ -119,6 +119,8 @@ enum Action {
     Wait(WaitReason),
     /// 任务终止（exit 或致命异常）。
     Exit(ExitInfo),
+    /// 线程组终止（exit_group）。
+    ExitGroup(ExitInfo),
 }
 
 /// 用户任务入口：在自己（任务）的内核栈上运行，直到 exit/被杀。
@@ -292,6 +294,9 @@ pub fn user_task_entry() -> ! {
                                     | Flow::SigReturn => Action::Continue,
                                     Flow::Yield => Action::Yield,
                                     Flow::Exited(code) => Action::Exit(ExitInfo::exited(code)),
+                                    Flow::ExitedGroup(code) => {
+                                        Action::ExitGroup(ExitInfo::exited(code))
+                                    }
                                 }
                             }
                         } else {
@@ -441,6 +446,7 @@ pub fn user_task_entry() -> ! {
         // 借用已结束，在此做调度决策
         match action {
             Action::Exit(info) => sched::exit_current(info),
+            Action::ExitGroup(info) => sched::exit_group_current(info),
             Action::Yield => sched::yield_now(),
             // Wait：先做可落睡的 park 检查，睡醒后补一次不落睡的重查。
             Action::Wait(reason) => {

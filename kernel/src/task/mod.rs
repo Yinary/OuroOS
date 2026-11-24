@@ -163,6 +163,11 @@ impl Registry {
         self.threads.retain(|t| t.tid != tid);
     }
 
+    /// 删除某线程组下全部线程记录。
+    pub(crate) fn remove_group_threads(&mut self, tgid: Pid) {
+        self.threads.retain(|t| t.tgid != tgid);
+    }
+
     /// 把线程号或进程号解析为线程组下标：先按 tid 查线程记录取其 tgid，找不到时按组记录自身的 pid 匹配。
     pub(crate) fn group_index(&self, pid: Pid) -> Option<usize> {
         let tgid = match self.thread(pid) {

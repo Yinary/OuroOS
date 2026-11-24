@@ -380,6 +380,56 @@ pub(super) fn reap_switched() {
         .reap_dead();
 }
 
+/// 当前任务所在线程组整体退出：登记组终态、终止组内其他线程，当前任务进 dead 表并永久切走。
+pub(super) fn exit_group_current(exit: ExitInfo) -> ! {
+    sync::assert_no_held("exit_group_current");
+    let cur_ptr = current_ptr();
+    let (pid, tgid, name) = {
+        let slot = SCHED.lock();
+        let task = slot
+            .as_ref()
+            .expect("scheduler not initialized")
+            .current
+            .as_ref()
+            .expect("exit without current task");
+        (task.pid, task.tgid, task.name)
+    };
+    log::debug!("thread group of '{}' (pid {}) exiting", name, pid);
+    registry::record_exit(tgid, exit);
+    request_children_wake();
+    {
+        let mut reg = REGISTRY.lock();
+        reg.remove_group_threads(tgid);
+    }
+    let (from, to) = {
+        let mut slot = SCHED.lock();
+        let s = slot.as_mut().expect("scheduler not initialized");
+        let mut cur = s.current.take().expect("exit without current task");
+        let from = cur.context_ptr();
+        debug_assert_eq!(cur_ptr, &mut *cur as *mut Task);
+        cur.state = TaskState::Exited;
+        s.dead.push(cur);
+        s.ready.retain(|task| task.tgid != tgid);
+        s.waiting.retain(|(task, _)| task.tgid != tgid);
+        s.drain_wake_requests();
+        s.wake_expired();
+        match s.ready.pop_front() {
+            Some(next) => {
+                let to = s.promote(next);
+                (from, to)
+            }
+            None => {
+                set_current(core::ptr::null_mut());
+                sync::set_holder(0);
+                timer::set_slice_end(None);
+                (from, addr_of!(s.idle_ctx))
+            }
+        }
+    };
+    switch_context(from, to);
+    unreachable!("exited task was resumed")
+}
+
 /// 当前任务退出：登记退出信息、释放地址空间、移入 dead 表并永久切走。
 /// 永不返回。退出信息的登记与空间释放集中在这里，调用方无需善后。
 /// 唤醒等待子进程退出的父任务（事件点直接唤醒，此时不持任何锁）。
@@ -397,27 +447,25 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
         (task.pid, task.tgid, task.name)
     };
     log::debug!("task '{}' (pid {}) exiting", name, pid);
-    if pid != tgid {
-        let key = {
-            let reg = REGISTRY.lock();
-            let clear = reg.thread(pid).map_or(0, |t| t.clear_child_tid);
-            if clear == 0 {
-                None
-            } else {
-                reg.group(pid).and_then(|r| r.space.as_ref()).and_then(|s| {
-                    let space = s.as_space();
-                    let key = space.translate(clear).map(|(pa, _)| FutexKey {
-                        frame: pa.raw() & !0xfff,
-                        offset: clear & 0xfff,
-                    });
-                    let _ = crate::mm::user_access::copy_to_user(space, clear, &[0; 4]);
-                    key
-                })
-            }
-        };
-        if let Some(key) = key {
-            wake_futex(key, 1, u32::MAX);
+    let key = {
+        let reg = REGISTRY.lock();
+        let clear = reg.thread(pid).map_or(0, |t| t.clear_child_tid);
+        if clear == 0 {
+            None
+        } else {
+            reg.group(pid).and_then(|r| r.space.as_ref()).and_then(|s| {
+                let space = s.as_space();
+                let key = space.translate(clear).map(|(pa, _)| FutexKey {
+                    frame: pa.raw() & !0xfff,
+                    offset: clear & 0xfff,
+                });
+                let _ = crate::mm::user_access::copy_to_user(space, clear, &[0; 4]);
+                key
+            })
         }
+    };
+    if let Some(key) = key {
+        wake_futex(key, 1, u32::MAX);
     }
     if let Some(info) = registry::record_thread_exit(pid, exit) {
         // 登记退出信息并释放地址空间：UserAddressSpace 的 Drop 会先切回
