@@ -21,7 +21,7 @@ use crate::{
 use super::{
     registry,
     task::{Task, TaskBody, TaskState, WaitReason},
-    ExitInfo,
+    ExitInfo, REGISTRY,
 };
 
 /// 当前任务地址（0 = idle）。以整数存址以满足 percpu 槽的 Send 要求。
@@ -330,7 +330,7 @@ pub(super) fn reap_switched() {
 pub(super) fn exit_current(exit: ExitInfo) -> ! {
     sync::assert_no_held("exit_current");
     let cur_ptr = current_ptr();
-    let (pid, name) = {
+    let (pid, tgid, name) = {
         let slot = SCHED.lock();
         let task = slot
             .as_ref()
@@ -338,14 +338,25 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
             .current
             .as_ref()
             .expect("exit without current task");
-        (task.pid, task.name)
+        (task.pid, task.tgid, task.name)
     };
     log::debug!("task '{}' (pid {}) exiting", name, pid);
-    // 登记退出信息并释放地址空间：UserAddressSpace 的 Drop 会先切回
-    // 内核根（若仍活动）再释放数据页/页表页。此刻仍在自己的内核栈上；
-    // 窗口映射在内核根与全部用户根中共享，切页表不影响栈访问。锁序 REGISTRY → FRAME。
-    registry::record_exit(pid, exit);
-    request_children_wake();
+    if pid != tgid {
+        let reg = REGISTRY.lock();
+        let clear = reg.thread(pid).map_or(0, |t| t.clear_child_tid);
+        if clear != 0 {
+            if let Some(space) = reg.group(pid).and_then(|r| r.space.as_ref()) {
+                let _ = crate::mm::user_access::copy_to_user(space.as_space(), clear, &[0; 4]);
+            }
+        }
+    }
+    if let Some(info) = registry::record_thread_exit(pid, exit) {
+        // 登记退出信息并释放地址空间：UserAddressSpace 的 Drop 会先切回
+        // 内核根（若仍活动）再释放数据页/页表页。此刻仍在自己的内核栈上；
+        // 窗口映射在内核根与全部用户根中共享，切页表不影响栈访问。锁序 REGISTRY → FRAME。
+        registry::record_exit(tgid, info);
+        request_children_wake();
+    }
     let (from, to) = {
         let mut slot = SCHED.lock();
         let s = slot.as_mut().expect("scheduler not initialized");

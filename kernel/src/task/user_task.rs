@@ -69,7 +69,7 @@ pub fn spawn_user(name: &'static str, elf: &[u8]) -> Result<Pid, SpawnError> {
         }
     })?;
     frame[TrapFrameArgs::SP] = sp;
-    let task = Task::new_user(pid, name, frame).map_err(|_| SpawnError::OutOfMemory)?;
+    let task = Task::new_user(pid, pid, name, frame).map_err(|_| SpawnError::OutOfMemory)?;
 
     let fs = crate::fs::context::Context::new().map_err(|_| SpawnError::OutOfMemory)?;
     let task = Box::try_new(task).map_err(|_| SpawnError::OutOfMemory)?;
@@ -252,7 +252,7 @@ pub fn user_task_entry() -> ! {
                                     &mut space.0,
                                     rec.fs.as_mut().expect("user fs context"),
                                     &mut rec.signal,
-                                    &mut thread.signal,
+                                    thread,
                                 ),
                                 None => Flow::Continue,
                             }
@@ -965,14 +965,17 @@ fn process_call(
         // clone(2) 的 child_tid 参数序是架构 ABI 的一部分：RV64 为
         // (flags, stack, ptid, tls, ctid)，LA64 为 (flags, stack, ptid,
         // ctid, tls)（对照两架构 clone.s 与 Linux fork.c 的拷贝语义）。
-        // 归一化为具名参数后再进通用 fork。
+        // 归一化为具名参数后再按 CLONE_THREAD 分流。
         sysnr::CLONE => {
             #[cfg(target_arch = "riscv64")]
             let (tls, child_tid) = (args[3], args[4]);
             #[cfg(target_arch = "loongarch64")]
             let (child_tid, tls) = (args[3], args[4]);
-            let _ = tls; // 本内核不支持 CLONE_SET_TLS，参数仅按 ABI 接收
-            fork_user(parent, frame, args[0], args[1], child_tid)
+            if args[0] & CLONE_THREAD != 0 {
+                fork_thread(parent, frame, args[0], args[1], args[2], tls, child_tid)
+            } else {
+                fork_user(parent, frame, args[0], args[1], child_tid)
+            }
         }
         sysnr::WAIT4 => {
             // wait4(2)：pid > 0 指定孩子，-1 等任意孩子，0 等本进程组，
@@ -1974,13 +1977,21 @@ fn sched_setaffinity(parent: Pid, pid_arg: usize, len: usize, mask: usize) -> Re
         Ok(0)
     }
 }
-/// 创建独立地址空间的子进程，保留父现场，子进程从下一条指令返回零。
-/// fork(2)/clone(2) 支持的标志：退出信号必须是 SIGCHLD（纯进程 fork），
-/// 另接受 NPTL fork 使用的 CLONE_CHILD_CLEARTID/CLONE_CHILD_SETTID（仅对
-/// 子进程生效；见 clone(2)），其余标志（线程/共享）不支持。
 const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
 const CLONE_CHILD_SETTID: usize = 0x0100_0000;
+const CLONE_VM: usize = 0x0000_0100;
+const CLONE_FS: usize = 0x0000_0200;
+const CLONE_FILES: usize = 0x0000_0400;
+const CLONE_SIGHAND: usize = 0x0000_0800;
+const CLONE_THREAD: usize = 0x0001_0000;
+const CLONE_SYSVSEM: usize = 0x0004_0000;
+const CLONE_SETTLS: usize = 0x0008_0000;
+const CLONE_PARENT_SETTID: usize = 0x0010_0000;
+const CLONE_DETACHED: usize = 0x0040_0000;
 
+/// 创建独立地址空间的子进程，保留父现场，子进程从下一条指令返回零。
+/// 退出信号必须是 SIGCHLD；另接受 NPTL fork 使用的 CLONE_CHILD_CLEARTID 与
+/// CLONE_CHILD_SETTID。带 CLONE_THREAD 的调用走 [`fork_thread`]。
 fn fork_user(
     parent: Pid,
     frame: &TrapFrame,
@@ -1992,7 +2003,7 @@ fn fork_user(
     if flags & !allowed != 0 || flags & 0xff != 17 {
         return Err(Errno::Invalid);
     }
-    let (mut space, creds) = {
+    let (space, creds) = {
         let reg = REGISTRY.lock();
         let source = reg.group(parent).ok_or(Errno::NoProcess)?;
         let space = source
@@ -2020,23 +2031,14 @@ fn fork_user(
         child_frame[TrapFrameArgs::SP] = stack;
     }
     let pid = super::registry::alloc_pid();
-    // CLONE_CHILD_SETTID：在子进程地址空间写入其 tid；CLONE_CHILD_CLEARTID：
-    // 子进程退出时清零该地址（退出路径已按 clear_child_tid 处理）。
-    if flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 && child_tid != 0 {
-        if flags & CLONE_CHILD_SETTID != 0 {
-            // 写入经 user_access 完成，目标是子进程自身的用户内存；地址来自
-            // 父进程参数，子进程尚未运行，无并发访问。
-            let _ = crate::mm::user_access::copy_to_user(
-                &space,
-                child_tid,
-                &(pid as u32).to_ne_bytes(),
-            );
-        }
-        if flags & CLONE_CHILD_CLEARTID != 0 {
-            space.clear_child_tid = child_tid;
-        }
+    // CLONE_CHILD_SETTID：在子进程地址空间写入其 tid。
+    if flags & CLONE_CHILD_SETTID != 0 && child_tid != 0 {
+        // 写入经 user_access 完成，目标是子进程自身的用户内存；地址来自
+        // 父进程参数，子进程尚未运行，无并发访问。
+        let _ =
+            crate::mm::user_access::copy_to_user(&space, child_tid, &(pid as u32).to_ne_bytes());
     }
-    let task = Task::new_user(pid, "child", child_frame).map_err(|_| Errno::NoMem)?;
+    let task = Task::new_user(pid, pid, "child", child_frame).map_err(|_| Errno::NoMem)?;
     let task = Box::try_new(task).map_err(|_| Errno::NoMem)?;
     super::registry::reserve().map_err(|_| Errno::NoMem)?;
     sched::reserve_task().map_err(|_| Errno::NoMem)?;
@@ -2092,9 +2094,107 @@ fn fork_user(
     }
     super::proc_table_push(pid, "child", parent, true);
     {
-        let reg = REGISTRY.lock();
+        let mut locked = REGISTRY.lock();
+        let reg = &mut *locked;
         proc_sync_holding(&reg.records, pid);
+        if flags & CLONE_CHILD_CLEARTID != 0 && child_tid != 0 {
+            if let Some(thread) = reg.thread_mut(pid) {
+                thread.clear_child_tid = child_tid;
+            }
+        }
     }
     sched::enqueue(task);
     Ok(pid)
+}
+
+/// 创建共享地址空间与文件表的新线程：退出信号必须为 0，必须同时带 CLONE_THREAD、
+/// CLONE_SIGHAND 与 CLONE_VM；另接受 CLONE_FS、CLONE_FILES、CLONE_SYSVSEM、
+/// CLONE_SETTLS 与三个 tid 标志，CLONE_DETACHED 按 Linux 忽略。
+fn fork_thread(
+    parent: Pid,
+    frame: &TrapFrame,
+    flags: usize,
+    stack: usize,
+    ptid: usize,
+    tls: usize,
+    child_tid: usize,
+) -> Result<usize, Errno> {
+    let allowed = CLONE_VM
+        | CLONE_FS
+        | CLONE_FILES
+        | CLONE_SIGHAND
+        | CLONE_THREAD
+        | CLONE_SYSVSEM
+        | CLONE_SETTLS
+        | CLONE_PARENT_SETTID
+        | CLONE_CHILD_CLEARTID
+        | CLONE_DETACHED
+        | CLONE_CHILD_SETTID;
+    if flags & 0xff != 0
+        || flags & (CLONE_SIGHAND | CLONE_VM) != (CLONE_SIGHAND | CLONE_VM)
+        || flags & !allowed != 0
+    {
+        return Err(Errno::Invalid);
+    }
+    let tgid = {
+        let reg = REGISTRY.lock();
+        reg.thread(parent).map_or(parent, |t| t.tgid)
+    };
+    let mut child_frame = TrapFrame::new();
+    child_frame.clone_from(frame);
+    child_frame.syscall_ok();
+    child_frame[TrapFrameArgs::RET] = 0;
+    if stack != 0 {
+        child_frame[TrapFrameArgs::SP] = stack;
+    }
+    if flags & CLONE_SETTLS != 0 {
+        child_frame[TrapFrameArgs::TLS] = tls;
+    }
+    let tid = super::registry::alloc_pid();
+    let task = Task::new_user(tid, tgid, "thread", child_frame).map_err(|_| Errno::NoMem)?;
+    let task = Box::try_new(task).map_err(|_| Errno::NoMem)?;
+    super::registry::reserve().map_err(|_| Errno::NoMem)?;
+    sched::reserve_task().map_err(|_| Errno::NoMem)?;
+    {
+        let mut locked = REGISTRY.lock();
+        super::registry::register_thread(&mut locked, tid, tgid, parent);
+    }
+    if flags & CLONE_PARENT_SETTID != 0 {
+        let copied = {
+            let reg = REGISTRY.lock();
+            reg.group(parent)
+                .and_then(|r| r.space.as_ref())
+                .is_some_and(|s| {
+                    crate::mm::user_access::copy_to_user(
+                        s.as_space(),
+                        ptid,
+                        &(tid as u32).to_ne_bytes(),
+                    )
+                    .is_ok()
+                })
+        };
+        if !copied {
+            REGISTRY.lock().remove_thread(tid);
+            return Err(Errno::Fault);
+        }
+    }
+    if flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 && child_tid != 0 {
+        let mut locked = REGISTRY.lock();
+        if flags & CLONE_CHILD_SETTID != 0 {
+            if let Some(space) = locked.group(parent).and_then(|r| r.space.as_ref()) {
+                let _ = crate::mm::user_access::copy_to_user(
+                    space.as_space(),
+                    child_tid,
+                    &(tid as u32).to_ne_bytes(),
+                );
+            }
+        }
+        if flags & CLONE_CHILD_CLEARTID != 0 {
+            if let Some(thread) = locked.thread_mut(tid) {
+                thread.clear_child_tid = child_tid;
+            }
+        }
+    }
+    sched::enqueue(task);
+    Ok(tid)
 }

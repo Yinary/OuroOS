@@ -126,6 +126,7 @@ pub struct ThreadRecord {
     pub tgid: Pid,
     /// 屏蔽字与备用栈；处置表与进程定向挂起在组记录里。
     pub signal: ThreadSig,
+    pub clear_child_tid: usize,
 }
 
 /// 注册表本体。pid 0 保留（"无任务"标识）。
@@ -337,7 +338,35 @@ mod registry {
             tid: pid,
             tgid: pid,
             signal: ThreadSig::new(),
+            clear_child_tid: 0,
         });
+    }
+
+    /// 登记一个新线程：信号状态从父线程 fork_from 继承。调用方须持 REGISTRY 锁。
+    pub fn register_thread(reg: &mut Registry, tid: Pid, tgid: Pid, parent_tid: Pid) {
+        let mut signal = ThreadSig::new();
+        if let Some(parent) = reg.thread(parent_tid) {
+            signal.fork_from(&parent.signal);
+        }
+        reg.threads.push(ThreadRecord {
+            tid,
+            tgid,
+            signal,
+            clear_child_tid: 0,
+        });
+    }
+
+    /// 删除线程记录并判断线程组是否已全部退出。
+    /// 返回 Some 表示这是组内最后一个线程，调用方接着按组退出处理。
+    pub fn record_thread_exit(tid: Pid, exit: ExitInfo) -> Option<ExitInfo> {
+        let mut reg = REGISTRY.lock();
+        let tgid = reg.thread(tid)?.tgid;
+        reg.remove_thread(tid);
+        let remaining = reg.threads.iter().filter(|t| t.tgid == tgid).count();
+        if remaining == 0 {
+            return Some(exit);
+        }
+        None
     }
 
     /// 任务退出的唯一登记点：记录终态、释放地址空间并通知父进程。
@@ -509,7 +538,8 @@ mod registry {
 /// 孵化一个内核任务：入口函数在自己的内核栈上运行，返回即退出(0)。
 pub fn spawn_kernel(name: &'static str, entry: fn()) -> Result<Pid, SpawnError> {
     let pid = registry::alloc_pid();
-    let task = task::Task::new_kernel(pid, name, entry).map_err(|_| SpawnError::OutOfMemory)?;
+    let task =
+        task::Task::new_kernel(pid, pid, name, entry).map_err(|_| SpawnError::OutOfMemory)?;
     let task = alloc::boxed::Box::try_new(task).map_err(|_| SpawnError::OutOfMemory)?;
     registry::reserve()?;
     sched::reserve_task().map_err(|_| SpawnError::OutOfMemory)?;
