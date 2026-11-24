@@ -174,7 +174,9 @@ impl Scheduler {
                 reg.records.iter().any(|r| {
                     r.pid == task.pid
                         && r.exit.is_none()
-                        && r.signal.pending() & !r.signal.blocked() != 0
+                        && r.signal.pending()
+                            & !reg.thread(task.pid).map_or(0, |t| t.signal.blocked())
+                            != 0
                 })
             });
         }

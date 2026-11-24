@@ -18,7 +18,7 @@ use crate::{
     trap::UserFault,
 };
 
-use signal::{SigInfoSlot, SignalState, CLD_EXITED, CLD_KILLED, SIGCHLD, SIG_IGN};
+use signal::{SigInfoSlot, SignalGroup, ThreadSig, CLD_EXITED, CLD_KILLED, SIGCHLD, SIG_IGN};
 
 pub use sched::yield_now;
 pub use task::{Pid, WaitReason};
@@ -101,7 +101,7 @@ pub struct ProcessRecord {
     child_system_ns: u64,
     fs: Option<crate::fs::context::Context>,
     /// 信号状态（模型见 signal 模块）。
-    pub signal: SignalState,
+    pub signal: SignalGroup,
     pub pid: Pid,
     pub name: &'static str,
     /// 用户任务的地址空间（单核凭证包装，见 mm::address_space::
@@ -119,10 +119,20 @@ pub struct ProcessRecord {
     pub creds: Credentials,
 }
 
+/// 线程记录：线程私有的信号状态。地址空间等组级资源在 ProcessRecord。
+pub struct ThreadRecord {
+    pub tid: Pid,
+    /// 所属线程组；当前每个进程只有一个线程，与 tid 相同。
+    pub tgid: Pid,
+    /// 屏蔽字与备用栈；处置表与进程定向挂起在组记录里。
+    pub signal: ThreadSig,
+}
+
 /// 注册表本体。pid 0 保留（"无任务"标识）。
 struct Registry {
     next_pid: Pid,
     records: Vec<ProcessRecord>,
+    threads: Vec<ThreadRecord>,
 }
 
 static REGISTRY: DebugMutex<Registry> = DebugMutex::new(
@@ -130,8 +140,26 @@ static REGISTRY: DebugMutex<Registry> = DebugMutex::new(
     Registry {
         next_pid: 1,
         records: Vec::new(),
+        threads: Vec::new(),
     },
 );
+
+impl Registry {
+    /// 按 tid 取线程记录。
+    pub(crate) fn thread(&self, tid: Pid) -> Option<&ThreadRecord> {
+        self.threads.iter().find(|t| t.tid == tid)
+    }
+
+    /// 按 tid 取可变的线程记录。
+    pub(crate) fn thread_mut(&mut self, tid: Pid) -> Option<&mut ThreadRecord> {
+        self.threads.iter_mut().find(|t| t.tid == tid)
+    }
+
+    /// 按 tid 删除线程记录。
+    pub(crate) fn remove_thread(&mut self, tid: Pid) {
+        self.threads.retain(|t| t.tid != tid);
+    }
+}
 
 /// 终态行积攒表：收割即删后注册表不留历史，输出推迟到时代结束，
 /// 避免混入用户程序的测试输出块（官方 oracle 按 START/END 判定）。
@@ -257,9 +285,11 @@ mod registry {
 
     /// 登记前预留容量，错误不会留下半注册的任务。
     pub fn reserve() -> Result<(), SpawnError> {
-        REGISTRY
-            .lock()
-            .records
+        let mut reg = REGISTRY.lock();
+        reg.records
+            .try_reserve(1)
+            .map_err(|_| SpawnError::OutOfMemory)?;
+        reg.threads
             .try_reserve(1)
             .map_err(|_| SpawnError::OutOfMemory)
     }
@@ -281,7 +311,12 @@ mod registry {
             child_user_ns: 0,
             child_system_ns: 0,
             fs: None,
-            signal: SignalState::new(),
+            signal: SignalGroup::new(),
+        });
+        reg.threads.push(ThreadRecord {
+            tid: pid,
+            tgid: pid,
+            signal: ThreadSig::new(),
         });
     }
 
@@ -339,10 +374,12 @@ mod registry {
             let auto_reap = if orphan {
                 false
             } else {
+                let parent_tgid = reg.thread(parent_pid).map_or(parent_pid, |t| t.tgid);
+                let parent_blocked = reg.thread(parent_pid).map_or(0, |t| t.signal.blocked());
                 match reg
                     .records
                     .iter_mut()
-                    .find(|r| r.pid == parent_pid && r.exit.is_none())
+                    .find(|r| r.pid == parent_tgid && r.exit.is_none())
                 {
                     Some(parent) => {
                         let d = parent.signal.disposition(SIGCHLD);
@@ -358,7 +395,7 @@ mod registry {
                         // SIGCHLD 生产点 IGN 无条件丢弃（do_notify_parent 的
                         // sig=0，屏蔽也不例外）；其余经 generate 过滤入队。
                         if d.handler != SIG_IGN {
-                            parent.signal.generate(SIGCHLD, chld_slot);
+                            parent.signal.generate(SIGCHLD, chld_slot, parent_blocked);
                         }
                         auto_reap
                     }
@@ -378,6 +415,9 @@ mod registry {
             reg.records.retain(|r| {
                 !(r.parent == pid && r.exit.is_some() || (r.pid == pid && (orphan || auto_reap)))
             });
+            for pid in &removed {
+                reg.remove_thread(*pid as Pid);
+            }
             proc_table_remove_all(|p| removed.contains(&p));
             for child in reg.records.iter_mut().filter(|r| r.parent == pid) {
                 child.parent = init;
@@ -400,6 +440,7 @@ mod registry {
             .iter()
             .position(|r| r.pid == target && r.parent == parent && r.exit.is_some())?;
         let rec = reg.records.remove(i);
+        reg.remove_thread(target);
         proc_table_remove_all(|p| p == target as u32);
         Some((
             rec.user_ns.saturating_add(rec.child_user_ns),

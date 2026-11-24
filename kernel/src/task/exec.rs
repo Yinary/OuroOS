@@ -287,7 +287,8 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
             .ok_or(Errno::Invalid)?;
         ctx.path((-100isize) as usize, &path)?
     };
-    let mut reg = REGISTRY.lock();
+    let mut locked = REGISTRY.lock();
+    let reg = &mut *locked;
     let rec = reg
         .records
         .iter_mut()
@@ -300,6 +301,9 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
     // —— 提交段：发布备齐对象，无分配、无失败路径 ——
     rec.space = Some(LocalSpace(space));
     rec.signal.reset_for_exec();
+    if let Some(thread) = reg.threads.iter_mut().find(|t| t.tid == pid) {
+        thread.signal.reset_for_exec();
+    }
     rec.did_exec = true;
     crate::task::proc_table_set_cmdline(pid, cmdline);
     if let Some(ctx) = rec.fs.as_mut() {

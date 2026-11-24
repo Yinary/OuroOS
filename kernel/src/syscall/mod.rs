@@ -262,7 +262,8 @@ pub fn dispatch(
     pid: usize,
     space: &mut UserAddressSpace,
     fs: &mut crate::fs::context::Context,
-    signal: &mut crate::task::signal::SignalState,
+    signal: &mut crate::task::signal::SignalGroup,
+    thread: &mut crate::task::signal::ThreadSig,
 ) -> Flow {
     // 调用号在 a7（TrapFrameArgs::SYSCALL），参数在 a0..；返回值写回 a0
     let nr = cx[TrapFrameArgs::SYSCALL];
@@ -330,6 +331,7 @@ pub fn dispatch(
                         pid: pid as u32,
                         ..Default::default()
                     },
+                    thread.blocked(),
                 );
             }
             cx[TrapFrameArgs::RET] = to_abi(ret);
@@ -423,20 +425,20 @@ pub fn dispatch(
         }
         sysnr::RT_SIGPROCMASK => {
             // rt_sigprocmask(2)：屏蔽集合改读
-            let ret = signal::rt_sigprocmask(space, a0, a1, a2, args[3], signal);
+            let ret = signal::rt_sigprocmask(space, a0, a1, a2, args[3], thread);
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
         sysnr::RT_SIGPENDING => {
             // rt_sigpending(2)：pending 位图回写
-            let ret = signal::rt_sigpending(space, a0, a1, signal);
+            let ret = signal::rt_sigpending(space, a0, a1, signal, thread);
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
         sysnr::SIGALTSTACK => {
             // sigaltstack(2)：备用栈登记的换读；只改调用者自身记录，
             // on_alt/SS_ONSTACK 判定用陷入前的用户 sp。
-            let ret = signal::rt_sigaltstack(space, cx[TrapFrameArgs::SP], a0, a1, signal);
+            let ret = signal::rt_sigaltstack(space, cx[TrapFrameArgs::SP], a0, a1, thread);
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
@@ -445,12 +447,12 @@ pub fn dispatch(
             // 失败按 force SIGSEGV 处置，偏差登记 docs/ostd-contracts.md §4.5。
             match crate::sigframe::restore(cx, space) {
                 // 成功：换回帧内保存的屏蔽集合（KILL/STOP 已剥除）。
-                Ok(old) => signal.setmask(old),
+                Ok(old) => thread.setmask(old),
                 Err(_) => {
                     signal.set_disposition(SIGSEGV, Default::default());
                     let mut one: SignalSet = 0;
                     one.add(SIGSEGV);
-                    signal.unblock(one);
+                    thread.unblock(one);
                     signal.generate(
                         SIGSEGV,
                         SigInfoSlot {
@@ -458,6 +460,7 @@ pub fn dispatch(
                             addr: cx[TrapFrameArgs::SP],
                             ..Default::default()
                         },
+                        thread.blocked(),
                     );
                 }
             }

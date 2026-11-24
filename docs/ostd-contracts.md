@@ -170,8 +170,9 @@ polyhal-boot 仍走 crates.io。polyhal-trap 的补丁：#5 TrapType 直达、
 | 对象 | 内容 | 位置 |
 |---|---|---|
 | Task | 内核栈 + 私有 KContext + 首次入口身体 + pid | 调度器 Box；身体首次取出后为 None |
-| ProcessRecord | 地址空间 + fs + 退出信息 + 父子关系 + 进程组与会话 + 信号状态 | 静态 REGISTRY |
-| SignalState | 处置表 / pending / blocked / 信息槽 / 备用栈 | `ProcessRecord.signal`；字段按共享侧（处置、pending）与私有侧（blocked、备用栈）分组注释，为线程化预留迁移形状（私有侧届时搬入线程记录） |
+| ProcessRecord | 地址空间 + fs + 退出信息 + 父子关系 + 进程组与会话 + 组级信号状态 | 静态 REGISTRY，按线程组登记 |
+| ThreadRecord | tid、所属线程组、屏蔽字与备用栈 | 静态 REGISTRY 的 threads 表；当前每个进程一个线程，tid 等于 pid |
+| SignalGroup / ThreadSig | 组级：处置表、pending、信息槽；线程级：屏蔽字、备用栈 | 分别为 `ProcessRecord.signal` 与 `ThreadRecord.signal`；线程定向挂起与逐线程唤醒留待多线程提交 |
 | CURRENT | 当前任务地址（整数存址，绕开裸指针 !Send） | percpu |
 
 Task 与 ProcessRecord 分离是为线程预留；地址空间只住注册表。pid
