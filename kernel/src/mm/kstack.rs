@@ -20,6 +20,9 @@ pub const WINDOW_BASE: usize = 0x4_0000_0000;
 const WINDOW_SIZE: usize = 0x0100_0000;
 /// 窗口在根表中的索引；用户页表创建时复制该项以共享下级表。
 pub(super) const WINDOW_ROOT_INDEX: usize = (WINDOW_BASE >> 30) & 511;
+/// 共享窗口占用的完整根项区间；用户地址空间不得使用该根项。
+pub(super) const WINDOW_ROOT_START: usize = WINDOW_ROOT_INDEX << 30;
+pub(super) const WINDOW_ROOT_END: usize = WINDOW_ROOT_START + (1 << 30);
 
 const WINDOW_PAGES: usize = WINDOW_SIZE / PAGE_SIZE;
 const L0_COUNT: usize = WINDOW_PAGES / 512;

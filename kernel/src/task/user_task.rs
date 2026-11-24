@@ -35,6 +35,8 @@ pub enum SpawnError {
     OutOfMemory,
     /// ELF 解析/加载失败（程序从未运行）。
     Load(ElfError),
+    /// 没有可信启动熵，拒绝构造可预测的 AT_RANDOM。
+    NoEntropy,
 }
 
 /// 孵化一个用户任务并加入就绪队列，返回 pid。
@@ -58,8 +60,13 @@ pub fn spawn_user(name: &'static str, elf: &[u8]) -> Result<Pid, SpawnError> {
     arg0.try_reserve_exact(name.len())
         .map_err(|_| SpawnError::OutOfMemory)?;
     arg0.push_str(name);
-    let sp = super::exec::stack(&space, &[arg0], &[], &entry, None, name)
-        .map_err(|_| SpawnError::OutOfMemory)?;
+    let sp = super::exec::stack(&space, &[arg0], &[], &entry, None, name).map_err(|e| {
+        if e == Errno::Io {
+            SpawnError::NoEntropy
+        } else {
+            SpawnError::OutOfMemory
+        }
+    })?;
     frame[TrapFrameArgs::SP] = sp;
     let task = Task::new_user(pid, name, frame).map_err(|_| SpawnError::OutOfMemory)?;
 
@@ -329,7 +336,21 @@ pub fn user_task_entry() -> ! {
                             reg.records.iter().find(|r| r.pid == pid)
                                 .and_then(|r| r.space.as_ref())
                                 .ok_or(crate::mm::address_space::MapError::NotMapped)
-                                .and_then(|s| { let space = s.as_space(); if space.translate(addr).is_some() { return Err(crate::mm::address_space::MapError::PermissionDenied); } space.ensure_access(addr, access) })
+                                .and_then(|s| {
+                                    let space = s.as_space();
+                                    if let Some((_, flags)) = space.translate(addr) {
+                                        if flags.contains(access) {
+                                            return Err(
+                                                crate::mm::address_space::MapError::PermissionDenied,
+                                            );
+                                        }
+                                    }
+                                    space.ensure_access(addr, access)?;
+                                    match space.translate(addr) {
+                                        Some((_, flags)) if flags.contains(access) => Ok(()),
+                                        _ => Err(crate::mm::address_space::MapError::PermissionDenied),
+                                    }
+                                })
                         };
                         if result.is_ok() { Action::Continue } else {
                             use crate::mm::address_space::MapError;
@@ -366,6 +387,10 @@ pub fn user_task_entry() -> ! {
                         }
                         let (kind, info) =
                             trap::fatal_fault(fatal).expect("fatal_fault covers fatal traps");
+                        let info = match kind {
+                            trap::UserFaultKind::Breakpoint => frame[TrapFrameArgs::SEPC],
+                            _ => info,
+                        };
                         // force 投递同上：由下一轮循环顶检查点消费。
                         let (sig, code) = fault_siginfo(kind);
                         force_signal(

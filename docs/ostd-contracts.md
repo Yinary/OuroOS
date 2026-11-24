@@ -48,7 +48,7 @@
 - 文件区域可扩展到 EOF 之后，只保留文件身份和页偏移；访问时以文件当前长度判定。关闭 fd、unlink 不丢失映射。共享映射可以通过零旧长度建立别名；等长 DONTUNMAP 保留源区间，源私有匿名页重新取零，文件与共享匿名页按后备取数。不支持跨不同属性区域搬移。
 - `mincore`（232）查询驻留位。文件映射按 inode 和页偏移查询共享缓存，同一文件页的别名可在首次访问前报告驻留。查询本身不会调页。PROT_NONE 仍属于映射。查询空洞返回 ENOMEM，未对齐起点返回 EINVAL，结果缓冲区不可写返回 EFAULT。复制前验证完整结果缓冲区。
 - MAP_SHARED | MAP_ANONYMOUS 使用按页号索引的共享对象，首次访问时分配物理页；fork 保留共享，最后一个映射销毁才释放，固定搬移和收缩保持引用。fork 不为共享页额外分配临时私有页。共享匿名区可以扩展，重叠的别名仍指向同一对象页。
-- 私有匿名 mmap、brk 与文件映射按需分配。用户缺页和内核复制共用 ensure_access；共享匿名也按需分配，ELF 装载页预分配。暂无换出或 COW。
+- 私有匿名 mmap、brk 与文件映射按需分配。用户缺页和内核复制共用 ensure_access；共享匿名也按需分配，ELF 装载页预分配。fork 后，已驻留的私有匿名页、堆页和用户栈页采用写时复制（copy-on-write，COW）。
 - 语义依据：[mremap(2)](https://man7.org/linux/man-pages/man2/mremap.2.html)、[mincore(2)](https://man7.org/linux/man-pages/man2/mincore.2.html)。实现独立编写，未复制 Linux 代码。
 
 ### 1.2 十律
@@ -85,7 +85,7 @@
 |---|---|
 | brk 字节级记账 | `address_space::brk` |
 | mmap 空洞 / MAP_FIXED | `find_free`、`replace_region` 事务替换 |
-| fork 深拷贝 | `deep_copy`，建成才发布，无 COW |
+| fork | `deep_copy` 完成子地址空间后，将父子共享的私有匿名、堆和栈物理页设为只读。首次写入时分配私有副本；只剩一个引用时恢复写权限。 |
 | exec 先建后切 | 新空间含 argv/envp/auxv，成功才替换 |
 | 页字节访问收口 | 拥有页复制及 ELF 初始页写入由 mm 封装；`elf.rs`、`fs/cache.rs`、`syscall/memory.rs`、`task/user_task.rs`、`task/exec.rs`、`task/task.rs` 拒绝 `unsafe` |
 | MAP_SHARED 文件页缓存 | `fs/cache.rs`；索引独立持有页，比较有效字节和上次写回基线，失败后可重试 |
@@ -96,7 +96,7 @@
 |---|---|
 | 直映硬化 | 直映区 base canary + 去可执行权限；未实现 |
 | 数据页/区域线性扫描 | 区域和页清单均按地址排序，查找走二分；fork/remap 仍逐页遍历 |
-| COW / 通用页缓存 / swap / 远端 TLB | 未做；MAP_SHARED 文件页缓存已实现，不是通用读写页缓存 |
+| 通用页缓存 / swap / 远端 TLB | 未做；MAP_SHARED 文件页缓存已实现，不是通用读写页缓存 |
 | 全局堆失败策略 | 8 MiB 固定；pipe 扩容、rsext4 的 `alloc::vec!` 不可失败，可耗尽→panic；需要统一 OOM 策略 |
 
 ## 2. polyhal 边界
@@ -149,8 +149,7 @@ README；不得直接编辑 `~/.cargo/registry`。上游 PR（MIT）待提。
   空间。内核任务与切换窗口内的代码运行在切换时仍激活的页表上
   （通常是上一任务；退出路径已切回内核根），依赖高半区一致（rv 复
   制根项，la 走 DMW）；这些路径不得访问用户低半区。
-- PC 推进归 HAL：断点 +2 由 polyhal 做，syscall 由 `syscall_ok` 恰
-  好一次。
+- 用户断点的信号地址和信号帧 PC 都指向断点指令。内核断点由 HAL 按指令长度推进，系统调用由 `syscall_ok` 推进一次。
 - 首次入口在调度器锁下取出 `TaskBody`；用户 TrapFrame 和 nanosleep
   截止时间由该任务内核栈上的运行循环局部持有，调度器不借用用户现场。
 
@@ -281,7 +280,7 @@ try_lock 失败即报告“持锁跨调度”。
 | faccessat/faccessat2 | 按路径检查存在性；X_OK 要求文件有任一执行位（无执行位 EACCES），R_OK/W_OK 在无凭证模型下放行；flags 仅接受 AT_EACCESS/AT_SYMLINK_NOFOLLOW，NOFOLLOW 暂与跟随一致 | 无 uid/gid 凭证检查 |
 | fchmod/fchmodat | 保留 07777 权限位（含 setuid/setgid/sticky），类型位由 inode 持有；仅普通文件与目录可改。fchmod 按已打开对象的 inode 身份生效（rename/unlink 后仍有效，管道/procfs FD 返回 ENOENT）；fchmodat 按路径，flags 仅接受 0/AT_SYMLINK_NOFOLLOW（后者暂与跟随一致）；FAT 卷返回 ENOTSUP | chmod(2) 未单独提供（走 fchmodat+AT_FDCWD 等价）；无 UID/GID 属主校验与 ACL |
 | syslog/klogctl | 按 man 2 action 编码：READ(2) 消耗式游标读取、READ_ALL(3) 全量、READ_CLEAR(4) 读后清空、CLEAR(5)、OPEN/CLOSE(0/1) 无操作返回 0、console 开关(6/7)无操作、SET_CONSOLE_LEVEL(8) 仅接受 1..=8 并记录（不变更实际输出）、SIZE_UNREAD(9)/SIZE_BUFFER(10) 返回未读/容量；其余 EINVAL | 日志环上限 8 KiB，只收集显式登记事件（启动报告/终态/panic），无内核分级日志 |
-| getrandom | 设备树 rng-seed 播种 ChaCha20 流（单次请求上限 64 KiB，可失败分配）；flags 仅接受 GRND_NONBLOCK/GRND_RANDOM；无种子时一律 EAGAIN（无合法阻塞唤醒来源），绝不以时间/常量伪造熵 | AT_RANDOM 在无种子时使 exec 失败（不假报随机性） |
+| getrandom | 设备树 rng-seed 播种 ChaCha20 流（单次请求上限 64 KiB，可失败分配）；flags 仅接受 GRND_NONBLOCK/GRND_RANDOM；无种子时一律 EAGAIN（无合法阻塞唤醒来源），绝不以时间/常量伪造熵 | 缺少可信启动熵时 execve 返回 EIO，保留旧映像；启动阶段若因此无法创建任何用户任务，内核同步文件系统并关机。 |
 | ioctl | 仅 /dev/misc/rtc 的 RTC_RD_TIME（cmd 按 unsigned int 截断比较）；其余命令与设备一律 ENOTTY | 终端 TCGETS/TCWINSZ、FIONBIO 等未实现（more 依赖的 isatty 降级为非终端） |
 | read/write/readv/writev | 共用 4 KiB 可失败堆缓冲区，单次分配后复用；向量描述符先复制到内核，最多 1024 项，总长度超过 ssize_t 返回 EINVAL；每次最多搬运 0x7ffff000 字节；遇短传输、EOF 或错误停止，已有进展时返回已完成长度 | 用户缓冲区按页交付，读只推进实际交付的偏移；完整调用持有打开文件锁；OOM 返回 ENOMEM，零长度不分配数据缓冲区 |
 | pread64/pwrite64/preadv/pwritev | 指定独立偏移，不修改共享文件偏移；负偏移 EINVAL，流式对象 ESPIPE；rv64/la64 原始向量定位 ABI 使用完整 pos_l，忽略 pos_h；O_APPEND 下定位写仍追加，与 Linux 已知行为一致 | 不支持 preadv2/pwritev2；Ext4 文件超限 EFBIG 独立于参数过长 E2BIG；部分错误仍按已完成字节数返回 |
@@ -346,7 +345,7 @@ FS 通过 `fs::mapping` 注册 MM 映射钩子：注册后，长度改变先由 
 | 基础调用 | clock_gettime(113)、exit_group(94) 等仍 ENOSYS；fcntl 文件锁和异步通知尚未实现；ioctl 仅支持 RTC_RD_TIME，TCGETS/TCWINSZ 等终端命令返回 ENOTTY |
 | 信号残余 | 停止/继续状态机、RT 排队、core 位等偏差与欠账集中登记 §4.5 |
 | ELF（动态库） | 内核不加载 DT_NEEDED 库（由用户态解释器完成）；libc-test 的 dlopen 等场景待验证 |
-| mm | COW、SIGBUS 用户投递；文件映射扩展；用户页执行禁止（NX） |
+| mm | SIGBUS 用户投递；文件映射扩展；用户页执行禁止（NX） |
 | fs | FAT getdents、句柄缓存与重命名；link/symlink；EXT4 日志重放 |
 
 ### 4.5 信号契约
@@ -507,6 +506,7 @@ signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综�
 | `make run-rv` / `make run-la` | 默认以 release 内核无盘启动 QEMU，运行七个演示任务（kthread A/B、hello、sched×2、check、ill）；官方原盘判分见下方 test 入口 |
 | `make selftest-rv` / `make selftest-la` | 构建 selftest 内核；启动该产物时启用 debug 断言、lock_debug、LOG=info 及额外 OOM 注入；polyhal #8 需 `-Zub-checks=no` |
 | `make test-rv` / `make test-la` | 官方原盘四组验收（basic/busybox × musl/glibc）：官方 QEMU 命令、原版 judge 判分、每轮干净盘副本；`make test-setup` 准备评测器与原盘 |
+| `tests/file_mapping.rs` | 用仓库固定的 Rust 执行 `rustc --edition=2021 --test tests/file_mapping.rs -o /tmp/ouro-file-mapping && /tmp/ouro-file-mapping`，覆盖缓存写回失败、重试与引用释放。 |
 | `tests/fs_stat.py --metadata` | `make all` 后执行 `python3 tests/fs_stat.py --metadata --output target/fs-validation/metadata`，验证双架构 128/256 字节 inode 的创建掩码、fork/exec、NOW/OMIT、FD/链接时间更新与落盘；只读版本先构建相应 feature，添加 --readonly 并指定独立输出目录，结束后恢复默认内核 |
 | `tests/fs_stat.py --truncate` | 构建后运行；验证双架构 128/256 字节 inode 的缩短、稀疏扩展、零尾部、预分配与索引回收、偏移不变、链接/已删名 FD、父子进程共享映射保护及错误参数；debugfs 独立核对落盘内容并运行 e2fsck/FAT fsck；只读构建增加 --readonly |
 | `tests/fs_stat.py --rename` / `tests/fs_rename_backend.py` | 前者在双架构及两种 inode 大小验证重命名、替换后的旧 FD、目录链接数/父项、扩容、目录引用保护与跨挂载拒绝，运行前后 e2fsck；只读构建另加 --readonly。后者在宿主端逐次注入元数据时间源 EIO，验证替换、插入和扩容后的回滚及 e2fsck，不代表磁盘掉电或所有 I/O 失败验证 |
@@ -538,7 +538,7 @@ signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综�
 
 mlock/munlock/mlock2 保存区域锁页属性，部分解锁拆分区域，ONFAULT 保持未驻留页延迟分配；普通锁页填充页后才提交锁属性。fork 不继承锁，DONTNEED 拒绝锁页，munmap 解除对应锁。已接入 RLIMIT_MEMLOCK 字节限额；缺少进程凭证模型，不能宣称通过 LTP 的凭证测例。mlockall 支持 CURRENT/FUTURE/ONFAULT，munlockall 同时清除未来策略；fork 不继承未来锁策略。
 
-msync 按相交 VMA 的文件偏移选择缓存页，再同步 Ext4 后端，失败返回后端错误；私有页不回写。最后一个映射释放时若写失败，缓存继续持有页，可在 fsync 或关机前重试。MS_INVALIDATE 遇锁页返回 EBUSY；MS_ASYNC 仍同步等待，FAT 同步仍返回 EOPNOTSUPP。页写入获后端接受与设备持久化是两个阶段。
+msync 按相交 VMA 的文件偏移选择缓存页，再同步 Ext4 后端，失败返回后端错误；私有页不回写。最后一个映射释放时若写失败，缓存继续持有页，可在 fsync 或关机前重试。MS_INVALIDATE 遇锁页返回 EBUSY。成功同步后共享别名继续使用同一缓存页，私有副本保留进程自己的修改。MS_ASYNC 仍同步等待，FAT 同步仍返回 EOPNOTSUPP。页写入获后端接受与设备持久化是两个阶段。
 
 ### 进程内存限额
 
@@ -562,7 +562,7 @@ msync 按相交 VMA 的文件偏移选择缓存页，再同步 Ext4 后端，失
 
 exec/spawn 从设备树启动熵派生独立的 16 字节，AT_RANDOM 指向新用户栈。静态 LoongArch glibc BusyBox 重定位后使用 mprotect(PROT_READ) 关闭写权限；页表保留执行权限。QEMU 10.0.2 上 `busybox sh -c exit` 成功。设备文件 /dev/zero 的打开和映射仍依赖 VFS。
 
-固定地址映射支持 MAP_FIXED_NOREPLACE（重叠返回 EEXIST，原数据保留）。MAP_LOCKED 使用与 mlockall 相同的限额，在建立映射后尽力预取，不改变未来映射的锁策略；没有交换空间预留账本，MAP_NORESERVE 不额外预留。MAP_POPULATE 在 VMA 建立后尽力预取；与 MAP_NONBLOCK 同用时不预取。未锁定的私有匿名 mremap 扩展只增加虚拟区间。MADV_DONTFORK/DOFORK 控制子进程是否继承该区间；WIPEONFORK/KEEPONFORK 控制私有匿名、堆、栈页在子进程内是否重新取零页。父进程内容不变。共享匿名扩展仅增加虚拟页描述，物理数据页按需分配；私有页 fork 深拷贝，没有实现 COW 或换出。
+固定地址映射支持 MAP_FIXED_NOREPLACE（重叠返回 EEXIST，原数据保留）。MAP_LOCKED 使用与 mlockall 相同的限额，在建立映射后尽力预取，不改变未来映射的锁策略；没有交换空间预留账本，MAP_NORESERVE 不额外预留。MAP_POPULATE 在 VMA 建立后尽力预取；与 MAP_NONBLOCK 同用时不预取。未锁定的私有匿名 mremap 扩展只增加虚拟区间。MADV_DONTFORK/DOFORK 控制子进程是否继承该区间；WIPEONFORK/KEEPONFORK 控制私有匿名、堆、栈页在子进程内是否重新取零页。父进程内容不变。共享匿名扩展仅增加虚拟页描述，物理数据页按需分配；fork 时私有匿名、堆和栈驻留页按写时复制共享。ELF 页和已驻留的私有文件页仍在 fork 时复制；尚无换出。
 
 /proc/meminfo 每次打开保存一次帧分配器统计；Cached 只计文件页缓存的数据帧。MemTotal 为已登记的可分配物理内存；MemAvailable 为 MemFree 的保守估计；交换为零。sysinfo(179) 提供同口径的总量和空闲量，单位 1024 字节；尚未统计负载均值和共享内存用量。procfs 另提供根目录、`/proc/<pid>/`（stat/cmdline/status）与设备节点，枚举来自 Task 维护的独立快照表（§4.3"其他"行）；/proc/mounts 报告根卷与 FAT 挂载。
 

@@ -208,7 +208,10 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame) -> TrapType {
     let estat = estat::read();
     let trap_type = match estat.cause() {
         Trap::Exception(Exception::Breakpoint) => {
-            tf.era += 4;
+            // OuroOS 补丁：用户信号帧保留断点地址；内核自检从下一条指令继续。
+            if !tf.from_user() {
+                tf.era += 4;
+            }
             TrapType::Breakpoint
         }
         Trap::Exception(Exception::AddressNotAligned) => {

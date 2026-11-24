@@ -3,7 +3,7 @@
 use super::shared::SharedPage;
 use super::{
     file::{self, FilePage, Mode},
-    frame::{FrameError, OwnedFrame},
+    frame::{FrameError, FrameRef},
     page_table::UserPageTable,
 };
 use alloc::vec::Vec;
@@ -77,7 +77,7 @@ pub struct VmArea {
 }
 /// 区域页的后备；未调入的文件页没有物理地址。
 pub(crate) enum Backing {
-    Private(OwnedFrame),
+    Private(FrameRef),
     AnonymousShared(SharedPage),
     File(FilePage),
 }
@@ -103,7 +103,52 @@ impl Backing {
 }
 struct Page {
     va: usize,
-    frame: Backing,
+    frame: RefCell<Backing>,
+}
+impl Page {
+    fn new(va: usize, frame: Backing) -> Self {
+        Self {
+            va,
+            frame: RefCell::new(frame),
+        }
+    }
+    fn backing(&self) -> core::cell::Ref<'_, Backing> {
+        self.frame.borrow()
+    }
+    fn replace(&self, frame: Backing) {
+        *self.frame.borrow_mut() = frame;
+    }
+    /// 请求权限到实际叶权限的唯一入口；共享私有帧在 COW 阶段扣除 W。
+    fn leaf_flags(&self, requested: MappingFlags) -> MappingFlags {
+        if matches!(&*self.backing(), Backing::Private(frame) if frame.strong_count() > 1) {
+            requested - MappingFlags::W
+        } else {
+            requested
+        }
+    }
+    fn install(
+        &self,
+        pt: &mut UserPageTable,
+        va: usize,
+        flags: MappingFlags,
+    ) -> Result<(), MapError> {
+        self.frame.borrow().install(pt, va, self.leaf_flags(flags))
+    }
+    fn addr(&self) -> Option<polyhal::PhysAddr> {
+        self.frame.borrow().addr()
+    }
+    fn private_info(&self) -> Option<(bool, polyhal::PhysAddr)> {
+        match &*self.backing() {
+            Backing::Private(frame) => Some((frame.strong_count() > 1, frame.addr())),
+            _ => None,
+        }
+    }
+    fn private_frame(&self) -> Option<FrameRef> {
+        match &*self.backing() {
+            Backing::Private(frame) => Some(frame.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// 一个用户地址空间，创建/运行/销毁均在同一核；数据页不允许外部释放。
@@ -135,6 +180,13 @@ fn check_flags(flags: MappingFlags) -> Result<(), MapError> {
     Ok(())
 }
 fn end_of(start: usize, count: usize) -> Result<usize, MapError> {
+    let end = end_of_unmap(start, count)?;
+    if start < super::kstack::WINDOW_ROOT_END && end > super::kstack::WINDOW_ROOT_START {
+        return Err(MapError::OutOfUserRange);
+    }
+    Ok(end)
+}
+fn end_of_unmap(start: usize, count: usize) -> Result<usize, MapError> {
     let end = count
         .checked_mul(PAGE_SIZE)
         .and_then(|n| start.checked_add(n))
@@ -267,7 +319,7 @@ impl UserAddressSpace {
         let version = file::truncations();
         if self.truncations.replace(version) != version {
             for page in &self.pages {
-                if let Backing::File(f) = &page.frame {
+                if let Backing::File(f) = &*page.backing() {
                     if f.stale() {
                         self.pt.borrow_mut().unmap(page.va);
                         f.discard();
@@ -331,10 +383,7 @@ impl UserAddressSpace {
         if !matches!(kind, AreaKind::Anonymous | AreaKind::Heap | AreaKind::Stack) {
             return Err(MapError::InvalidPermissions);
         }
-        let in_stack = self
-            .areas
-            .iter()
-            .any(|a| a.kind == AreaKind::Stack && a.start < end && start < a.end);
+        let in_stack = self.stack_covers(start, end);
         if end > GUARD_BOTTOM
             && !in_stack
             && !(kind == AreaKind::Stack && start >= USER_STACK_BOTTOM)
@@ -378,10 +427,7 @@ impl UserAddressSpace {
             true,
             Self::chargeable(AreaKind::Anonymous, false, flags),
         )?;
-        let in_stack = self
-            .areas
-            .iter()
-            .any(|a| a.kind == AreaKind::Stack && a.start < end && start < a.end);
+        let in_stack = self.stack_covers(start, end);
         if end > GUARD_BOTTOM && !in_stack {
             return Err(MapError::HitsStack);
         }
@@ -402,6 +448,9 @@ impl UserAddressSpace {
         for p in &self.pages {
             if start <= p.va && p.va < end {
                 self.pt.borrow_mut().unmap(p.va);
+                if let Backing::File(file) = &*p.backing() {
+                    file.discard();
+                }
             }
         }
         self.pages.retain(|p| p.va < start || p.va >= end);
@@ -439,12 +488,21 @@ impl UserAddressSpace {
         }
         self.refresh_files();
         let page_va = va / PAGE_SIZE * PAGE_SIZE;
+        // 叶项已满足请求时无需再查 pages/pending；避免顺序访问重复线性扫描。
+        if self
+            .pt
+            .borrow()
+            .translate(page_va)
+            .is_some_and(|(_, flags)| flags.contains(required))
+        {
+            return Ok(());
+        }
         if area.kind == AreaKind::SharedAnonymous {
             if self.pt.borrow().translate(va).is_some() {
                 return Ok(());
             }
             let page = self.page_at(page_va).ok_or(MapError::NotMapped)?;
-            let Backing::AnonymousShared(shared) = &page.frame else {
+            let Backing::AnonymousShared(shared) = &*page.backing() else {
                 return Err(MapError::NotMapped);
             };
             return shared.fault(|pa| {
@@ -456,7 +514,7 @@ impl UserAddressSpace {
         }
         if area.kind == AreaKind::File {
             let page = self.page_at(page_va).ok_or(MapError::NotMapped)?;
-            let Backing::File(file) = &page.frame else {
+            let Backing::File(file) = &*page.backing() else {
                 return Err(MapError::NotMapped);
             };
             if file.addr().is_none() {
@@ -466,8 +524,84 @@ impl UserAddressSpace {
                     return Err(e.into());
                 }
                 super::fence_icache();
+            } else if self.pt.borrow().translate(page_va).is_none() {
+                let pa = file.addr().ok_or(MapError::NotMapped)?;
+                self.pt.borrow_mut().map(page_va, pa, area.flags)?;
+                super::fence_icache();
             }
             return Ok(());
+        }
+        if matches!(
+            area.kind,
+            AreaKind::Anonymous | AreaKind::Heap | AreaKind::Stack
+        ) {
+            if let Some(page) = self.page_at(page_va) {
+                if let Some((shared, pa)) = page.private_info() {
+                    if required.contains(MappingFlags::W) {
+                        if shared {
+                            let old = page.private_frame().ok_or(MapError::NotMapped)?;
+                            let new = FrameRef::new()?;
+                            new.copy_from(&old);
+                            self.pt.borrow_mut().map(page_va, new.addr(), area.flags)?;
+                            page.replace(Backing::Private(new));
+                            super::fence_icache();
+                        } else if self.pt.borrow().translate(page_va).is_some() {
+                            self.pt.borrow_mut().protect(page_va, pa, area.flags);
+                        } else {
+                            self.pt.borrow_mut().map(page_va, pa, area.flags)?;
+                            super::fence_icache();
+                        }
+                    } else if self.pt.borrow().translate(page_va).is_none() {
+                        self.pt
+                            .borrow_mut()
+                            .map(page_va, pa, page.leaf_flags(area.flags))?;
+                        super::fence_icache();
+                    }
+                    return Ok(());
+                }
+            } else {
+                let pending_pos = self
+                    .pending
+                    .borrow()
+                    .iter()
+                    .position(|page| page.va == page_va);
+                if let Some(pos) = pending_pos {
+                    let info = {
+                        let pending = self.pending.borrow();
+                        pending[pos].private_info()
+                    };
+                    if let Some((shared, pa)) = info {
+                        if required.contains(MappingFlags::W) {
+                            if shared {
+                                let old = {
+                                    let pending = self.pending.borrow();
+                                    pending[pos].private_frame().ok_or(MapError::NotMapped)?
+                                };
+                                let new = FrameRef::new()?;
+                                new.copy_from(&old);
+                                self.pt.borrow_mut().map(page_va, new.addr(), area.flags)?;
+                                self.pending.borrow_mut()[pos].replace(Backing::Private(new));
+                                super::fence_icache();
+                            } else if self.pt.borrow().translate(page_va).is_some() {
+                                self.pt.borrow_mut().protect(page_va, pa, area.flags);
+                            } else {
+                                self.pt.borrow_mut().map(page_va, pa, area.flags)?;
+                                super::fence_icache();
+                            }
+                        } else if self.pt.borrow().translate(page_va).is_none() {
+                            let flags = self
+                                .pending
+                                .borrow()
+                                .get(pos)
+                                .map(|page| page.leaf_flags(area.flags))
+                                .ok_or(MapError::NotMapped)?;
+                            self.pt.borrow_mut().map(page_va, pa, flags)?;
+                            super::fence_icache();
+                        }
+                        return Ok(());
+                    }
+                }
+            }
         }
         if self.resident(va)? {
             return Ok(());
@@ -480,14 +614,11 @@ impl UserAddressSpace {
         }
         let mut pending = self.pending.borrow_mut();
         reserve(&mut pending, 1)?;
-        let frame = OwnedFrame::new()?;
+        let frame = FrameRef::new()?;
         self.pt
             .borrow_mut()
             .map(page_va, frame.addr(), area.flags)?;
-        pending.push(Page {
-            va: page_va,
-            frame: Backing::Private(frame),
-        });
+        pending.push(Page::new(page_va, Backing::Private(frame)));
         Ok(())
     }
 
@@ -530,7 +661,7 @@ impl UserAddressSpace {
                     .iter()
                     .find(|a| a.start <= page.va && page.va < a.end)
                     .ok_or(MapError::NotMapped)?;
-                page.frame.install(&mut pt, page.va, area.flags)?;
+                page.install(&mut pt, page.va, area.flags)?;
             }
         }
         let active = self.pt.borrow_mut().is_active();
@@ -611,6 +742,8 @@ impl UserAddressSpace {
         }
         if fits(start) {
             Ok(start)
+        } else if fits(super::kstack::WINDOW_ROOT_END) {
+            Ok(super::kstack::WINDOW_ROOT_END)
         } else {
             Err(MapError::OutOfMemory)
         }
@@ -651,10 +784,7 @@ impl UserAddressSpace {
         let mut fresh: Vec<Page> = Vec::new();
         reserve(&mut fresh, count)?;
         for va in (start..end).step_by(PAGE_SIZE) {
-            fresh.push(Page {
-                va,
-                frame: Backing::Private(OwnedFrame::new()?),
-            });
+            fresh.push(Page::new(va, Backing::Private(FrameRef::new()?)));
         }
         let mut next_pt = UserPageTable::new()?;
         for page in &self.pages {
@@ -666,10 +796,10 @@ impl UserAddressSpace {
                 .iter()
                 .find(|a| a.start <= page.va && page.va < a.end)
                 .ok_or(MapError::NotMapped)?;
-            page.frame.install(&mut next_pt, page.va, area.flags)?;
+            page.install(&mut next_pt, page.va, area.flags)?;
         }
         for page in &fresh {
-            page.frame.install(&mut next_pt, page.va, flags)?;
+            page.install(&mut next_pt, page.va, flags)?;
         }
         let active = self.pt.borrow_mut().is_active();
         core::mem::swap(self.pt.get_mut(), &mut next_pt);
@@ -722,13 +852,14 @@ impl UserAddressSpace {
         for page in &self.pages {
             if page.va >= start && page.va < end {
                 self.pt.borrow_mut().unmap(page.va);
-                if let Backing::File(file) = &page.frame {
+                if let Backing::File(file) = &*page.backing() {
                     file.discard();
                 }
             }
         }
-        self.pages
-            .retain(|p| p.va < start || p.va >= end || !matches!(p.frame, Backing::Private(_)));
+        self.pages.retain(|p| {
+            p.va < start || p.va >= end || !matches!(&*p.backing(), Backing::Private(_))
+        });
         super::fence_icache();
         Ok(())
     }
@@ -785,6 +916,23 @@ impl UserAddressSpace {
         Ok(())
     }
 
+    /// 立即锁页时，按可写私有映射的写权限预取，提前完成 fork 留下的 COW。
+    fn populate_locked(&self, area: &VmArea, start: usize, end: usize) -> Result<(), MapError> {
+        let cow = matches!(
+            area.kind,
+            AreaKind::Anonymous | AreaKind::Heap | AreaKind::Stack
+        );
+        let access = if cow && area.flags.contains(MappingFlags::W) {
+            MappingFlags::U | MappingFlags::W
+        } else {
+            MappingFlags::U
+        };
+        for va in (start..end).step_by(PAGE_SIZE) {
+            self.ensure_access(va, access)?;
+        }
+        Ok(())
+    }
+
     /// 修改锁页属性；普通锁页先填充页面，on-fault 只记录属性。
     pub fn lock_range(
         &mut self,
@@ -834,8 +982,8 @@ impl UserAddressSpace {
             }
         }
         if locked && !on_fault {
-            for va in (start..end).step_by(PAGE_SIZE) {
-                self.ensure_access(va, MappingFlags::U)?;
+            for area in self.areas.iter().filter(|a| a.start < end && start < a.end) {
+                self.populate_locked(area, start.max(area.start), end.min(area.end))?;
             }
         }
         self.areas = areas;
@@ -843,34 +991,7 @@ impl UserAddressSpace {
         Ok(())
     }
 
-    /// 仅撤销区间内的文件页；私有匿名内容与区间外页保持不变。
-    fn invalidate_file_range(
-        &mut self,
-        start: usize,
-        count: usize,
-    ) -> Result<(), crate::syscall::Errno> {
-        use crate::syscall::Errno;
-        let end = end_of(start, count).map_err(|_| Errno::NoMem)?;
-        for page in &self.pages {
-            if page.va < start || page.va >= end {
-                continue;
-            }
-            if let Backing::File(file) = &page.frame {
-                self.pt.borrow_mut().unmap(page.va);
-                if let Some((ino, offset)) = file.writeback_start() {
-                    crate::fs::cache::invalidate_range(ino, offset, PAGE_SIZE)
-                        .map_err(|_| Errno::NoMem)?;
-                }
-                file.discard();
-            }
-        }
-        self.pages
-            .retain(|p| !(start <= p.va && p.va < end && matches!(p.frame, Backing::File(_))));
-        super::fence_icache();
-        Ok(())
-    }
-
-    /// 同步完整映射区间内的可写共享文件页，复用文件系统已有写回入口。
+    /// 同步完整映射区间内的共享文件页，复用文件系统已有写回入口。
     pub fn sync_range(
         &mut self,
         start: usize,
@@ -888,36 +1009,17 @@ impl UserAddressSpace {
         {
             return Err(Errno::Busy);
         }
-        // MS_INVALIDATE：先同步请求范围，再仅失效文件页，保留私有匿名页。
-        if invalidate {
-            for area in self
-                .areas
-                .iter()
-                .filter(|a| a.kind == AreaKind::File && a.start < end && start < a.end)
-            {
-                let first = area.start.max(start);
-                let last = area.end.min(end);
-                let page = self.page_at(first).ok_or(Errno::Fault)?;
-                if let Backing::File(file) = &page.frame {
-                    if let Some((ino, offset)) = file.writeback_start() {
-                        let length = last - first;
-                        crate::fs::sync_mapping(ino, offset, length)?;
-                    }
-                }
-            }
-            self.invalidate_file_range(start, count)?;
-            return Ok(());
-        }
+        // 所有共享别名已使用同一缓存页；同步时保留其身份和私有映射的内容。
         // 每个文件 VMA 内页偏移连续；只同步用户指定区间对应的文件页。
         for area in self
             .areas
             .iter()
-            .filter(|a| a.kind == AreaKind::File && a.start < end && start < a.end)
+            .filter(|a| a.kind == AreaKind::File && a.shared_file && a.start < end && start < a.end)
         {
             let first = area.start.max(start);
             let length = area.end.min(end) - first;
             let page = self.page_at(first).ok_or(Errno::Fault)?;
-            if let Backing::File(file) = &page.frame {
+            if let Backing::File(file) = &*page.backing() {
                 if let Some((ino, offset)) = file.writeback_start() {
                     crate::fs::sync_mapping(ino, offset, length)?;
                 }
@@ -945,9 +1047,7 @@ impl UserAddressSpace {
             }
             if !on_fault {
                 for a in &self.areas {
-                    for va in (a.start..a.end).step_by(PAGE_SIZE) {
-                        self.ensure_access(va, MappingFlags::U)?;
-                    }
+                    self.populate_locked(a, a.start, a.end)?;
                 }
             }
             for a in &mut self.areas {
@@ -959,6 +1059,25 @@ impl UserAddressSpace {
         self.lock_onfault = on_fault;
         self.coalesce();
         Ok(())
+    }
+
+    /// 请求区间是否完全由现有用户栈 VMA 覆盖。
+    fn stack_covers(&self, start: usize, end: usize) -> bool {
+        if start < USER_STACK_BOTTOM {
+            return false;
+        }
+        let mut cursor = start;
+        for area in self
+            .areas
+            .iter()
+            .filter(|a| a.kind == AreaKind::Stack && a.start < end && start < a.end)
+        {
+            if area.start > cursor {
+                break;
+            }
+            cursor = cursor.max(area.end);
+        }
+        cursor >= end
     }
 
     /// 精确地址映射的冲突检测，全程由同一个可变地址空间借用保护。
@@ -979,19 +1098,17 @@ impl UserAddressSpace {
             return Ok(true);
         }
         if let Some(page) = self.page_at(page_va) {
-            return Ok(match &page.frame {
+            return Ok(match &*page.backing() {
                 Backing::File(file) => file.resident(),
                 frame => frame.addr().is_some(),
             });
         }
-        let pending = self.pending.borrow();
-        if pending.last().is_none_or(|p| p.va < page_va) {
-            return Ok(false);
-        }
-        Ok(pending
+        Ok(self
+            .pending
+            .borrow()
             .iter()
             .find(|p| p.va == page_va)
-            .is_some_and(|p| match &p.frame {
+            .is_some_and(|p| match &*p.backing() {
                 Backing::File(file) => file.resident(),
                 frame => frame.addr().is_some(),
             }))
@@ -1026,7 +1143,7 @@ impl UserAddressSpace {
         let old_end = if alias {
             start
         } else {
-            end_of(start, old_count)?
+            end_of_unmap(start, old_count)?
         };
         let area = *self
             .area_at(start)
@@ -1041,7 +1158,7 @@ impl UserAddressSpace {
             return Err(MapError::UnsupportedPermissions);
         }
         if alias {
-            let shareable = self.page_at(start).is_some_and(|p| match &p.frame {
+            let shareable = self.page_at(start).is_some_and(|p| match &*p.backing() {
                 Backing::AnonymousShared(_) => true,
                 Backing::File(f) => matches!(f.mode, Mode::Shared { .. }),
                 _ => false,
@@ -1157,29 +1274,27 @@ impl UserAddressSpace {
         reserve(&mut fresh, extra)?;
         reserve(&mut self.pages, extra)?;
         for i in keep..keep + extra {
-            fresh.push(Page {
-                va: dest + i * PAGE_SIZE,
-                frame: if matches!(area.kind, AreaKind::File | AreaKind::SharedAnonymous) {
-                    let last = self
-                        .page_at(if alias { start } else { old_end - PAGE_SIZE })
-                        .ok_or(MapError::NotMapped)?;
-                    match &last.frame {
-                        Backing::AnonymousShared(s) => {
-                            Backing::AnonymousShared(s.following(if alias {
-                                i
-                            } else {
-                                i - old_count + 1
-                            })?)
-                        }
-                        Backing::File(f) => Backing::File(
-                            f.following((if alias { i } else { i - old_count + 1 }) * PAGE_SIZE)?,
-                        ),
-                        _ => return Err(MapError::UnsupportedPermissions),
+            let frame = if matches!(area.kind, AreaKind::File | AreaKind::SharedAnonymous) {
+                let last = self
+                    .page_at(if alias { start } else { old_end - PAGE_SIZE })
+                    .ok_or(MapError::NotMapped)?;
+                match &*last.backing() {
+                    Backing::AnonymousShared(s) => {
+                        Backing::AnonymousShared(s.following(if alias {
+                            i
+                        } else {
+                            i - old_count + 1
+                        })?)
                     }
-                } else {
-                    Backing::Private(OwnedFrame::new()?)
-                },
-            });
+                    Backing::File(f) => Backing::File(
+                        f.following((if alias { i } else { i - old_count + 1 }) * PAGE_SIZE)?,
+                    ),
+                    _ => return Err(MapError::UnsupportedPermissions),
+                }
+            } else {
+                Backing::Private(FrameRef::new()?)
+            };
+            fresh.push(Page::new(dest + i * PAGE_SIZE, frame));
         }
         // 原区域保留后备身份，不保留私有副本。全部描述符在发布前准备。
         let mut original = Vec::new();
@@ -1194,20 +1309,19 @@ impl UserAddressSpace {
                 .iter()
                 .filter(|p| start <= p.va && p.va < old_end)
             {
-                let frame = match &page.frame {
+                let frame = match &*page.backing() {
                     Backing::AnonymousShared(p) => Backing::AnonymousShared(p.clone()),
                     Backing::File(f) => Backing::File(f.following(0)?),
                     _ => return Err(MapError::NotMapped),
                 };
-                original.push(Page { va: page.va, frame });
+                original.push(Page::new(page.va, frame));
             }
         }
         let mut pt = UserPageTable::new()?;
         for p in &self.pages {
             if start <= p.va && p.va < old_end {
                 if p.va < keep_end {
-                    p.frame
-                        .install(&mut pt, dest + (p.va - start), area.flags)?;
+                    p.install(&mut pt, dest + (p.va - start), area.flags)?;
                 }
             } else if p.va < dest || p.va >= end {
                 let flags = self
@@ -1216,12 +1330,12 @@ impl UserAddressSpace {
                     .find(|a| a.start <= p.va && p.va < a.end)
                     .ok_or(MapError::NotMapped)?
                     .flags;
-                p.frame.install(&mut pt, p.va, flags)?;
+                p.install(&mut pt, p.va, flags)?;
             }
         }
         for p in &fresh {
             if area.locked && !area.onfault {
-                match &p.frame {
+                match &*p.backing() {
                     Backing::File(f) => {
                         f.fault()?;
                     }
@@ -1229,7 +1343,7 @@ impl UserAddressSpace {
                     _ => {}
                 }
             }
-            p.frame.install(&mut pt, p.va, area.flags)?;
+            p.install(&mut pt, p.va, area.flags)?;
         }
         let active = self.pt.borrow_mut().is_active();
         core::mem::swap(self.pt.get_mut(), &mut pt);
@@ -1283,23 +1397,53 @@ impl UserAddressSpace {
             if area.no_fork || area.wipe_on_fork {
                 continue;
             }
-            let flags = area.flags;
-            let frame = match &source.frame {
-                Backing::Private(source) => {
-                    let dest = OwnedFrame::new()?;
-                    dest.copy_from(source);
+            let mut child_flags = area.flags;
+            let frame = match &*source.backing() {
+                Backing::Private(shared)
+                    if matches!(
+                        area.kind,
+                        AreaKind::Anonymous | AreaKind::Heap | AreaKind::Stack
+                    ) =>
+                {
+                    // 共享私有帧：子页沿用共享帧；父页在全部子页安装成功后再降权。
+                    child_flags = area.flags - MappingFlags::W;
+                    Backing::Private(shared.clone())
+                }
+                Backing::Private(shared) => {
+                    let dest = FrameRef::new()?;
+                    dest.copy_from(shared);
                     Backing::Private(dest)
                 }
                 Backing::File(f) => Backing::File(f.fork()?),
                 Backing::AnonymousShared(page) => Backing::AnonymousShared(page.clone()),
             };
-            frame.install(child.pt.get_mut(), source.va, flags)?;
-            child.pages.push(Page {
-                va: source.va,
-                frame,
-            });
+            frame.install(child.pt.get_mut(), source.va, child_flags)?;
+            child.pages.push(Page::new(source.va, frame));
         }
         child.pages.sort_unstable_by_key(|p| p.va);
+        // 子空间全部安装成功后再提交父 PTE 降权；失败路径不改父叶。
+        for source in self.pages.iter().chain(self.pending.borrow().iter()) {
+            let area = self
+                .areas
+                .iter()
+                .find(|a| a.start <= source.va && source.va < a.end)
+                .ok_or(MapError::NotMapped)?;
+            if !matches!(
+                area.kind,
+                AreaKind::Anonymous | AreaKind::Heap | AreaKind::Stack
+            ) {
+                continue;
+            }
+            if let Backing::Private(frame) = &*source.backing() {
+                if frame.strong_count() > 1 {
+                    self.pt.borrow_mut().protect(
+                        source.va,
+                        frame.addr(),
+                        area.flags - MappingFlags::W,
+                    );
+                }
+            }
+        }
         child.limits = self.limits;
         child.heap_start = self.heap_start;
         child.program_break = self.program_break;
@@ -1392,7 +1536,7 @@ impl UserAddressSpace {
                 .iter()
                 .find(|a| a.start <= p.va && p.va < a.end)
                 .ok_or(MapError::NotMapped)?;
-            p.frame.install(&mut pt, p.va, area.flags)?;
+            p.install(&mut pt, p.va, area.flags)?;
         }
         for (i, frame) in frames.into_iter().enumerate() {
             let va = start + i * PAGE_SIZE;
@@ -1408,7 +1552,7 @@ impl UserAddressSpace {
                 }
             }
             frame.install(&mut pt, va, flags)?;
-            fresh.push(Page { va, frame });
+            fresh.push(Page::new(va, frame));
         }
         let active = self.pt.borrow_mut().is_active();
         core::mem::swap(self.pt.get_mut(), &mut pt);
@@ -1470,7 +1614,7 @@ impl UserAddressSpace {
         let mut fresh: Vec<Page> = Vec::new();
         reserve(&mut fresh, count)?;
         for va in (start..end).step_by(PAGE_SIZE) {
-            let frame = match OwnedFrame::new() {
+            let frame = match FrameRef::new() {
                 Ok(frame) => frame,
                 Err(e) => {
                     for page in &fresh {
@@ -1486,10 +1630,7 @@ impl UserAddressSpace {
                 }
                 return Err(e.into());
             }
-            fresh.push(Page {
-                va,
-                frame: Backing::Private(frame),
-            });
+            fresh.push(Page::new(va, Backing::Private(frame)));
         }
         let ordered = self.pages.last().is_none_or(|p| p.va < start);
         self.append_pages(fresh, ordered);
@@ -1511,7 +1652,7 @@ impl UserAddressSpace {
     pub fn map_alloc(&mut self, va: usize, flags: MappingFlags) -> Result<PhysAddr, MapError> {
         self.map_region(va, 1, flags, AreaKind::Elf)?;
         self.page_at(va)
-            .and_then(|p| p.frame.addr())
+            .and_then(|p| p.addr())
             .ok_or(MapError::NotMapped)
     }
     /// 向已分配的 ELF 私有页写入初始内容；只接受页内区间，不检查用户写权限。
@@ -1524,7 +1665,7 @@ impl UserAddressSpace {
             return Err(MapError::NotMapped);
         }
         let page = self.page_at(page_va).ok_or(MapError::NotMapped)?;
-        match &page.frame {
+        match &*page.backing() {
             Backing::Private(frame) => frame
                 .write(va - page_va, data)
                 .map_err(|_| MapError::OutOfUserRange),
@@ -1583,7 +1724,7 @@ impl UserAddressSpace {
     /// 解除页区间，空洞允许；参数单位为页，syscall 层负责字节长度向上取整。
     pub fn unmap(&mut self, start: usize, count: usize) -> Result<(), MapError> {
         self.collect_pending()?;
-        let end = end_of(start, count)?;
+        let end = end_of_unmap(start, count)?;
         let next = self.split(start, end, None)?;
         for p in &self.pages {
             if start <= p.va && p.va < end {
@@ -1621,7 +1762,7 @@ impl UserAddressSpace {
         }
         if flags.contains(MappingFlags::W)
             && self.pages.iter().any(|p| {
-                p.va >= start && p.va < end && matches!(&p.frame, Backing::File(f) if f.mode == (Mode::Shared { writable: false }))
+                p.va >= start && p.va < end && matches!(&*p.backing(), Backing::File(f) if f.mode == (Mode::Shared { writable: false }))
             })
         {
             return Err(MapError::PermissionDenied);
@@ -1630,8 +1771,8 @@ impl UserAddressSpace {
         self.check_data_layout(&next)?;
         for p in &self.pages {
             if start <= p.va && p.va < end {
-                if let Some(pa) = p.frame.addr() {
-                    self.pt.borrow_mut().protect(p.va, pa, flags);
+                if let Some(pa) = p.addr() {
+                    self.pt.borrow_mut().protect(p.va, pa, p.leaf_flags(flags));
                 }
             }
         }
@@ -1640,12 +1781,16 @@ impl UserAddressSpace {
         Ok(())
     }
     fn same_backing_at(&self, boundary: usize) -> bool {
-        let find = |va| self.page_at(va).map(|p| &p.frame);
-        match (find(boundary - PAGE_SIZE), find(boundary)) {
-            (Some(Backing::File(a)), Some(Backing::File(b))) => a.immediately_before(b),
-            (Some(Backing::AnonymousShared(a)), Some(Backing::AnonymousShared(b))) => {
-                a.immediately_before(b)
-            }
+        let (Some(left), Some(right)) =
+            (self.page_at(boundary - PAGE_SIZE), self.page_at(boundary))
+        else {
+            return false;
+        };
+        let left = left.backing();
+        let right = right.backing();
+        match (&*left, &*right) {
+            (Backing::File(a), Backing::File(b)) => a.immediately_before(b),
+            (Backing::AnonymousShared(a), Backing::AnonymousShared(b)) => a.immediately_before(b),
             _ => false,
         }
     }
@@ -1676,16 +1821,24 @@ impl UserAddressSpace {
         if !(USER_BASE..USER_TOP).contains(&va) {
             return None;
         }
+        if (va >> 30) & 511 == super::kstack::WINDOW_ROOT_INDEX {
+            return None;
+        }
         self.pt.borrow_mut().translate(va)
     }
     /// ELF 段不能侵入固定栈和保护区。
     pub fn check_user_span(start: usize, len: usize) -> Result<(), MapError> {
         let end = start.checked_add(len).ok_or(MapError::OutOfUserRange)?;
         if end > GUARD_BOTTOM {
-            Err(MapError::HitsStack)
-        } else {
-            Ok(())
+            return Err(MapError::HitsStack);
         }
+        if len != 0
+            && start < super::kstack::WINDOW_ROOT_END
+            && end > super::kstack::WINDOW_ROOT_START
+        {
+            return Err(MapError::OutOfUserRange);
+        }
+        Ok(())
     }
     /// 切换页表并刷新本核 TLB。调用方当前使用内核栈，用户空间只在本核运行。
     pub fn activate(&self) {
