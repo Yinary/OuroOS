@@ -2,15 +2,14 @@
 //! 用户态陷阱由任务运行循环按完整 TrapType 处置。
 //! 职责划分依据见 docs/ostd-contracts.md §2/§3。
 
-use core::{sync::atomic::Ordering, time::Duration};
+use core::sync::atomic::Ordering;
 
-use polyhal::timer::set_next_timer;
 use polyhal_trap::{
     trap::TrapType,
     trapframe::{TrapFrame, TrapFrameArgs},
 };
 
-use crate::{config, BREAK_TICKS, TIMER_TICKS};
+use crate::{timer, BREAK_TICKS, TIMER_TICKS};
 
 #[cfg(target_arch = "loongarch64")]
 mod unaligned;
@@ -108,8 +107,9 @@ pub fn fatal_fault(trap_type: TrapType) -> Option<(UserFaultKind, usize)> {
 fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
     match trap_type {
         TrapType::Timer => {
-            TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
-            set_next_timer(crate::time::monotonic() + Duration::from_millis(config::TICK_MS));
+            if timer::on_interrupt() {
+                TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+            }
         }
         TrapType::Breakpoint => {
             // 用户态断点由运行循环按致命异常处置；内核态断点是启动自检

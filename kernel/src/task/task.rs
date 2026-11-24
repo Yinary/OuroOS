@@ -51,6 +51,16 @@ pub enum WaitReason {
     PollUntil(core::time::Duration),
 }
 
+impl WaitReason {
+    /// 带期限的等待原因返回其到期时刻。
+    pub fn deadline(&self) -> Option<core::time::Duration> {
+        match self {
+            WaitReason::Deadline(d) | WaitReason::PollUntil(d) => Some(*d),
+            _ => None,
+        }
+    }
+}
+
 /// 单个任务。
 pub struct Task {
     /// 内核上下文：切换的唯一载体。地址稳定性由 Box<Task> 保证。
@@ -60,9 +70,9 @@ pub struct Task {
     pub(super) pid: Pid,
     /// 调试与日志用名。
     pub(super) name: &'static str,
-    /// 本时间片起点的 tick；由调度器在切入（promote）时刷新，
-    /// 用户任务在逃逸点比较 [`crate::TIMER_TICKS`] 与它决定让出。
-    pub(super) slice_tick: usize,
+    /// 本时间片的终点；由调度器在切入（promote）时刷新，
+    /// 用户任务回用户态前比较当前时间与它决定让出。
+    pub(super) slice_end: core::time::Duration,
     /// 内核栈（纯所有权字段，仅 Drop 生效，无读取方；下划线豁免
     /// dead_code 检查）。任务回收时最终释放。
     _kstack: KernelStack,
@@ -87,7 +97,7 @@ impl Task {
             state: TaskState::Ready,
             pid,
             name,
-            slice_tick: 0,
+            slice_end: core::time::Duration::ZERO,
             _kstack: kstack,
         })
     }
@@ -105,7 +115,7 @@ impl Task {
             state: TaskState::Ready,
             pid,
             name,
-            slice_tick: 0,
+            slice_end: core::time::Duration::ZERO,
             _kstack: kstack,
         })
     }

@@ -450,12 +450,7 @@ pub fn user_task_entry() -> ! {
                     wait_uncompleted = outcome != ParkOutcome::Completed;
                 }
             }
-            Action::Continue => {
-                // 时间片起点由切入侧刷新。
-                if sched::slice_expired() {
-                    sched::yield_now();
-                }
-            }
+            Action::Continue => sched::resume_check(),
         }
     }
 }
