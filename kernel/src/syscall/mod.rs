@@ -64,6 +64,7 @@ pub mod sysnr {
     pub const EXIT_GROUP: usize = 94;
     pub const SYSINFO: usize = 179;
     pub const PPOLL: usize = 73;
+    pub const FUTEX: usize = 98;
     pub const NANOSLEEP: usize = 101;
     pub const CLOCK_GETTIME: usize = 113;
     pub const CLOCK_GETRES: usize = 114;
@@ -192,6 +193,8 @@ pub enum Errno {
     Fault,
     /// ENOSYS: 未实现的系统调用
     NoSys,
+    /// ETIMEDOUT: 等待超过期限。
+    TimedOut,
 }
 
 impl Errno {
@@ -232,6 +235,7 @@ impl Errno {
             Errno::BadF => 9,
             Errno::Fault => 14,
             Errno::NoSys => 38,
+            Errno::TimedOut => 110,
         }
     }
 }
@@ -500,6 +504,7 @@ pub fn dispatch(
         | sysnr::GETEGID
         | sysnr::GETTID
         | sysnr::CLONE
+        | sysnr::FUTEX
         | sysnr::EXECVE
         | sysnr::WAIT4
         | sysnr::WAITID

@@ -34,6 +34,13 @@ pub enum TaskState {
     Exited,
 }
 
+/// futex 等待的地址键：物理页帧号与页内字偏移。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FutexKey {
+    pub frame: usize,
+    pub offset: usize,
+}
+
 /// 任务挂起的原因；唤醒采用宽松匹配（醒来重查条件）而非精确订阅。
 /// 任何 pipe 状态变化唤醒全部 Pipe 等待者（单核惊群可忽略），
 /// 子进程退出唤醒全部 Children 等待者。
@@ -49,6 +56,10 @@ pub enum WaitReason {
     Signal,
     /// ppoll 同时等待管道变化或截止时间。
     PollUntil(core::time::Duration),
+    Futex {
+        key: FutexKey,
+        deadline: Option<core::time::Duration>,
+    },
 }
 
 impl WaitReason {
@@ -56,6 +67,7 @@ impl WaitReason {
     pub fn deadline(&self) -> Option<core::time::Duration> {
         match self {
             WaitReason::Deadline(d) | WaitReason::PollUntil(d) => Some(*d),
+            WaitReason::Futex { deadline, .. } => *deadline,
             _ => None,
         }
     }

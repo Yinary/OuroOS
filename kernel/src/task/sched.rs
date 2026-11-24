@@ -20,7 +20,7 @@ use crate::{
 
 use super::{
     registry,
-    task::{Task, TaskBody, TaskState, WaitReason},
+    task::{FutexKey, Task, TaskBody, TaskState, WaitReason},
     ExitInfo, REGISTRY,
 };
 
@@ -186,6 +186,7 @@ impl Scheduler {
         let now = crate::time::monotonic();
         self.move_waiting(|_, r| match r {
             WaitReason::Deadline(d) | WaitReason::PollUntil(d) => now >= *d,
+            WaitReason::Futex { deadline, .. } => deadline.is_some_and(|d| now >= d),
             _ => false,
         });
     }
@@ -316,6 +317,60 @@ pub fn park(reason: WaitReason) {
     reap_switched();
 }
 
+/// 唤醒某个 futex 键上至多 n 个等待者，返回实际唤醒数。
+pub fn wake_futex(key: FutexKey, n: usize) -> usize {
+    let mut slot = SCHED.lock();
+    let Some(s) = slot.as_mut() else {
+        return 0;
+    };
+    let mut woken = 0;
+    let mut i = 0;
+    while i < s.waiting.len() && woken < n {
+        if matches!(s.waiting[i].1, WaitReason::Futex { key: k, .. } if k == key) {
+            let (task, _) = s.waiting.swap_remove(i);
+            s.ready.push_back(task);
+            woken += 1;
+        } else {
+            i += 1;
+        }
+    }
+    s.refresh_deadline();
+    woken
+}
+
+/// 先唤醒 from 键上至多 nr_wake 个，再把至多 nr_requeue 个从 from 键改为等 to 键；返回唤醒数。
+pub fn requeue_futex(from: FutexKey, to: FutexKey, nr_wake: usize, nr_requeue: usize) -> usize {
+    let mut slot = SCHED.lock();
+    let Some(s) = slot.as_mut() else {
+        return 0;
+    };
+    let mut woken = 0;
+    let mut i = 0;
+    while i < s.waiting.len() && woken < nr_wake {
+        if matches!(s.waiting[i].1, WaitReason::Futex { key, .. } if key == from) {
+            let (task, _) = s.waiting.swap_remove(i);
+            s.ready.push_back(task);
+            woken += 1;
+        } else {
+            i += 1;
+        }
+    }
+    let mut requeued = 0;
+    for (_, reason) in s.waiting.iter_mut() {
+        if requeued >= nr_requeue {
+            break;
+        }
+        if let WaitReason::Futex { key, .. } = reason {
+            if *key == from {
+                *key = to;
+                requeued += 1;
+            }
+        }
+    }
+    s.refresh_deadline();
+    woken
+}
+
 /// 切到当前任务的栈后，回收此前退出任务的内核栈。
 pub(super) fn reap_switched() {
     let mut slot = SCHED.lock();
@@ -342,12 +397,25 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
     };
     log::debug!("task '{}' (pid {}) exiting", name, pid);
     if pid != tgid {
-        let reg = REGISTRY.lock();
-        let clear = reg.thread(pid).map_or(0, |t| t.clear_child_tid);
-        if clear != 0 {
-            if let Some(space) = reg.group(pid).and_then(|r| r.space.as_ref()) {
-                let _ = crate::mm::user_access::copy_to_user(space.as_space(), clear, &[0; 4]);
+        let key = {
+            let reg = REGISTRY.lock();
+            let clear = reg.thread(pid).map_or(0, |t| t.clear_child_tid);
+            if clear == 0 {
+                None
+            } else {
+                reg.group(pid).and_then(|r| r.space.as_ref()).and_then(|s| {
+                    let space = s.as_space();
+                    let key = space.translate(clear).map(|(pa, _)| FutexKey {
+                        frame: pa.raw() & !0xfff,
+                        offset: clear & 0xfff,
+                    });
+                    let _ = crate::mm::user_access::copy_to_user(space, clear, &[0; 4]);
+                    key
+                })
             }
+        };
+        if let Some(key) = key {
+            wake_futex(key, 1);
         }
     }
     if let Some(info) = registry::record_thread_exit(pid, exit) {

@@ -216,6 +216,7 @@ CURRENT 记录当前任务地址；调度器的 `current` Box 持有实体，切
   handler 类信号打断一律以 -EINTR 完成，pipe/wait4 按 SA_RESTART 分
   重启与 -EINTR，ppoll 不重启；语义规范与偏差见 §4.5。
 - 孵化预留 ready/waiting 各自容纳全部存活任务的容量；集中唤醒不分配。
+- futex 以物理页帧号与页内偏移为键：等待者按键挂起，唤醒方按键搬移就绪，重排队就地改键并保留各自期限；超时与其它截止时间共用调度边界扫描；被信号打断以 -EINTR 完成且不重启。
 - init 在仍有活跃进程时等待 Children 事件，醒后重查条件。
 - 等待表满时 park 退化为就绪让出；就绪空而等待非空时 idle 等时钟；
   互等即永久等待（QEMU 超时兜底）。
@@ -267,6 +268,7 @@ try_lock 失败即报告“持锁跨调度”。
 | 组 | 调用 | 实现 |
 |---|---|---|
 | 文件 | getcwd、dup、dup3、fcntl、mkdirat、mknodat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、readlinkat、readahead、statfs、fstatfs、newfstatat、fstat、fsync、statx、umask、utimensat、renameat、renameat2、truncate、ftruncate、fchmodat、fchmod | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
+| futex | WAIT、WAKE、REQUEUE、CMP_REQUEUE；键为物理页帧号与页内偏移，私有与共享标志都接受但键不区分；带超时的等待走截止时间扫描；被信号打断返回 EINTR | WAIT_BITSET、WAKE_BITSET、WAKE_OP 与 PI 系列返回 ENOSYS；线程退出清零 `clear_child_tid` 后唤醒该地址上的一个等待者 |
 | 进程 | exit、nanosleep、sched_yield、times、getpid、getppid、gettid、getuid、geteuid、getgid、getegid、getresuid、getresgid、getgroups、setuid、setgid、setreuid、setregid、setresuid、setresgid、setfsuid、setfsgid、setgroups、setpgid、getpgid、setsid、getsid、clone、execve、wait4、waitid | `task::process_call` |
 | 资源统计 | getrusage | `task::process_call` |
 | 调度查询与亲和 | sched_getscheduler、sched_getparam、sched_get_priority_max、sched_get_priority_min、sched_rr_get_interval、sched_getaffinity、sched_setaffinity | `task::process_call` |

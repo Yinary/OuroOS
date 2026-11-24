@@ -2,6 +2,7 @@
 //!（收割即删，见 §3 生命周期）、协作 + 时间片调度与等待/唤醒。
 //! 完整契约见 docs/ostd-contracts.md §3。
 
+mod futex;
 pub mod sched;
 pub mod signal;
 // Issue 指定的 `task/mod.rs` + `task/task.rs` 布局会自然形成同名子模块。
@@ -20,6 +21,7 @@ use crate::{
 
 use signal::{SigInfoSlot, SignalGroup, ThreadSig, CLD_EXITED, CLD_KILLED, SIGCHLD, SIG_IGN};
 
+pub use futex::{futex_call, FutexStep};
 pub use sched::yield_now;
 pub use task::{Pid, WaitReason};
 pub use user_task::{spawn_user, SpawnError};

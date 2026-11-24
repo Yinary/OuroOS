@@ -18,14 +18,14 @@ use crate::{
 };
 
 use super::{
-    sched,
+    futex_call, sched,
     signal::{
         default_action, fault_siginfo, force_signal, send_signal, DefaultAction, SigInfoSlot,
         SignalDisposition, SignalSet, SignalSetExt, SIGKILL, SIGSEGV, SIGSTOP, SIG_DFL, SIG_IGN,
         SI_TKILL,
     },
-    task::{Pid, Task, TaskBody, WaitReason},
-    ExitInfo, REGISTRY,
+    task::{FutexKey, Pid, Task, TaskBody, WaitReason},
+    ExitInfo, FutexStep, REGISTRY,
 };
 
 /// 孵化失败原因。
@@ -129,6 +129,7 @@ pub fn user_task_entry() -> ! {
         TaskBody::Kernel(_) => panic!("kernel task entered user entry"),
     };
     let mut sleep_deadline = None;
+    let mut futex_wait = None;
     // 循环局部等待状态：sigsuspend 的旧屏蔽集合、sigtimedwait 的等待集与截止。
     let mut sigsuspend_saved: Option<SignalSet> = None;
     let mut timedwait: Option<(SignalSet, core::time::Duration)> = None;
@@ -266,6 +267,7 @@ pub fn user_task_entry() -> ! {
                                     &mut sleep_deadline,
                                     &mut sigsuspend_saved,
                                     &mut timedwait,
+                                    &mut futex_wait,
                                     &mut wait_uncompleted,
                                 ),
                                 Flow::Wait(reason) => ProcessResult::Wait(reason),
@@ -448,6 +450,7 @@ pub fn user_task_entry() -> ! {
                     &mut frame,
                     &mut sleep_deadline,
                     &mut timedwait,
+                    &mut futex_wait,
                     true,
                 );
                 wait_uncompleted = outcome != ParkOutcome::Completed;
@@ -459,6 +462,7 @@ pub fn user_task_entry() -> ! {
                         &mut frame,
                         &mut sleep_deadline,
                         &mut timedwait,
+                        &mut futex_wait,
                         false,
                     );
                     wait_uncompleted = outcome != ParkOutcome::Completed;
@@ -533,6 +537,7 @@ fn park_check_signals(
     frame: &mut TrapFrame,
     sleep_deadline: &mut Option<core::time::Duration>,
     timedwait: &mut Option<(SignalSet, core::time::Duration)>,
+    futex_wait: &mut Option<(FutexKey, u32, Option<core::time::Duration>)>,
     allow_park: bool,
 ) -> ParkOutcome {
     // sigtimedwait 的等待集；Some 即本次挂起属于 rt_sigtimedwait。
@@ -643,6 +648,7 @@ fn park_check_signals(
             }
             // 其余：完成 syscall 返回 -EINTR；信号留给循环顶检查点。
             _ => {
+                *futex_wait = None;
                 frame.syscall_ok();
                 frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
                 ParkOutcome::Completed
@@ -673,6 +679,7 @@ fn process_call(
     sleep_deadline: &mut Option<core::time::Duration>,
     sigsuspend_saved: &mut Option<SignalSet>,
     timedwait: &mut Option<(SignalSet, core::time::Duration)>,
+    futex_wait: &mut Option<(FutexKey, u32, Option<core::time::Duration>)>,
     wait_uncompleted: &mut bool,
 ) -> ProcessResult {
     let args = frame.args();
@@ -975,6 +982,19 @@ fn process_call(
                 fork_thread(parent, frame, args[0], args[1], args[2], tls, child_tid)
             } else {
                 fork_user(parent, frame, args[0], args[1], child_tid)
+            }
+        }
+        sysnr::FUTEX => {
+            let step = {
+                let reg = REGISTRY.lock();
+                match reg.group(parent).and_then(|r| r.space.as_ref()) {
+                    Some(record) => futex_call(record.as_space(), args, futex_wait),
+                    None => FutexStep::Done(Err(Errno::NoProcess)),
+                }
+            };
+            match step {
+                FutexStep::Done(result) => result,
+                FutexStep::Wait(reason) => return ProcessResult::Wait(reason),
             }
         }
         sysnr::WAIT4 => {
