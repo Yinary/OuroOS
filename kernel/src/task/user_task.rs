@@ -70,11 +70,21 @@ pub fn spawn_user(name: &'static str, elf: &[u8]) -> Result<Pid, SpawnError> {
     super::proc_table_reserve().map_err(|_| SpawnError::OutOfMemory)?;
     // —— 提交段：此后不再失败 ——
     super::registry::register(pid, name, Some(crate::mm::address_space::LocalSpace(space)));
+    let (init_pgid, init_sid) = {
+        let reg = REGISTRY.lock();
+        let init = super::INIT_PID.load(core::sync::atomic::Ordering::Relaxed);
+        match reg.records.iter().find(|r| r.pid == init) {
+            Some(r) => (r.pgid, r.sid),
+            None => (init, init),
+        }
+    };
     {
         let mut reg = REGISTRY.lock();
         if let Some(r) = reg.records.iter_mut().find(|r| r.pid == pid) {
             r.fs = Some(fs);
             r.parent = super::INIT_PID.load(core::sync::atomic::Ordering::Relaxed);
+            r.pgid = init_pgid;
+            r.sid = init_sid;
         }
     }
     super::proc_table_push(
@@ -586,8 +596,11 @@ fn park_check_signals(
                 }
                 ParkOutcome::Completed
             }
-            // SA_RESTART：不完成不睡，信号留给循环顶检查点。
-            WaitReason::Pipe | WaitReason::Children if d.flags & SA_RESTART != 0 => {
+            // SA_RESTART：pipe 读写与 wait 的等待不完成不睡，信号留给循环顶检查点。
+            // ppoll 被 handler 信号打断一律以 -EINTR 完成。
+            WaitReason::Pipe | WaitReason::Children
+                if d.flags & SA_RESTART != 0 && frame[TrapFrameArgs::SYSCALL] != sysnr::PPOLL =>
+            {
                 ParkOutcome::Incomplete
             }
             // 其余：完成 syscall 返回 -EINTR；信号留给循环顶检查点。
@@ -921,19 +934,34 @@ fn process_call(
             fork_user(parent, frame, args[0], args[1], child_tid)
         }
         sysnr::WAIT4 => {
-            // wait4(2)：wanted <= 0 等任意孩子（无进程组概念，0 与 -1
-            // 等价）；>0 指定 pid；其余负值 EINVAL。无可收割孩子时挂起，
-            // 无孩子 ECHILD。收割即从注册表删除（生命周期见 mod.rs）。
-            // 可请求停止、恢复事件；当前没有产生这两种状态的信号接口。
+            // wait4(2)：pid > 0 指定孩子，-1 等任意孩子，0 等本进程组，
+            // 其余负值等进程组 -pid 的孩子；无可收割孩子时挂起，无孩子 ECHILD。
+            // 收割即从注册表删除；可请求停止、恢复事件，当前不产生这两种状态。
             if args[2] & !(1 | 2 | 8) != 0 {
                 Err(Errno::Invalid)
             } else {
                 let wanted = args[0] as i32;
-                if wanted < -1 {
-                    Err(Errno::Invalid)
+                if wanted == i32::MIN {
+                    Err(Errno::NoChild)
                 } else {
+                    let caller_pgid = REGISTRY
+                        .lock()
+                        .records
+                        .iter()
+                        .find(|r| r.pid == parent)
+                        .map_or(0, |r| r.pgid);
+                    let wanted_pgid = (-(wanted as i64)) as usize;
                     let matches = |r: &super::ProcessRecord| {
-                        r.parent == parent && (wanted <= 0 || r.pid == wanted as usize)
+                        r.parent == parent
+                            && if wanted == -1 {
+                                true
+                            } else if wanted == 0 {
+                                r.pgid == caller_pgid
+                            } else if wanted < -1 {
+                                r.pgid == wanted_pgid
+                            } else {
+                                r.pid == wanted as usize
+                            }
                     };
                     let (ready, has_children, status, reaped_pid) = {
                         let reg = REGISTRY.lock();
@@ -1001,6 +1029,19 @@ fn process_call(
                 }
             }
         }
+        sysnr::WAITID => return waitid(parent, frame, args),
+        sysnr::GETRUSAGE => get_rusage(parent, args),
+        sysnr::SCHED_GETSCHEDULER => sched_getscheduler(parent, args[0]),
+        sysnr::SCHED_GETPARAM => sched_getparam(parent, args[0], args[1]),
+        sysnr::SCHED_GET_PRIORITY_MAX => sched_priority_limit(args[0], true),
+        sysnr::SCHED_GET_PRIORITY_MIN => sched_priority_limit(args[0], false),
+        sysnr::SCHED_RR_GET_INTERVAL => sched_rr_get_interval(parent, args[0], args[1]),
+        sysnr::SCHED_GETAFFINITY => sched_getaffinity(parent, args[0], args[1], args[2]),
+        sysnr::SCHED_SETAFFINITY => sched_setaffinity(parent, args[0], args[1], args[2]),
+        sysnr::SETPGID => set_pg_id(parent, args),
+        sysnr::GETPGID => get_pg_or_sid(parent, args[0], false),
+        sysnr::GETSID => get_pg_or_sid(parent, args[0], true),
+        sysnr::SETSID => set_sid(parent),
         sysnr::KILL | sysnr::TGKILL => kill_or_tgkill(parent, nr, args),
         _ => Err(Errno::NoSys),
     };
@@ -1123,8 +1164,8 @@ fn queue_info(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
     .map(|_| 0)
 }
 
-/// kill(2)/tgkill(2)：解析目标与信号并发送。pid>0 为目标，
-/// pid==0 为自身，pid<0 为 EINVAL；sig==0 仅做存在性检查。
+/// kill(2)/tgkill(2)：解析目标与信号并发送。pid>0 为目标进程，
+/// pid==0 为调用者所在进程组，pid<0 为进程组或全体进程；sig==0 仅查存在性。
 /// 偏差登记 docs/ostd-contracts.md §4.5。
 fn kill_or_tgkill(parent: Pid, nr: usize, args: [usize; 6]) -> Result<usize, Errno> {
     let (pid_arg, sig_arg) = if nr == sysnr::KILL {
@@ -1138,36 +1179,396 @@ fn kill_or_tgkill(parent: Pid, nr: usize, args: [usize; 6]) -> Result<usize, Err
         }
         (args[1], args[2])
     };
-    // pid_t 为 32 位：截断后再按符号解释，兼容寄存器零扩展/符号扩展。
-    let pid = pid_arg as u32 as i32;
-    if pid < 0 {
-        return Err(Errno::Invalid);
-    }
-    let target = if pid == 0 { parent } else { pid as usize };
     // 负信号按 u32 解释为大值，落入 EINVAL。
     let sig = sig_arg as u32;
     if sig > 64 {
         return Err(Errno::Invalid);
     }
-    if sig == 0 {
-        let exists = REGISTRY
-            .lock()
+    // pid_t 为 32 位：截断后再按符号解释，兼容寄存器零扩展/符号扩展。
+    let pid = pid_arg as u32 as i32;
+    if pid == i32::MIN {
+        return Err(Errno::NoProcess);
+    }
+    let slot = SigInfoSlot {
+        // kill(2) 恒 SI_USER(=0)；tgkill 发内核保留码 SI_TKILL。
+        code: if nr == sysnr::KILL { 0 } else { SI_TKILL },
+        pid: parent as u32,
+        ..Default::default()
+    };
+    let mut reg = REGISTRY.lock();
+    let caller_pgid = reg
+        .records
+        .iter()
+        .find(|r| r.pid == parent)
+        .map(|r| r.pgid)
+        .ok_or(Errno::NoProcess)?;
+    let init = super::INIT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    let mut hits = 0usize;
+    for r in reg.records.iter_mut() {
+        if r.exit.is_some() {
+            continue;
+        }
+        let matched = if pid > 0 {
+            r.pid == pid as usize
+        } else if pid == 0 {
+            r.pgid == caller_pgid
+        } else if pid == -1 {
+            r.pid != init && r.pid != parent
+        } else {
+            r.pgid == -(pid as i64) as usize
+        };
+        if matched {
+            hits += 1;
+            if sig != 0 {
+                r.signal.generate(sig as u8, slot);
+            }
+        }
+    }
+    if hits == 0 {
+        Err(Errno::NoProcess)
+    } else {
+        Ok(0)
+    }
+}
+
+fn set_pg_id(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let pgid = args[1] as u32 as i32;
+    if pgid < 0 {
+        return Err(Errno::Invalid);
+    }
+    let pid = args[0] as u32 as i32;
+    if pid < 0 {
+        return Err(Errno::NoProcess);
+    }
+    let target = if pid == 0 { parent } else { pid as usize };
+    let mut reg = REGISTRY.lock();
+    let target_index = reg
+        .records
+        .iter()
+        .position(|r| r.pid == target)
+        .ok_or(Errno::NoProcess)?;
+    let target_sid = reg.records[target_index].sid;
+    if target != parent {
+        if reg.records[target_index].parent != parent {
+            return Err(Errno::NoProcess);
+        }
+        let caller_sid = reg
             .records
             .iter()
-            .any(|r| r.pid == target && r.exit.is_none());
-        return if exists { Ok(0) } else { Err(Errno::NoProcess) };
+            .find(|r| r.pid == parent)
+            .map(|r| r.sid)
+            .ok_or(Errno::NoProcess)?;
+        if target_sid != caller_sid {
+            return Err(Errno::Perm);
+        }
+        if reg.records[target_index].did_exec {
+            return Err(Errno::Access);
+        }
     }
-    send_signal(
-        target,
-        sig as u8,
-        SigInfoSlot {
-            // kill(2) 恒 SI_USER(=0)；tgkill 发内核保留码 SI_TKILL。
-            code: if nr == sysnr::KILL { 0 } else { SI_TKILL },
-            pid: parent as u32,
-            ..Default::default()
-        },
-    )
-    .map(|_| 0)
+    if target_sid == reg.records[target_index].pid {
+        return Err(Errno::Perm);
+    }
+    let pgid = if pgid == 0 { target } else { pgid as usize };
+    if pgid != target
+        && !reg
+            .records
+            .iter()
+            .any(|r| r.pgid == pgid && r.sid == target_sid)
+    {
+        return Err(Errno::Perm);
+    }
+    reg.records[target_index].pgid = pgid;
+    Ok(0)
+}
+
+fn get_pg_or_sid(parent: Pid, pid_arg: usize, want_sid: bool) -> Result<usize, Errno> {
+    let pid = pid_arg as u32 as i32;
+    if pid < 0 {
+        return Err(Errno::NoProcess);
+    }
+    let target = if pid == 0 { parent } else { pid as usize };
+    let reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter()
+        .find(|r| r.pid == target)
+        .ok_or(Errno::NoProcess)?;
+    Ok(if want_sid { rec.sid } else { rec.pgid })
+}
+
+fn set_sid(parent: Pid) -> Result<usize, Errno> {
+    let mut reg = REGISTRY.lock();
+    if reg.records.iter().any(|r| r.pgid == parent) {
+        return Err(Errno::Perm);
+    }
+    let rec = reg
+        .records
+        .iter_mut()
+        .find(|r| r.pid == parent)
+        .ok_or(Errno::NoProcess)?;
+    rec.pgid = parent;
+    rec.sid = parent;
+    Ok(parent)
+}
+
+fn waitid(parent: Pid, frame: &mut TrapFrame, args: [usize; 6]) -> ProcessResult {
+    const WNOHANG: u32 = 0x1;
+    const WSTOPPED: u32 = 0x2;
+    const WEXITED: u32 = 0x4;
+    const WCONTINUED: u32 = 0x8;
+    const WNOWAIT: u32 = 0x0100_0000;
+    const __WNOTHREAD: u32 = 0x2000_0000;
+    const __WALL: u32 = 0x4000_0000;
+    const __WCLONE: u32 = 0x8000_0000;
+    let allowed =
+        WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | __WNOTHREAD | __WALL | __WCLONE;
+    let idtype = args[0] as u32 as i32;
+    if !(0..=2).contains(&idtype) {
+        frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Invalid));
+        return ProcessResult::Done;
+    }
+    let options = args[3] as u32;
+    if options & !allowed != 0 || options & (WEXITED | WSTOPPED | WCONTINUED) == 0 {
+        frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Invalid));
+        return ProcessResult::Done;
+    }
+    let infop = args[2];
+    let id = args[1] as u32 as usize;
+    let (ready, any) = {
+        let reg = REGISTRY.lock();
+        let caller_pgid = match reg.records.iter().find(|r| r.pid == parent) {
+            Some(r) => r.pgid,
+            None => {
+                frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::NoProcess));
+                return ProcessResult::Done;
+            }
+        };
+        let matches = |r: &super::ProcessRecord| {
+            r.parent == parent
+                && match idtype {
+                    0 => true,
+                    1 => r.pid == id,
+                    _ => r.pgid == if id == 0 { caller_pgid } else { id },
+                }
+        };
+        let ready = reg
+            .records
+            .iter()
+            .position(|r| matches(r) && r.exit.is_some());
+        let any = reg.records.iter().any(matches);
+        let ready = ready.and_then(|i| {
+            let rec = reg.records.get(i)?;
+            Some((
+                rec.pid,
+                rec.exit?,
+                rec.user_ns.saturating_add(rec.child_user_ns),
+                rec.system_ns.saturating_add(rec.child_system_ns),
+            ))
+        });
+        (ready, any)
+    };
+    if let Some((child_pid, exit, user_ns, system_ns)) = ready {
+        let mut data = [0u8; 128];
+        data[0..4].copy_from_slice(&17u32.to_ne_bytes());
+        let (code, status) = match exit {
+            ExitInfo::Exited(n) => (1u32, n as u32 & 255),
+            ExitInfo::Signaled { sig, .. } => (2u32, sig as u32),
+        };
+        data[8..12].copy_from_slice(&code.to_ne_bytes());
+        data[16..20].copy_from_slice(&(child_pid as u32).to_ne_bytes());
+        data[24..28].copy_from_slice(&status.to_ne_bytes());
+        data[32..40].copy_from_slice(&(user_ns / 10_000_000).to_ne_bytes());
+        data[40..48].copy_from_slice(&(system_ns / 10_000_000).to_ne_bytes());
+        if infop != 0 {
+            let copied = REGISTRY
+                .lock()
+                .records
+                .iter()
+                .find(|r| r.pid == parent)
+                .and_then(|r| r.space.as_ref())
+                .is_some_and(|s| {
+                    crate::mm::user_access::copy_to_user(s.as_space(), infop, &data).is_ok()
+                });
+            if !copied {
+                frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Fault));
+                return ProcessResult::Done;
+            }
+        }
+        if options & WNOWAIT == 0 {
+            match super::registry::reap_child(parent, child_pid) {
+                Some((user, system)) => {
+                    let mut reg = REGISTRY.lock();
+                    if let Some(rec) = reg.records.iter_mut().find(|r| r.pid == parent) {
+                        rec.child_user_ns = rec.child_user_ns.saturating_add(user);
+                        rec.child_system_ns = rec.child_system_ns.saturating_add(system);
+                    }
+                }
+                None => {
+                    frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::NoChild));
+                    return ProcessResult::Done;
+                }
+            }
+        }
+        frame[TrapFrameArgs::RET] =
+            crate::syscall::to_abi(Ok(if infop == 0 { child_pid } else { 0 }));
+        return ProcessResult::Done;
+    }
+    if !any {
+        frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::NoChild));
+        return ProcessResult::Done;
+    }
+    if options & WNOHANG != 0 {
+        if infop != 0 {
+            let copied = REGISTRY
+                .lock()
+                .records
+                .iter()
+                .find(|r| r.pid == parent)
+                .and_then(|r| r.space.as_ref())
+                .is_some_and(|s| {
+                    crate::mm::user_access::copy_to_user(s.as_space(), infop, &[0u8; 128]).is_ok()
+                });
+            if !copied {
+                frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Fault));
+                return ProcessResult::Done;
+            }
+        }
+        frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Ok(0));
+        return ProcessResult::Done;
+    }
+    ProcessResult::Wait(WaitReason::Children)
+}
+
+fn get_rusage(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let who = args[0] as u32 as i32;
+    let reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter()
+        .find(|r| r.pid == parent)
+        .ok_or(Errno::NoProcess)?;
+    let (user, system) = match who {
+        0 | 1 => (rec.user_ns, rec.system_ns),
+        -1 => (rec.child_user_ns, rec.child_system_ns),
+        _ => return Err(Errno::Invalid),
+    };
+    let mut data = [0u8; 144];
+    data[0..8].copy_from_slice(&(user / 1_000_000_000).to_ne_bytes());
+    data[8..16].copy_from_slice(&((user % 1_000_000_000) / 1000).to_ne_bytes());
+    data[16..24].copy_from_slice(&(system / 1_000_000_000).to_ne_bytes());
+    data[24..32].copy_from_slice(&((system % 1_000_000_000) / 1000).to_ne_bytes());
+    rec.space
+        .as_ref()
+        .ok_or(Errno::NoProcess)
+        .and_then(|s| {
+            crate::mm::user_access::copy_to_user(s.as_space(), args[1], &data)
+                .map_err(|_| Errno::Fault)
+        })
+        .map(|()| 0)
+}
+
+fn sched_target(parent: Pid, pid_arg: usize) -> Result<usize, Errno> {
+    let pid = pid_arg as u32 as i32;
+    if pid < 0 {
+        return Err(Errno::NoProcess);
+    }
+    Ok(if pid == 0 { parent } else { pid as usize })
+}
+
+fn sched_getscheduler(parent: Pid, pid_arg: usize) -> Result<usize, Errno> {
+    let target = sched_target(parent, pid_arg)?;
+    let reg = REGISTRY.lock();
+    reg.records
+        .iter()
+        .find(|r| r.pid == target)
+        .ok_or(Errno::NoProcess)?;
+    Ok(0)
+}
+
+fn sched_getparam(parent: Pid, pid_arg: usize, param: usize) -> Result<usize, Errno> {
+    if (pid_arg as u32 as i32) < 0 {
+        return Err(Errno::Invalid);
+    }
+    if param == 0 {
+        return Err(Errno::Invalid);
+    }
+    let target = sched_target(parent, pid_arg)?;
+    let reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter()
+        .find(|r| r.pid == target)
+        .ok_or(Errno::NoProcess)?;
+    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    crate::mm::user_access::copy_to_user(space, param, &[0u8; 4]).map_err(|_| Errno::Fault)?;
+    Ok(0)
+}
+
+fn sched_priority_limit(policy_arg: usize, is_max: bool) -> Result<usize, Errno> {
+    let policy = policy_arg as u32 as i32;
+    match policy {
+        1 | 2 => Ok(if is_max { 99 } else { 1 }),
+        0 | 3 | 5 | 6 => Ok(0),
+        _ => Err(Errno::Invalid),
+    }
+}
+
+fn sched_rr_get_interval(parent: Pid, pid_arg: usize, tp: usize) -> Result<usize, Errno> {
+    if (pid_arg as u32 as i32) < 0 {
+        return Err(Errno::Invalid);
+    }
+    let target = sched_target(parent, pid_arg)?;
+    let reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter()
+        .find(|r| r.pid == target)
+        .ok_or(Errno::NoProcess)?;
+    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    let mut data = [0u8; 16];
+    data[8..16].copy_from_slice(&(crate::config::TICK_MS * 1_000_000).to_ne_bytes());
+    crate::mm::user_access::copy_to_user(space, tp, &data).map_err(|_| Errno::Fault)?;
+    Ok(0)
+}
+
+fn sched_getaffinity(parent: Pid, pid_arg: usize, len: usize, mask: usize) -> Result<usize, Errno> {
+    let target = sched_target(parent, pid_arg)?;
+    let reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter()
+        .find(|r| r.pid == target)
+        .ok_or(Errno::NoProcess)?;
+    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    let n = len.min(8);
+    let bits = 1u64.to_ne_bytes();
+    if n > 0 {
+        crate::mm::user_access::copy_to_user(space, mask, &bits[..n]).map_err(|_| Errno::Fault)?;
+    }
+    Ok(n)
+}
+
+fn sched_setaffinity(parent: Pid, pid_arg: usize, len: usize, mask: usize) -> Result<usize, Errno> {
+    let target = sched_target(parent, pid_arg)?;
+    let reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter()
+        .find(|r| r.pid == target)
+        .ok_or(Errno::NoProcess)?;
+    if len == 0 {
+        return Err(Errno::Invalid);
+    }
+    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    let n = len.min(8);
+    let mut data = [0u8; 8];
+    crate::mm::user_access::copy_from_user(space, mask, &mut data[..n])
+        .map_err(|_| Errno::Fault)?;
+    if data[0] & 1 == 0 {
+        Err(Errno::Invalid)
+    } else {
+        Ok(0)
+    }
 }
 /// 创建独立地址空间的子进程，保留父现场，子进程从下一条指令返回零。
 /// fork(2)/clone(2) 支持的标志：退出信号必须是 SIGCHLD（纯进程 fork），
@@ -1259,10 +1660,13 @@ fn fork_user(
                 }
                 core::cmp::Ordering::Equal => {}
             }
+            let (pgid, sid) = (reg.records[pi].pgid, reg.records[pi].sid);
             // 子进程继承备用栈，pending/info 清零。
             let child = &mut reg.records[ci];
             child.parent = parent;
             child.fs = Some(fs);
+            child.pgid = pgid;
+            child.sid = sid;
         }
     }
     super::proc_table_push(pid, "child", parent, true);

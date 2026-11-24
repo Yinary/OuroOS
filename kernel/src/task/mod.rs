@@ -59,6 +59,11 @@ pub struct ProcessRecord {
     pub space: Option<LocalSpace>,
     pub exit: Option<ExitInfo>,
     pub parent: Pid,
+    /// 进程组标识与会话标识；fork 继承，exec 保留。
+    pub pgid: Pid,
+    pub sid: Pid,
+    /// 是否执行过 execve；setpgid 据此拒绝修改子进程的进程组。
+    pub did_exec: bool,
 }
 
 /// 注册表本体。pid 0 保留（"无任务"标识）。
@@ -188,6 +193,9 @@ mod registry {
             space,
             exit: None,
             parent: 0,
+            pgid: pid,
+            sid: pid,
+            did_exec: false,
             user_ns: 0,
             system_ns: 0,
             child_user_ns: 0,
