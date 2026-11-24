@@ -93,6 +93,8 @@ pub fn dispatch(
         sysnr::FACCESSAT => faccessat(ctx, space, a),
         sysnr::FCHMOD => fchmod(ctx, space, a),
         sysnr::FCHMODAT => fchmodat(ctx, space, a),
+        // chmod(2)：等价于 fchmodat(AT_FDCWD, path, mode)。
+        sysnr::CHMOD => fchmodat(ctx, space, [(-100isize) as usize, a[0], a[1], 0, 0, 0]),
         sysnr::MKNODAT => mknodat(ctx, space, a),
         sysnr::FACCESSAT2 => faccessat2(ctx, space, a),
         sysnr::IOCTL => ioctl(ctx, space, a),
@@ -782,12 +784,9 @@ fn fchmod(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usiz
     ctx.fchmod_fd(a[0], a[1], space)
 }
 
-/// fchmodat(2)（dirfd, path, mode, flags）：按路径改权限位。flags 仅接受
-/// 0 / AT_SYMLINK_NOFOLLOW（后者暂与跟随一致）；FAT 卷返回 ENOTSUP。
+/// fchmodat(2)（dirfd, path, mode）：按路径改权限位，跟随符号链接。
+/// 第四个参数不读取；FAT 卷返回 ENOTSUP。
 fn fchmodat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
-    if a[3] & !0x100 != 0 {
-        return Err(Errno::Invalid);
-    }
     let path = ctx.path(a[0], &user_string(space, a[1])?)?;
     let ino = fs::lookup(&path)?;
     apply_chmod(path.as_str(), ino, a[2])

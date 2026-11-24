@@ -20,21 +20,16 @@ mod sigframe;
 mod sync;
 mod syscall;
 mod task;
+mod time;
+mod timer;
 mod trap;
 
 use core::{
     hint::spin_loop,
     sync::atomic::{AtomicUsize, Ordering},
-    time::Duration,
 };
 
-use polyhal::{
-    common::get_cpu_num,
-    instruction::ebreak,
-    irq::IRQ,
-    println,
-    timer::{current_time, set_next_timer},
-};
+use polyhal::{common::get_cpu_num, instruction::ebreak, irq::IRQ, println};
 use polyhal_boot::define_entry;
 
 /// 构建时由 build.rs 生成的内嵌用户 ELF 镜像（user/hello 构建产物）。
@@ -69,14 +64,17 @@ fn rust_main(hartid: usize) {
         "trap self-check failed: breakpoint not delivered"
     );
 
-    // 打开中断并启动第一个 tick。
+    // 打开中断并启动定时器。
     IRQ::int_enable();
-    set_next_timer(current_time() + Duration::from_millis(config::TICK_MS));
+    timer::init();
 
     // 自检：时钟中断持续到达——等待 BOOT_TICKS 个 tick（每次启动）
     while TIMER_TICKS.load(Ordering::Relaxed) < config::BOOT_TICKS {
         spin_loop();
     }
+
+    // 墙钟与 RTC 的秒边界对齐一次。
+    time::align_realtime();
 
     // 自检（heap/帧分配/trap/时钟）全部通过
     let boot_line = alloc::format!(

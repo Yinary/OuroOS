@@ -66,6 +66,8 @@ pub mod sysnr {
     pub const PPOLL: usize = 73;
     pub const NANOSLEEP: usize = 101;
     pub const CLOCK_GETTIME: usize = 113;
+    pub const CLOCK_GETRES: usize = 114;
+    pub const CLOCK_NANOSLEEP: usize = 115;
     pub const SCHED_YIELD: usize = 124;
     pub const KILL: usize = 129;
     pub const TGKILL: usize = 131;
@@ -116,6 +118,7 @@ pub mod sysnr {
     pub const GETTIMEOFDAY: usize = 169;
     pub const FACCESSAT: usize = 48;
     pub const FCHMODAT: usize = 53;
+    pub const CHMOD: usize = 90;
     pub const MKNODAT: usize = 33;
     pub const FCHMOD: usize = 52;
     pub const SYSLOG: usize = 116;
@@ -303,6 +306,7 @@ pub fn dispatch(
         | sysnr::FACCESSAT
         | sysnr::FACCESSAT2
         | sysnr::FCHMODAT
+        | sysnr::CHMOD
         | sysnr::FCHMOD
         | sysnr::MKNODAT
         | sysnr::IOCTL
@@ -474,6 +478,9 @@ pub fn dispatch(
         | sysnr::SYSINFO
         | sysnr::PPOLL
         | sysnr::NANOSLEEP
+        | sysnr::CLOCK_GETTIME
+        | sysnr::CLOCK_GETRES
+        | sysnr::CLOCK_NANOSLEEP
         | sysnr::TIMES
         | sysnr::GETPPID
         | sysnr::GETRESUID
@@ -616,17 +623,25 @@ pub fn dispatch(
                     .map(|_| 0)
                     .map_err(|_| Errno::Fault)
             } else {
-                let now = polyhal::timer::current_time();
-                let mut data = [0u8; 16];
-                data[..8].copy_from_slice(&now.as_secs().to_ne_bytes());
-                data[8..].copy_from_slice(&(now.subsec_micros() as u64).to_ne_bytes());
-                if a0 == 0 {
-                    Ok(0)
+                // gettimeofday(2)：tv 写墙钟，tz 非空时写零，两者可分别为空。
+                let now = crate::time::realtime();
+                let ret = if a0 == 0 {
+                    Ok(())
                 } else {
-                    user_access::copy_to_user(space, a0, &data)
-                        .map(|_| 0)
-                        .map_err(|_| Errno::Fault)
-                }
+                    let mut data = [0u8; 16];
+                    data[..8].copy_from_slice(&(now.as_secs() as i64).to_ne_bytes());
+                    data[8..].copy_from_slice(&(now.subsec_micros() as i64).to_ne_bytes());
+                    user_access::copy_to_user(space, a0, &data).map_err(|_| Errno::Fault)
+                };
+                ret.and_then(|()| {
+                    if a1 == 0 {
+                        Ok(0)
+                    } else {
+                        user_access::copy_to_user(space, a1, &[0u8; 8])
+                            .map(|()| 0)
+                            .map_err(|_| Errno::Fault)
+                    }
+                })
             };
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue

@@ -3,10 +3,11 @@ resolver = "2"
 members = ["kernel"]
 exclude = ["third_party/rsext4"]
 
-# 本地 vendor 的 polyhal-trap（修复 EscapeReason 有损、la 未分类异常 panic、
-# la 缺 from_user；修改清单见 third_party/polyhal-trap/README.md 与
-# docs/ostd-contracts.md 缺陷表）。不得直接编辑 ~/.cargo/registry 的源码。
+# 本地 vendor 的 polyhal 与 polyhal-trap：rv 时钟频率改读设备树，并修复
+# EscapeReason 有损、la 未分类异常 panic、la 缺 from_user。修改清单见
+# third_party/polyhal*/README.md 与 docs/ostd-contracts.md 缺陷表；不得编辑 registry 源码。
 [patch.crates-io]
+polyhal = { path = "third_party/polyhal" }
 polyhal-trap = { path = "third_party/polyhal-trap" }
 
 # selftest 专用构建档：release 优化 + debug 断言，

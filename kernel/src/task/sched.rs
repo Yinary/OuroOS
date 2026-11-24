@@ -14,7 +14,8 @@ use polyhal::kcontext::KContext;
 
 use crate::{
     sync::{self, DebugMutex},
-    TIMER_TICKS,
+    time::monotonic,
+    timer,
 };
 
 use super::{
@@ -69,17 +70,31 @@ pub(super) fn take_body() -> TaskBody {
         .expect("task body already taken")
 }
 
-/// 当前任务的时间片是否已用尽。
-pub(super) fn slice_expired() -> bool {
-    let slot = SCHED.lock();
-    let slice_tick = slot
-        .as_ref()
-        .expect("scheduler not initialized")
-        .current
-        .as_ref()
-        .expect("slice check without current")
-        .slice_tick;
-    current_tick() != slice_tick
+/// 每个时间片的长度。
+const SLICE: core::time::Duration = core::time::Duration::from_millis(crate::config::TICK_MS);
+
+/// 回用户态前的调度检查：时钟中断之后把到期的等待者搬回就绪表；
+/// 有任务因此就绪，或当前任务的时间片用尽时让出。
+pub fn resume_check() {
+    let yield_cpu = {
+        let mut slot = SCHED.lock();
+        let s = slot.as_mut().expect("scheduler not initialized");
+        let now = monotonic();
+        let expired = s.current.as_ref().is_some_and(|task| now >= task.slice_end);
+        let events = timer::events();
+        let woke = if s.last_timer_event != events {
+            s.last_timer_event = events;
+            let before = s.ready.len();
+            s.wake_expired();
+            s.ready.len() > before
+        } else {
+            false
+        };
+        expired || woke
+    };
+    if yield_cpu {
+        yield_now();
+    }
 }
 
 /// 写入当前任务地址（0 表示 idle）。仅调度器调用。
@@ -97,27 +112,27 @@ struct Scheduler {
     dead: Vec<Box<Task>>,
     /// idle（boot 栈）的内核上下文；最后一个任务退出时切回这里。
     idle_ctx: KContext,
+    /// 上次处理过的时钟中断序号。
+    last_timer_event: u64,
 }
 
 static SCHED: DebugMutex<Option<Scheduler>> = DebugMutex::new("SCHED", None);
 
-/// 当前核时钟 tick（任务全部运行在启动核上）。
-fn current_tick() -> usize {
-    TIMER_TICKS.load(Ordering::Relaxed)
-}
-
 impl Scheduler {
-    /// 把任务立为当前任务：置 Running、刷新时间片起点、更新 CURRENT。
+    /// 把任务立为当前任务：置 Running、刷新时间片终点、更新 CURRENT。
     /// 返回其 KContext 地址（Box 保证稳定）。
     fn promote(&mut self, mut task: Box<Task>) -> *const KContext {
         task.state = TaskState::Running;
-        task.slice_tick = current_tick();
+        let slice_end = monotonic() + SLICE;
+        task.slice_end = slice_end;
+        let timed = matches!(task.body, Some(TaskBody::User { .. }));
         let pid = task.pid;
         let ptr: *mut Task = &mut *task;
         let context = task.context_ptr() as *const KContext;
         self.current = Some(task);
         set_current(ptr);
         sync::set_holder(pid);
+        timer::set_slice_end(timed.then_some(slice_end));
         context
     }
 
@@ -167,7 +182,7 @@ impl Scheduler {
 
     /// 到期扫描：Deadline 已到的等待者搬回就绪表。
     fn wake_expired(&mut self) {
-        let now = polyhal::timer::current_time();
+        let now = crate::time::monotonic();
         self.move_waiting(|_, r| match r {
             WaitReason::Deadline(d) | WaitReason::PollUntil(d) => now >= *d,
             _ => false,
@@ -187,6 +202,12 @@ impl Scheduler {
                 i += 1;
             }
         }
+        self.refresh_deadline();
+    }
+
+    /// 把等待表里最早的到期时刻登记给定时器。
+    fn refresh_deadline(&self) {
+        timer::set_deadline(self.waiting.iter().filter_map(|(_, r)| r.deadline()).min());
     }
 }
 
@@ -200,6 +221,7 @@ pub(super) fn init() {
         waiting: Vec::new(),
         dead: Vec::new(),
         idle_ctx: KContext::blank(),
+        last_timer_event: 0,
     });
 }
 
@@ -277,11 +299,13 @@ pub fn park(reason: WaitReason) {
             cur.state = TaskState::Ready;
             s.ready.push_back(cur);
         }
+        s.refresh_deadline();
         let to = match s.ready.pop_front() {
             Some(next) => s.promote(next),
             None => {
                 set_current(core::ptr::null_mut());
                 sync::set_holder(0);
+                timer::set_slice_end(None);
                 addr_of!(s.idle_ctx)
             }
         };
@@ -339,6 +363,7 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
             None => {
                 set_current(core::ptr::null_mut());
                 sync::set_holder(0);
+                timer::set_slice_end(None);
                 (from, addr_of!(s.idle_ctx))
             }
         }
