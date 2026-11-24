@@ -397,6 +397,7 @@ pub(super) fn exit_group_current(exit: ExitInfo) -> ! {
     log::debug!("thread group of '{}' (pid {}) exiting", name, pid);
     registry::record_exit(tgid, exit);
     request_children_wake();
+    wake_vfork(pid);
     {
         let mut reg = REGISTRY.lock();
         reg.remove_group_threads(tgid);
@@ -428,6 +429,13 @@ pub(super) fn exit_group_current(exit: ExitInfo) -> ! {
     };
     switch_context(from, to);
     unreachable!("exited task was resumed")
+}
+
+/// 唤醒等待子进程 exec 或退出的 vfork 父进程。
+pub fn wake_vfork(child: super::task::Pid) {
+    let mut slot = SCHED.lock();
+    let s = slot.as_mut().expect("scheduler not initialized");
+    s.move_waiting(|_, reason| matches!(reason, WaitReason::Vfork(pid) if *pid == child));
 }
 
 /// 当前任务退出：登记退出信息、释放地址空间、移入 dead 表并永久切走。
@@ -474,6 +482,7 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
         registry::record_exit(tgid, info);
         request_children_wake();
     }
+    wake_vfork(pid);
     let (from, to) = {
         let mut slot = SCHED.lock();
         let s = slot.as_mut().expect("scheduler not initialized");

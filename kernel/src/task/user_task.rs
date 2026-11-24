@@ -132,6 +132,7 @@ pub fn user_task_entry() -> ! {
     };
     let mut sleep_deadline = None;
     let mut futex_wait = None;
+    let mut vfork_child: Option<Pid> = None;
     // 循环局部等待状态：sigsuspend 的旧屏蔽集合、sigtimedwait 的等待集与截止。
     let mut sigsuspend_saved: Option<SignalSet> = None;
     let mut timedwait: Option<(SignalSet, core::time::Duration)> = None;
@@ -264,6 +265,7 @@ pub fn user_task_entry() -> ! {
                                     &mut sigsuspend_saved,
                                     &mut timedwait,
                                     &mut futex_wait,
+                                    &mut vfork_child,
                                     &mut wait_uncompleted,
                                 ),
                                 Flow::Wait(reason) => ProcessResult::Wait(reason),
@@ -686,6 +688,7 @@ fn process_call(
     sigsuspend_saved: &mut Option<SignalSet>,
     timedwait: &mut Option<(SignalSet, core::time::Duration)>,
     futex_wait: &mut Option<(FutexKey, u32, Option<core::time::Duration>, u32)>,
+    vfork_child: &mut Option<Pid>,
     wait_uncompleted: &mut bool,
 ) -> ProcessResult {
     let args = frame.args();
@@ -1006,12 +1009,23 @@ fn process_call(
         // ctid, tls)（对照两架构 clone.s 与 Linux fork.c 的拷贝语义）。
         // 归一化为具名参数后再按 CLONE_THREAD 分流。
         sysnr::CLONE => {
+            log::debug!("DBG clone flags {:#x} stack {:#x}", args[0], args[1]);
             #[cfg(target_arch = "riscv64")]
             let (tls, child_tid) = (args[3], args[4]);
             #[cfg(target_arch = "loongarch64")]
             let (child_tid, tls) = (args[3], args[4]);
-            if args[0] & CLONE_THREAD != 0 {
+            if let Some(done) = vfork_child.take() {
+                Ok(done)
+            } else if args[0] & CLONE_THREAD != 0 {
                 fork_thread(parent, frame, args[0], args[1], args[2], tls, child_tid)
+            } else if args[0] & CLONE_VFORK != 0 {
+                match fork_vfork(parent, frame, args[0], args[1], child_tid) {
+                    Ok(pid) => {
+                        *vfork_child = Some(pid);
+                        return ProcessResult::Wait(WaitReason::Vfork(pid));
+                    }
+                    Err(e) => Err(e),
+                }
             } else {
                 fork_user(parent, frame, args[0], args[1], child_tid)
             }
@@ -2105,6 +2119,7 @@ const CLONE_THREAD: usize = 0x0001_0000;
 const CLONE_SYSVSEM: usize = 0x0004_0000;
 const CLONE_SETTLS: usize = 0x0008_0000;
 const CLONE_PARENT_SETTID: usize = 0x0010_0000;
+const CLONE_VFORK: usize = 0x0000_4000;
 const CLONE_DETACHED: usize = 0x0040_0000;
 
 /// 创建独立地址空间的子进程，保留父现场，子进程从下一条指令返回零。
@@ -2228,6 +2243,30 @@ fn fork_user(
 /// 创建共享地址空间与文件表的新线程：退出信号必须为 0，必须同时带 CLONE_THREAD、
 /// CLONE_SIGHAND 与 CLONE_VM；另接受 CLONE_FS、CLONE_FILES、CLONE_SYSVSEM、
 /// CLONE_SETTLS 与三个 tid 标志，CLONE_DETACHED 按 Linux 忽略。
+/// vfork：子进程按复制地址空间创建，父进程挂起到子进程 exec 或退出。
+fn fork_vfork(
+    parent: Pid,
+    frame: &TrapFrame,
+    flags: usize,
+    stack: usize,
+    child_tid: usize,
+) -> Result<Pid, Errno> {
+    let allowed = 17
+        | CLONE_VM
+        | CLONE_VFORK
+        | CLONE_PARENT_SETTID
+        | CLONE_CHILD_CLEARTID
+        | CLONE_CHILD_SETTID;
+    if flags & 0xff != 17
+        || flags & (CLONE_VM | CLONE_VFORK) != (CLONE_VM | CLONE_VFORK)
+        || flags & !allowed != 0
+    {
+        return Err(Errno::Invalid);
+    }
+    let inner = 17 | (flags & (CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID));
+    fork_user(parent, frame, inner, stack, child_tid)
+}
+
 fn fork_thread(
     parent: Pid,
     frame: &TrapFrame,

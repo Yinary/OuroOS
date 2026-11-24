@@ -61,6 +61,8 @@ pub enum WaitReason {
         deadline: Option<core::time::Duration>,
         bitset: u32,
     },
+    /// vfork 的父进程等待子进程 exec 或退出。
+    Vfork(Pid),
 }
 
 impl WaitReason {
