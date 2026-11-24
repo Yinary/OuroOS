@@ -173,9 +173,9 @@ impl Scheduler {
             self.move_waiting(|task, _| {
                 reg.group(task.pid).is_some_and(|r| {
                     r.exit.is_none()
-                        && r.signal.pending()
-                            & !reg.thread(task.pid).map_or(0, |t| t.signal.blocked())
-                            != 0
+                        && reg.thread(task.pid).is_some_and(|t| {
+                            (r.signal.pending() | t.signal.pending()) & !t.signal.blocked() != 0
+                        })
                 })
             });
         }

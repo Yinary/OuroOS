@@ -363,13 +363,13 @@ FS 通过 `fs::mapping` 注册 MM 映射钩子：注册后，长度改变先由 
 
 ### 4.5 信号契约
 
-**范围**：kill/tgkill、rt_sigaction/procmask/pending/sigsuspend/
+**范围**：kill/tkill/tgkill、rt_sigaction/procmask/pending/sigsuspend/
 sigtimedwait/sigqueueinfo/sigaltstack/sigreturn(139) 全链路；SIGCHLD
 （子退出）、SIGPIPE（pipe 无读者写入）、SIGSEGV/SIGILL/SIGBUS/SIGTRAP
 （致命异常映射）三类内核内产生源；handler 建帧投递（sa_mask/siginfo/
 浮点现场/备用栈）、EINTR 与 SA_RESTART、fork 继承与 execve 重置。
 
-**投递模型**：回用户态唯一路径（任务运行循环）为投递检查点，每次至多
+**投递模型**：信号分线程定向与组定向两类，可投递集合是两者挂起位图的并集减去该线程的屏蔽字；kill 与 tkill/tgkill 按目标是否等于某个线程号决定投递方式。回用户态唯一路径（任务运行循环）为投递检查点，每次至多
 一个信号；阻塞 syscall 在 park 前后两次快路径决策（第二次不落睡，处理
 睡中到达的信号）。产生统一经过滤：blocked 照常入队（屏蔽信号排队不丢）、
 IGN 或 DFL 且默认动作属 Ign/Cont 静默丢弃。同步（硬件）信号走 force：
@@ -391,7 +391,7 @@ IGN 或 DFL 且默认动作属 Ign/Cont 静默丢弃。同步（硬件）信号�
 | 终止与 core | 无 core dump：Core 类信号死亡恒 CLD_KILLED，wait status 无 0x80 位（Linux CLD_DUMPED + WCOREDUMP） |
 | 同步信号 si_code | 固定 SEGV_MAPERR/ILL_ILLOPC/BUS_ADRALN/TRAP_BRKPT，未细分 ACCERR/ADRERR；la handler 期间 FPU 异常回投 SIGFPE（fcsr_pending）未实现 |
 | stub | 无 vDSO，stub 内嵌帧内，无 icache flush（QEMU 语义一致）；rt_sigreturn badframe 按 force_sigsegv 式收敛（处置复位、不重试投递；Linux force_sig 在装 SIGSEGV handler 时可循环） |
-| kill 族 | 不做权限检查；pid<0 发往进程组 -pid，pid==0 发往调用者所在进程组，pid==-1 发往除 init 与调用者外的全部进程；tgkill 要求 tgid==tid（Linux tgid 不匹配返回 ESRCH） |
+| kill 族 | 不做权限检查；kill 的 pid 指向某个线程时投给该线程，指向线程组时投给组；pid<0 发往进程组 -pid，pid==0 发往调用者所在进程组，pid==-1 发往除 init 与调用者外的全部进程；tgkill 要求 tid 存在且属于给定 tgid，不匹配返回 ESRCH；tkill 按 tid 直接投递 |
 | sigpending/sigsetsize | rt_sigpending sigsetsize 收紧为 ==8（Linux 允许 ≤8） |
 | nanosleep | rem 仅被打断时回写（正常完成不回写，沿用原契约行） |
 

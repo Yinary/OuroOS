@@ -71,6 +71,7 @@ pub mod sysnr {
     pub const CLOCK_NANOSLEEP: usize = 115;
     pub const SCHED_YIELD: usize = 124;
     pub const KILL: usize = 129;
+    pub const TKILL: usize = 130;
     pub const TGKILL: usize = 131;
     // 信号
     pub const SIGALTSTACK: usize = 132;
@@ -477,6 +478,7 @@ pub fn dispatch(
         // KILL/TGKILL/RT_SIGSUSPEND/RT_SIGTIMEDWAIT/RT_SIGQUEUEINFO/SYSINFO/
         // PPOLL 改目标记录或依赖循环局部等待状态，在锁外（process_call）处理。
         sysnr::KILL
+        | sysnr::TKILL
         | sysnr::TGKILL
         | sysnr::RT_SIGSUSPEND
         | sysnr::RT_SIGTIMEDWAIT

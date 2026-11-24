@@ -174,7 +174,7 @@ pub(super) fn rt_sigpending(
     if sigsetsize != SIGSETSIZE {
         return Err(Errno::Invalid);
     }
-    let pending = group.pending() & thread.blocked();
+    let pending = (group.pending() | thread.pending()) & thread.blocked();
     user_access::copy_to_user(space, set, &pending.to_ne_bytes()).map_err(|_| Errno::Fault)?;
     Ok(0)
 }

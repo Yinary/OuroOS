@@ -150,18 +150,19 @@ pub fn user_task_entry() -> ! {
                 let reg = &mut *locked;
                 let index = reg.group_index(pid).expect("user task unregistered");
                 let rec = &mut reg.records[index];
+                let thread = reg
+                    .threads
+                    .iter_mut()
+                    .find(|t| t.tid == pid)
+                    .expect("user task unregistered");
                 rec.space
                     .as_ref()
                     .expect("running user task lost its space")
                     .as_space()
                     .activate();
                 // 投递检查点：每次回用户态至多处理一个信号；handler 在此建帧。
-                let blocked_now = reg
-                    .threads
-                    .iter()
-                    .find(|t| t.tid == pid)
-                    .map_or(0, |t| t.signal.blocked());
-                match rec.signal.take_deliverable(blocked_now) {
+                let blocked_now = thread.signal.blocked();
+                match super::signal::take_any(&mut rec.signal, &mut thread.signal, blocked_now) {
                     None => None,
                     Some((sig, slot)) => {
                         let d = rec.signal.disposition(sig);
@@ -193,17 +194,10 @@ pub fn user_task_entry() -> ! {
                                 blocked_now,
                                 save_mask,
                                 // SA_ONSTACK 选栈依据：当前登记的备用栈。
-                                reg.threads
-                                    .iter()
-                                    .find(|t| t.tid == pid)
-                                    .and_then(|t| t.signal.alt_stack()),
+                                thread.signal.alt_stack(),
                             ) {
                                 Ok(new_blocked) => {
-                                    if let Some(thread) =
-                                        reg.threads.iter_mut().find(|t| t.tid == pid)
-                                    {
-                                        thread.signal.setmask(new_blocked);
-                                    }
+                                    thread.signal.setmask(new_blocked);
                                     None
                                 }
                                 Err(_) => Some(ExitInfo::Signaled {
@@ -549,30 +543,36 @@ fn park_check_signals(
     // sigtimedwait 的等待集；Some 即本次挂起属于 rt_sigtimedwait。
     let tw_set = timedwait.map(|(set, _)| set);
     let peeked = {
-        let mut reg = REGISTRY.lock();
-        let blocked = reg.thread(pid).map_or(0, |t| t.signal.blocked());
-        let rec = reg.group_mut(pid).expect("user task unregistered");
+        let mut locked = REGISTRY.lock();
+        let reg = &mut *locked;
+        let index = reg.group_index(pid).expect("user task unregistered");
+        let rec = &mut reg.records[index];
+        let thread = reg
+            .threads
+            .iter_mut()
+            .find(|t| t.tid == pid)
+            .expect("user task unregistered");
+        let blocked = thread.signal.blocked();
         // 先查等待集内信号：命中即消费，不经处置。
         let tw_hit = tw_set.and_then(|set| {
             let mut hidden = blocked;
             hidden |= !set;
-            rec.signal.take_deliverable(hidden)
+            super::signal::take_any(&mut rec.signal, &mut thread.signal, hidden)
         });
         match tw_hit {
             Some((sig, slot)) => ParkPeek::TwHit { sig, slot },
-            None => match rec.signal.peek_deliverable(blocked) {
+            None => match super::signal::peek_any(&rec.signal, &thread.signal, blocked) {
                 None => ParkPeek::Empty,
                 Some((sig, _)) => {
                     let d = rec.signal.disposition(sig);
                     if d.handler != SIG_DFL && d.handler != SIG_IGN {
-                        // handler 分支不消费；DFL/IGN 分支经 take_deliverable 另取槽。
+                        // handler 分支不消费；DFL/IGN 分支经 take_any 另取槽。
                         ParkPeek::Handler(d)
                     } else {
                         // IGN 为防御分支。
-                        let (sig, slot) = rec
-                            .signal
-                            .take_deliverable(blocked)
-                            .expect("peeked signal still deliverable");
+                        let (sig, slot) =
+                            super::signal::take_any(&mut rec.signal, &mut thread.signal, blocked)
+                                .expect("peeked signal still deliverable");
                         ParkPeek::Default { sig, slot, d }
                     }
                 }
@@ -721,19 +721,27 @@ fn process_call(
                 // 重入决策：Ign/Cont/Stop 类信号锁内消费丢弃后继续查；
                 // 有后果的信号保留，以 -EINTR 完成，交检查点投递/终止。
                 let consequence = {
-                    let mut reg = REGISTRY.lock();
-                    let blocked = reg.thread(parent).map_or(0, |t| t.signal.blocked());
-                    let rec = reg.group_mut(parent).expect("user task unregistered");
+                    let mut locked = REGISTRY.lock();
+                    let reg = &mut *locked;
+                    let index = reg.group_index(parent).expect("user task unregistered");
+                    let rec = &mut reg.records[index];
+                    let thread = reg
+                        .threads
+                        .iter_mut()
+                        .find(|t| t.tid == parent)
+                        .expect("user task unregistered");
+                    let blocked = thread.signal.blocked();
                     loop {
-                        let Some((sig, _)) = rec.signal.peek_deliverable(blocked) else {
+                        let Some((sig, _)) =
+                            super::signal::peek_any(&rec.signal, &thread.signal, blocked)
+                        else {
                             break false;
                         };
                         if has_consequence(sig, rec.signal.disposition(sig)) {
                             break true;
                         }
                         // 无后果：不当投递，消费丢弃（同 Linux get_signal）。
-                        rec.signal
-                            .take_deliverable(blocked)
+                        super::signal::take_any(&mut rec.signal, &mut thread.signal, blocked)
                             .expect("peeked signal still deliverable");
                     }
                 };
@@ -754,13 +762,20 @@ fn process_call(
             if let Some((set, deadline)) = *timedwait {
                 // 重入：先查命中（Mesa），再查截止。
                 let taken = {
-                    let mut reg = REGISTRY.lock();
-                    let blocked = reg.thread(parent).map_or(0, |t| t.signal.blocked());
-                    reg.group_mut(parent).and_then(|rec| {
-                        let mut hidden = blocked;
-                        hidden |= !set;
-                        rec.signal.take_deliverable(hidden)
-                    })
+                    let mut locked = REGISTRY.lock();
+                    let reg = &mut *locked;
+                    match (
+                        reg.group_index(parent),
+                        reg.threads.iter_mut().find(|t| t.tid == parent),
+                    ) {
+                        (Some(index), Some(thread)) => {
+                            let rec = &mut reg.records[index];
+                            let mut hidden = thread.signal.blocked();
+                            hidden |= !set;
+                            super::signal::take_any(&mut rec.signal, &mut thread.signal, hidden)
+                        }
+                        _ => None,
+                    }
                 };
                 if let Some((sig, slot)) = taken {
                     *timedwait = None;
@@ -783,13 +798,24 @@ fn process_call(
                             set.del(SIGKILL);
                             set.del(SIGSTOP);
                             let taken = {
-                                let mut reg = REGISTRY.lock();
-                                let blocked = reg.thread(parent).map_or(0, |t| t.signal.blocked());
-                                reg.group_mut(parent).and_then(|rec| {
-                                    let mut hidden = blocked;
-                                    hidden |= !set;
-                                    rec.signal.take_deliverable(hidden)
-                                })
+                                let mut locked = REGISTRY.lock();
+                                let reg = &mut *locked;
+                                match (
+                                    reg.group_index(parent),
+                                    reg.threads.iter_mut().find(|t| t.tid == parent),
+                                ) {
+                                    (Some(index), Some(thread)) => {
+                                        let rec = &mut reg.records[index];
+                                        let mut hidden = thread.signal.blocked();
+                                        hidden |= !set;
+                                        super::signal::take_any(
+                                            &mut rec.signal,
+                                            &mut thread.signal,
+                                            hidden,
+                                        )
+                                    }
+                                    _ => None,
+                                }
                             };
                             if let Some((sig, slot)) = taken {
                                 write_uinfo(parent, args[1], sig, &slot).map(|_| sig as usize)
@@ -1112,7 +1138,7 @@ fn process_call(
         sysnr::GETPGID => get_pg_or_sid(parent, args[0], false),
         sysnr::GETSID => get_pg_or_sid(parent, args[0], true),
         sysnr::SETSID => set_sid(parent),
-        sysnr::KILL | sysnr::TGKILL => kill_or_tgkill(parent, nr, args),
+        sysnr::KILL | sysnr::TKILL | sysnr::TGKILL => kill_or_tgkill(parent, nr, args),
         _ => Err(Errno::NoSys),
     };
     frame[TrapFrameArgs::RET] = crate::syscall::to_abi(result);
@@ -1253,26 +1279,15 @@ fn queue_info(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
 /// pid==0 为调用者所在进程组，pid<0 为进程组或全体进程；sig==0 仅查存在性。
 /// 偏差登记 docs/ostd-contracts.md §4.5。
 fn kill_or_tgkill(parent: Pid, nr: usize, args: [usize; 6]) -> Result<usize, Errno> {
-    let (pid_arg, sig_arg) = if nr == sysnr::KILL {
-        (args[0], args[1])
+    let sig_arg = if nr == sysnr::KILL || nr == sysnr::TKILL {
+        args[1]
     } else {
-        // tgkill(tgid, tid, sig)：两者须 > 0 且相等（单线程模型）。
-        let tgid = args[0] as u32 as i32;
-        let tid = args[1] as u32 as i32;
-        if tgid <= 0 || tgid != tid {
-            return Err(Errno::Invalid);
-        }
-        (args[1], args[2])
+        args[2]
     };
     // 负信号按 u32 解释为大值，落入 EINVAL。
     let sig = sig_arg as u32;
     if sig > 64 {
         return Err(Errno::Invalid);
-    }
-    // pid_t 为 32 位：截断后再按符号解释，兼容寄存器零扩展/符号扩展。
-    let pid = pid_arg as u32 as i32;
-    if pid == i32::MIN {
-        return Err(Errno::NoProcess);
     }
     let slot = SigInfoSlot {
         // kill(2) 恒 SI_USER(=0)；tgkill 发内核保留码 SI_TKILL。
@@ -1282,16 +1297,86 @@ fn kill_or_tgkill(parent: Pid, nr: usize, args: [usize; 6]) -> Result<usize, Err
     };
     let mut locked = REGISTRY.lock();
     let reg = &mut *locked;
-    let caller_pgid = reg.group(parent).map(|r| r.pgid).ok_or(Errno::NoProcess)?;
+    if nr == sysnr::TKILL {
+        let tid = args[0] as u32 as i32;
+        if tid <= 0 {
+            return Err(Errno::Invalid);
+        }
+        let tid = tid as usize;
+        let Some(tid_index) = reg.threads.iter().position(|t| t.tid == tid) else {
+            return Err(Errno::NoProcess);
+        };
+        let index = reg.group_index(tid).ok_or(Errno::NoProcess)?;
+        if reg.records[index].exit.is_some() {
+            return Err(Errno::NoProcess);
+        }
+        if sig == 0 {
+            return Ok(0);
+        }
+        let group = &reg.records[index];
+        let thread = &mut reg.threads[tid_index];
+        super::signal::generate_thread(&group.signal, &mut thread.signal, sig as u8, slot);
+        return Ok(0);
+    }
+    if nr == sysnr::TGKILL {
+        let tgid = args[0] as u32 as i32;
+        let tid = args[1] as u32 as i32;
+        if tgid <= 0 || tid <= 0 {
+            return Err(Errno::Invalid);
+        }
+        let tid = tid as usize;
+        let index = reg.group_index(tid).ok_or(Errno::NoProcess)?;
+        if reg.records[index].pid != tgid as usize || reg.thread(tid).is_none() {
+            return Err(Errno::NoProcess);
+        }
+        if sig == 0 {
+            return Ok(0);
+        }
+        let group = &reg.records[index];
+        let thread = reg
+            .threads
+            .iter_mut()
+            .find(|t| t.tid == tid)
+            .ok_or(Errno::NoProcess)?;
+        super::signal::generate_thread(&group.signal, &mut thread.signal, sig as u8, slot);
+        return Ok(0);
+    }
+    // pid_t 为 32 位：截断后再按符号解释，兼容寄存器零扩展/符号扩展。
+    let pid = args[0] as u32 as i32;
+    if pid == i32::MIN {
+        return Err(Errno::NoProcess);
+    }
     let init = super::INIT_PID.load(core::sync::atomic::Ordering::Relaxed);
+    if pid > 0 {
+        let target = pid as usize;
+        let index = reg
+            .group_index(target)
+            .filter(|i| reg.records[*i].exit.is_none())
+            .ok_or(Errno::NoProcess)?;
+        if sig == 0 {
+            return Ok(0);
+        }
+        if let Some(tid_index) = reg.threads.iter().position(|t| t.tid == target) {
+            let group = &reg.records[index];
+            let thread = &mut reg.threads[tid_index];
+            super::signal::generate_thread(&group.signal, &mut thread.signal, sig as u8, slot);
+        } else {
+            let blocked = reg
+                .threads
+                .iter()
+                .find(|t| t.tgid == target)
+                .map_or(0, |t| t.signal.blocked());
+            reg.records[index].signal.generate(sig as u8, slot, blocked);
+        }
+        return Ok(0);
+    }
+    let caller_pgid = reg.group(parent).map(|r| r.pgid).ok_or(Errno::NoProcess)?;
     let mut hits = 0usize;
     for r in reg.records.iter_mut() {
         if r.exit.is_some() {
             continue;
         }
-        let matched = if pid > 0 {
-            r.pid == pid as usize
-        } else if pid == 0 {
+        let matched = if pid == 0 {
             r.pgid == caller_pgid
         } else if pid == -1 {
             r.pid != init && r.pid != parent
@@ -1304,7 +1389,7 @@ fn kill_or_tgkill(parent: Pid, nr: usize, args: [usize; 6]) -> Result<usize, Err
                 let blocked = reg
                     .threads
                     .iter()
-                    .find(|t| t.tid == r.pid)
+                    .find(|t| t.tgid == r.pid)
                     .map_or(0, |t| t.signal.blocked());
                 r.signal.generate(sig as u8, slot, blocked);
             }
