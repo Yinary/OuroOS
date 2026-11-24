@@ -101,6 +101,7 @@ pub mod sysnr {
     pub const GETTIMEOFDAY: usize = 169;
     pub const FACCESSAT: usize = 48;
     pub const FCHMODAT: usize = 53;
+    pub const CHMOD: usize = 90;
     pub const MKNODAT: usize = 33;
     pub const FCHMOD: usize = 52;
     pub const SYSLOG: usize = 116;
@@ -288,6 +289,7 @@ pub fn dispatch(
         | sysnr::FACCESSAT
         | sysnr::FACCESSAT2
         | sysnr::FCHMODAT
+        | sysnr::CHMOD
         | sysnr::FCHMOD
         | sysnr::MKNODAT
         | sysnr::IOCTL

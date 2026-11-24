@@ -7,7 +7,7 @@ use crate::config::KERNEL_HEAP_SIZE;
 #[global_allocator]
 static HEAP_ALLOCATOR: LockedHeap<32> = LockedHeap::<32>::empty();
 
-// TODO(yinary): 固定 8 MiB 堆，后续文件系统缓存等会不够用。应改为堆不足时从页帧分配器扩展。
+// TODO(yinary): 固定 32 MiB 堆，后续文件系统缓存等会不够用。应改为堆不足时从页帧分配器扩展。
 static mut HEAP_SPACE: [u8; KERNEL_HEAP_SIZE] = [0; KERNEL_HEAP_SIZE];
 
 pub fn init() {
