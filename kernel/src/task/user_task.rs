@@ -145,11 +145,8 @@ pub fn user_task_entry() -> ! {
             let signal_exit = {
                 let mut locked = REGISTRY.lock();
                 let reg = &mut *locked;
-                let rec = reg
-                    .records
-                    .iter_mut()
-                    .find(|r| r.pid == pid)
-                    .expect("user task unregistered");
+                let index = reg.group_index(pid).expect("user task unregistered");
+                let rec = &mut reg.records[index];
                 rec.space
                     .as_ref()
                     .expect("running user task lost its space")
@@ -223,7 +220,7 @@ pub fn user_task_entry() -> ! {
             kernel_start = crate::time::monotonic();
             {
                 let mut reg = REGISTRY.lock();
-                if let Some(rec) = reg.records.iter_mut().find(|r| r.pid == pid) {
+                if let Some(rec) = reg.group_mut(pid) {
                     rec.user_ns = rec.user_ns.saturating_add(
                         kernel_start
                             .saturating_sub(user_start)
@@ -242,11 +239,8 @@ pub fn user_task_entry() -> ! {
                         let flow = {
                             let mut locked = REGISTRY.lock();
                             let reg = &mut *locked;
-                            let rec = reg
-                                .records
-                                .iter_mut()
-                                .find(|r| r.pid == pid)
-                                .expect("user task unregistered");
+                            let index = reg.group_index(pid).expect("user task unregistered");
+                            let rec = &mut reg.records[index];
                             let space = rec
                                 .space
                                 .as_mut()
@@ -314,9 +308,7 @@ pub fn user_task_entry() -> ! {
                         let result = {
                             let reg = REGISTRY.lock();
                             let space = reg
-                                .records
-                                .iter()
-                                .find(|r| r.pid == pid)
+                                .group(pid)
                                 .and_then(|r| r.space.as_ref())
                                 .expect("running user task lost its space");
                             trap::emulate_unaligned(&mut frame, space.as_space(), addr)
@@ -355,7 +347,7 @@ pub fn user_task_entry() -> ! {
                         } | polyhal::pagetable::MappingFlags::U;
                         let result = {
                             let reg = REGISTRY.lock();
-                            reg.records.iter().find(|r| r.pid == pid)
+                            reg.group(pid)
                                 .and_then(|r| r.space.as_ref())
                                 .ok_or(crate::mm::address_space::MapError::NotMapped)
                                 .and_then(|s| {
@@ -440,7 +432,7 @@ pub fn user_task_entry() -> ! {
                 .as_nanos()
                 .min(u64::MAX as u128) as u64;
             let mut reg = REGISTRY.lock();
-            if let Some(rec) = reg.records.iter_mut().find(|r| r.pid == pid) {
+            if let Some(rec) = reg.group_mut(pid) {
                 rec.system_ns = rec.system_ns.saturating_add(spent);
             }
         }
@@ -548,11 +540,7 @@ fn park_check_signals(
     let peeked = {
         let mut reg = REGISTRY.lock();
         let blocked = reg.thread(pid).map_or(0, |t| t.signal.blocked());
-        let rec = reg
-            .records
-            .iter_mut()
-            .find(|r| r.pid == pid)
-            .expect("user task unregistered");
+        let rec = reg.group_mut(pid).expect("user task unregistered");
         // 先查等待集内信号：命中即消费，不经处置。
         let tw_hit = tw_set.and_then(|set| {
             let mut hidden = blocked;
@@ -630,7 +618,7 @@ fn park_check_signals(
                         rem[8..].copy_from_slice(&(left.subsec_nanos() as u64).to_ne_bytes());
                         // 写失败忽略（不改变返回值）。
                         let reg = REGISTRY.lock();
-                        if let Some(rec) = reg.records.iter().find(|r| r.pid == pid) {
+                        if let Some(rec) = reg.group(pid) {
                             if let Some(space) = rec.space.as_ref() {
                                 let _ = crate::mm::user_access::copy_to_user(
                                     space.as_space(),
@@ -722,11 +710,7 @@ fn process_call(
                 let consequence = {
                     let mut reg = REGISTRY.lock();
                     let blocked = reg.thread(parent).map_or(0, |t| t.signal.blocked());
-                    let rec = reg
-                        .records
-                        .iter_mut()
-                        .find(|r| r.pid == parent)
-                        .expect("user task unregistered");
+                    let rec = reg.group_mut(parent).expect("user task unregistered");
                     loop {
                         let Some((sig, _)) = rec.signal.peek_deliverable(blocked) else {
                             break false;
@@ -759,14 +743,11 @@ fn process_call(
                 let taken = {
                     let mut reg = REGISTRY.lock();
                     let blocked = reg.thread(parent).map_or(0, |t| t.signal.blocked());
-                    reg.records
-                        .iter_mut()
-                        .find(|r| r.pid == parent)
-                        .and_then(|rec| {
-                            let mut hidden = blocked;
-                            hidden |= !set;
-                            rec.signal.take_deliverable(hidden)
-                        })
+                    reg.group_mut(parent).and_then(|rec| {
+                        let mut hidden = blocked;
+                        hidden |= !set;
+                        rec.signal.take_deliverable(hidden)
+                    })
                 };
                 if let Some((sig, slot)) = taken {
                     *timedwait = None;
@@ -791,14 +772,11 @@ fn process_call(
                             let taken = {
                                 let mut reg = REGISTRY.lock();
                                 let blocked = reg.thread(parent).map_or(0, |t| t.signal.blocked());
-                                reg.records
-                                    .iter_mut()
-                                    .find(|r| r.pid == parent)
-                                    .and_then(|rec| {
-                                        let mut hidden = blocked;
-                                        hidden |= !set;
-                                        rec.signal.take_deliverable(hidden)
-                                    })
+                                reg.group_mut(parent).and_then(|rec| {
+                                    let mut hidden = blocked;
+                                    hidden |= !set;
+                                    rec.signal.take_deliverable(hidden)
+                                })
                             };
                             if let Some((sig, slot)) = taken {
                                 write_uinfo(parent, args[1], sig, &slot).map(|_| sig as usize)
@@ -835,9 +813,7 @@ fn process_call(
                     .to_ne_bytes(),
             );
             data[104..108].copy_from_slice(&1024u32.to_ne_bytes());
-            reg.records
-                .iter()
-                .find(|r| r.pid == parent)
+            reg.group(parent)
                 .and_then(|r| r.space.as_ref())
                 .ok_or(Errno::NoProcess)
                 .and_then(|s| {
@@ -849,11 +825,7 @@ fn process_call(
         sysnr::PPOLL => {
             let reg = REGISTRY.lock();
             let checked = (|| {
-                let rec = reg
-                    .records
-                    .iter()
-                    .find(|r| r.pid == parent)
-                    .ok_or(Errno::NoProcess)?;
+                let rec = reg.group(parent).ok_or(Errno::NoProcess)?;
                 let space = rec.space.as_ref().ok_or(Errno::Invalid)?.as_space();
                 if args[3] != 0 {
                     return Err(Errno::NotSupported);
@@ -907,9 +879,7 @@ fn process_call(
                 let reg = REGISTRY.lock();
                 let mut request = [0u8; 16];
                 let valid = reg
-                    .records
-                    .iter()
-                    .find(|r| r.pid == parent)
+                    .group(parent)
                     .and_then(|r| r.space.as_ref())
                     .is_some_and(|s| {
                         crate::mm::user_access::copy_from_user(s.as_space(), args[0], &mut request)
@@ -943,7 +913,7 @@ fn process_call(
         },
         sysnr::TIMES => {
             let reg = REGISTRY.lock();
-            if let Some(rec) = reg.records.iter().find(|r| r.pid == parent) {
+            if let Some(rec) = reg.group(parent) {
                 let mut data = [0; 32];
                 for (i, ns) in [
                     rec.user_ns,
@@ -969,12 +939,7 @@ fn process_call(
                 Err(Errno::NoProcess)
             }
         }
-        sysnr::GETPPID => Ok(REGISTRY
-            .lock()
-            .records
-            .iter()
-            .find(|r| r.pid == parent)
-            .map_or(0, |r| r.parent)),
+        sysnr::GETPPID => Ok(REGISTRY.lock().group(parent).map_or(0, |r| r.parent)),
         sysnr::GETUID => credential(parent, |c| c.ruid),
         sysnr::GETEUID => credential(parent, |c| c.euid),
         sysnr::GETGID => credential(parent, |c| c.rgid),
@@ -1020,12 +985,7 @@ fn process_call(
                 if wanted == i32::MIN {
                     Err(Errno::NoChild)
                 } else {
-                    let caller_pgid = REGISTRY
-                        .lock()
-                        .records
-                        .iter()
-                        .find(|r| r.pid == parent)
-                        .map_or(0, |r| r.pgid);
+                    let caller_pgid = REGISTRY.lock().group(parent).map_or(0, |r| r.pgid);
                     let wanted_pgid = (-(wanted as i64)) as usize;
                     let matches = |r: &super::ProcessRecord| {
                         r.parent == parent
@@ -1066,9 +1026,7 @@ fn process_call(
                         let child_pid = reaped_pid.expect("ready implies pid");
                         let copied = args[1] == 0 || {
                             let reg = REGISTRY.lock();
-                            reg.records
-                                .iter()
-                                .find(|r| r.pid == parent)
+                            reg.group(parent)
                                 .and_then(|r| r.space.as_ref())
                                 .is_some_and(|s| {
                                     crate::mm::user_access::copy_to_user(
@@ -1087,7 +1045,7 @@ fn process_call(
                             let (user, system) = super::registry::reap_child(parent, child_pid)
                                 .expect("child exists");
                             let mut reg = REGISTRY.lock();
-                            if let Some(rec) = reg.records.iter_mut().find(|r| r.pid == parent) {
+                            if let Some(rec) = reg.group_mut(parent) {
                                 rec.child_user_ns = rec.child_user_ns.saturating_add(user);
                                 rec.child_system_ns = rec.child_system_ns.saturating_add(system);
                             }
@@ -1128,9 +1086,7 @@ fn process_call(
 /// 取调用进程凭证中的一个号：getuid(2)、geteuid(2)、getgid(2)、getegid(2) 共用。
 fn credential(parent: Pid, pick: impl Fn(&super::Credentials) -> u32) -> Result<usize, Errno> {
     let reg = REGISTRY.lock();
-    reg.records
-        .iter()
-        .find(|r| r.pid == parent)
+    reg.group(parent)
         .map(|r| pick(&r.creds) as usize)
         .ok_or(Errno::NoProcess)
 }
@@ -1155,9 +1111,7 @@ fn read_sigset(parent: Pid, ptr: usize) -> Result<SignalSet, Errno> {
     let mut raw = [0u8; SIGSETSIZE];
     let ok = REGISTRY
         .lock()
-        .records
-        .iter()
-        .find(|r| r.pid == parent)
+        .group(parent)
         .and_then(|r| r.space.as_ref())
         .is_some_and(|s| user_access::copy_from_user(s.as_space(), ptr, &mut raw).is_ok());
     if ok {
@@ -1177,9 +1131,7 @@ fn write_uinfo(parent: Pid, uinfo: usize, sig: u8, slot: &SigInfoSlot) -> Result
     fill_siginfo(&mut buf, sig, slot);
     let ok = REGISTRY
         .lock()
-        .records
-        .iter()
-        .find(|r| r.pid == parent)
+        .group(parent)
         .and_then(|r| r.space.as_ref())
         .is_some_and(|s| user_access::copy_to_user(s.as_space(), uinfo, &buf).is_ok());
     if ok {
@@ -1198,9 +1150,7 @@ fn timedwait_deadline(parent: Pid, ts_ptr: usize) -> Result<core::time::Duration
     let mut raw = [0u8; 16];
     let ok = REGISTRY
         .lock()
-        .records
-        .iter()
-        .find(|r| r.pid == parent)
+        .group(parent)
         .and_then(|r| r.space.as_ref())
         .is_some_and(|s| user_access::copy_from_user(s.as_space(), ts_ptr, &mut raw).is_ok());
     if !ok {
@@ -1226,9 +1176,7 @@ fn queue_info(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
     let mut raw = [0u8; 128];
     let ok = REGISTRY
         .lock()
-        .records
-        .iter()
-        .find(|r| r.pid == parent)
+        .group(parent)
         .and_then(|r| r.space.as_ref())
         .is_some_and(|s| user_access::copy_from_user(s.as_space(), args[2], &mut raw).is_ok());
     if !ok {
@@ -1298,12 +1246,7 @@ fn kill_or_tgkill(parent: Pid, nr: usize, args: [usize; 6]) -> Result<usize, Err
     };
     let mut locked = REGISTRY.lock();
     let reg = &mut *locked;
-    let caller_pgid = reg
-        .records
-        .iter()
-        .find(|r| r.pid == parent)
-        .map(|r| r.pgid)
-        .ok_or(Errno::NoProcess)?;
+    let caller_pgid = reg.group(parent).map(|r| r.pgid).ok_or(Errno::NoProcess)?;
     let init = super::INIT_PID.load(core::sync::atomic::Ordering::Relaxed);
     let mut hits = 0usize;
     for r in reg.records.iter_mut() {
@@ -1359,12 +1302,7 @@ fn set_pg_id(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
         if reg.records[target_index].parent != parent {
             return Err(Errno::NoProcess);
         }
-        let caller_sid = reg
-            .records
-            .iter()
-            .find(|r| r.pid == parent)
-            .map(|r| r.sid)
-            .ok_or(Errno::NoProcess)?;
+        let caller_sid = reg.group(parent).map(|r| r.sid).ok_or(Errno::NoProcess)?;
         if target_sid != caller_sid {
             return Err(Errno::Perm);
         }
@@ -1409,11 +1347,7 @@ fn set_sid(parent: Pid) -> Result<usize, Errno> {
     if reg.records.iter().any(|r| r.pgid == parent) {
         return Err(Errno::Perm);
     }
-    let rec = reg
-        .records
-        .iter_mut()
-        .find(|r| r.pid == parent)
-        .ok_or(Errno::NoProcess)?;
+    let rec = reg.group_mut(parent).ok_or(Errno::NoProcess)?;
     rec.pgid = parent;
     rec.sid = parent;
     proc_sync_holding(&reg.records, parent);
@@ -1445,7 +1379,7 @@ fn waitid(parent: Pid, frame: &mut TrapFrame, args: [usize; 6]) -> ProcessResult
     let id = args[1] as u32 as usize;
     let (ready, any) = {
         let reg = REGISTRY.lock();
-        let caller_pgid = match reg.records.iter().find(|r| r.pid == parent) {
+        let caller_pgid = match reg.group(parent) {
             Some(r) => r.pgid,
             None => {
                 frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::NoProcess));
@@ -1491,9 +1425,7 @@ fn waitid(parent: Pid, frame: &mut TrapFrame, args: [usize; 6]) -> ProcessResult
         if infop != 0 {
             let copied = REGISTRY
                 .lock()
-                .records
-                .iter()
-                .find(|r| r.pid == parent)
+                .group(parent)
                 .and_then(|r| r.space.as_ref())
                 .is_some_and(|s| {
                     crate::mm::user_access::copy_to_user(s.as_space(), infop, &data).is_ok()
@@ -1507,7 +1439,7 @@ fn waitid(parent: Pid, frame: &mut TrapFrame, args: [usize; 6]) -> ProcessResult
             match super::registry::reap_child(parent, child_pid) {
                 Some((user, system)) => {
                     let mut reg = REGISTRY.lock();
-                    if let Some(rec) = reg.records.iter_mut().find(|r| r.pid == parent) {
+                    if let Some(rec) = reg.group_mut(parent) {
                         rec.child_user_ns = rec.child_user_ns.saturating_add(user);
                         rec.child_system_ns = rec.child_system_ns.saturating_add(system);
                     }
@@ -1530,9 +1462,7 @@ fn waitid(parent: Pid, frame: &mut TrapFrame, args: [usize; 6]) -> ProcessResult
         if infop != 0 {
             let copied = REGISTRY
                 .lock()
-                .records
-                .iter()
-                .find(|r| r.pid == parent)
+                .group(parent)
                 .and_then(|r| r.space.as_ref())
                 .is_some_and(|s| {
                     crate::mm::user_access::copy_to_user(s.as_space(), infop, &[0u8; 128]).is_ok()
@@ -1564,9 +1494,7 @@ fn read_timespec(parent: Pid, ptr: usize) -> Result<[i64; 2], Errno> {
     let mut data = [0u8; 16];
     let valid = REGISTRY
         .lock()
-        .records
-        .iter()
-        .find(|r| r.pid == parent)
+        .group(parent)
         .and_then(|r| r.space.as_ref())
         .is_some_and(|s| {
             crate::mm::user_access::copy_from_user(s.as_space(), ptr, &mut data).is_ok()
@@ -1587,9 +1515,7 @@ fn write_timespec(parent: Pid, ptr: usize, value: core::time::Duration) -> Resul
     data[8..].copy_from_slice(&(value.subsec_nanos() as i64).to_ne_bytes());
     REGISTRY
         .lock()
-        .records
-        .iter()
-        .find(|r| r.pid == parent)
+        .group(parent)
         .and_then(|r| r.space.as_ref())
         .ok_or(Errno::NoProcess)
         .and_then(|s| {
@@ -1603,11 +1529,7 @@ fn write_timespec(parent: Pid, ptr: usize, value: core::time::Duration) -> Resul
 fn clock_gettime(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
     let cpu = {
         let reg = REGISTRY.lock();
-        let rec = reg
-            .records
-            .iter()
-            .find(|r| r.pid == parent)
-            .ok_or(Errno::NoProcess)?;
+        let rec = reg.group(parent).ok_or(Errno::NoProcess)?;
         core::time::Duration::from_nanos(rec.user_ns.saturating_add(rec.system_ns))
     };
     let now = crate::time::lookup(args[0] as u32 as i32, cpu)?;
@@ -1688,11 +1610,7 @@ fn nanosleep_rem_ptr(frame: &TrapFrame) -> usize {
 fn get_rusage(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
     let who = args[0] as u32 as i32;
     let reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter()
-        .find(|r| r.pid == parent)
-        .ok_or(Errno::NoProcess)?;
+    let rec = reg.group(parent).ok_or(Errno::NoProcess)?;
     let (user, system) = match who {
         0 | 1 => (rec.user_ns, rec.system_ns),
         -1 => (rec.child_user_ns, rec.child_system_ns),
@@ -1717,11 +1635,7 @@ fn get_rusage(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
 /// 任一处写失败返回 EFAULT。
 fn get_res_id(parent: Pid, args: [usize; 6], want_gid: bool) -> Result<usize, Errno> {
     let reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter()
-        .find(|r| r.pid == parent)
-        .ok_or(Errno::NoProcess)?;
+    let rec = reg.group(parent).ok_or(Errno::NoProcess)?;
     let (real, effective, saved) = if want_gid {
         (rec.creds.rgid, rec.creds.egid, rec.creds.sgid)
     } else {
@@ -1742,11 +1656,7 @@ fn get_groups(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
         return Err(Errno::Invalid);
     }
     let reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter()
-        .find(|r| r.pid == parent)
-        .ok_or(Errno::NoProcess)?;
+    let rec = reg.group(parent).ok_or(Errno::NoProcess)?;
     let groups = &rec.creds.groups;
     let n = groups.len();
     if size == 0 {
@@ -1810,11 +1720,7 @@ impl IdSet {
 fn set_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
     let value = args[0] as u32;
     let mut reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter_mut()
-        .find(|r| r.pid == parent)
-        .ok_or(Errno::NoProcess)?;
+    let rec = reg.group_mut(parent).ok_or(Errno::NoProcess)?;
     let mut ids = IdSet::load(&rec.creds, gid);
     let privileged = rec.creds.euid == 0;
     if privileged {
@@ -1836,11 +1742,7 @@ fn set_re_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
     let real_arg = args[0] as u32;
     let effective_arg = args[1] as u32;
     let mut reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter_mut()
-        .find(|r| r.pid == parent)
-        .ok_or(Errno::NoProcess)?;
+    let rec = reg.group_mut(parent).ok_or(Errno::NoProcess)?;
     let old = IdSet::load(&rec.creds, gid);
     let privileged = rec.creds.euid == 0;
     if real_arg != u32::MAX && real_arg != old.real && real_arg != old.effective && !privileged {
@@ -1885,11 +1787,7 @@ fn set_re_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
 fn set_res_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
     let requested = [args[0] as u32, args[1] as u32, args[2] as u32];
     let mut reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter_mut()
-        .find(|r| r.pid == parent)
-        .ok_or(Errno::NoProcess)?;
+    let rec = reg.group_mut(parent).ok_or(Errno::NoProcess)?;
     let old = IdSet::load(&rec.creds, gid);
     if rec.creds.euid != 0 {
         for value in requested {
@@ -1932,11 +1830,7 @@ fn set_res_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> 
 fn set_fs_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
     let value = args[0] as u32;
     let mut reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter_mut()
-        .find(|r| r.pid == parent)
-        .ok_or(Errno::NoProcess)?;
+    let rec = reg.group_mut(parent).ok_or(Errno::NoProcess)?;
     let old = IdSet::load(&rec.creds, gid);
     if rec.creds.euid == 0
         || value == old.real
@@ -1954,11 +1848,7 @@ fn set_fs_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
 fn set_groups(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
     let size = args[0] as u32 as i32;
     let mut reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter_mut()
-        .find(|r| r.pid == parent)
-        .ok_or(Errno::NoProcess)?;
+    let rec = reg.group_mut(parent).ok_or(Errno::NoProcess)?;
     if rec.creds.euid != 0 {
         return Err(Errno::Perm);
     }
@@ -2104,11 +1994,7 @@ fn fork_user(
     }
     let (mut space, creds) = {
         let reg = REGISTRY.lock();
-        let source = reg
-            .records
-            .iter()
-            .find(|r| r.pid == parent)
-            .ok_or(Errno::NoProcess)?;
+        let source = reg.group(parent).ok_or(Errno::NoProcess)?;
         let space = source
             .space
             .as_ref()
@@ -2120,9 +2006,7 @@ fn fork_user(
     };
     let fs = {
         let reg = REGISTRY.lock();
-        reg.records
-            .iter()
-            .find(|r| r.pid == parent)
+        reg.group(parent)
             .and_then(|r| r.fs.as_ref())
             .ok_or(Errno::NoProcess)?
             .fork()?
@@ -2166,7 +2050,7 @@ fn fork_user(
         let mut locked = REGISTRY.lock();
         let reg = &mut *locked;
         // 先取父子记录下标，再以 split_at_mut 就地 fork_from。
-        let parent_index = reg.records.iter().position(|r| r.pid == parent);
+        let parent_index = reg.group_index(parent);
         let child_index = reg.records.iter().position(|r| r.pid == pid);
         if let (Some(pi), Some(ci)) = (parent_index, child_index) {
             debug_assert_ne!(pi, ci, "fork parent and child share a record");

@@ -441,9 +441,8 @@ pub fn send_signal(target: Pid, sig: u8, slot: SigInfoSlot) -> Result<(), Errno>
     let mut reg = REGISTRY.lock();
     let blocked = reg.thread(target).map_or(0, |t| t.signal.blocked());
     let rec = reg
-        .records
-        .iter_mut()
-        .find(|r| r.pid == target && r.exit.is_none())
+        .group_mut(target)
+        .filter(|r| r.exit.is_none())
         .ok_or(Errno::NoProcess)?;
     rec.signal.generate(sig, slot, blocked);
     Ok(())
@@ -455,24 +454,23 @@ pub fn send_signal(target: Pid, sig: u8, slot: SigInfoSlot) -> Result<(), Errno>
 pub fn force_signal(target: Pid, sig: u8, slot: SigInfoSlot) {
     let mut locked = REGISTRY.lock();
     let reg = &mut *locked;
-    if let Some(rec) = reg
-        .records
-        .iter_mut()
-        .find(|r| r.pid == target && r.exit.is_none())
-    {
+    if reg.group(target).is_none_or(|r| r.exit.is_some()) {
+        return;
+    }
+    let mut one: SignalSet = 0;
+    one.add(sig);
+    let blocked = match reg.threads.iter_mut().find(|t| t.tid == target) {
+        Some(thread) => {
+            thread.signal.unblock(one);
+            thread.signal.blocked()
+        }
+        None => 0,
+    };
+    if let Some(rec) = reg.group_mut(target) {
         if rec.signal.disposition(sig).handler == SIG_IGN {
             rec.signal
                 .set_disposition(sig, SignalDisposition::default());
         }
-        let mut one: SignalSet = 0;
-        one.add(sig);
-        let blocked = match reg.threads.iter_mut().find(|t| t.tid == target) {
-            Some(thread) => {
-                thread.signal.unblock(one);
-                thread.signal.blocked()
-            }
-            None => 0,
-        };
         rec.signal.generate(sig, slot, blocked);
     }
 }

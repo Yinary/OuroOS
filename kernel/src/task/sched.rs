@@ -171,9 +171,8 @@ impl Scheduler {
             // SCHED→REGISTRY，见 docs/ostd-contracts.md §5）。
             let reg = super::REGISTRY.lock();
             self.move_waiting(|task, _| {
-                reg.records.iter().any(|r| {
-                    r.pid == task.pid
-                        && r.exit.is_none()
+                reg.group(task.pid).is_some_and(|r| {
+                    r.exit.is_none()
                         && r.signal.pending()
                             & !reg.thread(task.pid).map_or(0, |t| t.signal.blocked())
                             != 0

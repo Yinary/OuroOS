@@ -159,6 +159,26 @@ impl Registry {
     pub(crate) fn remove_thread(&mut self, tid: Pid) {
         self.threads.retain(|t| t.tid != tid);
     }
+
+    /// 把线程号或进程号解析为线程组下标：先按 tid 查线程记录取其 tgid，找不到时按组记录自身的 pid 匹配。
+    pub(crate) fn group_index(&self, pid: Pid) -> Option<usize> {
+        let tgid = match self.thread(pid) {
+            Some(thread) => thread.tgid,
+            None => pid,
+        };
+        self.records.iter().position(|r| r.pid == tgid)
+    }
+
+    /// 按线程号或进程号取所属线程组记录。
+    pub(crate) fn group(&self, pid: Pid) -> Option<&ProcessRecord> {
+        self.records.get(self.group_index(pid)?)
+    }
+
+    /// 按线程号或进程号取所属线程组记录的可变引用。
+    pub(crate) fn group_mut(&mut self, pid: Pid) -> Option<&mut ProcessRecord> {
+        let index = self.group_index(pid)?;
+        self.records.get_mut(index)
+    }
 }
 
 /// 终态行积攒表：收割即删后注册表不留历史，输出推迟到时代结束，
@@ -326,11 +346,7 @@ mod registry {
     pub fn record_exit(pid: Pid, exit: ExitInfo) {
         let taken = {
             let mut reg = REGISTRY.lock();
-            let rec = reg
-                .records
-                .iter_mut()
-                .find(|r| r.pid == pid)
-                .expect("exiting task is not registered");
+            let rec = reg.group_mut(pid).expect("exiting task is not registered");
             rec.exit = Some(exit);
             // 快照置僵尸（procfs 可见的存活规则与注册表一致）
             proc_table_mark_zombie(pid);
