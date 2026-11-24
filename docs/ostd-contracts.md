@@ -127,15 +127,17 @@
 | 11 | rv 未知 cause unwrap 与 LoadFault 地址特判 panic | 已修：未知 cause 报 `Unhandled`；LoadFault 统一作为用户或内核页错误交 OS 判来源 |
 | 12 | 用户 FP 现场不完整 / 内核 FP 跨切换不保留 | 已修：rv/la 陷阱边界保存完整用户 FP、控制状态与内核 FP；框架切换包装器在原 KContext 外保存内核 FP |
 | — | la 缺 `TrapFrame::from_user` | 已修：vendor 补齐，OS 侧统一用 `from_user` |
+| 13 | rv 时钟频率写死 12.5 MHz，QEMU virt 的设备树是 10 MHz，来宾时间比真实时间慢 25% | 已修：vendor polyhal 本体，按设备树 `timebase-frequency` 换算 |
 
 ### 2.3 vendor 补丁
 
-polyhal-trap 0.4.0 整 crate vendor 至 `third_party/polyhal-trap`，
-根 `[patch.crates-io]` 指向本地；polyhal 本体与 polyhal-boot 仍走
-crates.io。补丁：#5 TrapType 直达、#7 Unhandled 转交、la `from_user`
-补齐、la 非对齐事件交 OS 安全模拟、完整 FP 现场与显式用户返回状态。
-清单与升级回归见该目录
-README；不得直接编辑 `~/.cargo/registry`。上游 PR（MIT）待提。
+polyhal 与 polyhal-trap 0.4.0 整 crate vendor 至 `third_party/polyhal`
+与 `third_party/polyhal-trap`，根 `[patch.crates-io]` 指向本地；
+polyhal-boot 仍走 crates.io。polyhal-trap 的补丁：#5 TrapType 直达、
+#7 Unhandled 转交、la `from_user` 补齐、la 非对齐事件交 OS 安全模拟、
+完整 FP 现场与显式用户返回状态、用户断点保留故障 PC。polyhal 的补丁：
+#13 rv 时钟频率读设备树。清单与升级回归见各目录 README；不得直接编辑
+`~/.cargo/registry`。上游 PR（MIT）待提。
 
 ## 3. task 契约
 

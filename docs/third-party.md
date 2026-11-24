@@ -4,7 +4,7 @@
 
 | 来源 | 协议 | 使用方式 | 登记时间 |
 |---|---|---|---|
-| [PolyHAL](https://github.com/Byte-OS/polyhal) polyhal / polyhal-boot / polyhal-trap 0.4.0 | MIT | crates.io 依赖（polyhal、polyhal-boot）；polyhal-trap 整 crate vendor 至 `third_party/polyhal-trap` 并打本地补丁（含 rv/la 用户断点 PC 修复，清单见其 README.md） | polyhal-patch 分支 |
+| [PolyHAL](https://github.com/Byte-OS/polyhal) polyhal / polyhal-boot / polyhal-trap 0.4.0 | MIT | crates.io 依赖（polyhal-boot）；polyhal 与 polyhal-trap 整 crate vendor 至 `third_party/polyhal` 与 `third_party/polyhal-trap` 并打本地补丁（rv 时钟频率读设备树，rv/la 用户断点 PC 修复，清单见各自 README.md） | polyhal-patch 分支 |
 | [PolyHAL](https://github.com/Byte-OS/polyhal) polyhal-trap 0.4.0 `trap/loongarch64/unaligned.rs` | MIT | 整数非对齐指令解码范围借鉴并重写于 `kernel/src/trap/unaligned.rs`；用户访存改用 OuroOS 权限检查与复制 | 2026-11-14 |
 | [virtio-drivers](https://github.com/rcore-os/virtio-drivers) 0.7.5 | MIT | 精确版本 crates.io 依赖；自写 DMA 与 MMIO/PCI 适配，未修改上游 | 2026-11-10 |
 | [rsext4 0.8.1](https://crates.io/crates/rsext4/0.8.1) | Apache-2.0 | 源码和许可证位于 `third_party/rsext4`，默认 Ext4 后端，`rsext4-readonly` 选择只读模式。补丁见该目录 README | 2026-11-12 |
