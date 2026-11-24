@@ -64,12 +64,14 @@ pub mod sysnr {
     pub const EXIT_GROUP: usize = 94;
     pub const SYSINFO: usize = 179;
     pub const PPOLL: usize = 73;
+    pub const FUTEX: usize = 98;
     pub const NANOSLEEP: usize = 101;
     pub const CLOCK_GETTIME: usize = 113;
     pub const CLOCK_GETRES: usize = 114;
     pub const CLOCK_NANOSLEEP: usize = 115;
     pub const SCHED_YIELD: usize = 124;
     pub const KILL: usize = 129;
+    pub const TKILL: usize = 130;
     pub const TGKILL: usize = 131;
     // 信号
     pub const SIGALTSTACK: usize = 132;
@@ -192,6 +194,8 @@ pub enum Errno {
     Fault,
     /// ENOSYS: 未实现的系统调用
     NoSys,
+    /// ETIMEDOUT: 等待超过期限。
+    TimedOut,
 }
 
 impl Errno {
@@ -232,6 +236,7 @@ impl Errno {
             Errno::BadF => 9,
             Errno::Fault => 14,
             Errno::NoSys => 38,
+            Errno::TimedOut => 110,
         }
     }
 }
@@ -252,6 +257,8 @@ pub enum Flow {
     SigReturn,
     /// 任务已退出，携带退出状态。
     Exited(i32),
+    /// 线程组退出：终止组内全部线程后登记组终态。
+    ExitedGroup(i32),
 }
 
 /// 系统调用分发，返回 Flow。返回值写回 a0，PC 推进与执行流决策由调用方处理。
@@ -262,7 +269,8 @@ pub fn dispatch(
     pid: usize,
     space: &mut UserAddressSpace,
     fs: &mut crate::fs::context::Context,
-    signal: &mut crate::task::signal::SignalState,
+    signal: &mut crate::task::signal::SignalGroup,
+    thread: &mut crate::task::ThreadRecord,
 ) -> Flow {
     // 调用号在 a7（TrapFrameArgs::SYSCALL），参数在 a0..；返回值写回 a0
     let nr = cx[TrapFrameArgs::SYSCALL];
@@ -330,6 +338,7 @@ pub fn dispatch(
                         pid: pid as u32,
                         ..Default::default()
                     },
+                    thread.signal.blocked(),
                 );
             }
             cx[TrapFrameArgs::RET] = to_abi(ret);
@@ -376,16 +385,12 @@ pub fn dispatch(
             Flow::Continue
         }
         sysnr::SET_TID_ADDRESS => {
-            space.clear_child_tid = a0;
+            thread.clear_child_tid = a0;
             cx[TrapFrameArgs::RET] = pid;
             Flow::Continue
         }
-        sysnr::EXIT | sysnr::EXIT_GROUP => {
-            if space.clear_child_tid != 0 {
-                let _ = user_access::copy_to_user(space, space.clear_child_tid, &[0; 4]);
-            }
-            Flow::Exited(a0 as i32)
-        }
+        sysnr::EXIT => Flow::Exited(a0 as i32),
+        sysnr::EXIT_GROUP => Flow::ExitedGroup(a0 as i32),
         sysnr::READAHEAD => {
             cx[TrapFrameArgs::RET] = to_abi(memory::readahead(fs, a0, a1, a2));
             Flow::Continue
@@ -423,20 +428,21 @@ pub fn dispatch(
         }
         sysnr::RT_SIGPROCMASK => {
             // rt_sigprocmask(2)：屏蔽集合改读
-            let ret = signal::rt_sigprocmask(space, a0, a1, a2, args[3], signal);
+            let ret = signal::rt_sigprocmask(space, a0, a1, a2, args[3], &mut thread.signal);
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
         sysnr::RT_SIGPENDING => {
             // rt_sigpending(2)：pending 位图回写
-            let ret = signal::rt_sigpending(space, a0, a1, signal);
+            let ret = signal::rt_sigpending(space, a0, a1, signal, &thread.signal);
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
         sysnr::SIGALTSTACK => {
             // sigaltstack(2)：备用栈登记的换读；只改调用者自身记录，
             // on_alt/SS_ONSTACK 判定用陷入前的用户 sp。
-            let ret = signal::rt_sigaltstack(space, cx[TrapFrameArgs::SP], a0, a1, signal);
+            let ret =
+                signal::rt_sigaltstack(space, cx[TrapFrameArgs::SP], a0, a1, &mut thread.signal);
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
@@ -445,12 +451,12 @@ pub fn dispatch(
             // 失败按 force SIGSEGV 处置，偏差登记 docs/ostd-contracts.md §4.5。
             match crate::sigframe::restore(cx, space) {
                 // 成功：换回帧内保存的屏蔽集合（KILL/STOP 已剥除）。
-                Ok(old) => signal.setmask(old),
+                Ok(old) => thread.signal.setmask(old),
                 Err(_) => {
                     signal.set_disposition(SIGSEGV, Default::default());
                     let mut one: SignalSet = 0;
                     one.add(SIGSEGV);
-                    signal.unblock(one);
+                    thread.signal.unblock(one);
                     signal.generate(
                         SIGSEGV,
                         SigInfoSlot {
@@ -458,6 +464,7 @@ pub fn dispatch(
                             addr: cx[TrapFrameArgs::SP],
                             ..Default::default()
                         },
+                        thread.signal.blocked(),
                     );
                 }
             }
@@ -471,6 +478,7 @@ pub fn dispatch(
         // KILL/TGKILL/RT_SIGSUSPEND/RT_SIGTIMEDWAIT/RT_SIGQUEUEINFO/SYSINFO/
         // PPOLL 改目标记录或依赖循环局部等待状态，在锁外（process_call）处理。
         sysnr::KILL
+        | sysnr::TKILL
         | sysnr::TGKILL
         | sysnr::RT_SIGSUSPEND
         | sysnr::RT_SIGTIMEDWAIT
@@ -501,6 +509,7 @@ pub fn dispatch(
         | sysnr::GETEGID
         | sysnr::GETTID
         | sysnr::CLONE
+        | sysnr::FUTEX
         | sysnr::EXECVE
         | sysnr::WAIT4
         | sysnr::WAITID

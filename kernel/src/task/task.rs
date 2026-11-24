@@ -34,6 +34,13 @@ pub enum TaskState {
     Exited,
 }
 
+/// futex 等待的地址键：物理页帧号与页内字偏移。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FutexKey {
+    pub frame: usize,
+    pub offset: usize,
+}
+
 /// 任务挂起的原因；唤醒采用宽松匹配（醒来重查条件）而非精确订阅。
 /// 任何 pipe 状态变化唤醒全部 Pipe 等待者（单核惊群可忽略），
 /// 子进程退出唤醒全部 Children 等待者。
@@ -49,6 +56,13 @@ pub enum WaitReason {
     Signal,
     /// ppoll 同时等待管道变化或截止时间。
     PollUntil(core::time::Duration),
+    Futex {
+        key: FutexKey,
+        deadline: Option<core::time::Duration>,
+        bitset: u32,
+    },
+    /// vfork 的父进程等待子进程 exec 或退出。
+    Vfork(Pid),
 }
 
 impl WaitReason {
@@ -56,6 +70,7 @@ impl WaitReason {
     pub fn deadline(&self) -> Option<core::time::Duration> {
         match self {
             WaitReason::Deadline(d) | WaitReason::PollUntil(d) => Some(*d),
+            WaitReason::Futex { deadline, .. } => *deadline,
             _ => None,
         }
     }
@@ -68,6 +83,7 @@ pub struct Task {
     pub(super) body: Option<TaskBody>,
     pub(super) state: TaskState,
     pub(super) pid: Pid,
+    pub(super) tgid: Pid,
     /// 调试与日志用名。
     pub(super) name: &'static str,
     /// 本时间片的终点；由调度器在切入（promote）时刷新，
@@ -85,7 +101,12 @@ impl Task {
     }
 
     /// 创建内核任务。trampoline 从调度器读取 current 任务后调用入口。
-    pub fn new_kernel(pid: Pid, name: &'static str, entry: fn()) -> Result<Self, FrameError> {
+    pub fn new_kernel(
+        pid: Pid,
+        tgid: Pid,
+        name: &'static str,
+        entry: fn(),
+    ) -> Result<Self, FrameError> {
         let kstack = KernelStack::new(config::KSTACK_PAGES)?;
         let mut context = KContext::blank();
         context[KContextArgs::KSP] = kstack.top();
@@ -96,6 +117,7 @@ impl Task {
             body: Some(TaskBody::Kernel(entry)),
             state: TaskState::Ready,
             pid,
+            tgid,
             name,
             slice_end: core::time::Duration::ZERO,
             _kstack: kstack,
@@ -103,7 +125,12 @@ impl Task {
     }
 
     /// 创建用户任务。`frame` 必须已设置好入口 PC 与用户栈顶。
-    pub fn new_user(pid: Pid, name: &'static str, frame: TrapFrame) -> Result<Self, FrameError> {
+    pub fn new_user(
+        pid: Pid,
+        tgid: Pid,
+        name: &'static str,
+        frame: TrapFrame,
+    ) -> Result<Self, FrameError> {
         let kstack = KernelStack::new(config::KSTACK_PAGES)?;
         let mut context = KContext::blank();
         context[KContextArgs::KSP] = kstack.top();
@@ -114,6 +141,7 @@ impl Task {
             body: Some(TaskBody::User { frame, pid }),
             state: TaskState::Ready,
             pid,
+            tgid,
             name,
             slice_end: core::time::Duration::ZERO,
             _kstack: kstack,
