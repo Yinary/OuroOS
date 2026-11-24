@@ -40,6 +40,57 @@ impl ExitInfo {
     }
 }
 
+/// 进程凭证：真实、有效、保存的用户号与组号，文件系统访问用的号，以及补充组。
+/// init 从全 0 开始，fork 继承，exec 保留。
+pub struct Credentials {
+    pub ruid: u32,
+    pub euid: u32,
+    pub suid: u32,
+    pub rgid: u32,
+    pub egid: u32,
+    pub sgid: u32,
+    pub fsuid: u32,
+    pub fsgid: u32,
+    pub groups: Vec<u32>,
+}
+
+impl Credentials {
+    /// 全 0 的凭证，即 root。
+    pub fn root() -> Self {
+        Self {
+            ruid: 0,
+            euid: 0,
+            suid: 0,
+            rgid: 0,
+            egid: 0,
+            sgid: 0,
+            fsuid: 0,
+            fsgid: 0,
+            groups: Vec::new(),
+        }
+    }
+
+    /// 复制凭证；补充组的内存预留失败时返回 Err。
+    pub fn try_clone(&self) -> Result<Self, ()> {
+        let mut groups = Vec::new();
+        groups
+            .try_reserve_exact(self.groups.len())
+            .map_err(|_| ())?;
+        groups.extend_from_slice(&self.groups);
+        Ok(Self {
+            ruid: self.ruid,
+            euid: self.euid,
+            suid: self.suid,
+            rgid: self.rgid,
+            egid: self.egid,
+            sgid: self.sgid,
+            fsuid: self.fsuid,
+            fsgid: self.fsgid,
+            groups,
+        })
+    }
+}
+
 /// 进程注册表条目：Task 之外的全部资源与终态。
 /// 生命周期：wait 成功收割即删除；孤儿过继 init，运行时间累归丢弃。
 /// 表内只存活跃进程与未被收割的僵尸。
@@ -64,6 +115,8 @@ pub struct ProcessRecord {
     pub sid: Pid,
     /// 是否执行过 execve；setpgid 据此拒绝修改子进程的进程组。
     pub did_exec: bool,
+    /// 凭证；fork 继承，exec 保留。
+    pub creds: Credentials,
 }
 
 /// 注册表本体。pid 0 保留（"无任务"标识）。
@@ -96,6 +149,11 @@ pub(crate) struct ProcEntry {
     /// b'R' 用户任务运行中 / b'S' 内核任务 / b'Z' 已退出未收割
     pub state: u8,
     pub ppid: u32,
+    /// 进程组与会话。
+    pub pgid: u32,
+    pub sid: u32,
+    /// 真实、有效、保存、文件系统用的用户号在前，组号在后。
+    pub ids: [u32; 8],
 }
 static PROC_TABLE: DebugMutex<alloc::vec::Vec<ProcEntry>> =
     DebugMutex::new("PROC_TABLE", alloc::vec::Vec::new());
@@ -117,7 +175,28 @@ pub(crate) fn proc_table_push(pid: Pid, name: &'static str, ppid: Pid, user: boo
         cmdline: None,
         state,
         ppid: ppid as u32,
+        pgid: pid as u32,
+        sid: pid as u32,
+        ids: [0; 8],
     });
+}
+
+/// 把进程组、会话与凭证写入 procfs 快照；调用方须已持 REGISTRY 锁。
+pub(crate) fn proc_table_sync(pid: Pid, pgid: Pid, sid: Pid, ids: [u32; 8]) {
+    if let Some(e) = PROC_TABLE.lock().iter_mut().find(|e| e.pid as Pid == pid) {
+        e.pgid = pgid as u32;
+        e.sid = sid as u32;
+        e.ids = ids;
+    }
+}
+
+/// FS 读接口：按 pid 取进程组、会话与八个身份号，不存在返回 None。
+pub fn proc_table_identity(pid: u32) -> Option<(u32, u32, [u32; 8])> {
+    PROC_TABLE
+        .lock()
+        .iter()
+        .find(|e| e.pid == pid)
+        .map(|e| (e.pgid, e.sid, e.ids))
 }
 
 /// execve 发布段更新真实 argv（cmdline）。
@@ -196,6 +275,7 @@ mod registry {
             pgid: pid,
             sid: pid,
             did_exec: false,
+            creds: Credentials::root(),
             user_ns: 0,
             system_ns: 0,
             child_user_ns: 0,

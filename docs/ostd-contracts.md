@@ -265,7 +265,7 @@ try_lock 失败即报告“持锁跨调度”。
 | 组 | 调用 | 实现 |
 |---|---|---|
 | 文件 | getcwd、dup、dup3、fcntl、mkdirat、mknodat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、readlinkat、readahead、statfs、fstatfs、newfstatat、fstat、fsync、statx、umask、utimensat、renameat、renameat2、truncate、ftruncate、fchmodat、fchmod | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
-| 进程 | exit、nanosleep、clock_gettime、clock_getres、clock_nanosleep、sched_yield、times、getpid、getppid、setpgid、getpgid、setsid、getsid、clone、execve、wait4、waitid | `task::process_call` |
+| 进程 | exit、nanosleep、sched_yield、times、getpid、getppid、gettid、getuid、geteuid、getgid、getegid、getresuid、getresgid、getgroups、setuid、setgid、setreuid、setregid、setresuid、setresgid、setfsuid、setfsgid、setgroups、setpgid、getpgid、setsid、getsid、clone、execve、wait4、waitid | `task::process_call` |
 | 资源统计 | getrusage | `task::process_call` |
 | 调度查询与亲和 | sched_getscheduler、sched_getparam、sched_get_priority_max、sched_get_priority_min、sched_rr_get_interval、sched_getaffinity、sched_setaffinity | `task::process_call` |
 | 访问检查/日志 | faccessat、faccessat2、syslog(klogctl) | `syscall/fs.rs`、`dmesg.rs` |
@@ -280,8 +280,8 @@ try_lock 失败即报告“持锁跨调度”。
 | 调用/类别 | 当前实现 | Linux 对照 / 说明 |
 |---|---|---|
 | mknodat | 仅 S_IFBLK：节点登记 (盘,分区) 身份（minor 编码），必须位于 /dev 下，分区须真实存在（总线位置校验），同名 EEXIST；major 须为 254（本内核块设备空间）。S_IFCHR/S_IFIFO/S_IFSOCK 返回 EOPNOTSUPP | 设备节点无独立文件系统支持，为内核注册表条目（内存态，重启即失） |
-| faccessat/faccessat2 | 按路径检查存在性；X_OK 要求文件有任一执行位（无执行位 EACCES），R_OK/W_OK 在无凭证模型下放行；flags 仅接受 AT_EACCESS/AT_SYMLINK_NOFOLLOW，NOFOLLOW 暂与跟随一致 | 无 uid/gid 凭证检查 |
-| fchmod/fchmodat | 保留 07777 权限位（含 setuid/setgid/sticky），类型位由 inode 持有；仅普通文件与目录可改。fchmod 按已打开对象的 inode 身份生效（rename/unlink 后仍有效，管道/procfs FD 返回 ENOENT）；fchmodat 按路径且总是跟随符号链接，不读取第四个参数，与 Linux 的三参数系统调用一致，fchmodat2 未实现；FAT 卷返回 ENOTSUP | 原始调用号 90 的 chmod 等价于 fchmodat(AT_FDCWD, path, mode)；无 UID/GID 属主校验与 ACL |
+| faccessat/faccessat2 | 按路径检查存在性；X_OK 要求文件有任一执行位（无执行位 EACCES），R_OK/W_OK 放行，不按凭证检查；flags 仅接受 AT_EACCESS/AT_SYMLINK_NOFOLLOW，NOFOLLOW 暂与跟随一致 | 不按 uid/gid 做权限检查 |
+| fchmod/fchmodat | 保留 07777 权限位（含 setuid/setgid/sticky），类型位由 inode 持有；仅普通文件与目录可改。fchmod 按已打开对象的 inode 身份生效（rename/unlink 后仍有效，管道/procfs FD 返回 ENOENT）；fchmodat 按路径，flags 仅接受 0/AT_SYMLINK_NOFOLLOW（后者暂与跟随一致）；FAT 卷返回 ENOTSUP | chmod(2) 未单独提供（走 fchmodat+AT_FDCWD 等价）；无 UID/GID 属主校验与 ACL |
 | syslog/klogctl | 按 man 2 action 编码：READ(2) 消耗式游标读取、READ_ALL(3) 全量、READ_CLEAR(4) 读后清空、CLEAR(5)、OPEN/CLOSE(0/1) 无操作返回 0、console 开关(6/7)无操作、SET_CONSOLE_LEVEL(8) 仅接受 1..=8 并记录（不变更实际输出）、SIZE_UNREAD(9)/SIZE_BUFFER(10) 返回未读/容量；其余 EINVAL | 日志环上限 8 KiB，只收集显式登记事件（启动报告/终态/panic），无内核分级日志 |
 | getrandom | 设备树 rng-seed 播种 ChaCha20 流（单次请求上限 64 KiB，可失败分配）；flags 仅接受 GRND_NONBLOCK/GRND_RANDOM；无种子时一律 EAGAIN（无合法阻塞唤醒来源），绝不以时间/常量伪造熵 | 缺少可信启动熵时 execve 返回 EIO，保留旧映像；启动阶段若因此无法创建任何用户任务，内核同步文件系统并关机。 |
 | ioctl | 仅 /dev/misc/rtc 的 RTC_RD_TIME（cmd 按 unsigned int 截断比较）；其余命令与设备一律 ENOTTY | 终端 TCGETS/TCWINSZ、FIONBIO 等未实现（more 依赖的 isatty 降级为非终端） |
@@ -294,6 +294,8 @@ try_lock 失败即报告“持锁跨调度”。
 | waitid | 支持 P_ALL、P_PID、P_PGID 与 WEXITED、WNOHANG、WNOWAIT；infop 填 si_signo、si_code、si_pid、si_status 与 CPU 时间；未指定 WNOHANG 且无僵尸时挂起；无匹配孩子 ECHILD | WSTOPPED 与 WCONTINUED 接受但不产生事件；第五参数 rusage 不填；infop 为 NULL 时返回子进程 pid |
 | getrusage | 支持 RUSAGE_SELF、RUSAGE_CHILDREN、RUSAGE_THREAD；ru_utime 与 ru_stime 取自任务记账，其余字段为 0 | 无 maxrss 与缺页统计；SIGCHLD 置 IGN 时自动收割的孩子，其时间仍计入 RUSAGE_CHILDREN |
 | sched_* 查询与亲和 | sched_getscheduler 恒返回 SCHED_OTHER，sched_getparam 恒返回优先级 0；sched_get_priority_max/min 对 SCHED_FIFO 与 SCHED_RR 返回 99/1，其余策略为 0；sched_rr_get_interval 返回一个时间片的长度；亲和掩码只含 0 号 CPU，sched_getaffinity 返回写入的字节数，sched_setaffinity 接受含 0 号 CPU 的掩码 | 策略与优先级暂不可设置；调度不读取亲和掩码 |
+| 身份查询 | getuid、geteuid、getgid、getegid 取自进程记录里的凭证；getresuid 与 getresgid 写出真实、有效、保存的号；getgroups 返回补充组；gettid 返回进程号，单线程下二者相同。`/proc/<pid>/stat` 的 pgrp 与 session、`/proc/<pid>/status` 的 Uid 与 Gid 取自同一来源，exec 的 AT_UID 等四项也取自凭证 | 语义兼容 |
+| 凭证切换 | setuid、setgid、setreuid、setregid、setresuid、setresgid、setfsuid、setfsgid、setgroups 按 Linux 6.12 的 `kernel/sys.c` 实现；有特权指有效用户号为 0；凭证与补充组经 fork 继承、跨 exec 保留 | 不按凭证做文件访问、kill 等权限检查；带 setuid 位或 setgid 位的可执行文件不会在 exec 时改变凭证，AT_SECURE 恒为 0；没有 capabilities 与用户命名空间 |
 | clone | 进程 fork：退出信号必须 SIGCHLD，另接受 NPTL fork 使用的 CLONE_CHILD_CLEARTID/CLONE_CHILD_SETTID（仅对子进程生效，tid 写入与退出清零见 clone(2)）；非零 stack 设置子 SP | 不支持线程/CLONE_VM 等共享地址空间；无 CLONE_PARENT_SETTID |
 | execve | argv/envp 各 ≤256 项、单串 ≤4095 字节；字符串总计最多 32 KiB；auxv 提供 AT_PHDR/PHENT/PHNUM、AT_BASE、AT_ENTRY、AT_PAGESZ、AT_RANDOM、AT_EXECFN、AT_UID/EUID/GID/EGID、AT_SECURE、AT_CLKTCK、AT_HWCAP、AT_FLAGS；ELF 支持 ET_EXEC 与 ET_DYN（装载基址固定 1 MiB，见 ELF 行）；PT_INTERP 请求的解释器缺失返回 ENOENT 并保留旧现场；`#!` 脚本按 binfmt_script 转交解释器（嵌套 ≤4 层，超限 ELOOP）；执行位统一校验（任一执行位缺失返回 EACCES，execve(2)；官方盘 basic/run-all.sh 为 0644，由用户态启动器按授权清单在运行副本 fchmodat 0755 并记录，见 §6.3 环境准备）；整镜像读入内核堆，镜像放不进内核堆时 ENOMEM | 无 shebang 的非 ELF 返回 ENOEXEC；无 libc 动态库加载（由用户态解释器完成）；AT_EXECFN 为原始路径 |
 | nanosleep | 到期返回 0；被打断返回 EINTR 并回写 rem；期限相对单调时钟 | 语义兼容 |
@@ -384,7 +386,7 @@ IGN 或 DFL 且默认动作属 Ign/Cont 静默丢弃。同步（硬件）信号�
 | 终止与 core | 无 core dump：Core 类信号死亡恒 CLD_KILLED，wait status 无 0x80 位（Linux CLD_DUMPED + WCOREDUMP） |
 | 同步信号 si_code | 固定 SEGV_MAPERR/ILL_ILLOPC/BUS_ADRALN/TRAP_BRKPT，未细分 ACCERR/ADRERR；la handler 期间 FPU 异常回投 SIGFPE（fcsr_pending）未实现 |
 | stub | 无 vDSO，stub 内嵌帧内，无 icache flush（QEMU 语义一致）；rt_sigreturn badframe 按 force_sigsegv 式收敛（处置复位、不重试投递；Linux force_sig 在装 SIGSEGV handler 时可循环） |
-| kill 族 | 无权限检查（无 uid）；pid<0 发往进程组 -pid，pid==0 发往调用者所在进程组，pid==-1 发往除 init 与调用者外的全部进程；tgkill 要求 tgid==tid（Linux tgid 不匹配返回 ESRCH） |
+| kill 族 | 不做权限检查；pid<0 发往进程组 -pid，pid==0 发往调用者所在进程组，pid==-1 发往除 init 与调用者外的全部进程；tgkill 要求 tgid==tid（Linux tgid 不匹配返回 ESRCH） |
 | sigpending/sigsetsize | rt_sigpending sigsetsize 收紧为 ==8（Linux 允许 ≤8） |
 | nanosleep | rem 仅被打断时回写（正常完成不回写，沿用原契约行） |
 
@@ -558,7 +560,7 @@ msync 按相交 VMA 的文件偏移选择缓存页，再同步 Ext4 后端，失
 |---|---|---|
 | MM | `mm::frame::memory_snapshot() -> MemorySnapshot`，同一次帧分配器加锁中读取已登记和空闲 RAM，字段 total_kib/free_kib 的单位为 KiB。无换页、无可回收缓存估算时，MemAvailable 可取 free_kib 的保守值。 | 已提供 |
 | procfs/VFS | 打开 /proc/meminfo 时取一次快照，生成 MemTotal、MemFree、MemAvailable、SwapFree 等字段；同一次打开按偏移读取，读尽返回 EOF。无交换设备时 SwapFree 为 0。 | 已接入只读 meminfo；brk01 现在阻塞在其后临时目录的 chown，不算通过 |
-| task | current_credentials(pid) 返回真实/有效 UID、GID，进程创建/exec 保留或更新凭证；getgid/getegid 等调用以及 VFS 授权共用此来源。 | 只定义契约 |
+| task | current_credentials(pid) 返回真实/有效 UID、GID，进程创建/exec 保留或更新凭证；getgid/getegid 等调用以及 VFS 授权共用此来源。 | 身份查询与切换调用已接入进程记录里的 `Credentials`；VFS 授权未接入 |
 | fs | set_owner(inode, uid: Option<u32>, gid: Option<u32>, credentials) 返回 Result；None 对应 uid/gid 的 -1，检查调用者权限，成功后 stat 与重新挂载均应可观察更新。 | 只定义契约；mincore01 在两架构初始化临时目录时报告 chown ENOSYS |
 | task/signal | 注册用户信号动作、投递访存异常与恢复用户上下文；无处理器时按相应信号终止进程。 | 已实现（§4.5）；原版 LTP 的信号用例接入与验收仍待 |
 
