@@ -6,8 +6,8 @@
 use super::Errno;
 use crate::mm::{address_space::UserAddressSpace, user_access};
 use crate::task::signal::{
-    default_action, DefaultAction, SignalDisposition, SignalSet, SignalSetExt, SignalState,
-    SIGKILL, SIGSTOP, SIG_DFL, SIG_IGN, SS_DISABLE,
+    default_action, DefaultAction, SignalDisposition, SignalGroup, SignalSet, SignalSetExt,
+    ThreadSig, SIGKILL, SIGSTOP, SIG_DFL, SIG_IGN, SS_DISABLE,
 };
 
 /// SA_* 与 SIG_BLOCK/UNBLOCK/SETMASK 的 UAPI 值
@@ -73,7 +73,7 @@ pub(super) fn rt_sigaction(
     act: usize,
     oact: usize,
     sigsetsize: usize,
-    state: &mut SignalState,
+    state: &mut SignalGroup,
 ) -> Result<usize, Errno> {
     if sigsetsize != SIGSETSIZE || !(1..=64).contains(&sig) {
         return Err(Errno::Invalid);
@@ -138,7 +138,7 @@ pub(super) fn rt_sigprocmask(
     set: usize,
     oldset: usize,
     sigsetsize: usize,
-    state: &mut SignalState,
+    state: &mut ThreadSig,
 ) -> Result<usize, Errno> {
     if sigsetsize != SIGSETSIZE || how > SIG_SETMASK {
         return Err(Errno::Invalid);
@@ -168,12 +168,13 @@ pub(super) fn rt_sigpending(
     space: &crate::mm::address_space::UserAddressSpace,
     set: usize,
     sigsetsize: usize,
-    state: &mut SignalState,
+    group: &SignalGroup,
+    thread: &ThreadSig,
 ) -> Result<usize, Errno> {
     if sigsetsize != SIGSETSIZE {
         return Err(Errno::Invalid);
     }
-    let pending = state.pending() & state.blocked();
+    let pending = (group.pending() | thread.pending()) & thread.blocked();
     user_access::copy_to_user(space, set, &pending.to_ne_bytes()).map_err(|_| Errno::Fault)?;
     Ok(0)
 }
@@ -189,7 +190,7 @@ pub(super) fn rt_sigaltstack(
     sp: usize,
     uss: usize,
     uoldss: usize,
-    state: &mut SignalState,
+    state: &mut ThreadSig,
 ) -> Result<usize, Errno> {
     if uoldss != 0 {
         let (ss_sp, ss_size, ss_flags) = match state.alt_stack() {

@@ -170,11 +170,7 @@ fn parse_shebang(image: &[u8]) -> Option<(alloc::string::String, Option<alloc::s
 pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Errno> {
     let (image, interp_image, argv, envp, path) = {
         let reg = REGISTRY.lock();
-        let rec = reg
-            .records
-            .iter()
-            .find(|r| r.pid == pid)
-            .ok_or(Errno::Invalid)?;
+        let rec = reg.group(pid).ok_or(Errno::Invalid)?;
         let space = rec.space.as_ref().ok_or(Errno::Invalid)?.as_space();
         let path = crate::syscall::fs::user_string(space, args[0])?;
         let mut argv = strings(space, args[1])?;
@@ -222,11 +218,7 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
     let mut space = UserAddressSpace::new().map_err(|_| Errno::NoMem)?;
     let ids = {
         let reg = REGISTRY.lock();
-        let current = reg
-            .records
-            .iter()
-            .find(|r| r.pid == pid)
-            .ok_or(Errno::Invalid)?;
+        let current = reg.group(pid).ok_or(Errno::Invalid)?;
         space.inherit_memory_limits(current.space.as_ref().ok_or(Errno::Invalid)?.as_space());
         let c = &current.creds;
         [c.ruid, c.euid, c.rgid, c.egid]
@@ -280,19 +272,15 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
     let exe_value = {
         let reg = REGISTRY.lock();
         let ctx = reg
-            .records
-            .iter()
-            .find(|r| r.pid == pid)
+            .group(pid)
             .and_then(|r| r.fs.as_ref())
             .ok_or(Errno::Invalid)?;
         ctx.path((-100isize) as usize, &path)?
     };
-    let mut reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter_mut()
-        .find(|r| r.pid == pid)
-        .ok_or(Errno::Invalid)?;
+    let mut locked = REGISTRY.lock();
+    let reg = &mut *locked;
+    let index = reg.group_index(pid).ok_or(Errno::Invalid)?;
+    let rec = &mut reg.records[index];
     if let Some(old) = rec.space.as_ref() {
         space.check_exec_limits().map_err(|_| Errno::NoMem)?;
         old.as_space().deactivate();
@@ -300,6 +288,9 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
     // —— 提交段：发布备齐对象，无分配、无失败路径 ——
     rec.space = Some(LocalSpace(space));
     rec.signal.reset_for_exec();
+    if let Some(thread) = reg.threads.iter_mut().find(|t| t.tid == pid) {
+        thread.signal.reset_for_exec();
+    }
     rec.did_exec = true;
     crate::task::proc_table_set_cmdline(pid, cmdline);
     if let Some(ctx) = rec.fs.as_mut() {
@@ -308,6 +299,8 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
         ctx.set_exe_path_owned(exe_value);
     }
     *frame = next;
+    drop(reg);
+    super::sched::wake_vfork(pid);
     Ok(())
 }
 

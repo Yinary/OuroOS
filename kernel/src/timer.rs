@@ -61,18 +61,14 @@ pub fn on_interrupt() -> bool {
 }
 
 /// 把定时器装到拍、时间片终点与最早到期时刻三者中最早的一个。
-/// 最早的时刻已经过去时改到下一拍，避免在没有调度边界的地方反复触发。
+/// 已过去的时刻按最小提前量立即触发，使到期者在最近的调度边界被处理。
 fn arm() {
     let now = now_ns();
     let earliest = NEXT_TICK_NS
         .load(Ordering::Relaxed)
         .min(SLICE_END_NS.load(Ordering::Relaxed))
         .min(DEADLINE_NS.load(Ordering::Relaxed));
-    let target = if earliest <= now {
-        now + tick_ns()
-    } else {
-        earliest.max(now + MIN_LEAD_NS)
-    };
+    let target = earliest.max(now + MIN_LEAD_NS);
     if ARMED_NS.swap(target, Ordering::Relaxed) != target {
         polyhal::timer::set_next_timer(Duration::from_nanos(target));
     }

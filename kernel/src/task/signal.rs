@@ -209,29 +209,23 @@ impl AltStack {
     }
 }
 
-/// 单进程的信号状态。
+/// 信号组的信号状态。
 #[derive(Debug)]
-pub struct SignalState {
+pub struct SignalGroup {
     /// 每信号处置表，下标即信号号；[0] 恒为默认值。
     disposition: [SignalDisposition; 65],
     /// 已到达未投递的信号位图。
     pending: SignalSet,
     /// 与 pending 对应的信息槽，仅在对应 pending 位有效时解释。
     info: [SigInfoSlot; 65],
-    /// 屏蔽位图。
-    blocked: SignalSet,
-    /// 信号备用栈（sigaltstack），默认禁用。
-    alt_stack: AltStack,
 }
 
-impl Clone for SignalState {
+impl Clone for SignalGroup {
     fn clone(&self) -> Self {
         Self {
             disposition: self.disposition,
             pending: self.pending,
             info: self.info,
-            blocked: self.blocked,
-            alt_stack: self.alt_stack,
         }
     }
 
@@ -240,25 +234,21 @@ impl Clone for SignalState {
         self.disposition.copy_from_slice(&source.disposition);
         self.pending = source.pending;
         self.info.copy_from_slice(&source.info);
-        self.blocked = source.blocked;
-        self.alt_stack = source.alt_stack;
     }
 }
 
-impl SignalState {
-    /// 全部处置为 DFL、pending/blocked 为空、备用栈禁用的新状态。
+impl SignalGroup {
+    /// 全部处置为 DFL、pending 为空的新状态。
     pub fn new() -> Self {
         Self {
             disposition: [SignalDisposition::default(); 65],
             pending: 0,
             info: [SigInfoSlot::default(); 65],
-            blocked: 0,
-            alt_stack: AltStack::default(),
         }
     }
 
     /// execve 后的状态重置：处置恢复 DFL（SIG_IGN 保持）、flags/mask
-    /// 与备用栈登记清除；pending/info 与 blocked 保持不变。
+    /// 清除；pending/info 保持不变。
     pub fn reset_for_exec(&mut self) {
         // 下标 0 不是合法信号，不在重置范围。
         for d in &mut self.disposition[1..] {
@@ -269,12 +259,10 @@ impl SignalState {
                 mask: 0,
             };
         }
-        // 备用栈登记在 execve 后清除。
-        self.alt_stack = AltStack::default();
     }
 }
 
-impl SignalState {
+impl SignalGroup {
     /// 将信号 sig 置为 pending 并写入信息槽；sig 不在 1..=64 时
     /// 不修改状态，标准信号已在 pending 时不更新信息槽。
     pub fn queue(&mut self, sig: u8, slot: SigInfoSlot) {
@@ -287,10 +275,10 @@ impl SignalState {
         self.pending.add(sig);
     }
 
-    /// 同锁信号产生入口：按处置过滤后将 sig 入队并请求信号唤醒。
+    /// 同锁信号产生入口：按屏蔽字与处置过滤后将 sig 入队并请求信号唤醒。
     /// 调用方须已持 REGISTRY 锁；sig 须在 1..=64。
-    pub fn generate(&mut self, sig: u8, slot: SigInfoSlot) {
-        if !self.blocked.has(sig) {
+    pub fn generate(&mut self, sig: u8, slot: SigInfoSlot, blocked: SignalSet) {
+        if !blocked.has(sig) {
             let d = self.disposition(sig);
             let ignored = d.handler == SIG_IGN
                 || (d.handler == SIG_DFL
@@ -320,6 +308,133 @@ impl SignalState {
         } else {
             SignalDisposition::default()
         }
+    }
+
+    /// 当前 pending 位图（rt_sigpending 回写用）。
+    pub fn pending(&self) -> SignalSet {
+        self.pending
+    }
+
+    /// fork(2) 后子进程的信号组状态：处置继承自父进程，
+    /// pending/info 清零。
+    pub fn fork_from(&mut self, parent: &SignalGroup) {
+        self.clone_from(parent);
+        self.pending = 0;
+        for slot in &mut self.info {
+            *slot = SigInfoSlot::default();
+        }
+    }
+
+    /// 清除信号 sig 的 pending 位与信息槽；域外信号不修改状态。
+    pub fn flush(&mut self, sig: u8) {
+        if (1..=64).contains(&sig) {
+            self.pending.del(sig);
+            self.info[sig as usize] = SigInfoSlot::default();
+        }
+    }
+
+    /// 返回最低的可投递信号与信息槽拷贝，不清除 pending 位；
+    /// 无信号返回 None。
+    pub fn peek_deliverable(&self, blocked: SignalSet) -> Option<(u8, SigInfoSlot)> {
+        let sig = (self.pending & !blocked).lowest()?;
+        Some((sig, self.info[sig as usize]))
+    }
+
+    /// 取出最低的可投递信号：清除 pending 位并返回信号号与信息槽；
+    /// 无信号返回 None。
+    pub fn take_deliverable(&mut self, blocked: SignalSet) -> Option<(u8, SigInfoSlot)> {
+        let sig = (self.pending & !blocked).lowest()?;
+        let slot = self.info[sig as usize];
+        self.pending.del(sig);
+        Some((sig, slot))
+    }
+}
+
+/// 单线程的信号状态。
+#[derive(Debug)]
+pub struct ThreadSig {
+    /// 线程定向的已到达未投递信号位图。
+    pending: SignalSet,
+    /// 与 pending 对应的信息槽。
+    info: [SigInfoSlot; 65],
+    /// 屏蔽位图。
+    blocked: SignalSet,
+    /// 信号备用栈（sigaltstack），默认禁用。
+    alt_stack: AltStack,
+}
+
+impl Clone for ThreadSig {
+    fn clone(&self) -> Self {
+        Self {
+            pending: self.pending,
+            info: self.info,
+            blocked: self.blocked,
+            alt_stack: self.alt_stack,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.pending = source.pending;
+        self.info.copy_from_slice(&source.info);
+        self.blocked = source.blocked;
+        self.alt_stack = source.alt_stack;
+    }
+}
+
+impl ThreadSig {
+    /// 无挂起信号、屏蔽集合为空、备用栈禁用的新状态。
+    pub fn new() -> Self {
+        Self {
+            pending: 0,
+            info: [SigInfoSlot::default(); 65],
+            blocked: 0,
+            alt_stack: AltStack::default(),
+        }
+    }
+
+    /// execve 后的状态重置：挂起与备用栈登记恢复默认。
+    pub fn reset_for_exec(&mut self) {
+        self.pending = 0;
+        self.info = [SigInfoSlot::default(); 65];
+        self.alt_stack = AltStack::default();
+    }
+
+    /// 把信号 sig 置为挂起并写入信息槽；标准信号已在挂起时不更新信息槽。
+    pub fn queue(&mut self, sig: u8, slot: SigInfoSlot) {
+        if !(1..=64).contains(&sig) {
+            return;
+        }
+        if sig >= 32 || !self.pending.has(sig) {
+            self.info[sig as usize] = slot;
+        }
+        self.pending.add(sig);
+    }
+
+    /// 清除信号 sig 的挂起位与信息槽。
+    pub fn flush(&mut self, sig: u8) {
+        if (1..=64).contains(&sig) {
+            self.pending.del(sig);
+            self.info[sig as usize] = SigInfoSlot::default();
+        }
+    }
+
+    /// 当前线程挂起位图。
+    pub fn pending(&self) -> SignalSet {
+        self.pending
+    }
+
+    /// 返回最低的可投递信号与信息槽拷贝；mask 为不予投递的集合。
+    pub fn peek_deliverable(&self, mask: SignalSet) -> Option<(u8, SigInfoSlot)> {
+        let sig = (self.pending & !mask).lowest()?;
+        Some((sig, self.info[sig as usize]))
+    }
+
+    /// 取出最低的可投递信号并清除挂起位。
+    pub fn take_deliverable(&mut self, mask: SignalSet) -> Option<(u8, SigInfoSlot)> {
+        let sig = (self.pending & !mask).lowest()?;
+        let slot = self.info[sig as usize];
+        self.pending.del(sig);
+        Some((sig, slot))
     }
 
     /// 把 add 中的信号加入屏蔽集合。
@@ -364,56 +479,77 @@ impl SignalState {
         self.alt_stack = AltStack { sp, size, enabled };
     }
 
-    /// 当前 pending 位图（rt_sigpending 回写用）。
-    pub fn pending(&self) -> SignalSet {
-        self.pending
-    }
-
-    /// fork(2) 后子进程的信号状态：处置、屏蔽与备用栈继承自父进程，
-    /// pending/info 清零。
-    pub fn fork_from(&mut self, parent: &SignalState) {
-        self.clone_from(parent);
+    /// fork(2) 后子线程的信号状态：屏蔽与备用栈继承自父线程，挂起清零。
+    pub fn fork_from(&mut self, parent: &ThreadSig) {
+        self.blocked = parent.blocked;
+        self.alt_stack = parent.alt_stack;
         self.pending = 0;
-        for slot in &mut self.info {
-            *slot = SigInfoSlot::default();
+        self.info = [SigInfoSlot::default(); 65];
+    }
+}
+
+/// 组定向与线程定向挂起里最低的可投递信号；mask 为不予投递的集合。
+pub fn peek_any(
+    group: &SignalGroup,
+    thread: &ThreadSig,
+    mask: SignalSet,
+) -> Option<(u8, SigInfoSlot)> {
+    let sig = ((group.pending() | thread.pending()) & !mask).lowest()?;
+    Some((sig, slot_of(group, thread, sig)))
+}
+
+fn slot_of(group: &SignalGroup, thread: &ThreadSig, sig: u8) -> SigInfoSlot {
+    if thread.pending().has(sig) {
+        thread.info[sig as usize]
+    } else {
+        group.info[sig as usize]
+    }
+}
+
+/// 取出组定向与线程定向挂起里最低的可投递信号。
+pub fn take_any(
+    group: &mut SignalGroup,
+    thread: &mut ThreadSig,
+    mask: SignalSet,
+) -> Option<(u8, SigInfoSlot)> {
+    let sig = ((group.pending() | thread.pending()) & !mask).lowest()?;
+    let slot = slot_of(group, thread, sig);
+    if thread.pending().has(sig) {
+        thread.pending.del(sig);
+    } else {
+        group.flush(sig);
+    }
+    Some((sig, slot))
+}
+
+/// 线程定向入队：按线程屏蔽字与组处置过滤后写入线程挂起集合。
+pub fn generate_thread(group: &SignalGroup, thread: &mut ThreadSig, sig: u8, slot: SigInfoSlot) {
+    if !thread.blocked().has(sig) {
+        let d = group.disposition(sig);
+        let ignored = d.handler == SIG_IGN
+            || (d.handler == SIG_DFL
+                && matches!(
+                    default_action(sig),
+                    DefaultAction::Ign | DefaultAction::Cont
+                ));
+        if ignored {
+            return;
         }
     }
-
-    /// 清除信号 sig 的 pending 位与信息槽；域外信号不修改状态。
-    pub fn flush(&mut self, sig: u8) {
-        if (1..=64).contains(&sig) {
-            self.pending.del(sig);
-            self.info[sig as usize] = SigInfoSlot::default();
-        }
-    }
-
-    /// 返回最低的可投递信号与信息槽拷贝，不清除 pending 位；
-    /// 无信号返回 None。
-    pub fn peek_deliverable(&self, blocked: SignalSet) -> Option<(u8, SigInfoSlot)> {
-        let sig = (self.pending & !blocked).lowest()?;
-        Some((sig, self.info[sig as usize]))
-    }
-
-    /// 取出最低的可投递信号：清除 pending 位并返回信号号与信息槽；
-    /// 无信号返回 None。
-    pub fn take_deliverable(&mut self, blocked: SignalSet) -> Option<(u8, SigInfoSlot)> {
-        let sig = (self.pending & !blocked).lowest()?;
-        let slot = self.info[sig as usize];
-        self.pending.del(sig);
-        Some((sig, slot))
-    }
+    thread.queue(sig, slot);
+    super::sched::request_signal_wake();
 }
 
 /// 锁外信号产生入口（kill/tgkill）：取 REGISTRY 锁并调用 generate。
 /// 目标不存在或已退出返回 ESRCH；已持锁调用方须改用 generate。
 pub fn send_signal(target: Pid, sig: u8, slot: SigInfoSlot) -> Result<(), Errno> {
     let mut reg = REGISTRY.lock();
+    let blocked = reg.thread(target).map_or(0, |t| t.signal.blocked());
     let rec = reg
-        .records
-        .iter_mut()
-        .find(|r| r.pid == target && r.exit.is_none())
+        .group_mut(target)
+        .filter(|r| r.exit.is_none())
         .ok_or(Errno::NoProcess)?;
-    rec.signal.generate(sig, slot);
+    rec.signal.generate(sig, slot, blocked);
     Ok(())
 }
 
@@ -421,25 +557,37 @@ pub fn send_signal(target: Pid, sig: u8, slot: SigInfoSlot) -> Result<(), Errno>
 /// 同步信号因此不可屏蔽或忽略。
 /// 调用方不得持 REGISTRY 锁。
 pub fn force_signal(target: Pid, sig: u8, slot: SigInfoSlot) {
-    let mut reg = REGISTRY.lock();
-    if let Some(rec) = reg
-        .records
-        .iter_mut()
-        .find(|r| r.pid == target && r.exit.is_none())
-    {
+    let mut locked = REGISTRY.lock();
+    let reg = &mut *locked;
+    if reg.group(target).is_none_or(|r| r.exit.is_some()) {
+        return;
+    }
+    let mut one: SignalSet = 0;
+    one.add(sig);
+    let blocked = match reg.threads.iter_mut().find(|t| t.tid == target) {
+        Some(thread) => {
+            thread.signal.unblock(one);
+            thread.signal.blocked()
+        }
+        None => 0,
+    };
+    if let Some(rec) = reg.group_mut(target) {
         if rec.signal.disposition(sig).handler == SIG_IGN {
             rec.signal
                 .set_disposition(sig, SignalDisposition::default());
         }
-        let mut one: SignalSet = 0;
-        one.add(sig);
-        rec.signal.unblock(one);
-        rec.signal.generate(sig, slot);
+        rec.signal.generate(sig, slot, blocked);
     }
 }
 
-impl Default for SignalState {
-    /// 见 [`SignalState::new`]。
+impl Default for SignalGroup {
+    /// 见 [`SignalGroup::new`]。
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for ThreadSig {
     fn default() -> Self {
         Self::new()
     }
