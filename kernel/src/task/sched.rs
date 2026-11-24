@@ -20,7 +20,7 @@ use crate::{
 
 use super::{
     registry,
-    task::{FutexKey, Task, TaskBody, TaskState, WaitReason},
+    task::{FutexKey, Pid, Task, TaskBody, TaskState, WaitReason},
     ExitInfo, REGISTRY,
 };
 
@@ -245,6 +245,87 @@ pub(super) fn reserve_task() -> Result<(), crate::mm::frame::FrameError> {
     debug_assert!(s.ready.capacity() >= live && s.waiting.capacity() >= live);
     Ok(())
 }
+/// 按 pid 取调度属性；任务不在调度器的三张表里时返回 None。
+pub fn sched_of(pid: Pid) -> Option<(u8, i32)> {
+    let slot = SCHED.lock();
+    let s = slot.as_ref()?;
+    if let Some(task) = s.current.as_ref().filter(|t| t.pid == pid) {
+        return Some((task.policy, task.priority));
+    }
+    if let Some(task) = s.ready.iter().find(|t| t.pid == pid) {
+        return Some((task.policy, task.priority));
+    }
+    s.waiting
+        .iter()
+        .find(|(t, _)| t.pid == pid)
+        .map(|(t, _)| (t.policy, t.priority))
+}
+
+/// 设置某个任务的策略与优先级；pid 不在调度器表里返回 false。
+pub fn set_sched(pid: Pid, policy: u8, priority: i32) -> bool {
+    let mut slot = SCHED.lock();
+    let Some(s) = slot.as_mut() else {
+        return false;
+    };
+    if let Some(task) = s.current.as_mut().filter(|t| t.pid == pid) {
+        task.policy = policy;
+        task.priority = priority;
+        return true;
+    }
+    if let Some(task) = s.ready.iter_mut().find(|t| t.pid == pid) {
+        task.policy = policy;
+        task.priority = priority;
+        return true;
+    }
+    s.waiting
+        .iter_mut()
+        .find(|(t, _)| t.pid == pid)
+        .is_some_and(|(t, _)| {
+            t.policy = policy;
+            t.priority = priority;
+            true
+        })
+}
+
+/// 按 pid 取谦让值；任务不在调度器的三张表里时返回 None。
+pub fn nice_of(pid: Pid) -> Option<i32> {
+    let slot = SCHED.lock();
+    let s = slot.as_ref()?;
+    if let Some(task) = s.current.as_ref().filter(|t| t.pid == pid) {
+        return Some(task.nice);
+    }
+    if let Some(task) = s.ready.iter().find(|t| t.pid == pid) {
+        return Some(task.nice);
+    }
+    s.waiting
+        .iter()
+        .find(|(t, _)| t.pid == pid)
+        .map(|(t, _)| t.nice)
+}
+
+/// 设置某个任务的谦让值；pid 不在调度器表里返回 false。
+pub fn set_nice(pid: Pid, nice: i32) -> bool {
+    let mut slot = SCHED.lock();
+    let Some(s) = slot.as_mut() else {
+        return false;
+    };
+    if let Some(task) = s.current.as_mut().filter(|t| t.pid == pid) {
+        task.nice = nice;
+        return true;
+    }
+    if let Some(task) = s.ready.iter_mut().find(|t| t.pid == pid) {
+        task.nice = nice;
+        return true;
+    }
+    s.waiting
+        .iter_mut()
+        .find(|(t, _)| t.pid == pid)
+        .is_some_and(|(t, _)| {
+            t.nice = nice;
+            true
+        })
+}
+
 /// 任务入就绪队列队尾。
 pub(super) fn enqueue(task: Box<Task>) {
     let mut slot = SCHED.lock();

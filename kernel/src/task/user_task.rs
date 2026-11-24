@@ -1009,7 +1009,6 @@ fn process_call(
         // ctid, tls)（对照两架构 clone.s 与 Linux fork.c 的拷贝语义）。
         // 归一化为具名参数后再按 CLONE_THREAD 分流。
         sysnr::CLONE => {
-            log::debug!("DBG clone flags {:#x} stack {:#x}", args[0], args[1]);
             #[cfg(target_arch = "riscv64")]
             let (tls, child_tid) = (args[3], args[4]);
             #[cfg(target_arch = "loongarch64")]
@@ -1141,8 +1140,12 @@ fn process_call(
         }
         sysnr::WAITID => return waitid(parent, frame, args),
         sysnr::GETRUSAGE => get_rusage(parent, args),
+        sysnr::SCHED_SETSCHEDULER => sched_setscheduler(parent, args),
+        sysnr::SCHED_SETPARAM => sched_setparam(parent, args),
         sysnr::SCHED_GETSCHEDULER => sched_getscheduler(parent, args[0]),
         sysnr::SCHED_GETPARAM => sched_getparam(parent, args[0], args[1]),
+        sysnr::SETPRIORITY => setpriority(parent, args),
+        sysnr::GETPRIORITY => getpriority(parent, args),
         sysnr::SCHED_GET_PRIORITY_MAX => sched_priority_limit(args[0], true),
         sysnr::SCHED_GET_PRIORITY_MIN => sched_priority_limit(args[0], false),
         sysnr::SCHED_RR_GET_INTERVAL => sched_rr_get_interval(parent, args[0], args[1]),
@@ -2016,12 +2019,8 @@ fn sched_target(parent: Pid, pid_arg: usize) -> Result<usize, Errno> {
 
 fn sched_getscheduler(parent: Pid, pid_arg: usize) -> Result<usize, Errno> {
     let target = sched_target(parent, pid_arg)?;
-    let reg = REGISTRY.lock();
-    reg.records
-        .iter()
-        .find(|r| r.pid == target)
-        .ok_or(Errno::NoProcess)?;
-    Ok(0)
+    let (policy, _) = super::sched::sched_of(target).ok_or(Errno::NoProcess)?;
+    Ok(policy as usize)
 }
 
 fn sched_getparam(parent: Pid, pid_arg: usize, param: usize) -> Result<usize, Errno> {
@@ -2032,15 +2031,98 @@ fn sched_getparam(parent: Pid, pid_arg: usize, param: usize) -> Result<usize, Er
         return Err(Errno::Invalid);
     }
     let target = sched_target(parent, pid_arg)?;
+    let (_, priority) = super::sched::sched_of(target).ok_or(Errno::NoProcess)?;
     let reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter()
-        .find(|r| r.pid == target)
-        .ok_or(Errno::NoProcess)?;
-    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
-    crate::mm::user_access::copy_to_user(space, param, &[0u8; 4]).map_err(|_| Errno::Fault)?;
+    let space = reg
+        .group(parent)
+        .and_then(|r| r.space.as_ref())
+        .ok_or(Errno::NoProcess)?
+        .as_space();
+    crate::mm::user_access::copy_to_user(space, param, &priority.to_ne_bytes())
+        .map_err(|_| Errno::Fault)?;
     Ok(0)
+}
+
+/// 读调度参数结构里的优先级字段。
+fn read_sched_priority(parent: Pid, ptr: usize) -> Result<i32, Errno> {
+    if ptr == 0 {
+        return Err(Errno::Invalid);
+    }
+    let mut raw = [0u8; 4];
+    let reg = REGISTRY.lock();
+    let space = reg
+        .group(parent)
+        .and_then(|r| r.space.as_ref())
+        .ok_or(Errno::NoProcess)?
+        .as_space();
+    crate::mm::user_access::copy_from_user(space, ptr, &mut raw).map_err(|_| Errno::Fault)?;
+    Ok(i32::from_ne_bytes(raw))
+}
+
+/// 策略与优先级组合是否合法：实时策略要求 1 到 99，其余策略要求 0。
+fn sched_policy_valid(policy: i32, priority: i32) -> bool {
+    match policy {
+        1 | 2 => (1..=99).contains(&priority),
+        0 | 3 | 5 => priority == 0,
+        _ => false,
+    }
+}
+
+/// sched_setscheduler(2)：设置目标任务的策略与优先级。
+fn sched_setscheduler(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let target = sched_target(parent, args[0])?;
+    let policy = args[1] as u32 as i32;
+    let priority = read_sched_priority(parent, args[2])?;
+    if !sched_policy_valid(policy, priority) {
+        return Err(Errno::Invalid);
+    }
+    if super::sched::set_sched(target, policy as u8, priority) {
+        Ok(0)
+    } else {
+        Err(Errno::NoProcess)
+    }
+}
+
+/// sched_setparam(2)：只改优先级，策略沿用目标当前的策略。
+fn sched_setparam(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let target = sched_target(parent, args[0])?;
+    let (policy, _) = super::sched::sched_of(target).ok_or(Errno::NoProcess)?;
+    let priority = read_sched_priority(parent, args[1])?;
+    if !sched_policy_valid(policy as i32, priority) {
+        return Err(Errno::Invalid);
+    }
+    if super::sched::set_sched(target, policy, priority) {
+        Ok(0)
+    } else {
+        Err(Errno::NoProcess)
+    }
+}
+
+/// setpriority(2)：只支持 PRIO_PROCESS，谦让值范围 -20 到 19。
+fn setpriority(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    if (args[0] as u32 as i32) != 0 {
+        return Err(Errno::Invalid);
+    }
+    let target = sched_target(parent, args[1])?;
+    let nice = args[2] as u32 as i32;
+    if !(-20..=19).contains(&nice) {
+        return Err(Errno::Invalid);
+    }
+    if super::sched::set_nice(target, nice) {
+        Ok(0)
+    } else {
+        Err(Errno::NoProcess)
+    }
+}
+
+/// getpriority(2)：只支持 PRIO_PROCESS，返回 20 减谦让值。
+fn getpriority(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    if (args[0] as u32 as i32) != 0 {
+        return Err(Errno::Invalid);
+    }
+    let target = sched_target(parent, args[1])?;
+    let nice = super::sched::nice_of(target).ok_or(Errno::NoProcess)?;
+    Ok((20 - nice) as usize)
 }
 
 fn sched_priority_limit(policy_arg: usize, is_max: bool) -> Result<usize, Errno> {

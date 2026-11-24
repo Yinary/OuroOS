@@ -162,7 +162,7 @@ polyhal-boot 仍走 crates.io。polyhal-trap 的补丁：#5 TrapType 直达、
 | 中断 | 任务时代内核态关中断；用户态与 idle 等待开；启动阶段（`IRQ::int_enable` 到 `task::run`）是例外，仅时钟到达 |
 | 抢占 | 只发生在用户态逃逸点；内核路径不可抢占，内核任务协作让出 |
 | 时钟 | 信号不丢失，挂起至少到调度边界送达；trap 回调不取锁 |
-| 时间片 | 固定 TICK_MS=100 按时间计算，轮转，无优先级；切入刷新 `slice_end`；等待中不占就绪队列 |
+| 时间片 | 固定 TICK_MS=100 按时间计算，轮转；切入刷新 `slice_end`；等待中不占就绪队列。策略与优先级只保存并回读，就绪队列的选择仍是轮转 |
 | 定时器 | 拍每 TICK_MS 一次；当前任务的时间片终点与等待表里最早的到期时刻会提前触发时钟中断，到期者在随后的调度边界回到就绪表；中断处理不取锁，只记事件与重装定时器 |
 
 ### 3.3 数据模型
@@ -299,7 +299,7 @@ try_lock 失败即报告“持锁跨调度”。
 | setpgid/getpgid/setsid/getsid | fork 继承进程组与会话，exec 保留；setpgid 只能作用于自身或尚未 exec 的同会话孩子，目标组须在同一会话，会话首领不能改组；setsid 以调用者为首领建立新会话与新进程组，调用者已是进程组首领时 EPERM | 无控制终端；孤儿进程组向停止成员发 SIGHUP/SIGCONT 的规则未实现；/proc/<pid>/stat 的 pgrp 与 session 字段仍为 0 |
 | waitid | 支持 P_ALL、P_PID、P_PGID 与 WEXITED、WNOHANG、WNOWAIT；infop 填 si_signo、si_code、si_pid、si_status 与 CPU 时间；未指定 WNOHANG 且无僵尸时挂起；无匹配孩子 ECHILD | WSTOPPED 与 WCONTINUED 接受但不产生事件；第五参数 rusage 不填；infop 为 NULL 时返回子进程 pid |
 | getrusage | 支持 RUSAGE_SELF、RUSAGE_CHILDREN、RUSAGE_THREAD；ru_utime 与 ru_stime 取自任务记账，其余字段为 0 | 无 maxrss 与缺页统计；SIGCHLD 置 IGN 时自动收割的孩子，其时间仍计入 RUSAGE_CHILDREN |
-| sched_* 查询与亲和 | sched_getscheduler 恒返回 SCHED_OTHER，sched_getparam 恒返回优先级 0；sched_get_priority_max/min 对 SCHED_FIFO 与 SCHED_RR 返回 99/1，其余策略为 0；sched_rr_get_interval 返回一个时间片的长度；亲和掩码只含 0 号 CPU，sched_getaffinity 返回写入的字节数，sched_setaffinity 接受含 0 号 CPU 的掩码 | 策略与优先级暂不可设置；调度不读取亲和掩码 |
+| sched_* 查询与亲和 | sched_setscheduler 与 sched_setparam 保存策略与优先级并按调用返回它们；策略接受 SCHED_OTHER、SCHED_FIFO、SCHED_RR、SCHED_BATCH 与 SCHED_IDLE，实时策略的优先级限 1 到 99，其余策略必须为 0；sched_get_priority_max/min 对 SCHED_FIFO 与 SCHED_RR 返回 99/1，其余策略为 0；sched_rr_get_interval 返回一个时间片的长度；亲和掩码只含 0 号 CPU，sched_getaffinity 返回写入的字节数，sched_setaffinity 接受含 0 号 CPU 的掩码 | 策略与优先级暂不可设置；调度不读取亲和掩码 |
 | 身份查询 | getuid、geteuid、getgid、getegid 取自进程记录里的凭证；getresuid 与 getresgid 写出真实、有效、保存的号；getgroups 返回补充组；gettid 返回进程号，单线程下二者相同。`/proc/<pid>/stat` 的 pgrp 与 session、`/proc/<pid>/status` 的 Uid 与 Gid 取自同一来源，exec 的 AT_UID 等四项也取自凭证 | 语义兼容 |
 | 凭证切换 | setuid、setgid、setreuid、setregid、setresuid、setresgid、setfsuid、setfsgid、setgroups 按 Linux 6.12 的 `kernel/sys.c` 实现；有特权指有效用户号为 0；凭证与补充组经 fork 继承、跨 exec 保留 | 不按凭证做文件访问、kill 等权限检查；带 setuid 位或 setgid 位的可执行文件不会在 exec 时改变凭证，AT_SECURE 恒为 0；没有 capabilities 与用户命名空间 |
 | clone | 进程 fork：退出信号必须 SIGCHLD，另接受 CLONE_CHILD_CLEARTID 与 CLONE_CHILD_SETTID；线程：退出信号必须为 0，必须同时带 CLONE_THREAD、CLONE_SIGHAND 与 CLONE_VM，另接受 CLONE_FS、CLONE_FILES、CLONE_SYSVSEM、CLONE_SETTLS 与三个 tid 标志，CLONE_DETACHED 按 Linux 忽略，其余组合返回 EINVAL；非零 stack 设置子 SP，CLONE_SETTLS 设置 TP | 不支持只共享部分资源的组合，例如共享文件表但不共享地址空间空间；无 CLONE_PARENT_SETTID |

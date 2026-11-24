@@ -86,8 +86,12 @@ pub mod sysnr {
     pub const SET_TID_ADDRESS: usize = 96;
     pub const WAITID: usize = 95;
     pub const GETRUSAGE: usize = 165;
+    pub const SCHED_SETPARAM: usize = 118;
+    pub const SCHED_SETSCHEDULER: usize = 119;
     pub const SCHED_GETSCHEDULER: usize = 120;
     pub const SCHED_GETPARAM: usize = 121;
+    pub const SETPRIORITY: usize = 140;
+    pub const GETPRIORITY: usize = 141;
     pub const SCHED_SETAFFINITY: usize = 122;
     pub const SCHED_GETAFFINITY: usize = 123;
     pub const SCHED_GET_PRIORITY_MAX: usize = 125;
@@ -514,8 +518,12 @@ pub fn dispatch(
         | sysnr::WAIT4
         | sysnr::WAITID
         | sysnr::GETRUSAGE
+        | sysnr::SCHED_SETPARAM
+        | sysnr::SCHED_SETSCHEDULER
         | sysnr::SCHED_GETSCHEDULER
         | sysnr::SCHED_GETPARAM
+        | sysnr::SETPRIORITY
+        | sysnr::GETPRIORITY
         | sysnr::SCHED_SETAFFINITY
         | sysnr::SCHED_GETAFFINITY
         | sysnr::SCHED_GET_PRIORITY_MAX
