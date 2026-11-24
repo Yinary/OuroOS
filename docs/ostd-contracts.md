@@ -170,8 +170,9 @@ polyhal-boot 仍走 crates.io。polyhal-trap 的补丁：#5 TrapType 直达、
 | 对象 | 内容 | 位置 |
 |---|---|---|
 | Task | 内核栈 + 私有 KContext + 首次入口身体 + pid | 调度器 Box；身体首次取出后为 None |
-| ProcessRecord | 地址空间 + fs + 退出信息 + 父子关系 + 进程组与会话 + 信号状态 | 静态 REGISTRY |
-| SignalState | 处置表 / pending / blocked / 信息槽 / 备用栈 | `ProcessRecord.signal`；字段按共享侧（处置、pending）与私有侧（blocked、备用栈）分组注释，为线程化预留迁移形状（私有侧届时搬入线程记录） |
+| ProcessRecord | 地址空间 + fs + 退出信息 + 父子关系 + 进程组与会话 + 组级信号状态 | 静态 REGISTRY，按线程组登记 |
+| ThreadRecord | tid、所属线程组、屏蔽字与备用栈、清 tid 地址 | 静态 REGISTRY 的 threads 表；无线程时每进程一条，tid 等于 pid |
+| SignalGroup / ThreadSig | 组级：处置表、pending、信息槽；线程级：屏蔽字、备用栈 | 分别为 `ProcessRecord.signal` 与 `ThreadRecord.signal`；线程定向挂起与逐线程唤醒留待多线程提交 |
 | CURRENT | 当前任务地址（整数存址，绕开裸指针 !Send） | percpu |
 
 Task 与 ProcessRecord 分离是为线程预留；地址空间只住注册表。pid
@@ -186,6 +187,8 @@ CURRENT 记录当前任务地址；调度器的 `current` Box 持有实体，切
   ECHILD。
 - 孤儿过继内核 init；已退出的孤儿即收，活孤儿随后退出时即收，运行时间丢弃。
 - 退出 Task 的内核栈先进入 dead 表，切到其他任务或 idle 栈后立即回收。
+- 线程退出只回收自己的线程记录与内核栈，清零自己的 `clear_child_tid` 并唤醒该地址上的一个等待者；组长先退出时组内其他线程继续运行，最后一个线程退出才登记组终态并产生 SIGCHLD。
+- 线程组退出由 exit_group 触发：登记组终态、删除组内全部线程记录、丢弃组内其他就绪与等待任务，当前任务随后切走。
 - 终态行积攒到任务时代结束统一输出，不混入用户程序的测试输出；
   积攒预留失败时静默丢弃该行（终态汇总可能缺项，无日志、无计数）——
   降级路径：异常退出可能被掩盖，需失败计数与上报。
@@ -214,6 +217,7 @@ CURRENT 记录当前任务地址；调度器的 `current` Box 持有实体，切
   handler 类信号打断一律以 -EINTR 完成，pipe/wait4 按 SA_RESTART 分
   重启与 -EINTR，ppoll 不重启；语义规范与偏差见 §4.5。
 - 孵化预留 ready/waiting 各自容纳全部存活任务的容量；集中唤醒不分配。
+- futex 以物理页帧号与页内偏移为键：等待者按键挂起，唤醒方按键搬移就绪，重排队就地改键并保留各自期限；超时与其它截止时间共用调度边界扫描；被信号打断以 -EINTR 完成且不重启。
 - init 在仍有活跃进程时等待 Children 事件，醒后重查条件。
 - 等待表满时 park 退化为就绪让出；就绪空而等待非空时 idle 等时钟；
   互等即永久等待（QEMU 超时兜底）。
@@ -265,6 +269,8 @@ try_lock 失败即报告“持锁跨调度”。
 | 组 | 调用 | 实现 |
 |---|---|---|
 | 文件 | getcwd、dup、dup3、fcntl、mkdirat、mknodat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、readlinkat、readahead、statfs、fstatfs、newfstatat、fstat、fsync、statx、umask、utimensat、renameat、renameat2、truncate、ftruncate、fchmodat、fchmod | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
+| futex | WAIT、WAKE、REQUEUE、CMP_REQUEUE、WAIT_BITSET、WAKE_BITSET；键为物理页帧号与页内偏移，私有与共享标志都接受但键不区分；普通等待的相对超时与 bitset 等待的绝对超时都换算成单调时刻；被信号打断返回 EINTR | WAKE_OP 与 PI 系列返回 ENOSYS；线程退出清零 `clear_child_tid` 后唤醒该地址上的一个等待者 |
+| vfork | 接受 CLONE_VM 与 CLONE_VFORK 加 SIGCHLD：子进程按复制地址空间创建，父进程挂起到子进程 exec 或退出后返回子进程号；posix_spawn 可用 | 子进程不与父进程共享内存，写时复制带来的语义偏差登记在此 |
 | 进程 | exit、nanosleep、sched_yield、times、getpid、getppid、gettid、getuid、geteuid、getgid、getegid、getresuid、getresgid、getgroups、setuid、setgid、setreuid、setregid、setresuid、setresgid、setfsuid、setfsgid、setgroups、setpgid、getpgid、setsid、getsid、clone、execve、wait4、waitid | `task::process_call` |
 | 资源统计 | getrusage | `task::process_call` |
 | 调度查询与亲和 | sched_getscheduler、sched_getparam、sched_get_priority_max、sched_get_priority_min、sched_rr_get_interval、sched_getaffinity、sched_setaffinity | `task::process_call` |
@@ -296,7 +302,7 @@ try_lock 失败即报告“持锁跨调度”。
 | sched_* 查询与亲和 | sched_getscheduler 恒返回 SCHED_OTHER，sched_getparam 恒返回优先级 0；sched_get_priority_max/min 对 SCHED_FIFO 与 SCHED_RR 返回 99/1，其余策略为 0；sched_rr_get_interval 返回一个时间片的长度；亲和掩码只含 0 号 CPU，sched_getaffinity 返回写入的字节数，sched_setaffinity 接受含 0 号 CPU 的掩码 | 策略与优先级暂不可设置；调度不读取亲和掩码 |
 | 身份查询 | getuid、geteuid、getgid、getegid 取自进程记录里的凭证；getresuid 与 getresgid 写出真实、有效、保存的号；getgroups 返回补充组；gettid 返回进程号，单线程下二者相同。`/proc/<pid>/stat` 的 pgrp 与 session、`/proc/<pid>/status` 的 Uid 与 Gid 取自同一来源，exec 的 AT_UID 等四项也取自凭证 | 语义兼容 |
 | 凭证切换 | setuid、setgid、setreuid、setregid、setresuid、setresgid、setfsuid、setfsgid、setgroups 按 Linux 6.12 的 `kernel/sys.c` 实现；有特权指有效用户号为 0；凭证与补充组经 fork 继承、跨 exec 保留 | 不按凭证做文件访问、kill 等权限检查；带 setuid 位或 setgid 位的可执行文件不会在 exec 时改变凭证，AT_SECURE 恒为 0；没有 capabilities 与用户命名空间 |
-| clone | 进程 fork：退出信号必须 SIGCHLD，另接受 NPTL fork 使用的 CLONE_CHILD_CLEARTID/CLONE_CHILD_SETTID（仅对子进程生效，tid 写入与退出清零见 clone(2)）；非零 stack 设置子 SP | 不支持线程/CLONE_VM 等共享地址空间；无 CLONE_PARENT_SETTID |
+| clone | 进程 fork：退出信号必须 SIGCHLD，另接受 CLONE_CHILD_CLEARTID 与 CLONE_CHILD_SETTID；线程：退出信号必须为 0，必须同时带 CLONE_THREAD、CLONE_SIGHAND 与 CLONE_VM，另接受 CLONE_FS、CLONE_FILES、CLONE_SYSVSEM、CLONE_SETTLS 与三个 tid 标志，CLONE_DETACHED 按 Linux 忽略，其余组合返回 EINVAL；非零 stack 设置子 SP，CLONE_SETTLS 设置 TP | 不支持只共享部分资源的组合，例如共享文件表但不共享地址空间空间；无 CLONE_PARENT_SETTID |
 | execve | argv/envp 各 ≤256 项、单串 ≤4095 字节；字符串总计最多 32 KiB；auxv 提供 AT_PHDR/PHENT/PHNUM、AT_BASE、AT_ENTRY、AT_PAGESZ、AT_RANDOM、AT_EXECFN、AT_UID/EUID/GID/EGID、AT_SECURE、AT_CLKTCK、AT_HWCAP、AT_FLAGS；ELF 支持 ET_EXEC 与 ET_DYN（装载基址固定 1 MiB，见 ELF 行）；PT_INTERP 请求的解释器缺失返回 ENOENT 并保留旧现场；`#!` 脚本按 binfmt_script 转交解释器（嵌套 ≤4 层，超限 ELOOP）；执行位统一校验（任一执行位缺失返回 EACCES，execve(2)；官方盘 basic/run-all.sh 为 0644，由用户态启动器按授权清单在运行副本 fchmodat 0755 并记录，见 §6.3 环境准备）；整镜像读入内核堆，镜像放不进内核堆时 ENOMEM | 无 shebang 的非 ELF 返回 ENOEXEC；无 libc 动态库加载（由用户态解释器完成）；AT_EXECFN 为原始路径 |
 | nanosleep | 到期返回 0；被打断返回 EINTR 并回写 rem；期限相对单调时钟 | 语义兼容 |
 | clock_gettime | 支持 CLOCK_REALTIME、MONOTONIC、BOOTTIME、MONOTONIC_RAW、两个 COARSE 时钟、TAI、进程与线程的 CPU 时间；未知或负的 clockid 返回 EINVAL | 闹钟类时钟未实现 |
@@ -315,7 +321,7 @@ try_lock 失败即报告“持锁跨调度”。
 | fsync | EXT4 写回该 inode 的共享页并同步 rsext4 缓存/日志 | FAT 返回 ENOTSUP |
 | mount | fstype 接受 vfat/fat；源设备 `/dev/vd<小写字母>[0-4]`（无后缀或 0 为整盘）；flags 必须 0，data 忽略；/proc/mounts 报告根卷（按实际设备号命名）与 FAT 挂载记录 | 仅 MBR 主分区；不限于 a-d |
 | 设备命名与根卷 | 设备号按总线枚举顺序分配，无内容特征重排；Ext4 根卷为扫描式选择：每盘先试分区 1..4 再试整盘，取第一个可挂载的 Ext4。官方 mount 测例写死的 `/dev/vda2`（辅助盘 FAT32 分区）由用户态启动器按授权清单 mknodat 建立块设备节点（major 254，minor=(盘<<4)\|分区，见 §6.3），内核按节点登记的真实设备身份解析挂载 | 设备节点是内核注册表条目而非文件系统实体；根卷语义与设备名无绑定；辅助盘由官方 harness 自动挂为第二块盘 |
-| mmap | 匿名与文件均支持 PRIVATE/SHARED；文件整页在 EOF 外允许建图，直接访问按 SIGBUS 终止；MAP_FIXED 事务替换 | 最后不足一页的尾部补零且不回写；MAP_FIXED 可覆盖用户栈；flags 白名单，MAP_DENYWRITE 与 MAP_EXECUTABLE 按 Linux 忽略 |
+| mmap | 匿名与文件均支持 PRIVATE/SHARED；文件整页在 EOF 外允许建图，直接访问按 SIGBUS 终止；MAP_FIXED 事务替换 | 最后不足一页的尾部补零且不回写；MAP_FIXED 可覆盖用户栈；flags 白名单，MAP_DENYWRITE、MAP_EXECUTABLE 与 MAP_STACK 按 Linux 忽略 |
 | mprotect | 支持 PROT_NONE 和 R/W/X 组合；W 隐含 R，只读 FD 建立的共享映射禁止提升写权限（EACCES） | 两架构无 NX；VMA 记录请求权限，页表执行写保护，可访问页实际带 X |
 | brk/munmap | brk 失败返回原 break；munmap 起址页对齐、长度向上取整、允许空洞 | 均无按需分页；brk 立即分配/释放物理页 |
 | ELF | ET_EXEC 固定地址与 ET_DYN（装载基址 0x10_0000：官方 basic 是 intptr_t 为 32 位 int 的无重定位 PIE，Linux 高位 ELF_ET_DYN_BASE 布局下其 brk 断言同样无法通过；低位基址同时保持空指针缺页）；段相位要求 p_vaddr 与 p_offset 按页同余且按 p_align 同余（不要求各自页对齐，busybox 第二段 offset/vaddr 均非对齐但同余）；PT_INTERP 支持；不同 PT_LOAD 落到同一用户页仍拒绝 | 无 NX，PT_GNU_* 忽略；AT_PHDR 要求程序头表在首个可读 PT_LOAD 内 |
@@ -350,7 +356,7 @@ FS 通过 `fs::mapping` 注册 MM 映射钩子：注册后，长度改变先由 
 
 | 类别 | 缺口 |
 |---|---|
-| 基础调用 | exit_group(94)、settimeofday(170) 等仍 ENOSYS；fcntl 文件锁和异步通知尚未实现；ioctl 仅支持 RTC_RD_TIME，TCGETS/TCWINSZ 等终端命令返回 ENOTTY |
+| 基础调用 | settimeofday(170) 等仍 ENOSYS；fcntl 文件锁和异步通知尚未实现；ioctl 仅支持 RTC_RD_TIME，TCGETS/TCWINSZ 等终端命令返回 ENOTTY |
 | 信号残余 | 停止/继续状态机、RT 排队、core 位等偏差与欠账集中登记 §4.5 |
 | ELF（动态库） | 内核不加载 DT_NEEDED 库（由用户态解释器完成）；libc-test 的 dlopen 等场景待验证 |
 | mm | SIGBUS 用户投递；文件映射扩展；用户页执行禁止（NX） |
@@ -358,13 +364,13 @@ FS 通过 `fs::mapping` 注册 MM 映射钩子：注册后，长度改变先由 
 
 ### 4.5 信号契约
 
-**范围**：kill/tgkill、rt_sigaction/procmask/pending/sigsuspend/
+**范围**：kill/tkill/tgkill、rt_sigaction/procmask/pending/sigsuspend/
 sigtimedwait/sigqueueinfo/sigaltstack/sigreturn(139) 全链路；SIGCHLD
 （子退出）、SIGPIPE（pipe 无读者写入）、SIGSEGV/SIGILL/SIGBUS/SIGTRAP
 （致命异常映射）三类内核内产生源；handler 建帧投递（sa_mask/siginfo/
 浮点现场/备用栈）、EINTR 与 SA_RESTART、fork 继承与 execve 重置。
 
-**投递模型**：回用户态唯一路径（任务运行循环）为投递检查点，每次至多
+**投递模型**：信号分线程定向与组定向两类，可投递集合是两者挂起位图的并集减去该线程的屏蔽字；kill 与 tkill/tgkill 按目标是否等于某个线程号决定投递方式。回用户态唯一路径（任务运行循环）为投递检查点，每次至多
 一个信号；阻塞 syscall 在 park 前后两次快路径决策（第二次不落睡，处理
 睡中到达的信号）。产生统一经过滤：blocked 照常入队（屏蔽信号排队不丢）、
 IGN 或 DFL 且默认动作属 Ign/Cont 静默丢弃。同步（硬件）信号走 force：
@@ -386,7 +392,7 @@ IGN 或 DFL 且默认动作属 Ign/Cont 静默丢弃。同步（硬件）信号�
 | 终止与 core | 无 core dump：Core 类信号死亡恒 CLD_KILLED，wait status 无 0x80 位（Linux CLD_DUMPED + WCOREDUMP） |
 | 同步信号 si_code | 固定 SEGV_MAPERR/ILL_ILLOPC/BUS_ADRALN/TRAP_BRKPT，未细分 ACCERR/ADRERR；la handler 期间 FPU 异常回投 SIGFPE（fcsr_pending）未实现 |
 | stub | 无 vDSO，stub 内嵌帧内，无 icache flush（QEMU 语义一致）；rt_sigreturn badframe 按 force_sigsegv 式收敛（处置复位、不重试投递；Linux force_sig 在装 SIGSEGV handler 时可循环） |
-| kill 族 | 不做权限检查；pid<0 发往进程组 -pid，pid==0 发往调用者所在进程组，pid==-1 发往除 init 与调用者外的全部进程；tgkill 要求 tgid==tid（Linux tgid 不匹配返回 ESRCH） |
+| kill 族 | 不做权限检查；kill 的 pid 指向某个线程时投给该线程，指向线程组时投给组；pid<0 发往进程组 -pid，pid==0 发往调用者所在进程组，pid==-1 发往除 init 与调用者外的全部进程；tgkill 要求 tid 存在且属于给定 tgid，不匹配返回 ESRCH；tkill 按 tid 直接投递 |
 | sigpending/sigsetsize | rt_sigpending sigsetsize 收紧为 ==8（Linux 允许 ≤8） |
 | nanosleep | rem 仅被打断时回写（正常完成不回写，沿用原契约行） |
 
@@ -403,7 +409,7 @@ signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综�
 | 检查 | DebugMutex 的 percpu 持锁深度及切换入口零深度检查始终启用；lock_debug 额外跟踪锁名/获取点（`#[track_caller]`） |
 | 锁序 | SCHED→FRAME；REGISTRY→{FRAME, EXIT_REPORTS, 打开文件 Handle, ROOT/MOUNTS/PAGES}；Handle→{ROOT, MOUNTS, PAGES}；PAGES→{ROOT, MOUNTS}；ROOT/MOUNTS→DISKS；SCHED→REGISTRY（信号唤醒 drain 唯一嵌套点，反向路径已核查不存在） |
 | 反向 | 任何路径不得反向持有；fs/drivers 的 `spin::Mutex` 不受 DebugMutex 深度检查保护 |
-| 唤醒 | 事件方不直接取 SCHED；用无锁原子标志，在调度边界消费 |
+| 唤醒 | 事件方不直接取 SCHED；用无锁原子标志，在调度边界消费。futex 的唤醒与重排队在注册表锁外按锁内算好的键执行 |
 | 锁外析构 | 退出路径的 space/fs Drop 在 REGISTRY 锁外完成；exec 目前是例外 |
 | 已知缺口 | 持有者 id 只更新不报告；dispatch 持 REGISTRY 做磁盘 I/O；exec 在 REGISTRY 锁内析构旧空间 |
 | 欠账 | 锁序图（lockdep 式环检测）；SMP 化时全面重审 |

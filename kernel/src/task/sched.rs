@@ -20,8 +20,8 @@ use crate::{
 
 use super::{
     registry,
-    task::{Task, TaskBody, TaskState, WaitReason},
-    ExitInfo,
+    task::{FutexKey, Task, TaskBody, TaskState, WaitReason},
+    ExitInfo, REGISTRY,
 };
 
 /// 当前任务地址（0 = idle）。以整数存址以满足 percpu 槽的 Send 要求。
@@ -171,10 +171,11 @@ impl Scheduler {
             // SCHED→REGISTRY，见 docs/ostd-contracts.md §5）。
             let reg = super::REGISTRY.lock();
             self.move_waiting(|task, _| {
-                reg.records.iter().any(|r| {
-                    r.pid == task.pid
-                        && r.exit.is_none()
-                        && r.signal.pending() & !r.signal.blocked() != 0
+                reg.group(task.pid).is_some_and(|r| {
+                    r.exit.is_none()
+                        && reg.thread(task.pid).is_some_and(|t| {
+                            (r.signal.pending() | t.signal.pending()) & !t.signal.blocked() != 0
+                        })
                 })
             });
         }
@@ -185,6 +186,7 @@ impl Scheduler {
         let now = crate::time::monotonic();
         self.move_waiting(|_, r| match r {
             WaitReason::Deadline(d) | WaitReason::PollUntil(d) => now >= *d,
+            WaitReason::Futex { deadline, .. } => deadline.is_some_and(|d| now >= d),
             _ => false,
         });
     }
@@ -315,6 +317,61 @@ pub fn park(reason: WaitReason) {
     reap_switched();
 }
 
+/// 唤醒某个 futex 键上至多 n 个 bitset 有交集的等待者，返回实际唤醒数。
+pub fn wake_futex(key: FutexKey, n: usize, bitset: u32) -> usize {
+    let mut slot = SCHED.lock();
+    let Some(s) = slot.as_mut() else {
+        return 0;
+    };
+    let mut woken = 0;
+    let mut i = 0;
+    while i < s.waiting.len() && woken < n {
+        if matches!(s.waiting[i].1, WaitReason::Futex { key: k, bitset: b, .. } if k == key && b & bitset != 0)
+        {
+            let (task, _) = s.waiting.swap_remove(i);
+            s.ready.push_back(task);
+            woken += 1;
+        } else {
+            i += 1;
+        }
+    }
+    s.refresh_deadline();
+    woken
+}
+
+/// 先唤醒 from 键上至多 nr_wake 个，再把至多 nr_requeue 个从 from 键改为等 to 键；返回唤醒数。
+pub fn requeue_futex(from: FutexKey, to: FutexKey, nr_wake: usize, nr_requeue: usize) -> usize {
+    let mut slot = SCHED.lock();
+    let Some(s) = slot.as_mut() else {
+        return 0;
+    };
+    let mut woken = 0;
+    let mut i = 0;
+    while i < s.waiting.len() && woken < nr_wake {
+        if matches!(s.waiting[i].1, WaitReason::Futex { key, .. } if key == from) {
+            let (task, _) = s.waiting.swap_remove(i);
+            s.ready.push_back(task);
+            woken += 1;
+        } else {
+            i += 1;
+        }
+    }
+    let mut requeued = 0;
+    for (_, reason) in s.waiting.iter_mut() {
+        if requeued >= nr_requeue {
+            break;
+        }
+        if let WaitReason::Futex { key, .. } = reason {
+            if *key == from {
+                *key = to;
+                requeued += 1;
+            }
+        }
+    }
+    s.refresh_deadline();
+    woken
+}
+
 /// 切到当前任务的栈后，回收此前退出任务的内核栈。
 pub(super) fn reap_switched() {
     let mut slot = SCHED.lock();
@@ -323,13 +380,11 @@ pub(super) fn reap_switched() {
         .reap_dead();
 }
 
-/// 当前任务退出：登记退出信息、释放地址空间、移入 dead 表并永久切走。
-/// 永不返回。退出信息的登记与空间释放集中在这里，调用方无需善后。
-/// 唤醒等待子进程退出的父任务（事件点直接唤醒，此时不持任何锁）。
-pub(super) fn exit_current(exit: ExitInfo) -> ! {
-    sync::assert_no_held("exit_current");
+/// 当前任务所在线程组整体退出：登记组终态、终止组内其他线程，当前任务进 dead 表并永久切走。
+pub(super) fn exit_group_current(exit: ExitInfo) -> ! {
+    sync::assert_no_held("exit_group_current");
     let cur_ptr = current_ptr();
-    let (pid, name) = {
+    let (pid, tgid, name) = {
         let slot = SCHED.lock();
         let task = slot
             .as_ref()
@@ -337,14 +392,97 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
             .current
             .as_ref()
             .expect("exit without current task");
-        (task.pid, task.name)
+        (task.pid, task.tgid, task.name)
+    };
+    log::debug!("thread group of '{}' (pid {}) exiting", name, pid);
+    registry::record_exit(tgid, exit);
+    request_children_wake();
+    wake_vfork(pid);
+    {
+        let mut reg = REGISTRY.lock();
+        reg.remove_group_threads(tgid);
+    }
+    let (from, to) = {
+        let mut slot = SCHED.lock();
+        let s = slot.as_mut().expect("scheduler not initialized");
+        let mut cur = s.current.take().expect("exit without current task");
+        let from = cur.context_ptr();
+        debug_assert_eq!(cur_ptr, &mut *cur as *mut Task);
+        cur.state = TaskState::Exited;
+        s.dead.push(cur);
+        s.ready.retain(|task| task.tgid != tgid);
+        s.waiting.retain(|(task, _)| task.tgid != tgid);
+        s.drain_wake_requests();
+        s.wake_expired();
+        match s.ready.pop_front() {
+            Some(next) => {
+                let to = s.promote(next);
+                (from, to)
+            }
+            None => {
+                set_current(core::ptr::null_mut());
+                sync::set_holder(0);
+                timer::set_slice_end(None);
+                (from, addr_of!(s.idle_ctx))
+            }
+        }
+    };
+    switch_context(from, to);
+    unreachable!("exited task was resumed")
+}
+
+/// 唤醒等待子进程 exec 或退出的 vfork 父进程。
+pub fn wake_vfork(child: super::task::Pid) {
+    let mut slot = SCHED.lock();
+    let s = slot.as_mut().expect("scheduler not initialized");
+    s.move_waiting(|_, reason| matches!(reason, WaitReason::Vfork(pid) if *pid == child));
+}
+
+/// 当前任务退出：登记退出信息、释放地址空间、移入 dead 表并永久切走。
+/// 永不返回。退出信息的登记与空间释放集中在这里，调用方无需善后。
+/// 唤醒等待子进程退出的父任务（事件点直接唤醒，此时不持任何锁）。
+pub(super) fn exit_current(exit: ExitInfo) -> ! {
+    sync::assert_no_held("exit_current");
+    let cur_ptr = current_ptr();
+    let (pid, tgid, name) = {
+        let slot = SCHED.lock();
+        let task = slot
+            .as_ref()
+            .expect("scheduler not initialized")
+            .current
+            .as_ref()
+            .expect("exit without current task");
+        (task.pid, task.tgid, task.name)
     };
     log::debug!("task '{}' (pid {}) exiting", name, pid);
-    // 登记退出信息并释放地址空间：UserAddressSpace 的 Drop 会先切回
-    // 内核根（若仍活动）再释放数据页/页表页。此刻仍在自己的内核栈上；
-    // 窗口映射在内核根与全部用户根中共享，切页表不影响栈访问。锁序 REGISTRY → FRAME。
-    registry::record_exit(pid, exit);
-    request_children_wake();
+    let key = {
+        let reg = REGISTRY.lock();
+        let clear = reg.thread(pid).map_or(0, |t| t.clear_child_tid);
+        if clear == 0 {
+            None
+        } else {
+            reg.group(pid).and_then(|r| r.space.as_ref()).and_then(|s| {
+                let space = s.as_space();
+                let key = space.translate(clear).map(|(pa, _)| FutexKey {
+                    frame: pa.raw() & !0xfff,
+                    offset: clear & 0xfff,
+                });
+                let _ = crate::mm::user_access::copy_to_user(space, clear, &[0; 4]);
+                key
+            })
+        }
+    };
+    if let Some(key) = key {
+        wake_futex(key, 1, u32::MAX);
+    }
+    if let Some(info) = registry::record_thread_exit(pid, exit) {
+        // 登记退出信息并释放地址空间：UserAddressSpace 的 Drop 会先切回
+        // 内核根（若仍活动）再释放数据页/页表页。此刻仍在自己的内核栈上；
+        // 窗口映射在内核根与全部用户根中共享，切页表不影响栈访问。锁序 REGISTRY → FRAME。
+        registry::record_exit(tgid, info);
+        request_children_wake();
+    }
+    wake_vfork(pid);
     let (from, to) = {
         let mut slot = SCHED.lock();
         let s = slot.as_mut().expect("scheduler not initialized");

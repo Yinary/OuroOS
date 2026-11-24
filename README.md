@@ -90,8 +90,8 @@ check: all syscall paths ok, faulting now
 |---|---|---|
 | basic-musl / basic-glibc | 102/102 | 102/102 |
 | busybox-musl / busybox-glibc | 54/55 | 54/55 |
-| libcbench-musl，有耗时的子项 | 23/27 | 22/27 |
-| libcbench-glibc，有耗时的子项 | 24/27 | 22/27 |
+| libcbench-musl，有耗时的子项 | 27/27 | 27/27 |
+| libcbench-glibc，有耗时的子项 | 27/27 | 27/27 |
 
 libcbench 每组包含 27 个性能子项。上表记录一次本地运行的有效计时数，当轮性能分与各项耗时见 `result.json`。
 
