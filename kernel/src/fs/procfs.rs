@@ -73,27 +73,37 @@ pub(super) fn mounts() -> Result<String, Errno> {
 }
 
 /// /proc/<pid>/stat 快照（proc(5) 编号 1..=53 全字段；busybox ps 按下标解析
-/// utime/ starttime 等字段，缺字段会导致进程行被跳过）。状态/父 pid 取
-/// 自 Task 快照表；CPU 记账与内存尺寸字段置 0（未导出，登记契约欠账）。
+/// utime/ starttime 等字段，缺字段会导致进程行被跳过）。状态、父 pid、进程组与
+/// 会话取自 Task 快照表；CPU 记账与内存尺寸字段置 0（未导出，登记契约欠账）。
 pub(super) fn pid_stat(pid: u32) -> Result<String, Errno> {
     let Some((name, state, ppid, _)) = crate::task::proc_table_lookup(pid) else {
         return Err(Errno::NoEntry);
     };
+    let Some((pgid, sid, _)) = crate::task::proc_table_identity(pid) else {
+        return Err(Errno::NoEntry);
+    };
     let mut out = String::new();
     out.try_reserve(256).map_err(|_| Errno::NoMem)?;
-    let _ = write!(out, "{} ({}) {} {}", pid, name, state as char, ppid);
-    // 字段 5..53 全部补零；comm 含空格的场景按 proc(5) 无需转义（任务名
+    let _ = write!(
+        out,
+        "{} ({}) {} {} {} {}",
+        pid, name, state as char, ppid, pgid, sid
+    );
+    // 字段 7..53 全部补零；comm 含空格的场景按 proc(5) 无需转义（任务名
     // 来自登记的 &'static str，不含括号）
-    for _ in 5..=53 {
+    for _ in 7..=53 {
         out.push_str(" 0");
     }
     out.push('\n');
     Ok(out)
 }
 
-/// /proc/<pid>/status 快照（proc(5) 关键行；Uid/Gid 无凭证模型恒 0）。
+/// /proc/<pid>/status 快照（proc(5) 关键行；Uid 与 Gid 取进程凭证）。
 pub(super) fn pid_status(pid: u32) -> Result<String, Errno> {
     let Some((name, state, ppid, _)) = crate::task::proc_table_lookup(pid) else {
+        return Err(Errno::NoEntry);
+    };
+    let Some((_, _, ids)) = crate::task::proc_table_identity(pid) else {
         return Err(Errno::NoEntry);
     };
     let mut out = String::new();
@@ -105,8 +115,8 @@ pub(super) fn pid_status(pid: u32) -> Result<String, Errno> {
     };
     let _ = write!(
         out,
-        "Name:\t{}\nState:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n",
-        name, state_text, pid, ppid
+        "Name:\t{}\nState:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n",
+        name, state_text, pid, ppid, ids[0], ids[1], ids[2], ids[3], ids[4], ids[5], ids[6], ids[7]
     );
     Ok(out)
 }

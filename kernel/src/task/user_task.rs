@@ -60,7 +60,8 @@ pub fn spawn_user(name: &'static str, elf: &[u8]) -> Result<Pid, SpawnError> {
     arg0.try_reserve_exact(name.len())
         .map_err(|_| SpawnError::OutOfMemory)?;
     arg0.push_str(name);
-    let sp = super::exec::stack(&space, &[arg0], &[], &entry, None, name).map_err(|e| {
+    let ids = [0; 4];
+    let sp = super::exec::stack(&space, &[arg0], &[], &entry, None, name, ids).map_err(|e| {
         if e == Errno::Io {
             SpawnError::NoEntropy
         } else {
@@ -100,6 +101,10 @@ pub fn spawn_user(name: &'static str, elf: &[u8]) -> Result<Pid, SpawnError> {
         super::INIT_PID.load(core::sync::atomic::Ordering::Relaxed),
         true,
     );
+    {
+        let reg = REGISTRY.lock();
+        proc_sync_holding(&reg.records, pid);
+    }
     sched::enqueue(task);
     Ok(pid)
 }
@@ -942,6 +947,15 @@ fn process_call(
             .iter()
             .find(|r| r.pid == parent)
             .map_or(0, |r| r.parent)),
+        sysnr::GETUID => credential(parent, |c| c.ruid),
+        sysnr::GETEUID => credential(parent, |c| c.euid),
+        sysnr::GETGID => credential(parent, |c| c.rgid),
+        sysnr::GETEGID => credential(parent, |c| c.egid),
+        // gettid(2)：单线程下线程号就是进程号。
+        sysnr::GETTID => Ok(parent),
+        sysnr::GETRESUID => get_res_id(parent, args, false),
+        sysnr::GETRESGID => get_res_id(parent, args, true),
+        sysnr::GETGROUPS => get_groups(parent, args),
         sysnr::EXECVE => match super::exec::exec(parent, [args[0], args[1], args[2]], frame) {
             Ok(()) => return ProcessResult::Replaced,
             Err(e) => Err(e),
@@ -1072,6 +1086,31 @@ fn process_call(
     };
     frame[TrapFrameArgs::RET] = crate::syscall::to_abi(result);
     ProcessResult::Done
+}
+
+/// 取调用进程凭证中的一个号：getuid(2)、geteuid(2)、getgid(2)、getegid(2) 共用。
+fn credential(parent: Pid, pick: impl Fn(&super::Credentials) -> u32) -> Result<usize, Errno> {
+    let reg = REGISTRY.lock();
+    reg.records
+        .iter()
+        .find(|r| r.pid == parent)
+        .map(|r| pick(&r.creds) as usize)
+        .ok_or(Errno::NoProcess)
+}
+
+/// 调用方已持 REGISTRY 锁时，把一个进程的身份同步到 procfs 快照。
+fn proc_sync_holding(records: &[super::ProcessRecord], pid: Pid) {
+    if let Some(r) = records.iter().find(|r| r.pid == pid) {
+        let c = &r.creds;
+        super::proc_table_sync(
+            r.pid,
+            r.pgid,
+            r.sid,
+            [
+                c.ruid, c.euid, c.suid, c.fsuid, c.rgid, c.egid, c.sgid, c.fsgid,
+            ],
+        );
+    }
 }
 
 /// 读用户空间 8 字节 sigset_t，失败返回 EFAULT。
@@ -1303,6 +1342,7 @@ fn set_pg_id(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
         return Err(Errno::Perm);
     }
     reg.records[target_index].pgid = pgid;
+    proc_sync_holding(&reg.records, target);
     Ok(0)
 }
 
@@ -1333,6 +1373,7 @@ fn set_sid(parent: Pid) -> Result<usize, Errno> {
         .ok_or(Errno::NoProcess)?;
     rec.pgid = parent;
     rec.sid = parent;
+    proc_sync_holding(&reg.records, parent);
     Ok(parent)
 }
 
@@ -1492,6 +1533,56 @@ fn get_rusage(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
         .map(|()| 0)
 }
 
+/// getresuid(2) 与 getresgid(2)：把真实、有效、保存的号写成三个 32 位整数；
+/// 任一处写失败返回 EFAULT。
+fn get_res_id(parent: Pid, args: [usize; 6], want_gid: bool) -> Result<usize, Errno> {
+    let reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter()
+        .find(|r| r.pid == parent)
+        .ok_or(Errno::NoProcess)?;
+    let (real, effective, saved) = if want_gid {
+        (rec.creds.rgid, rec.creds.egid, rec.creds.sgid)
+    } else {
+        (rec.creds.ruid, rec.creds.euid, rec.creds.suid)
+    };
+    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    for (ptr, value) in [(args[0], real), (args[1], effective), (args[2], saved)] {
+        user_access::copy_to_user(space, ptr, &value.to_ne_bytes()).map_err(|_| Errno::Fault)?;
+    }
+    Ok(0)
+}
+
+/// getgroups(2)：size 为 0 时只返回补充组的个数，否则写入并返回个数；
+/// size 为负或装不下返回 EINVAL。
+fn get_groups(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let size = args[0] as u32 as i32;
+    if size < 0 {
+        return Err(Errno::Invalid);
+    }
+    let reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter()
+        .find(|r| r.pid == parent)
+        .ok_or(Errno::NoProcess)?;
+    let groups = &rec.creds.groups;
+    let n = groups.len();
+    if size == 0 {
+        return Ok(n);
+    }
+    if n > size as usize {
+        return Err(Errno::Invalid);
+    }
+    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    for (i, g) in groups.iter().enumerate() {
+        let ptr = args[1].checked_add(i * 4).ok_or(Errno::Fault)?;
+        user_access::copy_to_user(space, ptr, &g.to_ne_bytes()).map_err(|_| Errno::Fault)?;
+    }
+    Ok(n)
+}
+
 fn sched_target(parent: Pid, pid_arg: usize) -> Result<usize, Errno> {
     let pid = pid_arg as u32 as i32;
     if pid < 0 {
@@ -1613,15 +1704,21 @@ fn fork_user(
     if flags & !allowed != 0 || flags & 0xff != 17 {
         return Err(Errno::Invalid);
     }
-    let mut space = {
+    let (mut space, creds) = {
         let reg = REGISTRY.lock();
         let source = reg
             .records
             .iter()
             .find(|r| r.pid == parent)
-            .and_then(|r| r.space.as_ref())
             .ok_or(Errno::NoProcess)?;
-        source.as_space().deep_copy().map_err(|_| Errno::NoMem)?
+        let space = source
+            .space
+            .as_ref()
+            .ok_or(Errno::NoProcess)?
+            .as_space()
+            .deep_copy()
+            .map_err(|_| Errno::NoMem)?;
+        (space, source.creds.try_clone().map_err(|_| Errno::NoMem)?)
     };
     let fs = {
         let reg = REGISTRY.lock();
@@ -1692,9 +1789,14 @@ fn fork_user(
             child.fs = Some(fs);
             child.pgid = pgid;
             child.sid = sid;
+            child.creds = creds;
         }
     }
     super::proc_table_push(pid, "child", parent, true);
+    {
+        let reg = REGISTRY.lock();
+        proc_sync_holding(&reg.records, pid);
+    }
     sched::enqueue(task);
     Ok(pid)
 }

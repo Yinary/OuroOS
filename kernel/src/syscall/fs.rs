@@ -169,7 +169,7 @@ pub fn dispatch(
             if let Some(rest) = path.strip_prefix("/proc/") {
                 if rest
                     .split_once('/')
-                    .is_some_and(|(_, f)| f == "stat" || f == "cmdline")
+                    .is_some_and(|(_, f)| f == "stat" || f == "cmdline" || f == "status")
                 {
                     let text = fs::procfs_text(&path)?;
                     return ctx.open_proc_text(text, a[2], a[2] & 0x80000 != 0);

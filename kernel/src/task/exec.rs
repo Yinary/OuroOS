@@ -38,7 +38,8 @@ fn strings(space: &UserAddressSpace, ptr: usize) -> Result<Vec<String>, Errno> {
 /// 布置 argc/argv/envp/auxv，栈顶按 16 字节对齐。
 ///
 /// `interp` 为解释器的 (入口, 基址)，存在时初次 PC 与 AT_BASE 取解释器；
-/// `execfn` 是被执行的路径名（AT_EXECFN，区别于 argv[0]）。
+/// `execfn` 是被执行的路径名（AT_EXECFN，区别于 argv[0]）；
+/// `ids` 是真实与有效的用户号、组号，填入 AT_UID 等四项。
 pub fn stack(
     space: &UserAddressSpace,
     argv: &[String],
@@ -46,6 +47,7 @@ pub fn stack(
     image: &elf::ImageInfo,
     interp: Option<(usize, usize)>,
     execfn: &str,
+    ids: [u32; 4],
 ) -> Result<usize, Errno> {
     let mut sp = USER_STACK_TOP;
     let mut pointers = Vec::new();
@@ -94,13 +96,13 @@ pub fn stack(
         9,
         image.entry, // AT_ENTRY
         11,
-        0,
+        ids[0] as usize, // AT_UID
         12,
-        0,
+        ids[1] as usize, // AT_EUID
         13,
-        0,
+        ids[2] as usize, // AT_GID
         14,
-        0, // AT_UID/AT_EUID/AT_GID/AT_EGID
+        ids[3] as usize, // AT_EGID
         16,
         0, // AT_HWCAP
         17,
@@ -218,16 +220,17 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
         (image, interp_image, argv, envp, path)
     };
     let mut space = UserAddressSpace::new().map_err(|_| Errno::NoMem)?;
-    {
+    let ids = {
         let reg = REGISTRY.lock();
         let current = reg
             .records
             .iter()
             .find(|r| r.pid == pid)
-            .and_then(|r| r.space.as_ref())
             .ok_or(Errno::Invalid)?;
-        space.inherit_memory_limits(current.as_space());
-    }
+        space.inherit_memory_limits(current.space.as_ref().ok_or(Errno::Invalid)?.as_space());
+        let c = &current.creds;
+        [c.ruid, c.euid, c.rgid, c.egid]
+    };
     let load_error = |e: elf::ElfError| {
         if matches!(e, elf::ElfError::OutOfMemory) {
             Errno::NoMem
@@ -254,6 +257,7 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
         &main,
         interp.as_ref().map(|i| (i.entry, i.base)),
         &path,
+        ids,
     )?;
     let mut next = TrapFrame::new();
     next[TrapFrameArgs::SEPC] = entry;

@@ -96,6 +96,14 @@ pub mod sysnr {
     pub const UNAME: usize = 160;
     pub const GETPID: usize = 172;
     pub const GETPPID: usize = 173;
+    pub const GETRESUID: usize = 148;
+    pub const GETRESGID: usize = 150;
+    pub const GETGROUPS: usize = 158;
+    pub const GETUID: usize = 174;
+    pub const GETEUID: usize = 175;
+    pub const GETGID: usize = 176;
+    pub const GETEGID: usize = 177;
+    pub const GETTID: usize = 178;
     pub const GETTIMEOFDAY: usize = 169;
     pub const FACCESSAT: usize = 48;
     pub const FCHMODAT: usize = 53;
@@ -459,6 +467,14 @@ pub fn dispatch(
         | sysnr::NANOSLEEP
         | sysnr::TIMES
         | sysnr::GETPPID
+        | sysnr::GETRESUID
+        | sysnr::GETRESGID
+        | sysnr::GETGROUPS
+        | sysnr::GETUID
+        | sysnr::GETEUID
+        | sysnr::GETGID
+        | sysnr::GETEGID
+        | sysnr::GETTID
         | sysnr::CLONE
         | sysnr::EXECVE
         | sysnr::WAIT4
