@@ -407,7 +407,7 @@ signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综�
 | 检查 | DebugMutex 的 percpu 持锁深度及切换入口零深度检查始终启用；lock_debug 额外跟踪锁名/获取点（`#[track_caller]`） |
 | 锁序 | SCHED→FRAME；REGISTRY→{FRAME, EXIT_REPORTS, 打开文件 Handle, ROOT/MOUNTS/PAGES}；Handle→{ROOT, MOUNTS, PAGES}；PAGES→{ROOT, MOUNTS}；ROOT/MOUNTS→DISKS；SCHED→REGISTRY（信号唤醒 drain 唯一嵌套点，反向路径已核查不存在） |
 | 反向 | 任何路径不得反向持有；fs/drivers 的 `spin::Mutex` 不受 DebugMutex 深度检查保护 |
-| 唤醒 | 事件方不直接取 SCHED；用无锁原子标志，在调度边界消费 |
+| 唤醒 | 事件方不直接取 SCHED；用无锁原子标志，在调度边界消费。futex 的唤醒与重排队在注册表锁外按锁内算好的键执行 |
 | 锁外析构 | 退出路径的 space/fs Drop 在 REGISTRY 锁外完成；exec 目前是例外 |
 | 已知缺口 | 持有者 id 只更新不报告；dispatch 持 REGISTRY 做磁盘 I/O；exec 在 REGISTRY 锁内析构旧空间 |
 | 欠账 | 锁序图（lockdep 式环检测）；SMP 化时全面重审 |

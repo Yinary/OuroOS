@@ -1,3 +1,6 @@
+//! futex 系统调用：等待键、命令分派与挂起后的重查。
+//! 键与唤醒动作在此计算，唤醒本体在注册表锁外执行。
+
 use core::time::Duration;
 
 use crate::{
@@ -6,10 +9,7 @@ use crate::{
     time::{monotonic, realtime},
 };
 
-use super::{
-    sched,
-    task::{FutexKey, WaitReason},
-};
+use super::task::{FutexKey, WaitReason};
 
 const FUTEX_WAIT: usize = 0;
 const FUTEX_WAKE: usize = 1;
@@ -25,6 +25,19 @@ const FUTEX_BITSET_MATCH_ANY: u32 = 0xffff_ffff;
 pub enum FutexStep {
     Done(Result<usize, Errno>),
     Wait(WaitReason),
+    /// 按键唤醒至多 n 个 bitset 有交集的等待者，由调用方在锁外执行。
+    Wake {
+        key: FutexKey,
+        n: usize,
+        bitset: u32,
+    },
+    /// 先唤醒再从 from 键重排队到 to 键，由调用方在锁外执行。
+    Requeue {
+        from: FutexKey,
+        to: FutexKey,
+        nr_wake: usize,
+        nr_requeue: usize,
+    },
 }
 
 /// 处理一次 futex 系统调用；pending 是本线程上一轮挂起留下的等待状态。
@@ -58,21 +71,28 @@ pub fn futex_call(
     }
     let cmd = args[1] & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
     match cmd {
+        FUTEX_WAIT if args[1] & FUTEX_CLOCK_REALTIME != 0 => FutexStep::Done(Err(Errno::NoSys)),
         FUTEX_WAIT => futex_wait(space, args, pending, FUTEX_BITSET_MATCH_ANY, false),
         FUTEX_WAIT_BITSET => match args[5] as u32 {
             0 => FutexStep::Done(Err(Errno::Invalid)),
             bitset => futex_wait(space, args, pending, bitset, true),
         },
         FUTEX_WAKE => match key_of(space, args[0]) {
-            Some(key) => {
-                FutexStep::Done(Ok(sched::wake_futex(key, args[2], FUTEX_BITSET_MATCH_ANY)))
-            }
+            Some(key) => FutexStep::Wake {
+                key,
+                n: args[2],
+                bitset: FUTEX_BITSET_MATCH_ANY,
+            },
             None => FutexStep::Done(Err(Errno::Fault)),
         },
         FUTEX_WAKE_BITSET => match args[5] as u32 {
             0 => FutexStep::Done(Err(Errno::Invalid)),
             bitset => match key_of(space, args[0]) {
-                Some(key) => FutexStep::Done(Ok(sched::wake_futex(key, args[2], bitset))),
+                Some(key) => FutexStep::Wake {
+                    key,
+                    n: args[2],
+                    bitset,
+                },
                 None => FutexStep::Done(Err(Errno::Fault)),
             },
         },
@@ -94,7 +114,12 @@ pub fn futex_call(
                 Some(key) => key,
                 None => return FutexStep::Done(Err(Errno::Fault)),
             };
-            FutexStep::Done(Ok(sched::requeue_futex(key, to, args[2], args[3])))
+            FutexStep::Requeue {
+                from: key,
+                to,
+                nr_wake: args[2],
+                nr_requeue: args[3],
+            }
         }
         _ => FutexStep::Done(Err(Errno::NoSys)),
     }

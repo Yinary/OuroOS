@@ -995,6 +995,13 @@ fn process_call(
             match step {
                 FutexStep::Done(result) => result,
                 FutexStep::Wait(reason) => return ProcessResult::Wait(reason),
+                FutexStep::Wake { key, n, bitset } => Ok(super::sched::wake_futex(key, n, bitset)),
+                FutexStep::Requeue {
+                    from,
+                    to,
+                    nr_wake,
+                    nr_requeue,
+                } => Ok(super::sched::requeue_futex(from, to, nr_wake, nr_requeue)),
             }
         }
         sysnr::WAIT4 => {
