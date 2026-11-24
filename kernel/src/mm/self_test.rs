@@ -29,6 +29,16 @@ pub(super) fn run() {
         assert_eq!(frame.strong_count(), 2);
         drop(clone);
         assert_eq!(frame.strong_count(), 1);
+        for n in 0..PAGE_SIZE / 32 {
+            frame.write(n * 32, &[n as u8; 32]).unwrap();
+        }
+        let private = frame.duplicate().expect("copy whole frame");
+        assert_ne!(private.addr(), frame.addr());
+        for n in 0..PAGE_SIZE / 32 {
+            let mut chunk = [0xff; 32];
+            private.read(n * 32, &mut chunk).unwrap();
+            assert_eq!(chunk, [n as u8; 32]);
+        }
     }
     {
         let baseline = frame::stats();
@@ -518,6 +528,49 @@ fn user_copy_tests() {
     }
 
     #[cfg(debug_assertions)]
+    {
+        let mut parent = UserAddressSpace::new().expect("fork root");
+        // 两端位于不同的末级页表，覆盖活动父表批量撤销写权限的边界。
+        let base = 0x7fe000;
+        let page = |n: usize| base + n * PAGE_SIZE;
+        parent
+            .reserve_region(base, 5, F::URW, AreaKind::Anonymous)
+            .unwrap();
+        for n in [4, 0, 2] {
+            copy_to_user(&parent, page(n), &[1]).unwrap();
+        }
+        parent.activate();
+        // 子页表分配中断后，父映射仍可原地写入。
+        frame::set_test_budget(Some(2));
+        let failed = parent.deep_copy();
+        frame::set_test_budget(None);
+        assert!(matches!(failed, Err(MapError::OutOfMemory)));
+        assert!(parent.translate(page(2)).unwrap().1.contains(F::W));
+        let first = parent.deep_copy().unwrap();
+        for n in [0, 2, 4] {
+            assert!(!parent.translate(page(n)).unwrap().1.contains(F::W));
+        }
+        copy_to_user(&parent, page(2), &[2]).unwrap();
+        copy_to_user(&parent, page(1), &[3]).unwrap();
+        let second = parent.deep_copy().unwrap();
+        copy_to_user(&parent, page(1), &[4]).unwrap();
+        let mut byte = [0];
+        for (space, n, expected) in [
+            (&first, 2, 1),
+            (&first, 1, 0),
+            (&second, 2, 2),
+            (&second, 1, 3),
+            (&parent, 1, 4),
+            (&parent, 4, 1),
+        ] {
+            copy_from_user(space, page(n), &mut byte).unwrap();
+            assert_eq!(byte, [expected]);
+        }
+        parent.deactivate();
+    }
+    assert_eq!(frame::stats(), baseline);
+
+    #[cfg(debug_assertions)]
     for all in [false, true] {
         let baseline = frame::stats();
         let mut parent = UserAddressSpace::new().expect("lock cow root");
@@ -561,7 +614,7 @@ fn user_copy_tests() {
     }
 
     {
-        // Stack COW：父页在 pending 中共享；父先写必须拆页，子仍持有旧帧。
+        // Stack COW：父先写必须拆页，子仍持有旧帧。
         let baseline = frame::stats();
         let mut parent = UserAddressSpace::new().expect("stack cow root");
         parent.map_stack().expect("stack map");
