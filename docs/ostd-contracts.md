@@ -268,7 +268,7 @@ try_lock 失败即报告“持锁跨调度”。
 | 组 | 调用 | 实现 |
 |---|---|---|
 | 文件 | getcwd、dup、dup3、fcntl、mkdirat、mknodat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、readlinkat、readahead、statfs、fstatfs、newfstatat、fstat、fsync、statx、umask、utimensat、renameat、renameat2、truncate、ftruncate、fchmodat、fchmod | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
-| futex | WAIT、WAKE、REQUEUE、CMP_REQUEUE；键为物理页帧号与页内偏移，私有与共享标志都接受但键不区分；带超时的等待走截止时间扫描；被信号打断返回 EINTR | WAIT_BITSET、WAKE_BITSET、WAKE_OP 与 PI 系列返回 ENOSYS；线程退出清零 `clear_child_tid` 后唤醒该地址上的一个等待者 |
+| futex | WAIT、WAKE、REQUEUE、CMP_REQUEUE、WAIT_BITSET、WAKE_BITSET；键为物理页帧号与页内偏移，私有与共享标志都接受但键不区分；普通等待的相对超时与 bitset 等待的绝对超时都换算成单调时刻；被信号打断返回 EINTR | WAKE_OP 与 PI 系列返回 ENOSYS；线程退出清零 `clear_child_tid` 后唤醒该地址上的一个等待者 |
 | 进程 | exit、nanosleep、sched_yield、times、getpid、getppid、gettid、getuid、geteuid、getgid、getegid、getresuid、getresgid、getgroups、setuid、setgid、setreuid、setregid、setresuid、setresgid、setfsuid、setfsgid、setgroups、setpgid、getpgid、setsid、getsid、clone、execve、wait4、waitid | `task::process_call` |
 | 资源统计 | getrusage | `task::process_call` |
 | 调度查询与亲和 | sched_getscheduler、sched_getparam、sched_get_priority_max、sched_get_priority_min、sched_rr_get_interval、sched_getaffinity、sched_setaffinity | `task::process_call` |

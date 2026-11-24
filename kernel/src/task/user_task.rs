@@ -537,7 +537,7 @@ fn park_check_signals(
     frame: &mut TrapFrame,
     sleep_deadline: &mut Option<core::time::Duration>,
     timedwait: &mut Option<(SignalSet, core::time::Duration)>,
-    futex_wait: &mut Option<(FutexKey, u32, Option<core::time::Duration>)>,
+    futex_wait: &mut Option<(FutexKey, u32, Option<core::time::Duration>, u32)>,
     allow_park: bool,
 ) -> ParkOutcome {
     // sigtimedwait 的等待集；Some 即本次挂起属于 rt_sigtimedwait。
@@ -679,7 +679,7 @@ fn process_call(
     sleep_deadline: &mut Option<core::time::Duration>,
     sigsuspend_saved: &mut Option<SignalSet>,
     timedwait: &mut Option<(SignalSet, core::time::Duration)>,
-    futex_wait: &mut Option<(FutexKey, u32, Option<core::time::Duration>)>,
+    futex_wait: &mut Option<(FutexKey, u32, Option<core::time::Duration>, u32)>,
     wait_uncompleted: &mut bool,
 ) -> ProcessResult {
     let args = frame.args();

@@ -317,8 +317,8 @@ pub fn park(reason: WaitReason) {
     reap_switched();
 }
 
-/// 唤醒某个 futex 键上至多 n 个等待者，返回实际唤醒数。
-pub fn wake_futex(key: FutexKey, n: usize) -> usize {
+/// 唤醒某个 futex 键上至多 n 个 bitset 有交集的等待者，返回实际唤醒数。
+pub fn wake_futex(key: FutexKey, n: usize, bitset: u32) -> usize {
     let mut slot = SCHED.lock();
     let Some(s) = slot.as_mut() else {
         return 0;
@@ -326,7 +326,8 @@ pub fn wake_futex(key: FutexKey, n: usize) -> usize {
     let mut woken = 0;
     let mut i = 0;
     while i < s.waiting.len() && woken < n {
-        if matches!(s.waiting[i].1, WaitReason::Futex { key: k, .. } if k == key) {
+        if matches!(s.waiting[i].1, WaitReason::Futex { key: k, bitset: b, .. } if k == key && b & bitset != 0)
+        {
             let (task, _) = s.waiting.swap_remove(i);
             s.ready.push_back(task);
             woken += 1;
@@ -415,7 +416,7 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
             }
         };
         if let Some(key) = key {
-            wake_futex(key, 1);
+            wake_futex(key, 1, u32::MAX);
         }
     }
     if let Some(info) = registry::record_thread_exit(pid, exit) {

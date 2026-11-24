@@ -59,6 +59,7 @@ pub enum WaitReason {
     Futex {
         key: FutexKey,
         deadline: Option<core::time::Duration>,
+        bitset: u32,
     },
 }
 
