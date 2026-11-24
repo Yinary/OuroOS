@@ -74,7 +74,7 @@
 | 位图而非 buddy | buddy 空闲链表依赖堆；位图 + try_reserve 使运行期帧分配零堆依赖 |
 | 零页保留 | 物理 <0x1000 永不分配，空 PTE 才可安全表示“从未映射” |
 | region 保留区 | FDT 保留、内核镜像、固件、对齐碎片有类型化来源；HAL 启动占用记 HalBoot |
-| 内核堆 | 固定 8 MiB，TODO 在 `allocator.rs`；mm 元数据 try_reserve |
+| 内核堆 | 固定 32 MiB，TODO 在 `allocator.rs`；mm 元数据 try_reserve |
 | user_access 并发前提 | 单核、内核不可抢占，复制期间无并发 munmap |
 | kstack | 每栈独占窗口槽（低地址 guard + 8 栈页）；窗口下级表在全部地址空间共享，guard 不映射；rv 复制窗口根项，la 自建仅含窗口项的内核根；数据帧连续以支持跨页 DMA |
 | ELF | ET_EXEC 静态小端 ELF64；差异见 §4 |
@@ -97,7 +97,7 @@
 | 直映硬化 | 直映区 base canary + 去可执行权限；未实现 |
 | 数据页/区域线性扫描 | 区域和页清单均按地址排序，查找走二分；fork/remap 仍逐页遍历 |
 | 通用页缓存 / swap / 远端 TLB | 未做；MAP_SHARED 文件页缓存已实现，不是通用读写页缓存 |
-| 全局堆失败策略 | 8 MiB 固定；pipe 扩容、rsext4 的 `alloc::vec!` 不可失败，可耗尽→panic；需要统一 OOM 策略 |
+| 全局堆失败策略 | 32 MiB 固定；pipe 扩容、rsext4 的 `alloc::vec!` 不可失败，可耗尽→panic；需要统一 OOM 策略 |
 
 ## 2. polyhal 边界
 
@@ -261,7 +261,7 @@ try_lock 失败即报告“持锁跨调度”。
 
 | 组 | 调用 | 实现 |
 |---|---|---|
-| 文件 | getcwd、dup、dup3、fcntl、mkdirat、mknodat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、readlinkat、readahead、statfs、fstatfs、newfstatat、fstat、fsync、statx、umask、utimensat、renameat、renameat2、truncate、ftruncate、fchmodat、fchmod | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
+| 文件 | getcwd、dup、dup3、fcntl、mkdirat、mknodat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、readlinkat、readahead、statfs、fstatfs、newfstatat、fstat、fsync、statx、umask、utimensat、renameat、renameat2、truncate、ftruncate、fchmodat、fchmod、chmod | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
 | 进程 | exit、nanosleep、sched_yield、times、getpid、getppid、setpgid、getpgid、setsid、getsid、clone、execve、wait4、waitid | `task::process_call` |
 | 资源统计 | getrusage | `task::process_call` |
 | 调度查询与亲和 | sched_getscheduler、sched_getparam、sched_get_priority_max、sched_get_priority_min、sched_rr_get_interval、sched_getaffinity、sched_setaffinity | `task::process_call` |
@@ -278,7 +278,7 @@ try_lock 失败即报告“持锁跨调度”。
 |---|---|---|
 | mknodat | 仅 S_IFBLK：节点登记 (盘,分区) 身份（minor 编码），必须位于 /dev 下，分区须真实存在（总线位置校验），同名 EEXIST；major 须为 254（本内核块设备空间）。S_IFCHR/S_IFIFO/S_IFSOCK 返回 EOPNOTSUPP | 设备节点无独立文件系统支持，为内核注册表条目（内存态，重启即失） |
 | faccessat/faccessat2 | 按路径检查存在性；X_OK 要求文件有任一执行位（无执行位 EACCES），R_OK/W_OK 在无凭证模型下放行；flags 仅接受 AT_EACCESS/AT_SYMLINK_NOFOLLOW，NOFOLLOW 暂与跟随一致 | 无 uid/gid 凭证检查 |
-| fchmod/fchmodat | 保留 07777 权限位（含 setuid/setgid/sticky），类型位由 inode 持有；仅普通文件与目录可改。fchmod 按已打开对象的 inode 身份生效（rename/unlink 后仍有效，管道/procfs FD 返回 ENOENT）；fchmodat 按路径，flags 仅接受 0/AT_SYMLINK_NOFOLLOW（后者暂与跟随一致）；FAT 卷返回 ENOTSUP | chmod(2) 未单独提供（走 fchmodat+AT_FDCWD 等价）；无 UID/GID 属主校验与 ACL |
+| fchmod/fchmodat | 保留 07777 权限位（含 setuid/setgid/sticky），类型位由 inode 持有；仅普通文件与目录可改。fchmod 按已打开对象的 inode 身份生效（rename/unlink 后仍有效，管道/procfs FD 返回 ENOENT）；fchmodat 按路径且总是跟随符号链接，不读取第四个参数，与 Linux 的三参数系统调用一致，fchmodat2 未实现；FAT 卷返回 ENOTSUP | 原始调用号 90 的 chmod 等价于 fchmodat(AT_FDCWD, path, mode)；无 UID/GID 属主校验与 ACL |
 | syslog/klogctl | 按 man 2 action 编码：READ(2) 消耗式游标读取、READ_ALL(3) 全量、READ_CLEAR(4) 读后清空、CLEAR(5)、OPEN/CLOSE(0/1) 无操作返回 0、console 开关(6/7)无操作、SET_CONSOLE_LEVEL(8) 仅接受 1..=8 并记录（不变更实际输出）、SIZE_UNREAD(9)/SIZE_BUFFER(10) 返回未读/容量；其余 EINVAL | 日志环上限 8 KiB，只收集显式登记事件（启动报告/终态/panic），无内核分级日志 |
 | getrandom | 设备树 rng-seed 播种 ChaCha20 流（单次请求上限 64 KiB，可失败分配）；flags 仅接受 GRND_NONBLOCK/GRND_RANDOM；无种子时一律 EAGAIN（无合法阻塞唤醒来源），绝不以时间/常量伪造熵 | 缺少可信启动熵时 execve 返回 EIO，保留旧映像；启动阶段若因此无法创建任何用户任务，内核同步文件系统并关机。 |
 | ioctl | 仅 /dev/misc/rtc 的 RTC_RD_TIME（cmd 按 unsigned int 截断比较）；其余命令与设备一律 ENOTTY | 终端 TCGETS/TCWINSZ、FIONBIO 等未实现（more 依赖的 isatty 降级为非终端） |
@@ -474,7 +474,7 @@ signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综�
 | 共享页修改跟踪与写回 | 无脏状态，未修改页与只读映射也会尝试写回；只读 Ext4 根卷写回被拒绝并记日志。需 MM 提供修改跟踪，FS 保留失败数据并支持重试 |
 | 共享页一致性失败 | `coherent` 的页内访问失败只记日志并跳过更新；最后释放时写回失败仍释放页。需明确错误传播、数据持有者和恢复策略 |
 | 堆与栈预算 | exec 整镜像读入 Vec，rsext4 单次 extent run 可分配 1 MiB；I/O 和目录临时缓冲区虽可失败分配，仍有分配开销，部分路径保留页大小栈缓冲区。需测量内存与性能成本 |
-| 分配失败覆盖 | 管道扩容及第三方部分分配不可失败；8 MiB 固定堆下可能触发分配失败终止。需与 §1.5 的全局 OOM 策略统一 |
+| 分配失败覆盖 | 管道扩容及第三方部分分配不可失败；32 MiB 固定堆下可能触发分配失败终止。需与 §1.5 的全局 OOM 策略统一 |
 | 脏卷启动与恢复 | 可写挂载拒绝需恢复的卷，入口对初始化错误使用 expect；无日志重放或降级策略。需确定恢复、只读降级或诊断退出方案 |
 | FAT 卸载失败 | 先移除挂载记录，再调用消费式 unmount；失败时记录已丢失。需确定可重试的同步与卸载流程 |
 | 目录完整性与后端审计 | 目录线性查找的校验和失败仍可能继续解析；第三方有 unwrap/panic 和不可失败分配，用户可达性及错误传播需逐项核对，不能沿用旧 ext4_rs 的审计结论 |
