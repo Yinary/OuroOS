@@ -201,9 +201,9 @@ pub fn user_task_entry() -> ! {
             if let Some(info) = signal_exit {
                 sched::exit_current(info);
             }
-            let user_start = polyhal::timer::current_time();
+            let user_start = crate::time::monotonic();
             let trap_type = run_user_task(&mut frame);
-            kernel_start = polyhal::timer::current_time();
+            kernel_start = crate::time::monotonic();
             {
                 let mut reg = REGISTRY.lock();
                 if let Some(rec) = reg.records.iter_mut().find(|r| r.pid == pid) {
@@ -413,7 +413,7 @@ pub fn user_task_entry() -> ! {
         };
 
         {
-            let spent = polyhal::timer::current_time()
+            let spent = crate::time::monotonic()
                 .saturating_sub(kernel_start)
                 .as_nanos()
                 .min(u64::MAX as u128) as u64;
@@ -450,12 +450,7 @@ pub fn user_task_entry() -> ! {
                     wait_uncompleted = outcome != ParkOutcome::Completed;
                 }
             }
-            Action::Continue => {
-                // 时间片起点由切入侧刷新。
-                if sched::slice_expired() {
-                    sched::yield_now();
-                }
-            }
+            Action::Continue => sched::resume_check(),
         }
     }
 }
@@ -593,13 +588,21 @@ fn park_check_signals(
                     // Wait 路径原欠一次 syscall_ok，EINTR 完成恰好补上。
                     frame.syscall_ok();
                     frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
-                } else {
-                    // nanosleep：清截止时间、回写剩余时间后以 -EINTR 完成。
+                    ParkOutcome::Completed
+                } else if is_absolute_nanosleep(frame) {
+                    // clock_nanosleep 的绝对期限：清截止时间，不回写剩余时间，以 -EINTR 完成。
                     *sleep_deadline = None;
-                    let rem_ptr = frame.args()[1];
+                    // Wait 路径原欠一次 syscall_ok，EINTR 完成恰好补上。
+                    frame.syscall_ok();
+                    frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
+                    ParkOutcome::Completed
+                } else {
+                    // nanosleep 与相对期限的 clock_nanosleep：清截止时间、回写剩余时间，以 -EINTR 完成。
+                    *sleep_deadline = None;
+                    let rem_ptr = nanosleep_rem_ptr(frame);
                     if rem_ptr != 0 {
                         // 剩余时间 timespec：16 字节 secs/nsecs（小端）。
-                        let left = until.saturating_sub(polyhal::timer::current_time());
+                        let left = until.saturating_sub(crate::time::monotonic());
                         let mut rem = [0u8; 16];
                         rem[..8].copy_from_slice(&left.as_secs().to_ne_bytes());
                         rem[8..].copy_from_slice(&(left.subsec_nanos() as u64).to_ne_bytes());
@@ -618,8 +621,8 @@ fn park_check_signals(
                     // Wait 路径原欠一次 syscall_ok，EINTR 完成恰好补上。
                     frame.syscall_ok();
                     frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
+                    ParkOutcome::Completed
                 }
-                ParkOutcome::Completed
             }
             // SA_RESTART：pipe 读写与 wait 的等待不完成不睡，信号留给循环顶检查点。
             // ppoll 被 handler 信号打断一律以 -EINTR 完成。
@@ -745,7 +748,7 @@ fn process_call(
                 if let Some((sig, slot)) = taken {
                     *timedwait = None;
                     write_uinfo(parent, args[1], sig, &slot).map(|_| sig as usize)
-                } else if polyhal::timer::current_time() >= deadline {
+                } else if crate::time::monotonic() >= deadline {
                     *timedwait = None;
                     Err(Errno::Again)
                 } else {
@@ -795,7 +798,7 @@ fn process_call(
             let reg = REGISTRY.lock();
             let mut data = [0u8; 112];
             let mem = crate::mm::frame::memory_snapshot();
-            data[..8].copy_from_slice(&polyhal::timer::current_time().as_secs().to_ne_bytes());
+            data[..8].copy_from_slice(&crate::time::monotonic().as_secs().to_ne_bytes());
             data[32..40].copy_from_slice(&mem.total_kib.to_ne_bytes());
             data[40..48].copy_from_slice(&mem.free_kib.to_ne_bytes());
             data[80..82].copy_from_slice(
@@ -844,7 +847,7 @@ fn process_call(
                         return Err(Errno::Invalid);
                     }
                     *sleep_deadline = Some(
-                        polyhal::timer::current_time()
+                        crate::time::monotonic()
                             .checked_add(core::time::Duration::new(sec as u64, ns as u32))
                             .ok_or(Errno::Invalid)?,
                     );
@@ -859,7 +862,7 @@ fn process_call(
             if checked == Ok(0) {
                 match *sleep_deadline {
                     None => return ProcessResult::Wait(WaitReason::Pipe),
-                    Some(d) if polyhal::timer::current_time() < d => {
+                    Some(d) if crate::time::monotonic() < d => {
                         return ProcessResult::Wait(WaitReason::PollUntil(d))
                     }
                     _ => {}
@@ -871,7 +874,7 @@ fn process_call(
         sysnr::NANOSLEEP => {
             // nanosleep(2)：到期返回 0；被打断时回写剩余时间并返回 -EINTR。
             if let Some(until) = *sleep_deadline {
-                if polyhal::timer::current_time() < until {
+                if crate::time::monotonic() < until {
                     return ProcessResult::Wait(WaitReason::Deadline(until));
                 }
                 *sleep_deadline = None;
@@ -896,7 +899,7 @@ fn process_call(
                     if sec < 0 || !(0..1_000_000_000).contains(&ns) {
                         Err(Errno::Invalid)
                     } else {
-                        let until = polyhal::timer::current_time()
+                        let until = crate::time::monotonic()
                             .checked_add(core::time::Duration::new(sec as u64, ns as u32));
                         if let Some(until) = until {
                             *sleep_deadline = Some(until);
@@ -908,6 +911,12 @@ fn process_call(
                 }
             }
         }
+        sysnr::CLOCK_GETTIME => clock_gettime(parent, args),
+        sysnr::CLOCK_GETRES => clock_getres(parent, args),
+        sysnr::CLOCK_NANOSLEEP => match clock_nanosleep(parent, sleep_deadline, args) {
+            SleepStep::Done(result) => result,
+            SleepStep::Wait(until) => return ProcessResult::Wait(WaitReason::Deadline(until)),
+        },
         sysnr::TIMES => {
             let reg = REGISTRY.lock();
             if let Some(rec) = reg.records.iter().find(|r| r.pid == parent) {
@@ -930,7 +939,7 @@ fn process_call(
                 {
                     Err(Errno::Fault)
                 } else {
-                    Ok((polyhal::timer::current_time().as_millis() / 10) as usize)
+                    Ok((crate::time::monotonic().as_millis() / 10) as usize)
                 }
             } else {
                 Err(Errno::NoProcess)
@@ -1135,7 +1144,7 @@ fn timedwait_deadline(parent: Pid, ts_ptr: usize) -> Result<core::time::Duration
     if sec < 0 || !(0..1_000_000_000).contains(&ns) {
         return Err(Errno::Invalid);
     }
-    polyhal::timer::current_time()
+    crate::time::monotonic()
         .checked_add(core::time::Duration::new(sec as u64, ns as u32))
         .ok_or(Errno::Invalid)
 }
@@ -1462,6 +1471,143 @@ fn waitid(parent: Pid, frame: &mut TrapFrame, args: [usize; 6]) -> ProcessResult
         return ProcessResult::Done;
     }
     ProcessResult::Wait(WaitReason::Children)
+}
+
+/// clock_nanosleep(2) 一次处理的结果。
+enum SleepStep {
+    /// 系统调用完成，所带的值即返回值。
+    Done(Result<usize, Errno>),
+    /// 尚未到期，挂起到该单调时刻后重执行。
+    Wait(core::time::Duration),
+}
+
+/// clock_nanosleep(2) 的 TIMER_ABSTIME：期限是所在时钟上的绝对时间。
+const TIMER_ABSTIME: usize = 1;
+
+/// 读用户态的 16 字节 timespec，返回秒与纳秒；读不到返回 EFAULT。
+fn read_timespec(parent: Pid, ptr: usize) -> Result<[i64; 2], Errno> {
+    let mut data = [0u8; 16];
+    let valid = REGISTRY
+        .lock()
+        .records
+        .iter()
+        .find(|r| r.pid == parent)
+        .and_then(|r| r.space.as_ref())
+        .is_some_and(|s| {
+            crate::mm::user_access::copy_from_user(s.as_space(), ptr, &mut data).is_ok()
+        });
+    if !valid {
+        return Err(Errno::Fault);
+    }
+    Ok([
+        i64::from_ne_bytes(data[..8].try_into().unwrap_or([0; 8])),
+        i64::from_ne_bytes(data[8..].try_into().unwrap_or([0; 8])),
+    ])
+}
+
+/// 把时间写成用户态的 16 字节 timespec。
+fn write_timespec(parent: Pid, ptr: usize, value: core::time::Duration) -> Result<usize, Errno> {
+    let mut data = [0u8; 16];
+    data[..8].copy_from_slice(&(value.as_secs() as i64).to_ne_bytes());
+    data[8..].copy_from_slice(&(value.subsec_nanos() as i64).to_ne_bytes());
+    REGISTRY
+        .lock()
+        .records
+        .iter()
+        .find(|r| r.pid == parent)
+        .and_then(|r| r.space.as_ref())
+        .ok_or(Errno::NoProcess)
+        .and_then(|s| {
+            crate::mm::user_access::copy_to_user(s.as_space(), ptr, &data).map_err(|_| Errno::Fault)
+        })
+        .map(|()| 0)
+}
+
+/// clock_gettime(2)：按 clockid 取时间并写入 timespec。支持 REALTIME、MONOTONIC、
+/// BOOTTIME 三类时钟与进程、线程的 CPU 时间，未知 clockid 返回 EINVAL。
+fn clock_gettime(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let cpu = {
+        let reg = REGISTRY.lock();
+        let rec = reg
+            .records
+            .iter()
+            .find(|r| r.pid == parent)
+            .ok_or(Errno::NoProcess)?;
+        core::time::Duration::from_nanos(rec.user_ns.saturating_add(rec.system_ns))
+    };
+    let now = crate::time::lookup(args[0] as u32 as i32, cpu)?;
+    write_timespec(parent, args[1], now)
+}
+
+/// clock_getres(2)：写入时钟分辨率；地址为 0 时只检查 clockid。
+fn clock_getres(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    crate::time::validate(args[0] as u32 as i32)?;
+    if args[1] == 0 {
+        Ok(0)
+    } else {
+        write_timespec(parent, args[1], crate::time::RESOLUTION)
+    }
+}
+
+/// clock_nanosleep(2)：睡到期限。相对期限与 REALTIME 上的绝对期限都换算成单调时刻，
+/// 再交给与 nanosleep 共用的到期等待。
+fn clock_nanosleep(
+    parent: Pid,
+    sleep_deadline: &mut Option<core::time::Duration>,
+    args: [usize; 6],
+) -> SleepStep {
+    if let Some(until) = *sleep_deadline {
+        if crate::time::monotonic() < until {
+            return SleepStep::Wait(until);
+        }
+        *sleep_deadline = None;
+        return SleepStep::Done(Ok(0));
+    }
+    let clock = match crate::time::sleepable(args[0] as u32 as i32) {
+        Ok(clock) => clock,
+        Err(e) => return SleepStep::Done(Err(e)),
+    };
+    let [sec, nsec] = match read_timespec(parent, args[2]) {
+        Ok(value) => value,
+        Err(e) => return SleepStep::Done(Err(e)),
+    };
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return SleepStep::Done(Err(Errno::Invalid));
+    }
+    let amount = core::time::Duration::new(sec as u64, nsec as u32);
+    let until = if args[1] & TIMER_ABSTIME == 0 {
+        crate::time::monotonic().checked_add(amount)
+    } else {
+        match clock {
+            crate::time::ClockKind::Monotonic => Some(amount),
+            crate::time::ClockKind::Realtime => {
+                Some(crate::time::monotonic() + amount.saturating_sub(crate::time::realtime()))
+            }
+            crate::time::ClockKind::Process => None,
+        }
+    };
+    match until {
+        Some(until) if crate::time::monotonic() < until => {
+            *sleep_deadline = Some(until);
+            SleepStep::Wait(until)
+        }
+        Some(_) => SleepStep::Done(Ok(0)),
+        None => SleepStep::Done(Err(Errno::Invalid)),
+    }
+}
+
+/// 当前等待的调用是否为绝对期限的 clock_nanosleep。
+fn is_absolute_nanosleep(frame: &TrapFrame) -> bool {
+    frame[TrapFrameArgs::SYSCALL] == sysnr::CLOCK_NANOSLEEP && frame.args()[1] & TIMER_ABSTIME != 0
+}
+
+/// 被打断的睡眠调用的剩余时间地址：nanosleep 是第二参数，clock_nanosleep 是第四参数。
+fn nanosleep_rem_ptr(frame: &TrapFrame) -> usize {
+    if frame[TrapFrameArgs::SYSCALL] == sysnr::CLOCK_NANOSLEEP {
+        frame.args()[3]
+    } else {
+        frame.args()[1]
+    }
 }
 
 fn get_rusage(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
