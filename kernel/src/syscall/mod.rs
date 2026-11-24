@@ -99,6 +99,15 @@ pub mod sysnr {
     pub const GETRESUID: usize = 148;
     pub const GETRESGID: usize = 150;
     pub const GETGROUPS: usize = 158;
+    pub const SETREGID: usize = 143;
+    pub const SETGID: usize = 144;
+    pub const SETREUID: usize = 145;
+    pub const SETUID: usize = 146;
+    pub const SETRESUID: usize = 147;
+    pub const SETRESGID: usize = 149;
+    pub const SETFSUID: usize = 151;
+    pub const SETFSGID: usize = 152;
+    pub const SETGROUPS: usize = 159;
     pub const GETUID: usize = 174;
     pub const GETEUID: usize = 175;
     pub const GETGID: usize = 176;
@@ -470,6 +479,15 @@ pub fn dispatch(
         | sysnr::GETRESUID
         | sysnr::GETRESGID
         | sysnr::GETGROUPS
+        | sysnr::SETREGID
+        | sysnr::SETGID
+        | sysnr::SETREUID
+        | sysnr::SETUID
+        | sysnr::SETRESUID
+        | sysnr::SETRESGID
+        | sysnr::SETFSUID
+        | sysnr::SETFSGID
+        | sysnr::SETGROUPS
         | sysnr::GETUID
         | sysnr::GETEUID
         | sysnr::GETGID

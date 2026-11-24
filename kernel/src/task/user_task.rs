@@ -956,6 +956,15 @@ fn process_call(
         sysnr::GETRESUID => get_res_id(parent, args, false),
         sysnr::GETRESGID => get_res_id(parent, args, true),
         sysnr::GETGROUPS => get_groups(parent, args),
+        sysnr::SETREGID => set_re_id(parent, args, true),
+        sysnr::SETGID => set_id(parent, args, true),
+        sysnr::SETREUID => set_re_id(parent, args, false),
+        sysnr::SETUID => set_id(parent, args, false),
+        sysnr::SETRESUID => set_res_id(parent, args, false),
+        sysnr::SETRESGID => set_res_id(parent, args, true),
+        sysnr::SETFSUID => set_fs_id(parent, args, false),
+        sysnr::SETFSGID => set_fs_id(parent, args, true),
+        sysnr::SETGROUPS => set_groups(parent, args),
         sysnr::EXECVE => match super::exec::exec(parent, [args[0], args[1], args[2]], frame) {
             Ok(()) => return ProcessResult::Replaced,
             Err(e) => Err(e),
@@ -1581,6 +1590,224 @@ fn get_groups(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
         user_access::copy_to_user(space, ptr, &g.to_ne_bytes()).map_err(|_| Errno::Fault)?;
     }
     Ok(n)
+}
+
+/// 一组身份号：真实、有效、保存与文件系统用的号；用户号与组号共用。
+#[derive(Clone, Copy)]
+struct IdSet {
+    real: u32,
+    effective: u32,
+    saved: u32,
+    fs: u32,
+}
+
+impl IdSet {
+    fn load(creds: &super::Credentials, gid: bool) -> Self {
+        if gid {
+            Self {
+                real: creds.rgid,
+                effective: creds.egid,
+                saved: creds.sgid,
+                fs: creds.fsgid,
+            }
+        } else {
+            Self {
+                real: creds.ruid,
+                effective: creds.euid,
+                saved: creds.suid,
+                fs: creds.fsuid,
+            }
+        }
+    }
+
+    fn store(&self, creds: &mut super::Credentials, gid: bool) {
+        if gid {
+            creds.rgid = self.real;
+            creds.egid = self.effective;
+            creds.sgid = self.saved;
+            creds.fsgid = self.fs;
+        } else {
+            creds.ruid = self.real;
+            creds.euid = self.effective;
+            creds.suid = self.saved;
+            creds.fsuid = self.fs;
+        }
+    }
+}
+
+/// setuid(2) 与 setgid(2)：有特权时真实号与保存号一起设为该值，否则只能设为真实号或保存号。
+fn set_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
+    let value = args[0] as u32;
+    let mut reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter_mut()
+        .find(|r| r.pid == parent)
+        .ok_or(Errno::NoProcess)?;
+    let mut ids = IdSet::load(&rec.creds, gid);
+    let privileged = rec.creds.euid == 0;
+    if privileged {
+        ids.real = value;
+        ids.saved = value;
+    } else if value != ids.real && value != ids.saved {
+        return Err(Errno::Perm);
+    }
+    ids.effective = value;
+    ids.fs = value;
+    ids.store(&mut rec.creds, gid);
+    proc_sync_holding(&reg.records, parent);
+    Ok(0)
+}
+
+/// setreuid(2) 与 setregid(2)：-1 表示不修改；真实号改变或有效号不等于原真实号时，
+/// 保存号跟随新的有效号。
+fn set_re_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
+    let real_arg = args[0] as u32;
+    let effective_arg = args[1] as u32;
+    let mut reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter_mut()
+        .find(|r| r.pid == parent)
+        .ok_or(Errno::NoProcess)?;
+    let old = IdSet::load(&rec.creds, gid);
+    let privileged = rec.creds.euid == 0;
+    if real_arg != u32::MAX && real_arg != old.real && real_arg != old.effective && !privileged {
+        return Err(Errno::Perm);
+    }
+    if effective_arg != u32::MAX
+        && effective_arg != old.real
+        && effective_arg != old.effective
+        && effective_arg != old.saved
+        && !privileged
+    {
+        return Err(Errno::Perm);
+    }
+    let real = if real_arg != u32::MAX {
+        real_arg
+    } else {
+        old.real
+    };
+    let effective = if effective_arg != u32::MAX {
+        effective_arg
+    } else {
+        old.effective
+    };
+    let saved = if real_arg != u32::MAX || (effective_arg != u32::MAX && effective_arg != old.real)
+    {
+        effective
+    } else {
+        old.saved
+    };
+    IdSet {
+        real,
+        effective,
+        saved,
+        fs: effective,
+    }
+    .store(&mut rec.creds, gid);
+    proc_sync_holding(&reg.records, parent);
+    Ok(0)
+}
+
+/// setresuid(2) 与 setresgid(2)：-1 表示不修改；无特权时每个新值须是原有三个号之一。
+fn set_res_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
+    let requested = [args[0] as u32, args[1] as u32, args[2] as u32];
+    let mut reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter_mut()
+        .find(|r| r.pid == parent)
+        .ok_or(Errno::NoProcess)?;
+    let old = IdSet::load(&rec.creds, gid);
+    if rec.creds.euid != 0 {
+        for value in requested {
+            if value != u32::MAX
+                && value != old.real
+                && value != old.effective
+                && value != old.saved
+            {
+                return Err(Errno::Perm);
+            }
+        }
+    }
+    let real = if requested[0] != u32::MAX {
+        requested[0]
+    } else {
+        old.real
+    };
+    let effective = if requested[1] != u32::MAX {
+        requested[1]
+    } else {
+        old.effective
+    };
+    let saved = if requested[2] != u32::MAX {
+        requested[2]
+    } else {
+        old.saved
+    };
+    IdSet {
+        real,
+        effective,
+        saved,
+        fs: effective,
+    }
+    .store(&mut rec.creds, gid);
+    proc_sync_holding(&reg.records, parent);
+    Ok(0)
+}
+
+/// setfsuid(2) 与 setfsgid(2)：不允许的值不生效；返回原来的文件系统用号。
+fn set_fs_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
+    let value = args[0] as u32;
+    let mut reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter_mut()
+        .find(|r| r.pid == parent)
+        .ok_or(Errno::NoProcess)?;
+    let old = IdSet::load(&rec.creds, gid);
+    if rec.creds.euid == 0
+        || value == old.real
+        || value == old.effective
+        || value == old.saved
+        || value == old.fs
+    {
+        IdSet { fs: value, ..old }.store(&mut rec.creds, gid);
+        proc_sync_holding(&reg.records, parent);
+    }
+    Ok(old.fs as usize)
+}
+
+/// setgroups(2)：只有有特权的进程可用；个数不在 0 到 65536 之间返回 EINVAL。
+fn set_groups(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let size = args[0] as u32 as i32;
+    let mut reg = REGISTRY.lock();
+    let rec = reg
+        .records
+        .iter_mut()
+        .find(|r| r.pid == parent)
+        .ok_or(Errno::NoProcess)?;
+    if rec.creds.euid != 0 {
+        return Err(Errno::Perm);
+    }
+    if !(0..=65536).contains(&size) {
+        return Err(Errno::Invalid);
+    }
+    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    let mut groups = alloc::vec::Vec::new();
+    groups
+        .try_reserve_exact(size as usize)
+        .map_err(|_| Errno::NoMem)?;
+    for i in 0..size as usize {
+        let ptr = args[1].checked_add(i * 4).ok_or(Errno::Fault)?;
+        let mut raw = [0u8; 4];
+        user_access::copy_from_user(space, ptr, &mut raw).map_err(|_| Errno::Fault)?;
+        groups.push(u32::from_ne_bytes(raw));
+    }
+    rec.creds.groups = groups;
+    proc_sync_holding(&reg.records, parent);
+    Ok(0)
 }
 
 fn sched_target(parent: Pid, pid_arg: usize) -> Result<usize, Errno> {
