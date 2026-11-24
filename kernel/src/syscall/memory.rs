@@ -41,7 +41,7 @@ fn flags(prot: usize) -> Result<F, Errno> {
     Ok(f)
 }
 /// mmap(2)：私有/共享匿名映射与文件映射，支持 FIXED。
-/// 匿名 fd 被忽略；offset 仍必须页对齐。
+/// 匿名 fd 被忽略；offset 仍必须页对齐；MAP_DENYWRITE 与 MAP_EXECUTABLE 被忽略。
 pub(super) fn mmap(
     space: &mut UserAddressSpace,
     a: [usize; 6],
@@ -51,8 +51,10 @@ pub(super) fn mmap(
     const NORESERVE: usize = 0x4000;
     const POPULATE: usize = 0x8000;
     const NONBLOCK: usize = 0x10000;
+    const DENYWRITE: usize = 0x800;
+    const EXECUTABLE: usize = 0x1000;
     let mut request = a;
-    request[3] &= !(LOCKED | NORESERVE | POPULATE | NONBLOCK);
+    request[3] &= !(LOCKED | NORESERVE | POPULATE | NONBLOCK | DENYWRITE | EXECUTABLE);
     let lock = a[3] & LOCKED != 0;
     let start = if lock {
         space.with_map_lock(|s| mmap_region(s, request, ctx))

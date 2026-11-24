@@ -86,7 +86,7 @@ pub mod sysnr {
     pub const GETTIMEOFDAY: usize = 169;
     pub const FACCESSAT: usize = 48;
     pub const FCHMODAT: usize = 53;
-    pub const MKNODAT: usize = 296;
+    pub const MKNODAT: usize = 33;
     pub const FCHMOD: usize = 52;
     pub const SYSLOG: usize = 116;
     pub const GETRANDOM: usize = 278;
