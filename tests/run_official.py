@@ -16,7 +16,8 @@ import sys
 GROUP_START = re.compile(r"#### OS COMP TEST GROUP START ([a-zA-Z0-9-]+) ####")
 GROUP_END = re.compile(r"#### OS COMP TEST GROUP END ([a-zA-Z0-9-]+) ####")
 QEMU_VERSION = re.compile(r"version 10\.0\.2\b")
-TARGET_GROUPS = ("basic-musl", "basic-glibc", "busybox-musl", "busybox-glibc")
+TARGET_GROUPS = ("basic-musl", "basic-glibc", "busybox-musl", "busybox-glibc",
+                 "libcbench-musl", "libcbench-glibc")
 IMAGES_DIR_DEFAULT = pathlib.Path("sdcard") / "pre-20250615"
 # judge 目录搜索链（--judge-dir 显式指定优先；末项为本机历史位置，向后兼容）
 JUDGE_DIR_CANDIDATES = (
@@ -163,10 +164,13 @@ def score_serial(judge_dir, serial_path):
     return results, notes
 
 
-def group_score(result):
-    """单组总分：judge 输出的明细列表求和（basic 逐测例、busybox 逐命令）。"""
-    return (sum(item.get("score", 0) for item in result),
-            sum(item.get("all", 0) for item in result))
+def group_score(name, cases):
+    """保留原版 judge 的分数；性能组另计实际返回耗时的子项数。"""
+    score = sum(case.get("score", 0) for case in cases)
+    if name.startswith("libcbench-"):
+        return {"score": score, "measured": sum(case["res"] > 0 for case in cases),
+                "cases": len(cases), "all": None}
+    return {"score": score, "all": sum(case.get("all", 0) for case in cases)}
 
 
 def run_arch(arch, args):
@@ -221,16 +225,21 @@ def run_arch(arch, args):
         "anomalies": notes["anomalies"],
         "group_lines": notes["group_lines"],
         "judge_errors": notes["judge_errors"],
-        "scores": {name: dict(zip(("score", "all"), group_score(result)))
+        "scores": {name: group_score(name, result)
                    for name, result in results.items()},
         "detail": results,
     }
         (out / "result.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
         for name in TARGET_GROUPS:
-            score = summary["scores"].get(name, {"score": None, "all": None})
+            score = summary["scores"].get(name)
             seen = notes["groups_seen"].get(name, 0)
-            print(f"[{arch}] {name:16s} {score['score']}/{score['all']}"
-                  f"（串口出现 {seen} 次组标记）", flush=True)
+            if score is None:
+                display = "缺少判分结果"
+            elif "measured" in score:
+                display = f"{score['score']:.2f} 分，{score['measured']}/{score['cases']} 项有耗时"
+            else:
+                display = f"{score['score']}/{score['all']}"
+            print(f"[{arch}] {name:16s} {display}（串口出现 {seen} 次组标记）", flush=True)
         if notes["judge_errors"]:
             print(f"[{arch}] judge 异常：{notes['judge_errors']}", flush=True)
         print(f"[{arch}] 串口：{out / 'serial.txt'}  判分明细：{out / 'result.json'}",

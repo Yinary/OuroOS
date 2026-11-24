@@ -230,7 +230,7 @@ test-setup:
 		fi; \
 	done
 
-# 组范围在 user/src/bin/official_init.rs 里按行注释调整（默认四组全跑）
+# 组范围在 user/src/bin/official_init.rs 里按行注释调整（默认运行 basic、busybox、libcbench 的 musl/glibc 两版）
 test-rv: check-qemu kernel-rv
 	$(PYTHON) tests/run_official.py rv --images-dir $(IMAGES_DIR) \
 		--judge-dir $(JUDGE_DIR) --output $(OFFICIAL_OUT) --timeout $(OFF_TIMEOUT)

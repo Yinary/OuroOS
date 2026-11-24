@@ -324,12 +324,13 @@ extern "C" fn ouro_main() -> ! {
     run_script(b"/musl\0", 5, b". ./busybox_testcode.sh\0");
     run_script(b"/glibc\0", 6, b". ./basic_testcode.sh\0");
     run_script(b"/glibc\0", 6, b". ./busybox_testcode.sh\0");
+    run_script(b"/musl\0", 5, b". ./libcbench_testcode.sh\0");
+    run_script(b"/glibc\0", 6, b". ./libcbench_testcode.sh\0");
     //
     // 其余组（依赖尚未实现的能力，按需启用；ltp/unixbench/lmbench 耗时分钟级）：
     // run_script(b"/musl\0", 5, b"./cyclictest_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./iozone_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./iperf_testcode.sh\0");
-    // run_script(b"/musl\0", 5, b"./libcbench_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./libctest_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./lmbench_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./ltp_testcode.sh\0");
