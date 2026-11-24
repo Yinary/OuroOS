@@ -51,6 +51,14 @@ impl From<FrameError> for MapError {
         Self::OutOfMemory
     }
 }
+/// 等待字的身份由地址空间或共享映射的后备对象决定，换物理页不改变身份。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FutexKey {
+    Private { tgid: usize, address: usize },
+    Anonymous { object: usize, offset: usize },
+    File { inode: u32, offset: usize },
+}
+
 /// 区域用途，用于后续 brk、mmap 与 exec 的策略区分。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AreaKind {
@@ -472,6 +480,36 @@ impl UserAddressSpace {
             })
             .ok()
             .map(|i| &self.areas[i])
+    }
+
+    /// 定位可读映射中的等待字。查询别名时无需调入页面，也不触发写时复制。
+    pub(crate) fn futex_key(&self, tgid: usize, address: usize, private: bool) -> Option<FutexKey> {
+        let area = self.area_at(address)?;
+        if !area.flags.contains(MappingFlags::R) {
+            return None;
+        }
+        if private || (area.kind != AreaKind::SharedAnonymous && !area.shared_file) {
+            return Some(FutexKey::Private { tgid, address });
+        }
+        let within = address % PAGE_SIZE;
+        let page = self.page_at(address - within)?;
+        match &*page.backing() {
+            Backing::AnonymousShared(page) => {
+                let (object, index) = page.identity();
+                Some(FutexKey::Anonymous {
+                    object,
+                    offset: index * PAGE_SIZE + within,
+                })
+            }
+            Backing::File(file) => {
+                let (inode, offset) = file.identity();
+                Some(FutexKey::File {
+                    inode,
+                    offset: offset + within,
+                })
+            }
+            Backing::Private(_) => None,
+        }
     }
 
     /// 为访问准备物理页；按区域权限处理匿名和文件后备缺页。
