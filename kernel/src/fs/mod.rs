@@ -473,7 +473,7 @@ pub fn chmod_apply(
         return Err(Errno::Invalid); // 仅普通文件与目录可 chmod
     }
     chmod_by_ino(ino, path, mode as u16 & 0o7777)?;
-    Ok(1)
+    Ok(0)
 }
 
 /// chmod(2) 底层：按 inode 身份更新权限位（fd 与路径解析殊途同归到
