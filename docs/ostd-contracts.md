@@ -264,7 +264,7 @@ try_lock 失败即报告“持锁跨调度”。
 | 组 | 调用 | 实现 |
 |---|---|---|
 | 文件 | getcwd、dup、dup3、fcntl、mkdirat、mknodat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、readlinkat、readahead、statfs、fstatfs、newfstatat、fstat、fsync、statx、umask、utimensat、renameat、renameat2、truncate、ftruncate、fchmodat、fchmod | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
-| 进程 | exit、nanosleep、sched_yield、times、getpid、getppid、setpgid、getpgid、setsid、getsid、clone、execve、wait4、waitid | `task::process_call` |
+| 进程 | exit、nanosleep、clock_gettime、clock_getres、clock_nanosleep、sched_yield、times、getpid、getppid、setpgid、getpgid、setsid、getsid、clone、execve、wait4、waitid | `task::process_call` |
 | 资源统计 | getrusage | `task::process_call` |
 | 调度查询与亲和 | sched_getscheduler、sched_getparam、sched_get_priority_max、sched_get_priority_min、sched_rr_get_interval、sched_getaffinity、sched_setaffinity | `task::process_call` |
 | 访问检查/日志 | faccessat、faccessat2、syslog(klogctl) | `syscall/fs.rs`、`dmesg.rs` |
@@ -295,10 +295,13 @@ try_lock 失败即报告“持锁跨调度”。
 | sched_* 查询与亲和 | sched_getscheduler 恒返回 SCHED_OTHER，sched_getparam 恒返回优先级 0；sched_get_priority_max/min 对 SCHED_FIFO 与 SCHED_RR 返回 99/1，其余策略为 0；sched_rr_get_interval 返回一个时间片的长度；亲和掩码只含 0 号 CPU，sched_getaffinity 返回写入的字节数，sched_setaffinity 接受含 0 号 CPU 的掩码 | 策略与优先级暂不可设置；调度不读取亲和掩码 |
 | clone | 进程 fork：退出信号必须 SIGCHLD，另接受 NPTL fork 使用的 CLONE_CHILD_CLEARTID/CLONE_CHILD_SETTID（仅对子进程生效，tid 写入与退出清零见 clone(2)）；非零 stack 设置子 SP | 不支持线程/CLONE_VM 等共享地址空间；无 CLONE_PARENT_SETTID |
 | execve | argv/envp 各 ≤256 项、单串 ≤4095 字节；字符串总计最多 32 KiB；auxv 提供 AT_PHDR/PHENT/PHNUM、AT_BASE、AT_ENTRY、AT_PAGESZ、AT_RANDOM、AT_EXECFN、AT_UID/EUID/GID/EGID、AT_SECURE、AT_CLKTCK、AT_HWCAP、AT_FLAGS；ELF 支持 ET_EXEC 与 ET_DYN（装载基址固定 1 MiB，见 ELF 行）；PT_INTERP 请求的解释器缺失返回 ENOENT 并保留旧现场；`#!` 脚本按 binfmt_script 转交解释器（嵌套 ≤4 层，超限 ELOOP）；执行位统一校验（任一执行位缺失返回 EACCES，execve(2)；官方盘 basic/run-all.sh 为 0644，由用户态启动器按授权清单在运行副本 fchmodat 0755 并记录，见 §6.3 环境准备）；整镜像读入内核堆，镜像放不进内核堆时 ENOMEM | 无 shebang 的非 ELF 返回 ENOEXEC；无 libc 动态库加载（由用户态解释器完成）；AT_EXECFN 为原始路径 |
-| nanosleep | 到期返回 0；rem 不回写；相对 now | 语义兼容 |
+| nanosleep | 到期返回 0；被打断返回 EINTR 并回写 rem；期限相对单调时钟 | 语义兼容 |
+| clock_gettime | 支持 CLOCK_REALTIME、MONOTONIC、BOOTTIME、MONOTONIC_RAW、两个 COARSE 时钟、TAI、进程与线程的 CPU 时间；未知或负的 clockid 返回 EINVAL | 闹钟类时钟未实现 |
+| clock_getres | 分辨率写 1 ns；地址为 0 时只检查 clockid | 语义兼容 |
+| clock_nanosleep | CLOCK_REALTIME、MONOTONIC、BOOTTIME、TAI 可睡，支持相对期限与 TIMER_ABSTIME，其余 flags 位被忽略；被打断返回 EINTR，相对期限回写剩余时间 | CPU 时间时钟、RAW 与 COARSE 时钟上的睡眠返回 EOPNOTSUPP；Linux 支持 CPU 时间时钟上的睡眠 |
 | times | tms 四字段来自任务记账；返回启动以来 100Hz tick | 语义兼容 |
 | uname | sysname=OuroOS、nodename=ouro、release=KERNEL_RELEASE（"6.1.0-OuroOS"，glibc 启动按 Linux 惯例解析该字段做最低内核版本检查，纯项目版本号会被判过旧）、version=OuroOS、machine=架构名、domainname=local | 合成身份信息 |
-| gettimeofday | 返回启动以来单调时间；ext4 时间从卷 `s_wtime` 起算 | 不是墙钟，无 RTC；两套时钟 |
+| gettimeofday | 返回墙钟：启动时与 RTC 的秒边界对齐，之后随单调时钟推进；tv 与 tz 可分别为空，tz 非空时写零 | 不跟随启动后 RTC 的变化；settimeofday 未实现；ext4 时间仍从卷 `s_wtime` 起算 |
 | newfstatat/fstat/statx | 共用 FS 元数据；Ext4 返回 UID/GID、atime/mtime/ctime（含纪元扩展与纳秒）及可用的 btime；FAT 权限 0777、所有者 0，时间未接通，statx 不置对应有效位；卷设备号为内核分配的合成标识 | rv64/la64 使用 asm-generic stat 布局；旧式 stat 的缺失时间填零；statx 不报告未提供的属性、挂载 ID、DIO 对齐等扩展字段 |
 | umask | 仅保存 0777 权限位，返回旧值；初始 022；fork 复制且之后独立，exec 保留；openat 新建与 mkdirat 按 mode & ~umask 创建，已有文件不改权限 | 无共享 FS Context 的线程语义、默认 ACL 或特殊权限位支持；FAT 沿用合成 0777，不能表达每文件的 POSIX 创建权限 |
 | utimensat | 支持 NULL times、指定秒/纳秒、UTIME_NOW/UTIME_OMIT、cwd/dirfd 相对路径、中间链接及 AT_SYMLINK_NOFOLLOW；AT_EMPTY_PATH 和 NULL path 的 FD 形式支持仍打开但已删名的 inode；双方 OMIT 不访问路径或写入，参数先经 user_access 复制 | Ext4 更新 atime/mtime 并更新 ctime，不改变 btime 或文件偏移；128 字节 inode 为秒精度，扩展 inode 支持纳秒及纪元位，指定时间越界时限制到可表示范围；FAT、管道和控制台暂 EOPNOTSUPP。尚无 UID/GID/capability 身份检查、目录搜索权限或 immutable/append-only 属性校验；Now 沿用卷 s_wtime 加启动时长，非完整 RTC 墙钟 |
@@ -344,7 +347,7 @@ FS 通过 `fs::mapping` 注册 MM 映射钩子：注册后，长度改变先由 
 
 | 类别 | 缺口 |
 |---|---|
-| 基础调用 | clock_gettime(113)、exit_group(94) 等仍 ENOSYS；fcntl 文件锁和异步通知尚未实现；ioctl 仅支持 RTC_RD_TIME，TCGETS/TCWINSZ 等终端命令返回 ENOTTY |
+| 基础调用 | exit_group(94)、settimeofday(170) 等仍 ENOSYS；fcntl 文件锁和异步通知尚未实现；ioctl 仅支持 RTC_RD_TIME，TCGETS/TCWINSZ 等终端命令返回 ENOTTY |
 | 信号残余 | 停止/继续状态机、RT 排队、core 位等偏差与欠账集中登记 §4.5 |
 | ELF（动态库） | 内核不加载 DT_NEEDED 库（由用户态解释器完成）；libc-test 的 dlopen 等场景待验证 |
 | mm | SIGBUS 用户投递；文件映射扩展；用户页执行禁止（NX） |

@@ -4,7 +4,7 @@
 
 use core::{sync::atomic::Ordering, time::Duration};
 
-use polyhal::timer::{current_time, set_next_timer};
+use polyhal::timer::set_next_timer;
 use polyhal_trap::{
     trap::TrapType,
     trapframe::{TrapFrame, TrapFrameArgs},
@@ -109,7 +109,7 @@ fn kernel_interrupt(ctx: &mut TrapFrame, trap_type: TrapType) {
     match trap_type {
         TrapType::Timer => {
             TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
-            set_next_timer(current_time() + Duration::from_millis(config::TICK_MS));
+            set_next_timer(crate::time::monotonic() + Duration::from_millis(config::TICK_MS));
         }
         TrapType::Breakpoint => {
             // 用户态断点由运行循环按致命异常处置；内核态断点是启动自检

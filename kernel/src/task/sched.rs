@@ -167,7 +167,7 @@ impl Scheduler {
 
     /// 到期扫描：Deadline 已到的等待者搬回就绪表。
     fn wake_expired(&mut self) {
-        let now = polyhal::timer::current_time();
+        let now = crate::time::monotonic();
         self.move_waiting(|_, r| match r {
             WaitReason::Deadline(d) | WaitReason::PollUntil(d) => now >= *d,
             _ => false,

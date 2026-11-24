@@ -94,7 +94,7 @@ impl BlockDevice for Partition {
         !WRITABLE
     }
     fn current_time(&self) -> Ext4Result<Ext4Timestamp> {
-        let elapsed = polyhal::timer::current_time();
+        let elapsed = crate::time::monotonic();
         Ok(Ext4Timestamp::new(
             self.time_base.saturating_add(elapsed.as_secs() as i64),
             elapsed.subsec_nanos(),
