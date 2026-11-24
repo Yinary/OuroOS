@@ -2246,6 +2246,7 @@ fn fork_user(
         child_frame[TrapFrameArgs::SP] = stack;
     }
     let pid = super::registry::alloc_pid();
+    let (policy, priority, nice) = super::sched::attrs_of(parent).ok_or(Errno::NoProcess)?;
     // CLONE_CHILD_SETTID：在子进程地址空间写入其 tid。
     if flags & CLONE_CHILD_SETTID != 0 && child_tid != 0 {
         // 写入经 user_access 完成，目标是子进程自身的用户内存；地址来自
@@ -2253,7 +2254,10 @@ fn fork_user(
         let _ =
             crate::mm::user_access::copy_to_user(&space, child_tid, &(pid as u32).to_ne_bytes());
     }
-    let task = Task::new_user(pid, pid, "child", child_frame).map_err(|_| Errno::NoMem)?;
+    let mut task = Task::new_user(pid, pid, "child", child_frame).map_err(|_| Errno::NoMem)?;
+    task.policy = policy;
+    task.priority = priority;
+    task.nice = nice;
     let task = Box::try_new(task).map_err(|_| Errno::NoMem)?;
     super::registry::reserve().map_err(|_| Errno::NoMem)?;
     sched::reserve_task().map_err(|_| Errno::NoMem)?;
@@ -2390,7 +2394,11 @@ fn fork_thread(
         child_frame[TrapFrameArgs::TLS] = tls;
     }
     let tid = super::registry::alloc_pid();
-    let task = Task::new_user(tid, tgid, "thread", child_frame).map_err(|_| Errno::NoMem)?;
+    let (policy, priority, nice) = super::sched::attrs_of(parent).ok_or(Errno::NoProcess)?;
+    let mut task = Task::new_user(tid, tgid, "thread", child_frame).map_err(|_| Errno::NoMem)?;
+    task.policy = policy;
+    task.priority = priority;
+    task.nice = nice;
     let task = Box::try_new(task).map_err(|_| Errno::NoMem)?;
     super::registry::reserve().map_err(|_| Errno::NoMem)?;
     sched::reserve_task().map_err(|_| Errno::NoMem)?;

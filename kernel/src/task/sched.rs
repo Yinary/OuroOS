@@ -272,20 +272,25 @@ pub(super) fn reserve_task() -> Result<(), crate::mm::frame::FrameError> {
     debug_assert!(s.ready.capacity() >= live && s.waiting.capacity() >= live);
     Ok(())
 }
-/// 按 pid 取调度属性；任务不在调度器的三张表里时返回 None。
-pub fn sched_of(pid: Pid) -> Option<(u8, i32)> {
+/// 按 pid 取调度属性三元组（策略、优先级、谦让值）；任务不在调度器的三张表里时返回 None。
+pub fn attrs_of(pid: Pid) -> Option<(u8, i32, i32)> {
     let slot = SCHED.lock();
     let s = slot.as_ref()?;
     if let Some(task) = s.current.as_ref().filter(|t| t.pid == pid) {
-        return Some((task.policy, task.priority));
+        return Some((task.policy, task.priority, task.nice));
     }
     if let Some(task) = s.ready.iter().find(|t| t.pid == pid) {
-        return Some((task.policy, task.priority));
+        return Some((task.policy, task.priority, task.nice));
     }
     s.waiting
         .iter()
         .find(|(t, _)| t.pid == pid)
-        .map(|(t, _)| (t.policy, t.priority))
+        .map(|(t, _)| (t.policy, t.priority, t.nice))
+}
+
+/// 按 pid 取调度策略与优先级；任务不在调度器的三张表里时返回 None。
+pub fn sched_of(pid: Pid) -> Option<(u8, i32)> {
+    attrs_of(pid).map(|(policy, priority, _)| (policy, priority))
 }
 
 /// 设置某个任务的策略与优先级；pid 不在调度器表里返回 false。
@@ -316,18 +321,7 @@ pub fn set_sched(pid: Pid, policy: u8, priority: i32) -> bool {
 
 /// 按 pid 取谦让值；任务不在调度器的三张表里时返回 None。
 pub fn nice_of(pid: Pid) -> Option<i32> {
-    let slot = SCHED.lock();
-    let s = slot.as_ref()?;
-    if let Some(task) = s.current.as_ref().filter(|t| t.pid == pid) {
-        return Some(task.nice);
-    }
-    if let Some(task) = s.ready.iter().find(|t| t.pid == pid) {
-        return Some(task.nice);
-    }
-    s.waiting
-        .iter()
-        .find(|(t, _)| t.pid == pid)
-        .map(|(t, _)| t.nice)
+    attrs_of(pid).map(|(_, _, nice)| nice)
 }
 
 /// 设置某个任务的谦让值；pid 不在调度器表里返回 false。
