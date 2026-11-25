@@ -90,6 +90,12 @@ pub struct Task {
     /// 本时间片的终点；由调度器在切入（promote）时刷新，
     /// 用户任务回用户态前比较当前时间与它决定让出。
     pub(super) slice_end: core::time::Duration,
+    /// 调度策略：0 其他、1 先进先出、2 轮转、3 批处理、5 空闲。
+    pub(super) policy: u8,
+    /// 实时策略的优先级 1 到 99；普通策略为 0。
+    pub(super) priority: i32,
+    /// 普通策略的谦让值，-20 到 19，越小越优先。
+    pub(super) nice: i32,
     /// 内核栈（纯所有权字段，仅 Drop 生效，无读取方；下划线豁免
     /// dead_code 检查）。任务回收时最终释放。
     _kstack: KernelStack,
@@ -122,6 +128,9 @@ impl Task {
             tgid,
             name,
             slice_end: core::time::Duration::ZERO,
+            policy: 0,
+            priority: 0,
+            nice: 0,
             _kstack: kstack,
         })
     }
@@ -147,6 +156,9 @@ impl Task {
             tgid,
             name,
             slice_end: core::time::Duration::ZERO,
+            policy: 0,
+            priority: 0,
+            nice: 0,
             _kstack: kstack,
         })
     }

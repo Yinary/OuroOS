@@ -299,7 +299,7 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
         ctx.set_exe_path_owned(exe_value);
     }
     *frame = next;
-    drop(reg);
+    drop(locked);
     super::sched::wake_vfork(pid);
     Ok(())
 }
