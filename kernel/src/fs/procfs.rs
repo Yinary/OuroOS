@@ -1,5 +1,5 @@
 //! 只读虚拟文件：每次 open 捕获一次快照；dup/fork 共享快照和读偏移。
-//! 覆盖 /proc/meminfo、/proc/mounts、/proc/<pid>/{stat,cmdline} 与 /dev/null。
+//! 覆盖 /proc/meminfo、/proc/mounts、/proc/<pid>/{stat,cmdline} 与基本 /dev 设备节点。
 use crate::syscall::Errno;
 use alloc::string::String;
 use core::fmt::Write;
@@ -8,6 +8,19 @@ pub(super) const MEMINFO: u32 = u32::MAX - 1;
 pub(super) const DIR: u32 = u32::MAX;
 /// /dev/null 的虚拟 inode：读返回 EOF，写全部接收并丢弃（null(4)）
 pub(super) const DEVNULL: u32 = u32::MAX - 2;
+/// /dev/zero 的虚拟 inode。
+pub(super) const DEVZERO: u32 = u32::MAX - 8;
+
+pub(super) fn zero_metadata() -> super::Metadata {
+    super::Metadata {
+        ino: u64::from(DEVZERO),
+        rdev: (1 << 8) | 5,
+        mode: 0o020666,
+        links: 1,
+        block_size: 4096,
+        ..Default::default()
+    }
+}
 /// /dev 目录
 pub(super) const DEVDIR: u32 = u32::MAX - 3;
 /// /dev/misc/rtc（RTC 查询设备，hwclock 使用）

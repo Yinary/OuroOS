@@ -105,6 +105,8 @@ enum Kind {
     MemInfo(String),
     /// /dev/null：读 EOF、写全收（见 fs::procfs::DEVNULL）
     DevNull,
+    /// /dev/zero：读返回零填充，写入丢弃。
+    DevZero,
     /// /dev/misc/rtc：仅支持 ioctl 的 RTC 查询设备
     Rtc,
     /// /dev 下的块设备节点：按节点登记的 (盘, 分区) 通用块访问
@@ -572,6 +574,14 @@ impl Context {
         self.open_special(Kind::DevNull, flags, cloexec)
     }
 
+    /// 打开 /dev/zero；独占创建已存在的节点返回 EEXIST。
+    pub(crate) fn open_devzero(&mut self, flags: usize, cloexec: bool) -> Result<usize, Errno> {
+        if flags & 0xc0 == 0xc0 {
+            return Err(Errno::Exists);
+        }
+        self.open_special(Kind::DevZero, flags, cloexec)
+    }
+
     /// fchmod(2)（fd, mode）：按已打开对象的 inode 身份改权限位，
     /// rename/unlink 后仍有效；非 inode FD 返回 ENOENT（fd 无权限位语义）。
     pub(crate) fn fchmod_fd(
@@ -795,6 +805,7 @@ impl OpenFile {
     /// 返回打开对象的属性快照；管道与控制台提供合成属性。
     pub(crate) fn metadata(&self) -> Result<fs::Metadata, Errno> {
         match &self.kind {
+            Kind::DevZero => Ok(super::procfs::zero_metadata()),
             Kind::Inode { ino, .. } => {
                 // procfs 虚拟节点（/proc、/dev/*、pid 派生）无后端 inode
                 // 元数据，直接按统一 stat 结果合成
@@ -844,7 +855,10 @@ impl OpenFile {
 
     /// 依据打开模式检查读写权限，失败返回 EBADF。
     pub(crate) fn check_access(&self, reading: bool) -> Result<(), Errno> {
-        if (reading && self.flags & 3 == 1) || (!reading && self.flags & 3 == 0) {
+        if (matches!(self.kind, Kind::DevZero) && self.flags & 0x200000 != 0)
+            || (reading && self.flags & 3 == 1)
+            || (!reading && self.flags & 3 == 0)
+        {
             return Err(Errno::BadF);
         }
         Ok(())
@@ -864,6 +878,9 @@ impl OpenFile {
     /// 从起点、当前位置或文件末尾调整偏移；管道返回 ESPIPE。
     pub(crate) fn seek(&mut self, delta: isize, whence: usize) -> Result<usize, Errno> {
         let base = match &self.kind {
+            Kind::DevZero if self.flags & 0x200000 != 0 => return Err(Errno::BadF),
+            Kind::DevZero if whence <= 4 => return Ok(0),
+            Kind::DevZero => return Err(Errno::Invalid),
             Kind::Inode { ino, .. } => match whence {
                 0 => 0,
                 1 => self.offset,
@@ -931,6 +948,7 @@ impl OpenFile {
                 Ok(delivered)
             }
             Kind::DevNull | Kind::Rtc => Ok(0),
+            Kind::DevZero => self.read_at(0, data, false, deliver),
             Kind::DevBlk { .. } => Ok(0), // 设备块读走专用路径（见 read_devblk）
             Kind::MemInfo(text) => {
                 let bytes = text.as_bytes().get(self.offset..).unwrap_or(&[]);
@@ -956,6 +974,7 @@ impl OpenFile {
     pub(crate) fn write_chunk(&mut self, data: &[u8], first: bool) -> Result<usize, Errno> {
         self.check_type(first)?;
         match &self.kind {
+            Kind::DevZero => Ok(data.len()),
             Kind::Output => {
                 use polyhal::debug_console::DebugConsole;
                 for &b in data {
@@ -989,10 +1008,10 @@ impl OpenFile {
         }
     }
 
-    /// 定位 I/O 只接受 inode 对象；流式对象返回 ESPIPE。
+    /// 定位 I/O 只接受支持偏移的对象；流式对象返回 ESPIPE。
     pub(crate) fn check_positioned(&self) -> Result<(), Errno> {
         match self.kind {
-            Kind::Inode { .. } | Kind::MemInfo(_) => Ok(()),
+            Kind::Inode { .. } | Kind::MemInfo(_) | Kind::DevZero => Ok(()),
             _ => Err(Errno::SeekPipe),
         }
     }
@@ -1006,6 +1025,15 @@ impl OpenFile {
         deliver: impl FnOnce(&[u8]) -> Result<usize, Errno>,
     ) -> Result<usize, Errno> {
         self.check_type(first)?;
+        if matches!(self.kind, Kind::DevZero) {
+            data.fill(0);
+            let delivered = deliver(data)?;
+            return if delivered <= data.len() {
+                Ok(delivered)
+            } else {
+                Err(Errno::Invalid)
+            };
+        }
         if let Kind::DevBlk { disk, start, len } = &self.kind {
             // 块设备节点：分区起点+fd 偏移经驱动通用读
             let off = start + offset;
@@ -1048,7 +1076,7 @@ impl OpenFile {
             crate::drivers::write_bytes(*disk, off, data).map_err(|_| Errno::Io)?;
             return Ok(data.len());
         }
-        if matches!(self.kind, Kind::DevNull | Kind::Rtc) {
+        if matches!(self.kind, Kind::DevNull | Kind::DevZero | Kind::Rtc) {
             return Ok(data.len());
         }
         let ino = match self.kind {
@@ -1146,7 +1174,9 @@ pub(crate) fn poll(
                 Kind::Output => 0x104 & requested,
                 Kind::Inode { .. } | Kind::MemInfo(_) => 0x145 & requested,
                 // /dev/null 与 rtc 永远可读（EOF）可写；块节点同
-                Kind::DevNull | Kind::Rtc | Kind::DevBlk { .. } => 0x145 & requested,
+                Kind::DevNull | Kind::DevZero | Kind::Rtc | Kind::DevBlk { .. } => {
+                    0x145 & requested
+                }
                 Kind::Pipe { pipe, reading } => {
                     let p = pipe.lock();
                     if *reading {

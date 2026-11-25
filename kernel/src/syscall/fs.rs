@@ -189,6 +189,9 @@ pub fn dispatch(
             if path == "/dev/null" {
                 return ctx.open_devnull(a[2], a[2] & 0x80000 != 0);
             }
+            if path == "/dev/zero" {
+                return ctx.open_devzero(a[2], a[2] & 0x80000 != 0);
+            }
             if path == "/dev/misc/rtc" {
                 return ctx.open_rtc(a[2], a[2] & 0x80000 != 0);
             }

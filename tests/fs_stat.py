@@ -62,12 +62,13 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / "target/fs-validation/stat")
     parser.add_argument("--metadata", action="store_true", help="验证 umask 和 utimensat")
     parser.add_argument("--rename", action="store_true", help="验证 renameat 和 renameat2")
+    parser.add_argument("--devzero", action="store_true", help="验证 /dev/zero 设备读写")
     parser.add_argument("--rmdir", action="store_true", help="验证空目录删除及引用释放")
     parser.add_argument("--chown", action="store_true", help="验证 fchown 与 fchownat")
     parser.add_argument("--truncate", action="store_true", help="验证 truncate 和 ftruncate")
     parser.add_argument("--readonly", action="store_true", help="metadata 专项要求只读内核")
     args = parser.parse_args()
-    if sum((args.metadata, args.rename, args.truncate, args.chown, args.rmdir)) > 1:
+    if sum((args.metadata, args.rename, args.truncate, args.chown, args.rmdir, args.devzero)) > 1:
         parser.error("一次只能选择一组专项")
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -76,7 +77,8 @@ def main():
                     ignore=shutil.ignore_patterns("target"))
     program = ("fs_truncate.rs" if args.truncate else "fs_rename.rs" if args.rename
                else "fs_metadata.rs" if args.metadata else "fs_chown.rs" if args.chown
-               else "fs_rmdir.rs" if args.rmdir else "fs_stat.rs")
+               else "fs_rmdir.rs" if args.rmdir else "fs_devzero.rs" if args.devzero
+               else "fs_stat.rs")
     shutil.copyfile(ROOT / "tests" / program, user / "src/bin/smoke.rs")
     if args.metadata:
         shutil.copyfile(ROOT / "tests/fs_metadata_exec.rs", user / "src/bin/check.rs")
@@ -216,6 +218,7 @@ def main():
             markers = (("TRUNCATE PASS:",) if args.truncate else
                        ("CHOWN PASS:",) if args.chown else
                        ("RMDIR PASS:",) if args.rmdir else
+                       ("DEVZERO PASS:",) if args.devzero else
                        ("RENAME PASS:",) if args.rename else
                        ("METADATA PASS:", "MASK EXEC PASS") if args.metadata else
                        ("STAT PASS:", "READLINK PASS:", "STATFS PASS:"))
@@ -261,7 +264,8 @@ def main():
             run(["e2fsck", "-fn", str(ext)], out / f"{stem}-after-fsck.log")
             suite = ("truncate" if args.truncate else "rename" if args.rename
                      else "metadata" if args.metadata else "chown" if args.chown
-                     else "rmdir" if args.rmdir else "status queries")
+                     else "rmdir" if args.rmdir else "devzero" if args.devzero
+                     else "status queries")
             print(f"{stem}: PASS ({suite} and e2fsck)", flush=True)
 
 

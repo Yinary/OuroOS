@@ -124,6 +124,9 @@ static DEVICE_NODES: crate::sync::DebugMutex<
 /// 核分配的块设备 major（254）。盘号/分区号必须真实存在（总线枚举取
 /// 得），否则 ENODEV。
 pub fn mknod_blk(name: &str, mode: usize, dev: u64) -> Result<(), Errno> {
+    if name == "zero" {
+        return Err(Errno::Exists);
+    }
     let major = (dev >> 8) & 0xfff;
     let minor = dev & 0xff; // minor ≤ 255 场景（本内核盘数/分区数远小于）
                             // 本内核所有 virtio-blk 固定 major 254（自分配块设备号空间）
@@ -161,6 +164,9 @@ pub fn lookup_blk_node(name: &str) -> Option<(usize, usize)> {
 pub fn lookup(path: &str) -> Result<u32, Errno> {
     if path == "/dev/null" {
         return Ok(procfs::DEVNULL);
+    }
+    if path == "/dev/zero" {
+        return Ok(procfs::DEVZERO);
     }
     if path == "/dev" {
         return Ok(procfs::DEVDIR);
@@ -216,7 +222,7 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
 
 /// 返回 inode 类型、长度、链接数和磁盘占用。
 pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
-    if ino == procfs::DEVNULL {
+    if matches!(ino, procfs::DEVNULL | procfs::DEVZERO) {
         return Ok((0o020666, 0, 1, 0));
     }
     if ino == procfs::DEVDIR || ino == procfs::MISC_DIR {
