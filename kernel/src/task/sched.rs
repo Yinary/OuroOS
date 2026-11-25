@@ -20,7 +20,7 @@ use crate::{
 
 use super::{
     registry,
-    task::{FutexKey, Task, TaskBody, TaskState, WaitReason},
+    task::{FutexKey, Pid, Task, TaskBody, TaskState, WaitReason},
     ExitInfo, REGISTRY,
 };
 
@@ -74,7 +74,7 @@ pub(super) fn take_body() -> TaskBody {
 const SLICE: core::time::Duration = core::time::Duration::from_millis(crate::config::TICK_MS);
 
 /// 回用户态前的调度检查：时钟中断之后把到期的等待者搬回就绪表；
-/// 有任务因此就绪，或当前任务的时间片用尽时让出。
+/// 有任务因此就绪、就绪表出现等级更高的任务，或当前任务的时间片用尽时让出。
 pub fn resume_check() {
     let yield_cpu = {
         let mut slot = SCHED.lock();
@@ -90,7 +90,11 @@ pub fn resume_check() {
         } else {
             false
         };
-        expired || woke
+        let outranked = match s.current.as_ref() {
+            Some(cur) => s.ready.iter().any(|task| rank(task) > rank(cur)),
+            None => false,
+        };
+        expired || woke || outranked
     };
     if yield_cpu {
         yield_now();
@@ -118,7 +122,30 @@ struct Scheduler {
 
 static SCHED: DebugMutex<Option<Scheduler>> = DebugMutex::new("SCHED", None);
 
+/// 就绪等级：实时策略（先进先出、轮转）高于普通策略（其他、批处理），
+/// 空闲策略最低；实时策略之间比较优先级数值，其余策略数值为 0。
+fn rank(task: &Task) -> (i8, i32) {
+    match task.policy {
+        1 | 2 => (2, task.priority),
+        5 => (0, 0),
+        _ => (1, 0),
+    }
+}
+
 impl Scheduler {
+    /// 取出就绪等级最高的任务；同等级按就绪先后。
+    fn pick_next(&mut self) -> Option<Box<Task>> {
+        let mut best: Option<(usize, (i8, i32))> = None;
+        for (i, task) in self.ready.iter().enumerate() {
+            let r = rank(task);
+            if best.is_none_or(|(_, b)| r > b) {
+                best = Some((i, r));
+            }
+        }
+        let (i, _) = best?;
+        self.ready.remove(i)
+    }
+
     /// 把任务立为当前任务：置 Running、刷新时间片终点、更新 CURRENT。
     /// 返回其 KContext 地址（Box 保证稳定）。
     fn promote(&mut self, mut task: Box<Task>) -> *const KContext {
@@ -245,6 +272,81 @@ pub(super) fn reserve_task() -> Result<(), crate::mm::frame::FrameError> {
     debug_assert!(s.ready.capacity() >= live && s.waiting.capacity() >= live);
     Ok(())
 }
+/// 按 pid 取调度属性三元组（策略、优先级、谦让值）；任务不在调度器的三张表里时返回 None。
+pub fn attrs_of(pid: Pid) -> Option<(u8, i32, i32)> {
+    let slot = SCHED.lock();
+    let s = slot.as_ref()?;
+    if let Some(task) = s.current.as_ref().filter(|t| t.pid == pid) {
+        return Some((task.policy, task.priority, task.nice));
+    }
+    if let Some(task) = s.ready.iter().find(|t| t.pid == pid) {
+        return Some((task.policy, task.priority, task.nice));
+    }
+    s.waiting
+        .iter()
+        .find(|(t, _)| t.pid == pid)
+        .map(|(t, _)| (t.policy, t.priority, t.nice))
+}
+
+/// 按 pid 取调度策略与优先级；任务不在调度器的三张表里时返回 None。
+pub fn sched_of(pid: Pid) -> Option<(u8, i32)> {
+    attrs_of(pid).map(|(policy, priority, _)| (policy, priority))
+}
+
+/// 设置某个任务的策略与优先级；pid 不在调度器表里返回 false。
+pub fn set_sched(pid: Pid, policy: u8, priority: i32) -> bool {
+    let mut slot = SCHED.lock();
+    let Some(s) = slot.as_mut() else {
+        return false;
+    };
+    if let Some(task) = s.current.as_mut().filter(|t| t.pid == pid) {
+        task.policy = policy;
+        task.priority = priority;
+        return true;
+    }
+    if let Some(task) = s.ready.iter_mut().find(|t| t.pid == pid) {
+        task.policy = policy;
+        task.priority = priority;
+        return true;
+    }
+    s.waiting
+        .iter_mut()
+        .find(|(t, _)| t.pid == pid)
+        .is_some_and(|(t, _)| {
+            t.policy = policy;
+            t.priority = priority;
+            true
+        })
+}
+
+/// 按 pid 取谦让值；任务不在调度器的三张表里时返回 None。
+pub fn nice_of(pid: Pid) -> Option<i32> {
+    attrs_of(pid).map(|(_, _, nice)| nice)
+}
+
+/// 设置某个任务的谦让值；pid 不在调度器表里返回 false。
+pub fn set_nice(pid: Pid, nice: i32) -> bool {
+    let mut slot = SCHED.lock();
+    let Some(s) = slot.as_mut() else {
+        return false;
+    };
+    if let Some(task) = s.current.as_mut().filter(|t| t.pid == pid) {
+        task.nice = nice;
+        return true;
+    }
+    if let Some(task) = s.ready.iter_mut().find(|t| t.pid == pid) {
+        task.nice = nice;
+        return true;
+    }
+    s.waiting
+        .iter_mut()
+        .find(|(t, _)| t.pid == pid)
+        .is_some_and(|(t, _)| {
+            t.nice = nice;
+            true
+        })
+}
+
 /// 任务入就绪队列队尾。
 pub(super) fn enqueue(task: Box<Task>) {
     let mut slot = SCHED.lock();
@@ -270,8 +372,7 @@ pub fn yield_now() {
         s.drain_wake_requests();
         s.wake_expired();
         let next = s
-            .ready
-            .pop_front()
+            .pick_next()
             .expect("ready queue must contain the yielding task");
         let to = s.promote(next);
         (from, to)
@@ -302,7 +403,7 @@ pub fn park(reason: WaitReason) {
             s.ready.push_back(cur);
         }
         s.refresh_deadline();
-        let to = match s.ready.pop_front() {
+        let to = match s.pick_next() {
             Some(next) => s.promote(next),
             None => {
                 set_current(core::ptr::null_mut());
@@ -414,7 +515,7 @@ pub(super) fn exit_group_current(exit: ExitInfo) -> ! {
         s.waiting.retain(|(task, _)| task.tgid != tgid);
         s.drain_wake_requests();
         s.wake_expired();
-        match s.ready.pop_front() {
+        match s.pick_next() {
             Some(next) => {
                 let to = s.promote(next);
                 (from, to)
@@ -493,7 +594,7 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
         s.dead.push(cur);
         s.drain_wake_requests();
         s.wake_expired();
-        match s.ready.pop_front() {
+        match s.pick_next() {
             Some(next) => {
                 let to = s.promote(next);
                 (from, to)
@@ -532,7 +633,7 @@ pub(super) fn run_loop() {
             s.reap_dead();
             s.drain_wake_requests();
             s.wake_expired();
-            s.ready.pop_front().map(|task| s.promote(task))
+            s.pick_next().map(|task| s.promote(task))
         };
         match next {
             Some(to) => {
