@@ -96,8 +96,6 @@ pub fn dispatch(
         sysnr::FCHOWNAT | sysnr::FCHOWN => chown(nr, ctx, space, a, credentials),
         sysnr::FCHMOD => fchmod(ctx, space, a),
         sysnr::FCHMODAT => fchmodat(ctx, space, a),
-        // chmod(2)：等价于 fchmodat(AT_FDCWD, path, mode)。
-        sysnr::CHMOD => fchmodat(ctx, space, [(-100isize) as usize, a[0], a[1], 0, 0, 0]),
         sysnr::MKNODAT => mknodat(ctx, space, a),
         sysnr::FACCESSAT2 => faccessat2(ctx, space, a),
         sysnr::IOCTL => ioctl(ctx, space, a),

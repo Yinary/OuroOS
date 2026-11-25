@@ -1174,6 +1174,7 @@ fn process_call(
         sysnr::SCHED_SETAFFINITY => sched_setaffinity(parent, args[0], args[1], args[2]),
         sysnr::SETPGID => set_pg_id(parent, args),
         sysnr::GETPGID => get_pg_or_sid(parent, args[0], false),
+        sysnr::CAPGET => capget(parent, args),
         sysnr::GETSID => get_pg_or_sid(parent, args[0], true),
         sysnr::SETSID => set_sid(parent),
         sysnr::KILL | sysnr::TKILL | sysnr::TGKILL => kill_or_tgkill(parent, nr, args),
@@ -1804,6 +1805,67 @@ fn get_res_id(parent: Pid, args: [usize; 6], want_gid: bool) -> Result<usize, Er
     for (ptr, value) in [(args[0], real), (args[1], effective), (args[2], saved)] {
         user_access::copy_to_user(space, ptr, &value.to_ne_bytes()).map_err(|_| Errno::Fault)?;
     }
+    Ok(0)
+}
+
+/// capget(2)（header, data）：按头部版本号回填目标进程的能力集，返回 0。
+/// euid 为 0 的进程 permitted 与 effective 是全集，其余位为空；版本不认识时把
+/// 0x20080522 写回头部并返回 EINVAL。数据指针为空返回 0，pid 为负或地址不可访问报错。
+fn capget(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let reg = REGISTRY.lock();
+    let caller = reg.group(parent).ok_or(Errno::NoProcess)?;
+    let space = caller.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    let mut header = [0u8; 8];
+    user_access::copy_from_user(space, args[0], &mut header).map_err(|_| Errno::Fault)?;
+    let version = u32::from_ne_bytes([header[0], header[1], header[2], header[3]]);
+    let pid = i32::from_ne_bytes([header[4], header[5], header[6], header[7]]);
+    let words = match version {
+        0x1998_0330 => 1usize,
+        0x2007_1026 | 0x2008_0522 => 2usize,
+        _ => {
+            user_access::copy_to_user(space, args[0], &0x2008_0522u32.to_ne_bytes())
+                .map_err(|_| Errno::Fault)?;
+            return if args[1] == 0 {
+                Ok(0)
+            } else {
+                Err(Errno::Invalid)
+            };
+        }
+    };
+    if args[1] == 0 {
+        return Ok(0);
+    }
+    if pid < 0 {
+        return Err(Errno::Invalid);
+    }
+    let euid = if pid == 0 || pid as usize == parent {
+        caller.creds.euid
+    } else {
+        reg.group(pid as usize)
+            .or_else(|| reg.thread(pid as usize).and_then(|t| reg.group(t.tgid)))
+            .ok_or(Errno::NoProcess)?
+            .creds
+            .euid
+    };
+    let (effective, permitted, inheritable) = if euid == 0 {
+        (
+            [0xffff_ffffu32, 0x0000_01ffu32],
+            [0xffff_ffffu32, 0x0000_01ffu32],
+            [0u32, 0u32],
+        )
+    } else {
+        ([0u32; 2], [0u32; 2], [0u32; 2])
+    };
+    let mut bytes = [0u8; 24];
+    let flat = effective
+        .iter()
+        .zip(permitted.iter())
+        .zip(inheritable.iter())
+        .flat_map(|((e, p), i)| [*e, *p, *i]);
+    for (dst, value) in bytes.chunks_exact_mut(4).zip(flat) {
+        dst.copy_from_slice(&value.to_ne_bytes());
+    }
+    user_access::copy_to_user(space, args[1], &bytes[..words * 12]).map_err(|_| Errno::Fault)?;
     Ok(0)
 }
 

@@ -126,7 +126,7 @@ pub mod sysnr {
     pub const FCHMODAT: usize = 53;
     pub const FCHOWNAT: usize = 54;
     pub const FCHOWN: usize = 55;
-    pub const CHMOD: usize = 90;
+    pub const CAPGET: usize = 90;
     pub const MKNODAT: usize = 33;
     pub const FCHMOD: usize = 52;
     pub const SYSLOG: usize = 116;
@@ -323,7 +323,6 @@ pub fn dispatch(
         | sysnr::FCHMODAT
         | sysnr::FCHOWNAT
         | sysnr::FCHOWN
-        | sysnr::CHMOD
         | sysnr::FCHMOD
         | sysnr::MKNODAT
         | sysnr::IOCTL
@@ -504,6 +503,7 @@ pub fn dispatch(
         | sysnr::GETRESUID
         | sysnr::GETRESGID
         | sysnr::GETGROUPS
+        | sysnr::CAPGET
         | sysnr::SETREGID
         | sysnr::SETGID
         | sysnr::SETREUID
