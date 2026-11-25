@@ -89,8 +89,10 @@ check: all syscall paths ok, faulting now
 |---|---|---|
 | basic-musl / basic-glibc | 102/102 | 102/102 |
 | busybox-musl / busybox-glibc | 54/55 | 54/55 |
+| lua-musl / lua-glibc | 9/9 | 9/9 |
+| libcbench-musl / libcbench-glibc | 27/27 | 27/27 |
 
-busybox 各差 1 分来自判分器内嵌的 `kill 10` 命令与盘上命令表不对齐（外部差异，非功能缺陷）。自建盘 FS 语义回归（`make test-regress`）双架构四配置全通过。
+busybox 各差 1 分来自判分器内嵌的 `kill 10` 命令与盘上命令表不对齐（外部差异，非功能缺陷）。libcbench 按有效计时数计：27 个子项各得 1 到 2 分的性能分，慢于基线得 1 分，快于基线按比例增加。basic 的 `test_pipe` 偶发因父子进程输出交错少 3 分，见契约 §3.8。自建盘 FS 语义回归（`make test-regress`）双架构四配置全通过。
 
 ## 文档
 

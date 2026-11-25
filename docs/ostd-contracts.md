@@ -244,6 +244,7 @@ try_lock 失败即报告“持锁跨调度”。
 | #5/#7 分类器 | vendor 已修；模拟器内部/未知中断见 §2 #9/#10 |
 | #8 polyhal percpu | 未修；selftest 用 `-Zub-checks=no` |
 | la idle | 自旋等钟；Deadline 依赖硬件时钟读数，不阻塞正确性 |
+| 进程间输出交错 | 时间片在两次 `write` 之间到期时让出，另一进程的输出会插入同一行。basic 的 `test_pipe` 自带 `printf` 一行发三次 `write`，判分要求整行完整，本机出现率约 6%，每次少 3 分 |
 
 | 欠账 | 现状 / 计划 |
 |---|---|
@@ -519,7 +520,7 @@ signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综�
 |---|---|
 | `make run-rv` / `make run-la` | 默认以 release 内核无盘启动 QEMU，运行七个演示任务（kthread A/B、hello、sched×2、check、ill）；官方原盘判分见下方 test 入口 |
 | `make selftest-rv` / `make selftest-la` | 构建 selftest 内核；启动该产物时启用 debug 断言、lock_debug、LOG=info 及额外 OOM 注入；polyhal #8 需 `-Zub-checks=no` |
-| `make test-rv` / `make test-la` | 官方原盘四组验收（basic/busybox × musl/glibc）：官方 QEMU 命令、原版 judge 判分、每轮干净盘副本；`make test-setup` 准备评测器与原盘 |
+| `make test-rv` / `make test-la` | 官方原盘八组验收（basic/busybox/lua/libcbench × musl/glibc）：官方 QEMU 命令、原版 judge 判分、每轮干净盘副本；`make test-setup` 准备评测器与原盘 |
 | `tests/file_mapping.rs` | 用仓库固定的 Rust 执行 `rustc --edition=2021 --test tests/file_mapping.rs -o /tmp/ouro-file-mapping && /tmp/ouro-file-mapping`，覆盖缓存写回失败、重试与引用释放。 |
 | `tests/fs_stat.py --metadata` | `make all` 后执行 `python3 tests/fs_stat.py --metadata --output target/fs-validation/metadata`，验证双架构 128/256 字节 inode 的创建掩码、fork/exec、NOW/OMIT、FD/链接时间更新与落盘；只读版本先构建相应 feature，添加 --readonly 并指定独立输出目录，结束后恢复默认内核 |
 | `tests/fs_stat.py --truncate` | 构建后运行；验证双架构 128/256 字节 inode 的缩短、稀疏扩展、零尾部、预分配与索引回收、偏移不变、链接/已删名 FD、父子进程共享映射保护及错误参数；debugfs 独立核对落盘内容并运行 e2fsck/FAT fsck；只读构建增加 --readonly |
