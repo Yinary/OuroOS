@@ -349,6 +349,16 @@ pub(super) fn update_times(ino: u32, times: [super::TimeUpdate; 2]) -> Result<()
     })
 }
 
+/// 按 inode 更新属主和属组，写入只读卷时返回 EROFS。
+pub(super) fn set_owner(ino: u32, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        rsext4::metadata::chown_inode(&mut v.device, &mut v.fs, InodeNumber::new(ino)?, uid, gid)
+    })
+}
+
 /// 查询根卷容量，空闲计数取自后端当前快照。
 pub(super) fn filesystem_stats() -> Result<super::FileSystemStats, Errno> {
     access(|v| {

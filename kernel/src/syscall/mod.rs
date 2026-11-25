@@ -124,6 +124,8 @@ pub mod sysnr {
     pub const GETTIMEOFDAY: usize = 169;
     pub const FACCESSAT: usize = 48;
     pub const FCHMODAT: usize = 53;
+    pub const FCHOWNAT: usize = 54;
+    pub const FCHOWN: usize = 55;
     pub const CHMOD: usize = 90;
     pub const MKNODAT: usize = 33;
     pub const FCHMOD: usize = 52;
@@ -274,6 +276,7 @@ pub fn dispatch(
     space: &mut UserAddressSpace,
     fs: &mut crate::fs::context::Context,
     signal: &mut crate::task::signal::SignalGroup,
+    credentials: &crate::task::Credentials,
     thread: &mut crate::task::ThreadRecord,
 ) -> Flow {
     // 调用号在 a7（TrapFrameArgs::SYSCALL），参数在 a0..；返回值写回 a0
@@ -318,6 +321,8 @@ pub fn dispatch(
         | sysnr::FACCESSAT
         | sysnr::FACCESSAT2
         | sysnr::FCHMODAT
+        | sysnr::FCHOWNAT
+        | sysnr::FCHOWN
         | sysnr::CHMOD
         | sysnr::FCHMOD
         | sysnr::MKNODAT
@@ -328,6 +333,7 @@ pub fn dispatch(
                 [args[0], args[1], args[2], args[3], args[4], args[5]],
                 space,
                 fs,
+                credentials,
             );
             // pipe 无数据/无空间且非 O_NONBLOCK：转为阻塞等待
             if ret == Err(Errno::WouldBlock) {

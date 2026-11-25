@@ -249,6 +249,7 @@ pub fn user_task_entry() -> ! {
                                     &mut space.0,
                                     rec.fs.as_mut().expect("user fs context"),
                                     &mut rec.signal,
+                                    &rec.creds,
                                     thread,
                                 ),
                                 None => Flow::Continue,

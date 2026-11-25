@@ -11,6 +11,8 @@
 | [rust-fatfs](https://github.com/rafalh/rust-fatfs) 38b3a7950bf0e765e34286d1dfe76c519ee347e2 | MIT | 锁定 Git revision，no_std + alloc + lfn，FAT 挂载/读写/unlink（无目录列举） | 2026-11-10 |
 | [Linux](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git) 6.x `arch/{riscv,loongarch}/kernel/signal.c` 与 UAPI 头（signal/sigcontext/ucontext/siginfo） | GPL-2.0（仅对照，未复制代码） | 信号帧布局/魔数/stub 指令编码的 ABI 事实标准：`kernel/src/sigframe/` 逐项对照并经交叉 gcc offsetof 实测核验；投递/EINTR 语义参考 `kernel/signal.c`（仅思路） | 2026-11-19 |
 
+属主更新补丁：rsext4 新增 `metadata::chown_inode`，复用现有元数据更新流程。Linux v6.12 `fs/attr.c` 仅用于核对基本授权语义，未复制源码。
+
 历史条目：ext4_rs 1.3.3（MIT）曾作为 Ext4 后端 vendor 于 `third_party/ext4_rs`，含块分配起点与 panic 审计 9 处补丁，随 rsext4 接入而移除（fs/rsext4 集成分支）；审计工作待在 rsext4 上重做（见 ostd-contracts §6 欠账）。
 
 本地 JBD2 栈占用补丁：提交临时块改为预先可失败分配的堆缓冲，复用单个 payload，避免多块数组叠加；版本与协议不变，详见 rsext4 README。

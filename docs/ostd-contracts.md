@@ -288,6 +288,7 @@ try_lock 失败即报告“持锁跨调度”。
 |---|---|---|
 | mknodat | 仅 S_IFBLK：节点登记 (盘,分区) 身份（minor 编码），必须位于 /dev 下，分区须真实存在（总线位置校验），同名 EEXIST；major 须为 254（本内核块设备空间）。S_IFCHR/S_IFIFO/S_IFSOCK 返回 EOPNOTSUPP | 设备节点无独立文件系统支持，为内核注册表条目（内存态，重启即失） |
 | faccessat/faccessat2 | 按路径检查存在性；X_OK 要求文件有任一执行位（无执行位 EACCES），R_OK/W_OK 放行，不按凭证检查；flags 仅接受 AT_EACCESS/AT_SYMLINK_NOFOLLOW，NOFOLLOW 暂与跟随一致 | 不按 uid/gid 做权限检查 |
+| fchown/fchownat | Ext4 按 FD 或路径修改属主和属组，两个 ID 独立接受 -1 保留。支持 AT_SYMLINK_NOFOLLOW、空字符串配合 AT_EMPTY_PATH，以及已删名但仍打开的 inode。普通属主可保留原属主并改到原属组、文件系统组或补充组。 | 特权沿用进程有效 UID 为 0 的规则，普通属主按文件系统 UID 判断。暂未接入 CAP_CHOWN、目录搜索授权、FAT、虚拟对象或空指针形式的 AT_EMPTY_PATH。沿用后端 ctime、set-ID 位及日志更新规则。 |
 | fchmod/fchmodat | 保留 07777 权限位（含 setuid/setgid/sticky），类型位由 inode 持有；仅普通文件与目录可改。fchmod 按已打开对象的 inode 身份生效（rename/unlink 后仍有效，管道/procfs FD 返回 ENOENT）；fchmodat 按路径，flags 仅接受 0/AT_SYMLINK_NOFOLLOW（后者暂与跟随一致）；FAT 卷返回 ENOTSUP | chmod(2) 未单独提供（走 fchmodat+AT_FDCWD 等价）；无 UID/GID 属主校验与 ACL |
 | syslog/klogctl | 按 man 2 action 编码：READ(2) 消耗式游标读取、READ_ALL(3) 全量、READ_CLEAR(4) 读后清空、CLEAR(5)、OPEN/CLOSE(0/1) 无操作返回 0、console 开关(6/7)无操作、SET_CONSOLE_LEVEL(8) 仅接受 1..=8 并记录（不变更实际输出）、SIZE_UNREAD(9)/SIZE_BUFFER(10) 返回未读/容量；其余 EINVAL | 日志环上限 8 KiB，只收集显式登记事件（启动报告/终态/panic），无内核分级日志 |
 | getrandom | 设备树 rng-seed 播种 ChaCha20 流（单次请求上限 64 KiB，可失败分配）；flags 仅接受 GRND_NONBLOCK/GRND_RANDOM；无种子时一律 EAGAIN（无合法阻塞唤醒来源），绝不以时间/常量伪造熵 | 缺少可信启动熵时 execve 返回 EIO，保留旧映像；启动阶段若因此无法创建任何用户任务，内核同步文件系统并关机。 |
@@ -566,9 +567,9 @@ msync 按相交 VMA 的文件偏移选择缓存页，再同步 Ext4 后端，失
 | 提供方 | 接口与约束 | 当前状态 |
 |---|---|---|
 | MM | `mm::frame::memory_snapshot() -> MemorySnapshot`，同一次帧分配器加锁中读取已登记和空闲 RAM，字段 total_kib/free_kib 的单位为 KiB。无换页、无可回收缓存估算时，MemAvailable 可取 free_kib 的保守值。 | 已提供 |
-| procfs/VFS | 打开 /proc/meminfo 时取一次快照，生成 MemTotal、MemFree、MemAvailable、SwapFree 等字段；同一次打开按偏移读取，读尽返回 EOF。无交换设备时 SwapFree 为 0。 | 已接入只读 meminfo；brk01 现在阻塞在其后临时目录的 chown，不算通过 |
+| procfs/VFS | 打开 /proc/meminfo 时取一次快照，生成 MemTotal、MemFree、MemAvailable、SwapFree 等字段；同一次打开按偏移读取，读尽返回 EOF。无交换设备时 SwapFree 为 0。 | 已接入只读 meminfo；既有 brk01 记录越过该步骤后在临时目录的 chown 中断，接入属主修改后待复测 |
 | task | current_credentials(pid) 返回真实/有效 UID、GID，进程创建/exec 保留或更新凭证；getgid/getegid 等调用以及 VFS 授权共用此来源。 | 身份查询与切换调用已接入进程记录里的 `Credentials`；VFS 授权未接入 |
-| fs | set_owner(inode, uid: Option<u32>, gid: Option<u32>, credentials) 返回 Result；None 对应 uid/gid 的 -1，检查调用者权限，成功后 stat 与重新挂载均应可观察更新。 | 只定义契约；mincore01 在两架构初始化临时目录时报告 chown ENOSYS |
+| fs | set_owner(inode, uid: Option<u32>, gid: Option<u32>, credentials) 返回 Result；None 对应 uid/gid 的 -1，检查调用者权限，成功后 stat 与重新挂载均应可观察更新。 | 已接入 Ext4 的 fchownat/fchown。既有 mincore01 双架构记录是在修改前报告 chown ENOSYS，需重新运行 |
 | task/signal | 注册用户信号动作、投递访存异常与恢复用户上下文；无处理器时按相应信号终止进程。 | 已实现（§4.5）；原版 LTP 的信号用例接入与验收仍待 |
 
 测试基线是 pre-2025 的 LTP 20240524。上述 TBROK 发生于测试框架初始化阶段，未执行对应 MM 断言。

@@ -714,8 +714,7 @@ impl OpenFile {
         Ok(0)
     }
 
-    /// 获取 inode，设备和管道返回 EINVAL。
-    #[cfg(not(feature = "rsext4-readonly"))]
+    /// 获取 inode；没有后端 inode 的对象返回 EINVAL。
     pub(crate) fn inode(&self) -> Result<u32, Errno> {
         match self.kind {
             Kind::Inode { ino, .. } => Ok(ino),

@@ -9,6 +9,7 @@ use crate::{
         context::{parent, Context},
     },
     mm::{address_space::UserAddressSpace, user_access},
+    task::Credentials,
 };
 use alloc::{string::String, vec::Vec};
 
@@ -33,6 +34,7 @@ pub fn dispatch(
     a: [usize; 6],
     space: &UserAddressSpace,
     ctx: &mut Context,
+    credentials: &Credentials,
 ) -> Result<usize, Errno> {
     match nr {
         sysnr::UMASK => Ok(ctx.set_umask(a[0])),
@@ -91,6 +93,7 @@ pub fn dispatch(
             Ok(0)
         }
         sysnr::FACCESSAT => faccessat(ctx, space, a),
+        sysnr::FCHOWNAT | sysnr::FCHOWN => chown(nr, ctx, space, a, credentials),
         sysnr::FCHMOD => fchmod(ctx, space, a),
         sysnr::FCHMODAT => fchmodat(ctx, space, a),
         // chmod(2)：等价于 fchmodat(AT_FDCWD, path, mode)。
@@ -424,6 +427,54 @@ fn utimensat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<u
     }
     let info = ctx.query(dir, &path, flags & 0x1000 != 0, flags & 0x100 == 0)?;
     fs::update_times(info.ino as u32, times)?;
+    Ok(0)
+}
+
+/// Linux fchown/fchownat：按 FD 或路径修改 Ext4 对象的归属。
+fn chown(
+    nr: usize,
+    ctx: &Context,
+    space: &UserAddressSpace,
+    a: [usize; 6],
+    credentials: &Credentials,
+) -> Result<usize, Errno> {
+    const AT_FDCWD: isize = -100;
+    const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+    const AT_EMPTY_PATH: u32 = 0x1000;
+    const O_PATH: usize = 0x200000;
+
+    let id = |raw: usize| {
+        let value = raw as u32;
+        (value != u32::MAX).then_some(value)
+    };
+    let fd_inode = |fd, allow_path: bool| {
+        let file = ctx.get(fd)?;
+        let file = file.lock();
+        if !allow_path && file.status_flags() & O_PATH != 0 {
+            return Err(Errno::BadF);
+        }
+        file.inode().map_err(|_| Errno::NotSupported)
+    };
+
+    let (ino, uid, gid) = if nr == sysnr::FCHOWN {
+        (fd_inode(a[0] as u32 as usize, false)?, id(a[1]), id(a[2]))
+    } else {
+        let flags = a[4] as u32;
+        if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+            return Err(Errno::Invalid);
+        }
+        let dir = a[0] as u32 as i32 as isize;
+        let path = user_string(space, a[1])?;
+        let empty = flags & AT_EMPTY_PATH != 0;
+        let ino = if empty && path.is_empty() && dir != AT_FDCWD {
+            fd_inode(dir as usize, true)?
+        } else {
+            ctx.query(dir as usize, &path, empty, flags & AT_SYMLINK_NOFOLLOW == 0)?
+                .ino as u32
+        };
+        (ino, id(a[2]), id(a[3]))
+    };
+    fs::set_owner(ino, uid, gid, credentials)?;
     Ok(0)
 }
 

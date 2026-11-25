@@ -33,6 +33,29 @@ pub(crate) fn update_times(ino: u32, times: [TimeUpdate; 2]) -> Result<(), Errno
     }
 }
 
+/// 更新 Ext4 inode 的属主和属组。None 保留对应字段。
+pub(crate) fn set_owner(
+    ino: u32,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    credentials: &crate::task::Credentials,
+) -> Result<(), Errno> {
+    if ino & FAT_INODE != 0 || procfs::pid_ino_parts(ino).is_some() {
+        return Err(Errno::NotSupported);
+    }
+    let info = ext4::metadata(ino)?;
+    if credentials.euid != 0 {
+        let changes_owner = uid.is_some_and(|uid| uid != info.uid);
+        let forbidden_group = gid.is_some_and(|gid| {
+            gid != info.gid && gid != credentials.fsgid && !credentials.groups.contains(&gid)
+        });
+        if credentials.fsuid != info.uid || changes_owner || forbidden_group {
+            return Err(Errno::Perm);
+        }
+    }
+    ext4::set_owner(ino, uid, gid)
+}
+
 /// 已挂载文件系统的容量快照，块数以 block_size 字节为单位。
 pub(crate) struct FileSystemStats {
     pub kind: u64,

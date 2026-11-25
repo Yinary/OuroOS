@@ -1,5 +1,5 @@
 //! Public path-based metadata APIs.
-// OuroOS patch: 按 inode 更新时间，供内核的 FD 与链接操作复用。
+// OuroOS patch: 按 inode 更新时间和归属，供 FD 与链接操作复用。
 
 use super::Ext4InodeMetadataUpdate;
 use crate::{
@@ -34,6 +34,17 @@ pub fn chown<B: BlockDevice>(
 ) -> Ext4Result<()> {
     let path = normalize_path(path);
     let (inode_num, _) = get_inode_with_num(fs, device, &path)?.ok_or(Ext4Error::invalid_input())?;
+    chown_inode(device, fs, inode_num, uid, gid)
+}
+
+/// 按 inode 更新属主和属组，None 保留对应字段，只读卷返回错误。
+pub fn chown_inode<B: BlockDevice>(
+    device: &mut Jbd2Dev<B>,
+    fs: &mut Ext4FileSystem,
+    inode_num: InodeNumber,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> Ext4Result<()> {
     let _ = fs.apply_inode_metadata(device, inode_num, Ext4InodeMetadataUpdate::chown(uid, gid))?;
     Ok(())
 }
