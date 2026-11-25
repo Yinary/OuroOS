@@ -188,6 +188,10 @@ impl FilePage {
             data: RefCell::new(None),
         }
     }
+    pub(super) fn identity(&self) -> (u32, usize) {
+        (self.file.ino, self.offset)
+    }
+
     pub(super) fn immediately_before(&self, next: &Self) -> bool {
         Arc::ptr_eq(&self.file, &next.file)
             && self.mode == next.mode

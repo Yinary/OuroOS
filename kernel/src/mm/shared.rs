@@ -1,18 +1,31 @@
 //! 共享匿名对象由映射持有；相同对象的相同页号在各地址空间引用同一帧。
 use super::{address_space::MapError, frame::OwnedFrame};
 use alloc::{sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use polyhal::PhysAddr;
 use spin::Mutex;
 
+// 序号只在新建共享对象时分配，地址复用不会唤醒上一对象的等待者。
+static NEXT_OBJECT: AtomicUsize = AtomicUsize::new(1);
+
+struct SharedObject {
+    id: usize,
+    pages: Mutex<Vec<(usize, OwnedFrame)>>,
+}
+
 #[derive(Clone)]
 pub(crate) struct SharedPage {
-    object: Arc<Mutex<Vec<(usize, OwnedFrame)>>>,
+    object: Arc<SharedObject>,
     index: usize,
 }
 impl SharedPage {
     pub(super) fn first() -> Result<Self, MapError> {
         Ok(Self {
-            object: Arc::try_new(Mutex::new(Vec::new())).map_err(|_| MapError::OutOfMemory)?,
+            object: Arc::try_new(SharedObject {
+                id: NEXT_OBJECT.fetch_add(1, Ordering::Relaxed),
+                pages: Mutex::new(Vec::new()),
+            })
+            .map_err(|_| MapError::OutOfMemory)?,
             index: 0,
         })
     }
@@ -25,8 +38,12 @@ impl SharedPage {
             index: self.index.checked_add(n).ok_or(MapError::OutOfUserRange)?,
         })
     }
+    pub(super) fn identity(&self) -> (usize, usize) {
+        (self.object.id, self.index)
+    }
+
     pub(super) fn addr(&self) -> Option<PhysAddr> {
-        let pages = self.object.lock();
+        let pages = self.object.pages.lock();
         pages
             .binary_search_by_key(&self.index, |p| p.0)
             .ok()
@@ -37,7 +54,7 @@ impl SharedPage {
         &self,
         install: impl FnOnce(PhysAddr) -> Result<(), MapError>,
     ) -> Result<(), MapError> {
-        let mut pages = self.object.lock();
+        let mut pages = self.object.pages.lock();
         match pages.binary_search_by_key(&self.index, |p| p.0) {
             Ok(i) => install(pages[i].1.addr()),
             Err(i) => {

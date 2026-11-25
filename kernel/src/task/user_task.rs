@@ -24,7 +24,7 @@ use super::{
         SignalDisposition, SignalSet, SignalSetExt, SIGKILL, SIGSEGV, SIGSTOP, SIG_DFL, SIG_IGN,
         SI_TKILL,
     },
-    task::{FutexKey, Pid, Task, TaskBody, WaitReason},
+    task::{FutexEnd, Pid, Task, TaskBody, WaitReason},
     ExitInfo, FutexStep, REGISTRY,
 };
 
@@ -131,7 +131,6 @@ pub fn user_task_entry() -> ! {
         TaskBody::Kernel(_) => panic!("kernel task entered user entry"),
     };
     let mut sleep_deadline = None;
-    let mut futex_wait = None;
     let mut vfork_child: Option<Pid> = None;
     // 循环局部等待状态：sigsuspend 的旧屏蔽集合、sigtimedwait 的等待集与截止。
     let mut sigsuspend_saved: Option<SignalSet> = None;
@@ -264,7 +263,6 @@ pub fn user_task_entry() -> ! {
                                     &mut sleep_deadline,
                                     &mut sigsuspend_saved,
                                     &mut timedwait,
-                                    &mut futex_wait,
                                     &mut vfork_child,
                                     &mut wait_uncompleted,
                                 ),
@@ -446,28 +444,34 @@ pub fn user_task_entry() -> ! {
             Action::Yield => sched::yield_now(),
             // Wait：先做可落睡的 park 检查，睡醒后补一次不落睡的重查。
             Action::Wait(reason) => {
-                let outcome = park_check_signals(
-                    pid,
-                    reason,
-                    &mut frame,
-                    &mut sleep_deadline,
-                    &mut timedwait,
-                    &mut futex_wait,
-                    true,
-                );
-                wait_uncompleted = outcome != ParkOutcome::Completed;
-                if outcome == ParkOutcome::Parked {
-                    // 睡醒后的不落睡重查。
+                let mut allow_park = true;
+                loop {
                     let outcome = park_check_signals(
                         pid,
                         reason,
                         &mut frame,
                         &mut sleep_deadline,
                         &mut timedwait,
-                        &mut futex_wait,
-                        false,
+                        allow_park,
                     );
-                    wait_uncompleted = outcome != ParkOutcome::Completed;
+                    match outcome {
+                        ParkOutcome::Parked => allow_park = false,
+                        ParkOutcome::Incomplete if matches!(reason, WaitReason::Futex { .. }) => {
+                            if allow_park {
+                                // 入队前丢弃了默认忽略的信号，沿用原截止时间。
+                                continue;
+                            }
+                            // 信号导致的虚假唤醒也须返回用户，由调用方重查条件。
+                            frame.syscall_ok();
+                            frame[TrapFrameArgs::RET] = 0;
+                            wait_uncompleted = false;
+                            break;
+                        }
+                        _ => {
+                            wait_uncompleted = outcome != ParkOutcome::Completed;
+                            break;
+                        }
+                    }
                 }
             }
             Action::Continue => sched::resume_check(),
@@ -539,7 +543,6 @@ fn park_check_signals(
     frame: &mut TrapFrame,
     sleep_deadline: &mut Option<core::time::Duration>,
     timedwait: &mut Option<(SignalSet, core::time::Duration)>,
-    futex_wait: &mut Option<(FutexKey, u32, Option<core::time::Duration>, u32)>,
     allow_park: bool,
 ) -> ParkOutcome {
     // sigtimedwait 的等待集；Some 即本次挂起属于 rt_sigtimedwait。
@@ -585,8 +588,17 @@ fn park_check_signals(
         ParkPeek::Empty => {
             if allow_park {
                 // 无可投递信号：挂起，醒来后由调用方补一次不落睡的重查。
-                sched::park(reason);
-                ParkOutcome::Parked
+                match sched::park(reason) {
+                    Some(end) => {
+                        frame.syscall_ok();
+                        frame[TrapFrameArgs::RET] = crate::syscall::to_abi(match end {
+                            FutexEnd::Notified => Ok(0),
+                            FutexEnd::TimedOut => Err(Errno::TimedOut),
+                        });
+                        ParkOutcome::Completed
+                    }
+                    None => ParkOutcome::Parked,
+                }
             } else {
                 ParkOutcome::Incomplete
             }
@@ -656,7 +668,6 @@ fn park_check_signals(
             }
             // 其余：完成 syscall 返回 -EINTR；信号留给循环顶检查点。
             _ => {
-                *futex_wait = None;
                 frame.syscall_ok();
                 frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
                 ParkOutcome::Completed
@@ -687,7 +698,6 @@ fn process_call(
     sleep_deadline: &mut Option<core::time::Duration>,
     sigsuspend_saved: &mut Option<SignalSet>,
     timedwait: &mut Option<(SignalSet, core::time::Duration)>,
-    futex_wait: &mut Option<(FutexKey, u32, Option<core::time::Duration>, u32)>,
     vfork_child: &mut Option<Pid>,
     wait_uncompleted: &mut bool,
 ) -> ProcessResult {
@@ -1032,21 +1042,31 @@ fn process_call(
         sysnr::FUTEX => {
             let step = {
                 let reg = REGISTRY.lock();
-                match reg.group(parent).and_then(|r| r.space.as_ref()) {
-                    Some(record) => futex_call(record.as_space(), args, futex_wait),
-                    None => FutexStep::Done(Err(Errno::NoProcess)),
+                match reg
+                    .group(parent)
+                    .and_then(|r| Some((r.pid, r.space.as_ref()?)))
+                {
+                    Some((tgid, space)) => futex_call(space.as_space(), tgid, args),
+                    None => Err(Errno::NoProcess),
                 }
             };
             match step {
-                FutexStep::Done(result) => result,
-                FutexStep::Wait(reason) => return ProcessResult::Wait(reason),
-                FutexStep::Wake { key, n, bitset } => Ok(super::sched::wake_futex(key, n, bitset)),
-                FutexStep::Requeue {
+                Err(error) => Err(error),
+                Ok(FutexStep::Wait(reason)) => return ProcessResult::Wait(reason),
+                Ok(FutexStep::Wake { key, n, bitset }) => {
+                    Ok(sched::wake_futex(key, n, bitset, None))
+                }
+                Ok(FutexStep::Requeue {
                     from,
                     to,
                     nr_wake,
                     nr_requeue,
-                } => Ok(super::sched::requeue_futex(from, to, nr_wake, nr_requeue)),
+                }) => Ok(sched::wake_futex(
+                    from,
+                    nr_wake,
+                    u32::MAX,
+                    Some((to, nr_requeue)),
+                )),
             }
         }
         sysnr::WAIT4 => {

@@ -7,7 +7,7 @@ use polyhal_trap::trapframe::TrapFrame;
 
 use crate::{
     config,
-    mm::{frame::FrameError, kstack::KernelStack},
+    mm::{address_space::FutexKey, frame::FrameError, kstack::KernelStack},
 };
 
 use super::{sched, user_task};
@@ -34,11 +34,11 @@ pub enum TaskState {
     Exited,
 }
 
-/// futex 等待的地址键：物理页帧号与页内字偏移。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FutexKey {
-    pub frame: usize,
-    pub offset: usize,
+/// 调度器从等待队列中移除任务时记录结果，之后到达的事件不能覆盖它。
+#[derive(Clone, Copy)]
+pub(super) enum FutexEnd {
+    Notified,
+    TimedOut,
 }
 
 /// 任务挂起的原因；唤醒采用宽松匹配（醒来重查条件）而非精确订阅。
@@ -82,6 +82,7 @@ pub struct Task {
     context: KContext,
     pub(super) body: Option<TaskBody>,
     pub(super) state: TaskState,
+    pub(super) futex_end: Option<FutexEnd>,
     pub(super) pid: Pid,
     pub(super) tgid: Pid,
     /// 调试与日志用名。
@@ -122,6 +123,7 @@ impl Task {
             context,
             body: Some(TaskBody::Kernel(entry)),
             state: TaskState::Ready,
+            futex_end: None,
             pid,
             tgid,
             name,
@@ -149,6 +151,7 @@ impl Task {
             context,
             body: Some(TaskBody::User { frame, pid }),
             state: TaskState::Ready,
+            futex_end: None,
             pid,
             tgid,
             name,

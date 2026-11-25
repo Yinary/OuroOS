@@ -13,6 +13,7 @@ use core::{
 use polyhal::kcontext::KContext;
 
 use crate::{
+    mm::address_space::FutexKey,
     sync::{self, DebugMutex},
     time::monotonic,
     timer,
@@ -20,7 +21,7 @@ use crate::{
 
 use super::{
     registry,
-    task::{FutexKey, Pid, Task, TaskBody, TaskState, WaitReason},
+    task::{FutexEnd, Pid, Task, TaskBody, TaskState, WaitReason},
     ExitInfo, REGISTRY,
 };
 
@@ -211,20 +212,26 @@ impl Scheduler {
     /// 到期扫描：Deadline 已到的等待者搬回就绪表。
     fn wake_expired(&mut self) {
         let now = crate::time::monotonic();
-        self.move_waiting(|_, r| match r {
+        self.move_waiting(|task, r| match r {
             WaitReason::Deadline(d) | WaitReason::PollUntil(d) => now >= *d,
-            WaitReason::Futex { deadline, .. } => deadline.is_some_and(|d| now >= d),
+            WaitReason::Futex {
+                deadline: Some(d), ..
+            } if now >= *d => {
+                task.futex_end = Some(FutexEnd::TimedOut);
+                true
+            }
             _ => false,
         });
     }
 
     /// 把谓词匹配的等待任务搬回就绪表；谓词可按任务与其等待原因联合判定。
-    fn move_waiting(&mut self, f: impl Fn(&Task, &WaitReason) -> bool) {
+    fn move_waiting(&mut self, f: impl Fn(&mut Task, &WaitReason) -> bool) {
         // 自检：每次集中唤醒前，就绪表足以容纳全部等待任务。
         debug_assert!(self.ready.capacity() >= self.ready.len() + self.waiting.len());
         let mut i = 0;
         while i < self.waiting.len() {
-            if f(&self.waiting[i].0, &self.waiting[i].1) {
+            let (task, reason) = &mut self.waiting[i];
+            if f(task, reason) {
                 let (task, _) = self.waiting.swap_remove(i);
                 self.ready.push_back(task);
             } else {
@@ -384,7 +391,7 @@ pub fn yield_now() {
 /// 当前任务挂起等待：移入等待表并切到下一个就绪任务（或 idle）。
 /// 切回点即 park 调用点，syscall PC 由调用方保留以便重执行重查条件；
 /// 等待表容量耗尽时退化为就绪让出（不分配、不失败，条件重查仍正确）。
-pub fn park(reason: WaitReason) {
+pub(super) fn park(reason: WaitReason) -> Option<FutexEnd> {
     sync::assert_no_held("park");
     let cur_ptr = current_ptr();
     let (from, to) = {
@@ -415,62 +422,50 @@ pub fn park(reason: WaitReason) {
         (from, to)
     };
     switch_context(from, to);
-    reap_switched();
+    let mut slot = SCHED.lock();
+    let s = slot.as_mut().expect("scheduler not initialized");
+    s.reap_dead();
+    s.current.as_mut().and_then(|task| task.futex_end.take())
 }
 
-/// 唤醒某个 futex 键上至多 n 个 bitset 有交集的等待者，返回实际唤醒数。
-pub fn wake_futex(key: FutexKey, n: usize, bitset: u32) -> usize {
+/// 按键和位掩码匹配一次等待表。先唤醒，再把至多指定数量的后续等待者迁往目标键。
+pub(super) fn wake_futex(
+    from: FutexKey,
+    nr_wake: usize,
+    bits: u32,
+    requeue: Option<(FutexKey, usize)>,
+) -> usize {
     let mut slot = SCHED.lock();
-    let Some(s) = slot.as_mut() else {
-        return 0;
-    };
-    let mut woken = 0;
-    let mut i = 0;
-    while i < s.waiting.len() && woken < n {
-        if matches!(s.waiting[i].1, WaitReason::Futex { key: k, bitset: b, .. } if k == key && b & bitset != 0)
+    let Some(s) = slot.as_mut() else { return 0 };
+    let (to, nr_requeue) = requeue.unwrap_or((from, 0));
+    let (mut woken, mut moved, mut i) = (0, 0, 0);
+    let mut removed_deadline = false;
+    while i < s.waiting.len() && (woken < nr_wake || moved < nr_requeue) {
+        if let WaitReason::Futex {
+            key,
+            bitset,
+            deadline,
+        } = &mut s.waiting[i].1
         {
-            let (task, _) = s.waiting.swap_remove(i);
-            s.ready.push_back(task);
-            woken += 1;
-        } else {
-            i += 1;
-        }
-    }
-    s.refresh_deadline();
-    woken
-}
-
-/// 先唤醒 from 键上至多 nr_wake 个，再把至多 nr_requeue 个从 from 键改为等 to 键；返回唤醒数。
-pub fn requeue_futex(from: FutexKey, to: FutexKey, nr_wake: usize, nr_requeue: usize) -> usize {
-    let mut slot = SCHED.lock();
-    let Some(s) = slot.as_mut() else {
-        return 0;
-    };
-    let mut woken = 0;
-    let mut i = 0;
-    while i < s.waiting.len() && woken < nr_wake {
-        if matches!(s.waiting[i].1, WaitReason::Futex { key, .. } if key == from) {
-            let (task, _) = s.waiting.swap_remove(i);
-            s.ready.push_back(task);
-            woken += 1;
-        } else {
-            i += 1;
-        }
-    }
-    let mut requeued = 0;
-    for (_, reason) in s.waiting.iter_mut() {
-        if requeued >= nr_requeue {
-            break;
-        }
-        if let WaitReason::Futex { key, .. } = reason {
-            if *key == from {
+            if *key == from && *bitset & bits != 0 {
+                if woken < nr_wake {
+                    removed_deadline |= deadline.is_some();
+                    let (mut task, _) = s.waiting.swap_remove(i);
+                    task.futex_end = Some(FutexEnd::Notified);
+                    s.ready.push_back(task);
+                    woken += 1;
+                    continue;
+                }
                 *key = to;
-                requeued += 1;
+                moved += 1;
             }
         }
+        i += 1;
     }
-    s.refresh_deadline();
-    woken
+    if removed_deadline {
+        s.refresh_deadline();
+    }
+    woken + moved
 }
 
 /// 切到当前任务的栈后，回收此前退出任务的内核栈。
@@ -564,17 +559,16 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
         } else {
             reg.group(pid).and_then(|r| r.space.as_ref()).and_then(|s| {
                 let space = s.as_space();
-                let key = space.translate(clear).map(|(pa, _)| FutexKey {
-                    frame: pa.raw() & !0xfff,
-                    offset: clear & 0xfff,
-                });
-                let _ = crate::mm::user_access::copy_to_user(space, clear, &[0; 4]);
-                key
+                if clear % core::mem::align_of::<u32>() != 0 {
+                    return None;
+                }
+                crate::mm::user_access::copy_to_user(space, clear, &[0; 4]).ok()?;
+                space.futex_key(tgid, clear, false)
             })
         }
     };
     if let Some(key) = key {
-        wake_futex(key, 1, u32::MAX);
+        wake_futex(key, 1, u32::MAX, None);
     }
     if let Some(info) = registry::record_thread_exit(pid, exit) {
         // 登记退出信息并释放地址空间：UserAddressSpace 的 Drop 会先切回
