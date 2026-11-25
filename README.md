@@ -50,8 +50,9 @@ OuroOS v0.1.0 · riscv64 · boot hart 0 · 1 cpus · boot ok
 ```
 
 随后内核进入用户态链路。挂载官方测例盘时由内嵌启动器 `official_init`
-布置动态解释器与 busybox 入口后运行盘上组脚本；无盘或调试场景则依次
-运行内嵌的用户程序 `smoke` 与 `check`（源码在 `user/`，构建时嵌入内核
+布置动态解释器与 busybox 入口后运行盘上组脚本；LTP 组例外，由启动器按
+目录顺序逐例执行并套用逐例时限。无盘或调试场景则依次运行内嵌的用户
+程序 `smoke` 与 `check`（源码在 `user/`，构建时嵌入内核
 镜像，不经磁盘），用户程序运行在用户权限级，经 ecall / syscall 执行
 write、exit 及内存系统调用：
 

@@ -567,12 +567,12 @@ msync 按相交 VMA 的文件偏移选择缓存页，再同步 Ext4 后端，失
 | 提供方 | 接口与约束 | 当前状态 |
 |---|---|---|
 | MM | `mm::frame::memory_snapshot() -> MemorySnapshot`，同一次帧分配器加锁中读取已登记和空闲 RAM，字段 total_kib/free_kib 的单位为 KiB。无换页、无可回收缓存估算时，MemAvailable 可取 free_kib 的保守值。 | 已提供 |
-| procfs/VFS | 打开 /proc/meminfo 时取一次快照，生成 MemTotal、MemFree、MemAvailable、SwapFree 等字段；同一次打开按偏移读取，读尽返回 EOF。无交换设备时 SwapFree 为 0。 | 已接入只读 meminfo；既有 brk01 记录越过该步骤后在临时目录的 chown 中断，接入属主修改后待复测 |
+| procfs/VFS | 打开 /proc/meminfo 时取一次快照，生成 MemTotal、MemFree、MemAvailable、SwapFree 等字段；同一次打开按偏移读取，读尽返回 EOF。无交换设备时 SwapFree 为 0。 | 已接入只读 meminfo；brk01 越过临时目录的 chown，通过 1 条断言 |
 | task | current_credentials(pid) 返回真实/有效 UID、GID，进程创建/exec 保留或更新凭证；getgid/getegid 等调用以及 VFS 授权共用此来源。 | 身份查询与切换调用已接入进程记录里的 `Credentials`；VFS 授权未接入 |
-| fs | set_owner(inode, uid: Option<u32>, gid: Option<u32>, credentials) 返回 Result；None 对应 uid/gid 的 -1，检查调用者权限，成功后 stat 与重新挂载均应可观察更新。 | 已接入 Ext4 的 fchownat/fchown。既有 mincore01 双架构记录是在修改前报告 chown ENOSYS，需重新运行 |
+| fs | set_owner(inode, uid: Option<u32>, gid: Option<u32>, credentials) 返回 Result；None 对应 uid/gid 的 -1，检查调用者权限，成功后 stat 与重新挂载均应可观察更新。 | 已接入 Ext4 的 fchownat/fchown，chown01、chown05、fchown01 共通过 8 条断言；mincore01 已越过 chown，属旧接口用例，不打印 Summary |
 | task/signal | 注册用户信号动作、投递访存异常与恢复用户上下文；无处理器时按相应信号终止进程。 | 已实现（§4.5）；原版 LTP 的信号用例接入与验收仍待 |
 
-测试基线是 pre-2025 的 LTP 20240524。上述 TBROK 发生于测试框架初始化阶段，未执行对应 MM 断言。
+测试基线是 pre-2025 的 LTP 20240524。表中状态取自启动器逐例驱动的全量运行，见下文。
 
 三层页表为信号只读返回页预留最高 1 GiB 根槽，普通用户映射上界为 2^38 − 2^30，可装入默认链接在 0x120000000 的 LoongArch 静态 ELF。exec 按继承的 STACK 软限额确定栈预留量，上限 8 MiB。mprotect 验证整段覆盖、文件写权限和限额后提交；空洞返回 ENOMEM，未对齐地址返回 EINVAL。两架构原版 mprotect01 的空洞与非对齐检查均通过；后续需要为已接入的 /dev/zero 提供 mmap，并保留只读 FD 的共享写权限上限。
 
@@ -582,6 +582,10 @@ exec/spawn 从设备树启动熵派生独立的 16 字节，AT_RANDOM 指向新�
 
 /proc/meminfo 每次打开保存一次帧分配器统计；Cached 只计文件页缓存的数据帧。MemTotal 为已登记的可分配物理内存；MemAvailable 为 MemFree 的保守估计；交换为零。sysinfo(179) 提供同口径的总量和空闲量，单位 1024 字节；尚未统计负载均值和共享内存用量。procfs 另提供根目录、`/proc/<pid>/`（stat/cmdline/status）与设备节点，枚举来自 Task 维护的独立快照表（§4.3"其他"行）；/proc/mounts 报告根卷与 FAT 挂载。
 
-本地 pre-2025 的 ltp_testcode.sh 会枚举镜像实际安装的二进制。双架构原版 mremap05 七条断言通过；mmap17 在版本预检 TCONF，mprotect01 在 /dev/zero 前通过两条断言，brk01、mincore01、msync01 依赖临时目录属主，mlock01 依赖凭证。版本门槛、TCONF、TBROK 均不计为通过；未修改测例、脚本或 uname 来绕过这些前置条件。
+LTP 组由启动器逐例驱动，不执行盘上的 ltp_testcode.sh：按名字排序遍历 ltp/testcases/bin 的普通文件，每例在独立会话里执行并套用 2 秒逐例时限，超时按会话逐进程 SIGKILL，回收等待上限 30 秒；用例超时或 /tmp 空闲低于 256 MiB 时清空 /tmp，单次最多两万次删除尝试。组结束后列出用例自建会话留下的进程，对它们发 SIGKILL 并等待退出，上限同样是 30 秒。截止时刻取启动器开始后 3400 秒，到点后不再启动新用例；该组只在 loongarch64 上启用，riscv64 上截止时刻已过、不启动任何用例并打印空的组标记，判分按两架构相加，所以该组分数只来自 loongarch64。glibc 组当前零分，调用位置保留但未启用。原版脚本无逐例时限，镜像中第一个不退出的用例是 cgroup_fj_proc，先 sigsuspend 等待信号，因此原版脚本在任何内核上都跑不到第 107 例之后；脚本也无超时保护，第 184 例 connect01 会 kill(0, SIGKILL) 终止同进程组的脚本 shell。
+
+loongarch64 实测，2026-11-25，内核含属主修改、rmdir 延迟回收、/dev/zero 与 capget：musl 组 2820 例全部执行，组内 1234 秒，其中 277 例超时被杀共等 525 秒；通过断言 1101 条，分布在 287 例，按判分公式折算的单架构组分约 149.5。逐例时限取 2 秒而不是 5 秒：5 秒时限下正常结束的用例里只有 alarm05 到 alarm07 需要超过 2 秒，估计共少 3 条断言，换来组内时间少约 830 秒。退出状态为 TCONF 的 795 例与 TBROK 的 613 例不计分，原因未逐例归类。glibc 组前 220 例零通过断言，未启用。
+
+本地 pre-2025 的 ltp_testcode.sh 会枚举镜像实际安装的二进制。启动器逐例驱动下，mlock01 通过 4 条，brk01 通过 1 条，mmap17 通过 1 条；mprotect01 在第 3 条断言的 mmap 处中断；mincore01 与 msync01 打印了通过断言，但属旧接口用例，不打印 Summary，不计分。TCONF、TBROK 均不计为通过；未修改测例、脚本或 uname 来绕过前置条件。
 
 信号与 MM 联合路径：MM 先尝试修复用户缺页，再向信号模块交付未映射、权限不足或文件后备错误；内核代表 syscall 复制用户指针失败继续返回 EFAULT。
