@@ -84,27 +84,21 @@ impl UserPageTable {
             }
             pa = arch::address(pte);
         }
-        self.tables
-            .try_reserve(missing)
-            .map_err(|_| FrameError::OutOfMemory)?;
-        let mut prepared: [Option<OwnedFrame>; 2] = [None, None];
-        for frame in prepared.iter_mut().take(missing) {
-            *frame = Some(OwnedFrame::new()?);
-        }
-        pa = self.root.addr();
-        let mut frames = prepared.into_iter().flatten();
-        for level in (1..=2).rev() {
-            let i = (va >> (12 + 9 * level)) & 511;
-            let mut pte = read(pa, i);
-            if pte == 0 {
-                // missing 由同一条路径预计算，期间 &mut self 排除并发修改。
-                if let Some(frame) = frames.next() {
-                    pte = arch::table(frame.addr());
-                    self.tables.push(frame);
-                    write(pa, i, pte);
-                }
+        if missing != 0 {
+            self.tables
+                .try_reserve(missing)
+                .map_err(|_| FrameError::OutOfMemory)?;
+            let mut prepared: [Option<OwnedFrame>; 2] = [None, None];
+            for frame in prepared.iter_mut().take(missing) {
+                *frame = Some(OwnedFrame::new()?);
             }
-            pa = arch::address(pte);
+            // pa 已指向首个缺项所在的表；下级新表均已清零。
+            for (level, frame) in (1..=missing).rev().zip(prepared.into_iter().flatten()) {
+                let next = frame.addr();
+                self.tables.push(frame);
+                write(pa, (va >> (12 + 9 * level)) & 511, arch::table(next));
+                pa = next;
+            }
         }
         write(pa, (va >> 12) & 511, arch::leaf(data, flags));
         if self.is_active() {
@@ -129,6 +123,38 @@ impl UserPageTable {
             if self.is_active() {
                 TLB::flush_vaddr(VirtAddr::new(va));
             }
+        }
+    }
+    /// 在返回用户态前撤销整批共享页的写权限。地址有序时可复用同一张末级表。
+    pub(super) fn write_protect_pages(&mut self, pages: impl Iterator<Item = usize>) {
+        let mut last = None;
+        let mut changed = false;
+        for va in pages {
+            let key = va >> 21;
+            let table = match last {
+                Some((prev, table)) if prev == key => table,
+                _ => {
+                    let Some((table, _)) = self.path(va) else {
+                        continue;
+                    };
+                    last = Some((key, table));
+                    table
+                }
+            };
+            let slot = (va >> 12) & 511;
+            let pte = read(table, slot);
+            let flags = arch::flags(pte);
+            if flags.contains(MappingFlags::W) {
+                write(
+                    table,
+                    slot,
+                    arch::leaf(arch::address(pte), flags - MappingFlags::W),
+                );
+                changed = true;
+            }
+        }
+        if changed && self.is_active() {
+            TLB::flush_all();
         }
     }
     pub(super) fn unmap(&mut self, va: usize) {

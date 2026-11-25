@@ -218,12 +218,15 @@ impl OwnedFrame {
     }
     /// 将另一拥有页复制到本页；传入自身也合法。
     pub fn copy_from(&self, source: &OwnedFrame) {
-        // SAFETY: 两个 OwnedFrame 在复制期间均持有已分配页；copy 允许传入同一页。
+        if self.pa == source.pa {
+            return;
+        }
+        // SAFETY: 两个所有者持有不同的完整物理页，页对齐且范围无重叠。
         unsafe {
-            core::ptr::copy(
-                direct_map_addr(source.pa) as *const u8,
-                direct_map_addr(self.pa) as *mut u8,
-                PAGE_SIZE,
+            core::ptr::copy_nonoverlapping(
+                direct_map_addr(source.pa) as *const usize,
+                direct_map_addr(self.pa) as *mut usize,
+                PAGE_SIZE / core::mem::size_of::<usize>(),
             );
         }
     }
@@ -243,7 +246,19 @@ pub struct FrameRef(Arc<OwnedFrame>);
 impl FrameRef {
     /// 分配并清零一页；Arc 元数据分配失败返回 OOM。
     pub fn new() -> Result<Self, FrameError> {
-        let frame = OwnedFrame::new()?;
+        Self::share(OwnedFrame::new()?)
+    }
+
+    /// 复制一整页。目标页由源页完整初始化后才交给调用方；分配失败时回收。
+    pub(super) fn duplicate(&self) -> Result<Self, FrameError> {
+        let dest = OwnedFrame {
+            pa: frame_alloc(1)?,
+        };
+        dest.copy_from(&self.0);
+        Self::share(dest)
+    }
+
+    fn share(frame: OwnedFrame) -> Result<Self, FrameError> {
         Arc::try_new(frame)
             .map(Self)
             .map_err(|_| FrameError::OutOfMemory)
@@ -258,11 +273,6 @@ impl FrameRef {
     #[allow(dead_code)]
     pub fn strong_count(&self) -> usize {
         Arc::strong_count(&self.0)
-    }
-
-    /// 将另一页内容复制到本页；传入自身也合法。
-    pub fn copy_from(&self, source: &Self) {
-        self.0.copy_from(&source.0);
     }
 }
 impl core::ops::Deref for FrameRef {

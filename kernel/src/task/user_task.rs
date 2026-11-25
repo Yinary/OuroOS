@@ -2219,16 +2219,17 @@ fn fork_user(
         return Err(Errno::Invalid);
     }
     let (space, creds) = {
-        let reg = REGISTRY.lock();
-        let source = reg.group(parent).ok_or(Errno::NoProcess)?;
+        let mut reg = REGISTRY.lock();
+        let source = reg.group_mut(parent).ok_or(Errno::NoProcess)?;
+        let creds = source.creds.try_clone().map_err(|_| Errno::NoMem)?;
         let space = source
             .space
-            .as_ref()
+            .as_mut()
             .ok_or(Errno::NoProcess)?
-            .as_space()
+            .0
             .deep_copy()
             .map_err(|_| Errno::NoMem)?;
-        (space, source.creds.try_clone().map_err(|_| Errno::NoMem)?)
+        (space, creds)
     };
     let fs = {
         let reg = REGISTRY.lock();
