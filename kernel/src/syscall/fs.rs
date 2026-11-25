@@ -42,18 +42,18 @@ pub fn dispatch(
         sysnr::TRUNCATE | sysnr::FTRUNCATE => truncate(nr, ctx, space, a),
         sysnr::RENAMEAT | sysnr::RENAMEAT2 => renameat(nr, ctx, space, a),
         sysnr::GETCWD => {
-            if a[1] < ctx.cwd().len() + 1 {
+            let cwd = ctx.cwd()?;
+            if a[1] < cwd.len() + 1 {
                 return Err(Errno::Range);
             }
-            user_access::copy_to_user(space, a[0], ctx.cwd().as_bytes())
-                .map_err(|_| Errno::Fault)?;
+            user_access::copy_to_user(space, a[0], cwd.as_bytes()).map_err(|_| Errno::Fault)?;
             user_access::copy_to_user(
                 space,
-                a[0].checked_add(ctx.cwd().len()).ok_or(Errno::Fault)?,
+                a[0].checked_add(cwd.len()).ok_or(Errno::Fault)?,
                 &[0],
             )
             .map_err(|_| Errno::Fault)?;
-            Ok(ctx.cwd().len() + 1)
+            Ok(cwd.len() + 1)
         }
         sysnr::DUP => ctx.install(ctx.get(a[0])?, false),
         sysnr::FCNTL => fcntl(ctx, a[0] as u32 as usize, a[1] as u32, a[2] as u32),
@@ -114,18 +114,23 @@ pub fn dispatch(
             if a[2] & !0x200 != 0 {
                 return Err(Errno::NotSupported);
             }
-            let path = ctx.path(a[0], &user_string(space, a[1])?)?;
+            let input = user_string(space, a[1])?;
+            let path = ctx.path(a[0], &input)?;
             let ino = fs::lookup(&path)?;
             if a[2] & 0x200 != 0 {
-                // AT_REMOVEDIR（rmdir(2)）：仅空目录，被 cwd/目录 FD/挂载点
-                // 引用时 EBUSY；错误码先行，避免误删后再回滚
+                match input.trim_end_matches('/').rsplit('/').next() {
+                    Some(".") => return Err(Errno::Invalid),
+                    Some("..") => return Err(Errno::NotEmpty),
+                    _ => {}
+                }
                 if fs::stat(ino)?.0 & 0xf000 != 0x4000 {
                     return Err(Errno::NotDir);
                 }
-                if crate::fs::context::directory_busy(&path) || fs::contains_mount(&path) {
+                if path == "/" || fs::contains_mount(&path) {
                     return Err(Errno::Busy);
                 }
-                fs::rmdir(&path, ino)?;
+                let (p, name) = parent(&path)?;
+                fs::rmdir(p, ino, name)?;
                 return Ok(0);
             }
             let (p, name) = parent(&path)?;
@@ -150,10 +155,11 @@ pub fn dispatch(
         sysnr::GETDENTS64 => getdents64(ctx, space, a[0], a[1], a[2]),
         sysnr::CHDIR => {
             let path = ctx.path((-100isize) as usize, &user_string(space, a[0])?)?;
-            if fs::stat(fs::lookup(&path)?)?.0 & 0xf000 != 0x4000 {
+            let ino = fs::lookup(&path)?;
+            if fs::stat(ino)?.0 & 0xf000 != 0x4000 {
                 return Err(Errno::NotDir);
             }
-            ctx.set_cwd(path)?;
+            ctx.set_cwd(path, ino)?;
             Ok(0)
         }
         sysnr::OPENAT => {
@@ -318,6 +324,9 @@ fn getdents64(
     let handle = ctx.get(fd)?;
     let mut f = handle.lock();
     let ino = f.directory()?;
+    if f.detached_directory() {
+        return Ok(0);
+    }
     let mut out = [0u8; 4096];
     let cap = count.min(out.len());
     let mut used = 0;

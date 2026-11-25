@@ -509,12 +509,13 @@ pub fn chmod_by_ino(ino: u32, path: &str, mode: u16) -> Result<(), Errno> {
 }
 
 /// 删除空目录（rmdir 语义）；FAT 未接入目录删除，返回 ENOTSUP。
-pub fn rmdir(path: &str, ino: u32) -> Result<(), Errno> {
-    if ino & FAT_INODE != 0 {
-        Err(Errno::NotSupported)
-    } else {
-        ext4::rmdir(path, ino)
+pub fn rmdir(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
+    if (parent | ino) & FAT_INODE != 0 || procfs::pid_ino_parts(ino).is_some() {
+        return Err(Errno::NotSupported);
     }
+    ext4::rmdir(parent, ino, name)?;
+    context::detach_directory(ino);
+    Ok(())
 }
 
 /// 读取文件并叠加尚未写回的共享页。

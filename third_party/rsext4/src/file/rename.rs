@@ -1,5 +1,5 @@
-//! 按父目录 inode 重命名；保留被替换 inode，由调用方按引用计数回收。
-// OuroOS patch: rename-by-inode (see README.md).
+//! 按父目录 inode 更新目录项，由调用方管理被移除对象的引用。
+// OuroOS patch: 按 inode 更新目录项并延迟回收，见 README.md。
 use super::{
     delete::{find_named_entry_in_parent, remove_named_entry_at},
     *,
@@ -61,7 +61,7 @@ impl Undo {
     ) -> Ext4Result<()> {
         for (block, data) in &self.blocks {
             fs.datablock_cache
-                .modify(dev, *block, |out| out.copy_from_slice(data))?;
+                .modify_via_journal(dev, *block, |out| out.copy_from_slice(data))?;
         }
         for (ino, inode) in &self.inodes {
             fs.modify_inode(dev, *ino, |out| *out = *inode)?;
@@ -289,8 +289,54 @@ pub fn rename_entry<B: BlockDevice>(
     result
 }
 
-/// 回收已无链接和外部引用的重命名旧目标，目录同时减少分组目录计数。
-pub fn reclaim_rename_target<B: BlockDevice>(
+/// 移除空目录的名字并清零链接数，调用方负责在无引用时回收 inode。
+pub fn unlink_empty_directory<B: BlockDevice>(
+    fs: &mut Ext4FileSystem,
+    dev: &mut Jbd2Dev<B>,
+    parent: InodeNumber,
+    ino: InodeNumber,
+    name: &str,
+) -> Ext4Result<()> {
+    if fs.readonly {
+        return Err(Ext4Error::read_only());
+    }
+    valid_name(name)?;
+    let dir = fs.get_inode_by_num(dev, parent)?;
+    let entry = find_named_entry_in_parent(fs, dev, parent, &dir, name.as_bytes())?;
+    if entry.ino != ino {
+        return Err(Ext4Error::not_found());
+    }
+    let mut child = fs.get_inode_by_num(dev, ino)?;
+    if !child.is_dir() {
+        return Err(Ext4Error::not_dir());
+    }
+    if !super::delete::is_dir_empty(fs, dev, &mut child)? {
+        return Err(Ext4Error::new(Errno::ENOTEMPTY));
+    }
+    // dir_nlink 溢出后用 1 表示未知的目录链接数。
+    let links = match dir.i_links_count {
+        0 => return Err(Ext4Error::corrupted()),
+        1 => 1,
+        n => n - 1,
+    };
+    let mut undo = Undo::new()?;
+    undo.block(fs, dev, entry.phys)?;
+    undo.inode(fs, dev, parent)?;
+    undo.inode(fs, dev, ino)?;
+    let result = (|| {
+        remove_named_entry_at(fs, dev, parent, &dir, entry.phys, name.as_bytes())?;
+        fs.set_inode_links_count(dev, parent, links)?;
+        fs.set_inode_links_count(dev, ino, 0)?;
+        fs.touch_parent_dir_for_entry_change(dev, parent)
+    })();
+    if result.is_err() {
+        undo.restore(fs, dev).map_err(|_| Ext4Error::io())?;
+    }
+    result
+}
+
+/// 回收已无链接和外部引用的 inode，目录同时减少分组目录计数。
+pub fn reclaim_unlinked_inode<B: BlockDevice>(
     fs: &mut Ext4FileSystem,
     dev: &mut Jbd2Dev<B>,
     ino: InodeNumber,
@@ -339,7 +385,7 @@ pub fn rename<B: BlockDevice>(
     let (old_parent, name) = by_path(fs, device, old)?;
     let (new_parent, target) = by_path(fs, device, new)?;
     if let Some(ino) = rename_entry(fs, device, old_parent, &name, new_parent, &target, false)? {
-        reclaim_rename_target(fs, device, ino)?;
+        reclaim_unlinked_inode(fs, device, ino)?;
     }
     Ok(())
 }

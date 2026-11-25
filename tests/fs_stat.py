@@ -62,11 +62,12 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / "target/fs-validation/stat")
     parser.add_argument("--metadata", action="store_true", help="验证 umask 和 utimensat")
     parser.add_argument("--rename", action="store_true", help="验证 renameat 和 renameat2")
+    parser.add_argument("--rmdir", action="store_true", help="验证空目录删除及引用释放")
     parser.add_argument("--chown", action="store_true", help="验证 fchown 与 fchownat")
     parser.add_argument("--truncate", action="store_true", help="验证 truncate 和 ftruncate")
     parser.add_argument("--readonly", action="store_true", help="metadata 专项要求只读内核")
     args = parser.parse_args()
-    if sum((args.metadata, args.rename, args.truncate, args.chown)) > 1:
+    if sum((args.metadata, args.rename, args.truncate, args.chown, args.rmdir)) > 1:
         parser.error("一次只能选择一组专项")
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -75,7 +76,7 @@ def main():
                     ignore=shutil.ignore_patterns("target"))
     program = ("fs_truncate.rs" if args.truncate else "fs_rename.rs" if args.rename
                else "fs_metadata.rs" if args.metadata else "fs_chown.rs" if args.chown
-               else "fs_stat.rs")
+               else "fs_rmdir.rs" if args.rmdir else "fs_stat.rs")
     shutil.copyfile(ROOT / "tests" / program, user / "src/bin/smoke.rs")
     if args.metadata:
         shutil.copyfile(ROOT / "tests/fs_metadata_exec.rs", user / "src/bin/check.rs")
@@ -214,12 +215,15 @@ def main():
             text = (out / f"{stem}.log").read_text(errors="replace")
             markers = (("TRUNCATE PASS:",) if args.truncate else
                        ("CHOWN PASS:",) if args.chown else
+                       ("RMDIR PASS:",) if args.rmdir else
                        ("RENAME PASS:",) if args.rename else
                        ("METADATA PASS:", "MASK EXEC PASS") if args.metadata else
                        ("STAT PASS:", "READLINK PASS:", "STATFS PASS:"))
             if (not all(marker in text for marker in markers)
                     or "basic-init): exited with status 0" not in text):
                 raise RuntimeError(f"{stem} failed: {text[-1600:]}")
+            if args.rmdir and args.readonly != ("RMDIR READONLY" in text):
+                raise RuntimeError(f"{stem}: 内核只读配置与测试要求不符")
             if args.chown and args.readonly != ("CHOWN READONLY" in text):
                 raise RuntimeError(f"{stem}: 内核只读配置与测试要求不符")
             if args.metadata and args.readonly != ("METADATA READONLY" in text):
@@ -246,9 +250,18 @@ def main():
                 match = re.search(r"User:\s+(\d+)\s+Group:\s+(\d+)", log.read_text())
                 if not match or tuple(map(int, match.groups())) != expected:
                     raise RuntimeError(f"{stem}: 落盘属主或属组不符")
+            if args.rmdir and not args.readonly:
+                inode = re.search(r"RMDIR FREED INODE: (\d+)", text)
+                if inode is None:
+                    raise RuntimeError(f"{stem}: 缺少待核对的目录 inode")
+                log = out / f"{stem}-reclaim.log"
+                run(["debugfs", "-R", f"testi <{inode[1]}>", str(ext)], log)
+                if "is not in use" not in log.read_text():
+                    raise RuntimeError(f"{stem}: 最后一个目录引用释放后 inode 仍已分配")
             run(["e2fsck", "-fn", str(ext)], out / f"{stem}-after-fsck.log")
             suite = ("truncate" if args.truncate else "rename" if args.rename
-                     else "metadata" if args.metadata else "chown" if args.chown else "status queries")
+                     else "metadata" if args.metadata else "chown" if args.chown
+                     else "rmdir" if args.rmdir else "status queries")
             print(f"{stem}: PASS ({suite} and e2fsck)", flush=True)
 
 
