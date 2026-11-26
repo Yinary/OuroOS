@@ -117,6 +117,8 @@ enum Kind {
         start: usize,
         len: u64,
     },
+    /// 本地回环套接字句柄
+    Socket(crate::net::SocketId),
 }
 /// 共享偏移、打开标志和文件资源的持有者。
 pub(crate) struct OpenFile {
@@ -142,6 +144,9 @@ impl Drop for OpenFile {
                 // 对端计数变化可能使等待者可读（EOF）或写失败（EPIPE），
                 // 请求唤醒；无锁原子标志，可在任意持锁环境下调用。
                 crate::task::sched::request_pipe_wake();
+            }
+            Kind::Socket(id) => {
+                crate::net::close(*id);
             }
             _ => {}
         }
@@ -758,6 +763,40 @@ impl Context {
         };
         Ok((rfd, wfd))
     }
+
+    /// 将新创建的套接字句柄安装到 FD 表（默认 O_RDWR，按需置 O_NONBLOCK/FD_CLOEXEC）。
+    /// 安装失败时自动关闭套接字句柄，避免泄漏。
+    pub(crate) fn open_socket(
+        &mut self,
+        id: crate::net::SocketId,
+        nonblock: bool,
+        cloexec: bool,
+    ) -> Result<usize, Errno> {
+        let flags = 2 | if nonblock { 0x800 } else { 0 };
+        let file = match fs::try_arc(Mutex::new(OpenFile {
+            kind: Kind::Socket(id),
+            offset: 0,
+            flags,
+        })) {
+            Ok(f) => f,
+            Err(e) => {
+                crate::net::close(id);
+                return Err(e);
+            }
+        };
+        // 若 install 失败，file 被 drop，OpenFile::drop 自动调用 net::close(id)。
+        self.install(file, cloexec)
+    }
+
+    /// 查询 FD 对应的套接字句柄与当前 O_NONBLOCK 状态；非套接字返回 ENOTSOCK。
+    pub(crate) fn socket_id(&self, fd: usize) -> Result<(crate::net::SocketId, bool), Errno> {
+        let handle = self.get(fd)?;
+        let f = handle.lock();
+        match f.kind {
+            Kind::Socket(id) => Ok((id, f.flags & 0x800 != 0)),
+            _ => Err(Errno::NotSock),
+        }
+    }
 }
 
 /// 确认路径存在且为目录。
@@ -873,6 +912,12 @@ impl OpenFile {
                 mode: 0o100444,
                 links: 1,
                 size: text.len() as u64,
+                block_size: 4096,
+                ..Default::default()
+            }),
+            Kind::Socket(_) => Ok(fs::Metadata {
+                mode: 0o140777,
+                links: 1,
                 block_size: 4096,
                 ..Default::default()
             }),
@@ -1011,6 +1056,10 @@ impl OpenFile {
                 self.offset = self.offset.checked_add(count).ok_or(Errno::Invalid)?;
                 Ok(count)
             }
+            Kind::Socket(id) => {
+                let nonblock = self.flags & 0x800 != 0;
+                crate::net::recvfrom(*id, data, 0, nonblock, |bytes, _| deliver(bytes))
+            }
             _ => Err(Errno::BadF),
         }
     }
@@ -1039,6 +1088,10 @@ impl OpenFile {
                 p.data.extend(data);
                 crate::task::sched::request_pipe_wake();
                 Ok(data.len())
+            }
+            Kind::Socket(id) => {
+                let nonblock = self.flags & 0x800 != 0;
+                crate::net::sendto(*id, data, 0, None, nonblock)
             }
             Kind::Inode { ino, .. } => {
                 let offset = if self.flags & 0x400 != 0 {
@@ -1223,6 +1276,7 @@ pub(crate) fn poll(
                 Kind::DevNull | Kind::DevZero | Kind::Rtc | Kind::DevBlk { .. } => {
                     0x145 & requested
                 }
+                Kind::Socket(id) => crate::net::poll_events(*id, requested),
                 Kind::Pipe { pipe, reading } => {
                     let p = pipe.lock();
                     if *reading {

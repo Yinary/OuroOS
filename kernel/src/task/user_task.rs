@@ -671,6 +671,7 @@ fn park_check_signals(
             }
             // 其余：完成 syscall 返回 -EINTR；信号留给循环顶检查点。
             _ => {
+                *sleep_deadline = None;
                 frame.syscall_ok();
                 frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
                 ParkOutcome::Completed
@@ -1220,6 +1221,40 @@ fn process_call(
         sysnr::GETSID => get_pg_or_sid(parent, args[0], true),
         sysnr::SETSID => set_sid(parent),
         sysnr::KILL | sysnr::TKILL | sysnr::TGKILL => kill_or_tgkill(parent, nr, args),
+        sysnr::ACCEPT | sysnr::ACCEPT4 | sysnr::CONNECT | sysnr::SENDTO | sysnr::RECVFROM => {
+            let flow = {
+                let mut locked = REGISTRY.lock();
+                let reg = &mut *locked;
+                match (
+                    reg.group_index(parent),
+                    reg.threads.iter().find(|t| t.tid == parent),
+                ) {
+                    (Some(index), Some(thread)) => {
+                        let blocked = thread.signal.blocked();
+                        let tgid = thread.tgid;
+                        let rec = &mut reg.records[index];
+                        match (rec.space.as_ref(), rec.fs.as_mut()) {
+                            (Some(space), Some(fs)) => crate::syscall::net::dispatch_blocking(
+                                nr,
+                                args,
+                                space.as_space(),
+                                fs,
+                                &mut rec.signal,
+                                blocked,
+                                tgid,
+                                sleep_deadline,
+                            ),
+                            _ => crate::syscall::net::NetFlow::Done(Err(Errno::Invalid)),
+                        }
+                    }
+                    _ => crate::syscall::net::NetFlow::Done(Err(Errno::NoProcess)),
+                }
+            };
+            match flow {
+                crate::syscall::net::NetFlow::Done(res) => res,
+                crate::syscall::net::NetFlow::Wait(reason) => return ProcessResult::Wait(reason),
+            }
+        }
         _ => Err(Errno::NoSys),
     };
     frame[TrapFrameArgs::RET] = crate::syscall::to_abi(result);
