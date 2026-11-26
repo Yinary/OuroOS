@@ -216,9 +216,10 @@ impl Scheduler {
         }
     }
 
-    /// 到期扫描：Deadline 已到的等待者搬回就绪表。
+    /// 到期扫描：Deadline 已到的等待者搬回就绪表，并触发已到期的 ITIMER_REAL。
     fn wake_expired(&mut self) {
         let now = crate::time::monotonic();
+        let itimer_fired = super::fire_expired_itimers(now);
         self.move_waiting(|task, r| match r {
             WaitReason::Deadline(d)
             | WaitReason::PollUntil(d)
@@ -231,6 +232,10 @@ impl Scheduler {
             }
             _ => false,
         });
+        if itimer_fired {
+            self.drain_wake_requests();
+            self.refresh_deadline();
+        }
     }
 
     /// 把谓词匹配的等待任务搬回就绪表；谓词可按任务与其等待原因联合判定。
@@ -250,9 +255,23 @@ impl Scheduler {
         self.refresh_deadline();
     }
 
-    /// 把等待表里最早的到期时刻登记给定时器。
+    /// 把等待表与活动 ITIMER_REAL 中最早的到期时刻登记给定时器。
     fn refresh_deadline(&self) {
-        timer::set_deadline(self.waiting.iter().filter_map(|(_, r)| r.deadline()).min());
+        let wait_min = self.waiting.iter().filter_map(|(_, r)| r.deadline()).min();
+        let itimer_min = super::next_itimer_deadline();
+        let earliest = match (wait_min, itimer_min) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        timer::set_deadline(earliest);
+    }
+}
+
+/// 刷新硬件定时器的最早到期时刻（setitimer 更新 ITIMER_REAL 后在锁外调用）。
+pub(super) fn refresh_timer_deadline() {
+    let slot = SCHED.lock();
+    if let Some(s) = slot.as_ref() {
+        s.refresh_deadline();
     }
 }
 

@@ -10,11 +10,36 @@ pub(super) const DIR: u32 = u32::MAX;
 pub(super) const DEVNULL: u32 = u32::MAX - 2;
 /// /dev/zero 的虚拟 inode。
 pub(super) const DEVZERO: u32 = u32::MAX - 8;
+/// /dev/urandom 与 /dev/random 的虚拟 inode。
+pub(super) const DEVURANDOM: u32 = u32::MAX - 9;
+pub(super) const DEVRANDOM: u32 = u32::MAX - 10;
+
+pub(super) fn null_metadata() -> super::Metadata {
+    super::Metadata {
+        ino: u64::from(DEVNULL),
+        rdev: (1 << 8) | 3,
+        mode: 0o020666,
+        links: 1,
+        block_size: 4096,
+        ..Default::default()
+    }
+}
 
 pub(super) fn zero_metadata() -> super::Metadata {
     super::Metadata {
         ino: u64::from(DEVZERO),
         rdev: (1 << 8) | 5,
+        mode: 0o020666,
+        links: 1,
+        block_size: 4096,
+        ..Default::default()
+    }
+}
+
+pub(super) fn random_metadata(urandom: bool) -> super::Metadata {
+    super::Metadata {
+        ino: u64::from(if urandom { DEVURANDOM } else { DEVRANDOM }),
+        rdev: (1 << 8) | if urandom { 9 } else { 8 },
         mode: 0o020666,
         links: 1,
         block_size: 4096,

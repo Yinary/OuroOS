@@ -64,11 +64,14 @@ pub mod sysnr {
     pub const EXIT: usize = 93;
     pub const EXIT_GROUP: usize = 94;
     pub const SYSINFO: usize = 179;
+    pub const PSELECT6: usize = 72;
     pub const PPOLL: usize = 73;
     pub const FUTEX: usize = 98;
     pub const SET_ROBUST_LIST: usize = 99;
     pub const GET_ROBUST_LIST: usize = 100;
     pub const NANOSLEEP: usize = 101;
+    pub const GETITIMER: usize = 102;
+    pub const SETITIMER: usize = 103;
     pub const CLOCK_GETTIME: usize = 113;
     pub const CLOCK_GETRES: usize = 114;
     pub const CLOCK_NANOSLEEP: usize = 115;
@@ -582,8 +585,11 @@ pub fn dispatch(
         | sysnr::RT_SIGTIMEDWAIT
         | sysnr::RT_SIGQUEUEINFO
         | sysnr::SYSINFO
+        | sysnr::PSELECT6
         | sysnr::PPOLL
         | sysnr::NANOSLEEP
+        | sysnr::GETITIMER
+        | sysnr::SETITIMER
         | sysnr::CLOCK_GETTIME
         | sysnr::CLOCK_GETRES
         | sysnr::CLOCK_NANOSLEEP

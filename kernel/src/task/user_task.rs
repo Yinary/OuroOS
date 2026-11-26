@@ -663,9 +663,11 @@ fn park_check_signals(
                 }
             }
             // SA_RESTART：pipe 读写与 wait 的等待不完成不睡，信号留给循环顶检查点。
-            // ppoll 被 handler 信号打断一律以 -EINTR 完成。
+            // ppoll 与 pselect6 被 handler 信号打断一律以 -EINTR 完成。
             WaitReason::Pipe | WaitReason::Children
-                if d.flags & SA_RESTART != 0 && frame[TrapFrameArgs::SYSCALL] != sysnr::PPOLL =>
+                if d.flags & SA_RESTART != 0
+                    && frame[TrapFrameArgs::SYSCALL] != sysnr::PPOLL
+                    && frame[TrapFrameArgs::SYSCALL] != sysnr::PSELECT6 =>
             {
                 ParkOutcome::Incomplete
             }
@@ -878,6 +880,219 @@ fn process_call(
                         .map_err(|_| Errno::Fault)
                 })
                 .map(|()| 0)
+        }
+        sysnr::PSELECT6 => {
+            // pselect6(2)：检查 read/write/except 位图集合，可选相对超时与临时信号掩码。
+            enum SelectStep {
+                Done(Result<usize, Errno>),
+                Wait(WaitReason),
+            }
+            let step = {
+                let mut locked = REGISTRY.lock();
+                let reg = &mut *locked;
+                let res: Result<SelectStep, Errno> = (|| {
+                    let index = reg.group_index(parent).ok_or(Errno::NoProcess)?;
+                    let space = reg.records[index]
+                        .space
+                        .as_ref()
+                        .ok_or(Errno::Invalid)?
+                        .as_space();
+                    if args[5] != 0 && sigsuspend_saved.is_none() {
+                        let mut sigarg = [0u8; 16];
+                        crate::mm::user_access::copy_from_user(space, args[5], &mut sigarg)
+                            .map_err(|_| Errno::Fault)?;
+                        let ss = usize::from_ne_bytes(sigarg[0..8].try_into().unwrap_or([0; 8]));
+                        let ss_len =
+                            usize::from_ne_bytes(sigarg[8..16].try_into().unwrap_or([0; 8]));
+                        if ss != 0 {
+                            if ss_len != SIGSETSIZE {
+                                return Err(Errno::Invalid);
+                            }
+                            let mut raw_mask = [0u8; SIGSETSIZE];
+                            crate::mm::user_access::copy_from_user(space, ss, &mut raw_mask)
+                                .map_err(|_| Errno::Fault)?;
+                            let mut new_mask = SignalSet::from_ne_bytes(raw_mask);
+                            new_mask.del(SIGKILL);
+                            new_mask.del(SIGSTOP);
+                            if let Some(thread) = reg.threads.iter_mut().find(|t| t.tid == parent) {
+                                *sigsuspend_saved = Some(thread.signal.blocked());
+                                thread.signal.setmask(new_mask);
+                            }
+                        }
+                    }
+                    if args[4] != 0 && sleep_deadline.is_none() {
+                        let mut ts = [0u8; 16];
+                        crate::mm::user_access::copy_from_user(space, args[4], &mut ts)
+                            .map_err(|_| Errno::Fault)?;
+                        let sec = i64::from_ne_bytes(ts[0..8].try_into().unwrap_or([0; 8]));
+                        let ns = i64::from_ne_bytes(ts[8..16].try_into().unwrap_or([0; 8]));
+                        if sec < 0 || !(0..1_000_000_000).contains(&ns) {
+                            return Err(Errno::Invalid);
+                        }
+                        *sleep_deadline = Some(
+                            crate::time::monotonic()
+                                .checked_add(core::time::Duration::new(sec as u64, ns as u32))
+                                .ok_or(Errno::Invalid)?,
+                        );
+                    }
+                    let rec = &reg.records[index];
+                    let space = rec.space.as_ref().ok_or(Errno::Invalid)?.as_space();
+                    let fs = rec.fs.as_ref().ok_or(Errno::Invalid)?;
+                    let sets = crate::fs::context::select_check(
+                        fs, space, args[0], args[1], args[2], args[3],
+                    )?;
+                    if sets.ready > 0 {
+                        crate::fs::context::select_write_back(
+                            space, args[1], args[2], args[3], &sets,
+                        )?;
+                        return Ok(SelectStep::Done(Ok(sets.ready)));
+                    }
+                    match *sleep_deadline {
+                        None => Ok(SelectStep::Wait(WaitReason::Pipe)),
+                        Some(d) if crate::time::monotonic() < d => {
+                            Ok(SelectStep::Wait(WaitReason::PollUntil(d)))
+                        }
+                        Some(_) => {
+                            crate::fs::context::select_write_back(
+                                space, args[1], args[2], args[3], &sets,
+                            )?;
+                            Ok(SelectStep::Done(Ok(0)))
+                        }
+                    }
+                })();
+                match res {
+                    Ok(SelectStep::Wait(reason)) => SelectStep::Wait(reason),
+                    other => {
+                        if let Some(saved) = sigsuspend_saved.take() {
+                            if let Some(thread) = reg.threads.iter_mut().find(|t| t.tid == parent) {
+                                thread.signal.setmask(saved);
+                            }
+                        }
+                        SelectStep::Done(match other {
+                            Ok(SelectStep::Done(r)) => r,
+                            Err(e) => Err(e),
+                            Ok(SelectStep::Wait(_)) => unreachable!(),
+                        })
+                    }
+                }
+            };
+            match step {
+                SelectStep::Wait(reason) => return ProcessResult::Wait(reason),
+                SelectStep::Done(res) => {
+                    *sleep_deadline = None;
+                    res
+                }
+            }
+        }
+        sysnr::GETITIMER => {
+            // getitimer(2)：查询 ITIMER_REAL 当前剩余时间与周期。
+            let which = args[0] as u32 as i32;
+            if which < 0 || which > 2 {
+                Err(Errno::Invalid)
+            } else if which != 0 {
+                Err(Errno::NotSupported)
+            } else if args[1] == 0 {
+                Err(Errno::Fault)
+            } else {
+                let reg = REGISTRY.lock();
+                let rec = reg.group(parent).ok_or(Errno::NoProcess);
+                rec.and_then(|r| {
+                    let space = r.space.as_ref().ok_or(Errno::Invalid)?.as_space();
+                    let now = crate::time::monotonic();
+                    let mut raw = [0u8; 32];
+                    if let Some((deadline, interval)) = r.itimer_real {
+                        let rem = deadline.saturating_sub(now);
+                        raw[0..8].copy_from_slice(&(interval.as_secs() as i64).to_ne_bytes());
+                        raw[8..16]
+                            .copy_from_slice(&(interval.subsec_micros() as i64).to_ne_bytes());
+                        raw[16..24].copy_from_slice(&(rem.as_secs() as i64).to_ne_bytes());
+                        raw[24..32].copy_from_slice(&(rem.subsec_micros() as i64).to_ne_bytes());
+                    }
+                    crate::mm::user_access::copy_to_user(space, args[1], &raw)
+                        .map(|()| 0)
+                        .map_err(|_| Errno::Fault)
+                })
+            }
+        }
+        sysnr::SETITIMER => {
+            // setitimer(2)：设置或关闭 ITIMER_REAL，到期产生 SIGALRM。
+            let which = args[0] as u32 as i32;
+            let res = if which < 0 || which > 2 {
+                Err(Errno::Invalid)
+            } else if which != 0 {
+                Err(Errno::NotSupported)
+            } else if args[1] == 0 {
+                Err(Errno::Fault)
+            } else {
+                let mut reg = REGISTRY.lock();
+                let index = reg.group_index(parent);
+                match index {
+                    None => Err(Errno::NoProcess),
+                    Some(idx) => {
+                        let res = (|| {
+                            let space = reg.records[idx]
+                                .space
+                                .as_ref()
+                                .ok_or(Errno::Invalid)?
+                                .as_space();
+                            let mut new_raw = [0u8; 32];
+                            crate::mm::user_access::copy_from_user(space, args[1], &mut new_raw)
+                                .map_err(|_| Errno::Fault)?;
+                            let int_sec =
+                                i64::from_ne_bytes(new_raw[0..8].try_into().unwrap_or([0; 8]));
+                            let int_usec =
+                                i64::from_ne_bytes(new_raw[8..16].try_into().unwrap_or([0; 8]));
+                            let val_sec =
+                                i64::from_ne_bytes(new_raw[16..24].try_into().unwrap_or([0; 8]));
+                            let val_usec =
+                                i64::from_ne_bytes(new_raw[24..32].try_into().unwrap_or([0; 8]));
+                            if int_sec < 0
+                                || val_sec < 0
+                                || !(0..1_000_000).contains(&int_usec)
+                                || !(0..1_000_000).contains(&val_usec)
+                            {
+                                return Err(Errno::Invalid);
+                            }
+                            let now = crate::time::monotonic();
+                            if args[2] != 0 {
+                                let mut old_raw = [0u8; 32];
+                                if let Some((deadline, interval)) = reg.records[idx].itimer_real {
+                                    let rem = deadline.saturating_sub(now);
+                                    old_raw[0..8].copy_from_slice(
+                                        &(interval.as_secs() as i64).to_ne_bytes(),
+                                    );
+                                    old_raw[8..16].copy_from_slice(
+                                        &(interval.subsec_micros() as i64).to_ne_bytes(),
+                                    );
+                                    old_raw[16..24]
+                                        .copy_from_slice(&(rem.as_secs() as i64).to_ne_bytes());
+                                    old_raw[24..32].copy_from_slice(
+                                        &(rem.subsec_micros() as i64).to_ne_bytes(),
+                                    );
+                                }
+                                crate::mm::user_access::copy_to_user(space, args[2], &old_raw)
+                                    .map_err(|_| Errno::Fault)?;
+                            }
+                            let val =
+                                core::time::Duration::new(val_sec as u64, (val_usec as u32) * 1000);
+                            let interval =
+                                core::time::Duration::new(int_sec as u64, (int_usec as u32) * 1000);
+                            reg.records[idx].itimer_real = if val.is_zero() {
+                                None
+                            } else {
+                                Some((now.saturating_add(val), interval))
+                            };
+                            super::recompute_next_itimer(&reg);
+                            Ok(0)
+                        })();
+                        res
+                    }
+                }
+            };
+            if res.is_ok() {
+                sched::refresh_timer_deadline();
+            }
+            res
         }
         sysnr::PPOLL => {
             let reg = REGISTRY.lock();

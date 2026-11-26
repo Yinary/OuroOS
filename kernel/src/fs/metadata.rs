@@ -32,8 +32,17 @@ pub(crate) struct Metadata {
 
 /// 按 inode 取得后端元数据，失败返回后端错误。
 pub(super) fn metadata(ino: u32) -> Result<Metadata, Errno> {
+    if ino == super::procfs::DEVNULL {
+        return Ok(super::procfs::null_metadata());
+    }
     if ino == super::procfs::DEVZERO {
         return Ok(super::procfs::zero_metadata());
+    }
+    if ino == super::procfs::DEVURANDOM {
+        return Ok(super::procfs::random_metadata(true));
+    }
+    if ino == super::procfs::DEVRANDOM {
+        return Ok(super::procfs::random_metadata(false));
     }
     // procfs 虚拟节点（/proc、/proc/<pid>、/dev/*）无后端 inode，按统一
     // stat 结果合成，避免 resolve 逐分量解析时把虚拟节点当 ext4 处理

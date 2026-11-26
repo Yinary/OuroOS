@@ -27,6 +27,8 @@ pub const SIGFPE: u8 = 8;
 pub const SIGSEGV: u8 = 11;
 /// SIGPIPE：向无读者的管道写入。
 pub const SIGPIPE: u8 = 13;
+/// SIGALRM：实时定时器（ITIMER_REAL）到期信号。
+pub const SIGALRM: u8 = 14;
 /// SIGKILL：不可捕获、不可屏蔽的终止信号。
 pub const SIGKILL: u8 = 9;
 /// SIGCHLD：子进程终止。

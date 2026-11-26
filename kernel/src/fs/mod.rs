@@ -168,6 +168,12 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
     if path == "/dev/zero" {
         return Ok(procfs::DEVZERO);
     }
+    if path == "/dev/urandom" {
+        return Ok(procfs::DEVURANDOM);
+    }
+    if path == "/dev/random" {
+        return Ok(procfs::DEVRANDOM);
+    }
     if path == "/dev" {
         return Ok(ext4::lookup("/dev").unwrap_or(procfs::DEVDIR));
     }
@@ -221,7 +227,10 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
 
 /// 返回 inode 类型、长度、链接数和磁盘占用。
 pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
-    if matches!(ino, procfs::DEVNULL | procfs::DEVZERO) {
+    if matches!(
+        ino,
+        procfs::DEVNULL | procfs::DEVZERO | procfs::DEVURANDOM | procfs::DEVRANDOM
+    ) {
         return Ok((0o020666, 0, 1, 0));
     }
     if ino == procfs::DEVDIR || ino == procfs::MISC_DIR {

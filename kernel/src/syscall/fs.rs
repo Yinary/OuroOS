@@ -190,6 +190,12 @@ pub fn dispatch(
             if path == "/dev/zero" {
                 return ctx.open_devzero(a[2], a[2] & 0x80000 != 0);
             }
+            if path == "/dev/urandom" {
+                return ctx.open_devrandom(true, a[2], a[2] & 0x80000 != 0);
+            }
+            if path == "/dev/random" {
+                return ctx.open_devrandom(false, a[2], a[2] & 0x80000 != 0);
+            }
             if path == "/dev/misc/rtc" {
                 return ctx.open_rtc(a[2], a[2] & 0x80000 != 0);
             }
