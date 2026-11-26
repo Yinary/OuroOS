@@ -197,7 +197,9 @@ impl UserPageTable {
         }
     }
     pub(super) fn activate(&self) {
-        arch::switch(self.root.addr().raw());
+        if !self.is_active() {
+            arch::switch(self.root.addr().raw());
+        }
     }
     pub(super) fn deactivate(&self) {
         arch::switch(self.kernel);
