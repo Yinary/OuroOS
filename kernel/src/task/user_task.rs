@@ -144,7 +144,7 @@ pub fn user_task_entry() -> ! {
         let kernel_start;
         let action = {
             // 每轮激活本任务页表；REGISTRY 锁不跨 run_user_task。
-            // 致命信号在此记下，锁释放后跳过用户态直接退出。
+            // 致命信号在此记下，锁释放后结束整个线程组。
             let signal_exit = {
                 let mut locked = REGISTRY.lock();
                 let reg = &mut *locked;
@@ -210,7 +210,7 @@ pub fn user_task_entry() -> ! {
                 }
             };
             if let Some(info) = signal_exit {
-                sched::exit_current(info);
+                sched::exit_group_current(info);
             }
             let user_start = crate::time::monotonic();
             let trap_type = run_user_task(&mut frame);
@@ -676,8 +676,8 @@ fn park_check_signals(
         },
         ParkPeek::Default { sig, slot, d } => {
             if let Some(info) = delivery_verdict(sig, slot, d) {
-                // Term/Core：已消费，按默认动作终止。
-                sched::exit_current(info);
+                // Term/Core：已消费，按默认动作结束整个线程组。
+                sched::exit_group_current(info);
             }
             // 丢弃即可，由 syscall 重执行重查决定是否继续等。
             ParkOutcome::Incomplete
