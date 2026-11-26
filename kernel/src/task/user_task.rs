@@ -559,12 +559,9 @@ fn park_check_signals(
             .find(|t| t.tid == pid)
             .expect("user task unregistered");
         let blocked = thread.signal.blocked();
-        // 先查等待集内信号：命中即消费，不经处置。
-        let tw_hit = tw_set.and_then(|set| {
-            let mut hidden = blocked;
-            hidden |= !set;
-            super::signal::take_any(&mut rec.signal, &mut thread.signal, hidden)
-        });
+        // 先查等待集内信号（含已屏蔽信号，同 sigtimedwait(2)）：命中即消费，不经处置。
+        let tw_hit = tw_set
+            .and_then(|set| super::signal::take_any(&mut rec.signal, &mut thread.signal, !set));
         match tw_hit {
             Some((sig, slot)) => ParkPeek::TwHit { sig, slot },
             None => match super::signal::peek_any(&rec.signal, &thread.signal, blocked) {
@@ -617,15 +614,16 @@ fn park_check_signals(
             ParkOutcome::Completed
         }
         ParkPeek::Handler(d) => match reason {
-            WaitReason::Deadline(until) => {
+            WaitReason::SigTimedWait { .. } => {
                 // sigtimedwait 被集合外 handler 信号打断：以 -EINTR 完成。
-                if tw_set.is_some() {
-                    *timedwait = None;
-                    // Wait 路径原欠一次 syscall_ok，EINTR 完成恰好补上。
-                    frame.syscall_ok();
-                    frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
-                    ParkOutcome::Completed
-                } else if is_absolute_nanosleep(frame) {
+                *timedwait = None;
+                // Wait 路径原欠一次 syscall_ok，EINTR 完成恰好补上。
+                frame.syscall_ok();
+                frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
+                ParkOutcome::Completed
+            }
+            WaitReason::Deadline(until) => {
+                if is_absolute_nanosleep(frame) {
                     // clock_nanosleep 的绝对期限：清截止时间，不回写剩余时间，以 -EINTR 完成。
                     *sleep_deadline = None;
                     // Wait 路径原欠一次 syscall_ok，EINTR 完成恰好补上。
@@ -770,9 +768,8 @@ fn process_call(
             }
         }
         sysnr::RT_SIGTIMEDWAIT => {
-            // rt_sigtimedwait(2)：等待集合内未屏蔽信号，命中即取出返回
+            // rt_sigtimedwait(2)：等待集合内信号（含已屏蔽信号），命中即取出返回
             // 信号号（不经处置）；超时 EAGAIN，集合外 handler 信号打断 -EINTR。
-            // 偏差登记 docs/ostd-contracts.md §4.5。
             if let Some((set, deadline)) = *timedwait {
                 // 重入：先查命中（Mesa），再查截止。
                 let taken = {
@@ -784,9 +781,7 @@ fn process_call(
                     ) {
                         (Some(index), Some(thread)) => {
                             let rec = &mut reg.records[index];
-                            let mut hidden = thread.signal.blocked();
-                            hidden |= !set;
-                            super::signal::take_any(&mut rec.signal, &mut thread.signal, hidden)
+                            super::signal::take_any(&mut rec.signal, &mut thread.signal, !set)
                         }
                         _ => None,
                     }
@@ -799,10 +794,10 @@ fn process_call(
                     Err(Errno::Again)
                 } else {
                     // 未到截止被假唤醒：带剩余时间重新挂起。
-                    return ProcessResult::Wait(WaitReason::Deadline(deadline));
+                    return ProcessResult::Wait(WaitReason::SigTimedWait { set, deadline });
                 }
             } else {
-                // 首次：读集合与超时；已命中立即返回，否则挂起。
+                // 首次：先校验集合与超时，再尝试消费等待集内挂起信号；未命中且未到期才挂起。
                 if args[3] != SIGSETSIZE {
                     Err(Errno::Invalid)
                 } else {
@@ -811,34 +806,38 @@ fn process_call(
                         Ok(mut set) => {
                             set.del(SIGKILL);
                             set.del(SIGSTOP);
-                            let taken = {
-                                let mut locked = REGISTRY.lock();
-                                let reg = &mut *locked;
-                                match (
-                                    reg.group_index(parent),
-                                    reg.threads.iter_mut().find(|t| t.tid == parent),
-                                ) {
-                                    (Some(index), Some(thread)) => {
-                                        let rec = &mut reg.records[index];
-                                        let mut hidden = thread.signal.blocked();
-                                        hidden |= !set;
-                                        super::signal::take_any(
-                                            &mut rec.signal,
-                                            &mut thread.signal,
-                                            hidden,
-                                        )
-                                    }
-                                    _ => None,
-                                }
-                            };
-                            if let Some((sig, slot)) = taken {
-                                write_uinfo(parent, args[1], sig, &slot).map(|_| sig as usize)
-                            } else {
-                                match timedwait_deadline(parent, args[2]) {
-                                    Err(e) => Err(e),
-                                    Ok(deadline) => {
+                            match timedwait_deadline(parent, args[2]) {
+                                Err(e) => Err(e),
+                                Ok(deadline) => {
+                                    let taken = {
+                                        let mut locked = REGISTRY.lock();
+                                        let reg = &mut *locked;
+                                        match (
+                                            reg.group_index(parent),
+                                            reg.threads.iter_mut().find(|t| t.tid == parent),
+                                        ) {
+                                            (Some(index), Some(thread)) => {
+                                                let rec = &mut reg.records[index];
+                                                super::signal::take_any(
+                                                    &mut rec.signal,
+                                                    &mut thread.signal,
+                                                    !set,
+                                                )
+                                            }
+                                            _ => None,
+                                        }
+                                    };
+                                    if let Some((sig, slot)) = taken {
+                                        write_uinfo(parent, args[1], sig, &slot)
+                                            .map(|_| sig as usize)
+                                    } else if crate::time::monotonic() >= deadline {
+                                        Err(Errno::Again)
+                                    } else {
                                         *timedwait = Some((set, deadline));
-                                        return ProcessResult::Wait(WaitReason::Deadline(deadline));
+                                        return ProcessResult::Wait(WaitReason::SigTimedWait {
+                                            set,
+                                            deadline,
+                                        });
                                     }
                                 }
                             }

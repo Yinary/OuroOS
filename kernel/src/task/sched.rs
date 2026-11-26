@@ -197,12 +197,19 @@ impl Scheduler {
         if WAKE_SIGNALS.swap(false, Ordering::AcqRel) {
             // 信号唤醒：持 REGISTRY 锁按可投递性搬回等待者（锁序
             // SCHED→REGISTRY，见 docs/ostd-contracts.md §5）。
+            // rt_sigtimedwait 允许消费等待集内的已屏蔽信号，唤醒条件同步放宽到等待集。
             let reg = super::REGISTRY.lock();
-            self.move_waiting(|task, _| {
+            self.move_waiting(|task, reason| {
+                let extra = match reason {
+                    WaitReason::SigTimedWait { set, .. } => *set,
+                    _ => 0,
+                };
                 reg.group(task.pid).is_some_and(|r| {
                     r.exit.is_none()
                         && reg.thread(task.pid).is_some_and(|t| {
-                            (r.signal.pending() | t.signal.pending()) & !t.signal.blocked() != 0
+                            (r.signal.pending() | t.signal.pending())
+                                & (!t.signal.blocked() | extra)
+                                != 0
                         })
                 })
             });
@@ -213,7 +220,9 @@ impl Scheduler {
     fn wake_expired(&mut self) {
         let now = crate::time::monotonic();
         self.move_waiting(|task, r| match r {
-            WaitReason::Deadline(d) | WaitReason::PollUntil(d) => now >= *d,
+            WaitReason::Deadline(d)
+            | WaitReason::PollUntil(d)
+            | WaitReason::SigTimedWait { deadline: d, .. } => now >= *d,
             WaitReason::Futex {
                 deadline: Some(d), ..
             } if now >= *d => {
