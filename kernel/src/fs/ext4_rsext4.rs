@@ -94,11 +94,16 @@ impl BlockDevice for Partition {
         !WRITABLE
     }
     fn current_time(&self) -> Ext4Result<Ext4Timestamp> {
-        let elapsed = crate::time::monotonic();
-        Ok(Ext4Timestamp::new(
-            self.time_base.saturating_add(elapsed.as_secs() as i64),
-            elapsed.subsec_nanos(),
-        ))
+        let now = crate::time::realtime();
+        if now.as_secs() > 0 {
+            Ok(Ext4Timestamp::new(now.as_secs() as i64, now.subsec_nanos()))
+        } else {
+            let elapsed = crate::time::monotonic();
+            Ok(Ext4Timestamp::new(
+                self.time_base.saturating_add(elapsed.as_secs() as i64),
+                elapsed.subsec_nanos(),
+            ))
+        }
     }
 }
 
