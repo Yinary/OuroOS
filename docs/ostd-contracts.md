@@ -471,6 +471,7 @@ signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综�
 | context | 每进程 cwd、FD 表、打开文件对象与管道 | `fs/context.rs` |
 | fs / metadata | 路径与 inode 分发、统一属性和目录接口、状态查询路径解析 | `fs/mod.rs`、`fs/metadata.rs` |
 | cache | 文件共享页、普通读写与已有映射间的内容同步 | `fs/cache.rs` |
+| 块层缓存 | 4 KiB 物理页帧承载的写回块缓存（16 MiB 上限、Clock 淘汰、`flush` 连续脏块合并写回），透明实现 `rsext4::BlockDevice` | `fs/block_cache.rs` |
 | 文件系统适配 | Ext4 根卷与 FAT 挂载卷、后端错误转换 | `fs/ext4_rsext4.rs`、`fs/fat.rs` |
 | 第三方后端 | rsext4 0.8.1 的 inode、目录、数据块与日志；rust-fatfs 的 FAT 操作 | `third_party/rsext4/`、`kernel/Cargo.toml` |
 | 块设备 | VirtIO Block 同步 I/O、字节访问与 MBR 分区解析 | `drivers/mod.rs` |
@@ -502,7 +503,8 @@ signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综�
 | Ext4 元数据布局 | rsext4 按超级块的 `s_desc_size`、`s_inode_size` 读取布局，不固定为 64 字节描述符或 128 字节 inode；4 KiB 限制来自后端 `BLOCK_SIZE` |
 | inode 标识 | 最高位区分 FAT 与 Ext4；Ext4 拒绝该位已置位的 inode，FAT 从 `0x8000_0000` 分配虚拟编号 |
 | 共享页与普通读写 | read 叠加已有共享页，write 更新后端后同步已有共享页；truncate 改变长度前检查存活共享页，当前单核非抢占路径中检查后直接进入截断，不允许中途调度；成功初始化的共享页在最后释放时尝试写回，长度限于当前 EOF 内；失败限制见 §6.5 |
-| 显式同步 | Ext4 fsync 先写回该 inode 的驻留共享页，再同步后端缓存、日志和设备；关机时同步并卸载可写根卷，FAT fsync 返回 ENOTSUP |
+| 显式同步 | Ext4 fsync 先写回该 inode 的驻留共享页，再同步后端缓存、日志、`BlockCache` 全部脏块与底层块设备 `flush`；关机时同步并卸载可写根卷，释放块缓存物理页帧；FAT fsync 返回 ENOTSUP |
+| 块缓存与帧记账 | `BlockCache` 数据存放于独占 `OwnedFrame`（上限 4096 块 = 16 MiB），按需分配，OOM 时淘汰既有槽或直通底层；持有帧数计入 `fs::retained_frames()`（任务退出帧守恒自检）与 `/proc/meminfo` 的 `Buffers`/`MemAvailable` 字段 |
 | 字节块访问 | 完整对齐的扇区范围一次提交；不完整扇区先读后改，调用方负责串行化重叠写入 |
 | 错误边界 | FS 对外返回项目 `Errno`，后端错误由适配层转换；不保证任意失败都无磁盘副作用，也不据此保证第三方内部无 panic |
 
@@ -585,7 +587,7 @@ signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综�
 
 ### 存储调用链栈预算
 
-文件 syscall 的目录输出与 read/write 暂存使用可失败分配的 4 KiB 堆缓冲，分配失败返回 ENOMEM，发生在读取、写入和目录游标推进之前。RISC-V selftest 构建中分发栈帧由 8400 字节降为 512 字节。JBD2 提交的三个暂存块也在首个磁盘写入前准备完成；不改变存储接口或 16 KiB 内核栈配置。该修复不构成所有存储路径的栈上界证明，保护页防止向相邻栈页写入，当前没有独立的溢出恢复栈。
+文件 syscall 的目录输出与 read/write 暂存使用可失败分配的 4 KiB 堆缓冲（`transfer` 通过单槽全局池复用已分配的 4 KiB 堆缓冲以消除高频小读写分配开销，首次分配失败仍返回 ENOMEM，发生在读取、写入和目录游标推进之前）。RISC-V selftest 构建中分发栈帧由 8400 字节降为 512 字节。`user_access` 对 4 页以内的短传输使用栈上 64 字节数组并合并权限校验与单次页表翻译；`UserPageTable::activate` 在当前硬件页表已指向本空间时跳过冗余寄存器写回与全局 TLB 刷洗（所有 `map`/`protect`/`unmap` 修改处已即时刷 TLB）。JBD2 提交的三个暂存块也在首个磁盘写入前准备完成；不改变存储接口或内核栈配置。该修复不构成所有存储路径的栈上界证明，保护页防止向相邻栈页写入，当前没有独立的溢出恢复栈。
 
 ### madvise 支持范围
 

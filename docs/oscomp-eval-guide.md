@@ -187,3 +187,21 @@ python3 tests/run_official.py la --groups ltp-musl --ltp-filter chown,statx --lt
   - `la`：`iozone-musl` **20.00/20**（20/20）、`iozone-glibc` **20.00/20**（20/20，双库合跑共耗时约 220 秒）。
   - 4 进程并发模式下单进程最大吞吐约 `1.1–2.7 MB/s`（低于官方 Linux 页缓存基线，当前 20 项均稳拿保底 1.0 分，合计 +80 分）；后续引入通用文件页缓存后可进一步拉高该组吞吐得分。
   - **默认送测启用状态**：`official_init.rs` 已在默认送测流程中启用 `iozone-musl` 与 `iozone-glibc`，顺序排在 `netperf` 之后、`lmbench` 之前，以在单机总预算内优先锁定稳定的 `iozone` 得分。
+
+### 5.5 通用块层写回缓存与 I/O 热路径优化验证结果（`fs/io-cache`）
+
+- **优化范围（均属通用操作系统机制，无测例特判、不弱化 `fsync`/`sync` 持久化语义）**：
+  1. **通用 4 KiB 块层写回缓存（`kernel/src/fs/block_cache.rs`）**：在 `rsext4::Jbd2Dev` 之下包裹 `Partition`，以独占物理页帧 `OwnedFrame` 承载块数据（单卷上限 4,096 块 = 16 MiB，不占 32 MiB 固定内核堆），采用开放寻址哈希表（Knuth 后向移位无墓碑删除）与 Clock 淘汰策略；`flush()` 对所有脏块按块号排序并合并连续段（最多 16 块 = 64 KiB）批量写回后再调用 `drivers::flush`，保证 `fsync`/`sync`/`umount` 真实落盘；物理帧计入 `fs::retained_frames()` 与 `/proc/meminfo` 的 `Buffers`/`MemAvailable` 字段。
+  2. **块内切片直读直写与 `rsext4` 热路径瘦身**：扩展 `rsext4::BlockDevice::{read_slice, write_slice}` 默认方法并透传至 `BlockCache` 原地切片读写，消除 32 块小 `datablock_cache` 淘汰抖动与整块搬运；单块读直走 `resolve_inode_block` 免 `Vec<ExtentRun>` 堆分配；`atime` 采用 Linux `mount(8)` 默认 `relatime` 语义；`InodeCache` 命中单次查找并将 inode CRC32C 重算延迟至落盘编码前统一执行（与原逐次重算位级一致）。
+  3. **VFS/系统调用/内存热路径去冗余**：`OpenFile::check_type` 直接判定目录标记免除每次读写 `fs::stat` 加锁；`fs::write` 合并旧长度读取并用只读切片同步共享页（消除 4 KiB 栈数组清零与拷贝），`fs/cache` 无映射时原子快路径免锁跳过；`transfer` 通过单槽 4 KiB 堆缓冲池复用暂存区；`user_access` 对 ≤4 页短传输使用栈数组并合并单次页表翻译；`UserPageTable::activate` 在硬件页表已指向本空间时跳过冗余寄存器写回与全局 TLB 刷洗。
+- **双架构 `iozone` 优化前后实测对比（QEMU 10.0.2 + QCOW2 覆盖层，满分口径 20 项 × 渐近上限 2.0 = 40.00/组，4 配置理论上限 160.00）**：
+  - `rv` `iozone-musl`：**20.00 → 37.50/20**（+17.50；4 进程 `readers` 由 ~1.2 MB/s 升至 190.7 MB/s，`rewriters` 升至 162.2 MB/s）；
+  - `rv` `iozone-glibc`：**20.00 → 37.34/20**（+17.34；双库总 CPU 时间降至 25.1 秒）；
+  - `la` `iozone-musl`：**20.00 → 38.03/20**（+18.03；4 进程 `re-readers` 升至 244.0 MB/s）；
+  - `la` `iozone-glibc`：**20.00 → 38.21/20**（+18.21；单进程 `reread` 达 300.2 MB/s）；
+  - **四配置合计**：**80.00 → 151.08 / 160**（**+71.08 分**，达到理论渐近上限的 94.4%，全部 80/80 子项均超越官方 Linux 基线 3.2×–50.0×）。
+- **关联组增益与回归验证**：
+  - `rv` 9 组回归（总耗时约 58 秒）：`basic` 102/102、`busybox` 54/55、`lua` 9/9、`libctest-musl` 217/220 零回退，`iperf-musl` 由 `6.38` 升至 **7.23/6**、`netperf-musl` 由 `8.08` 升至 **8.74/5**；
+  - `la` 9 组回归：`basic` 102/102、`busybox` 54/55、`lua` 9/9、`libctest-musl` 217/220 零回退，`iperf-musl` 由 `6.91` 升至 **7.96/6**、`netperf-musl` 由 `8.57` 升至 **9.25/5**；
+  - `rv` `lmbench-musl` 前 7 项抽测（300 秒内）：`Simple syscall` 降至 **1.84 µs**、`Simple read` **3.41 µs**、`Simple write` **3.21 µs**、`Select on 100 fd's` **7.94 µs**（7 项得 12.91/14）；
+  - 文件系统一致性专项：`fs_rename_backend.py`（15/15 故障注入回滚 + `e2fsck`）、`fs_stat.py`（默认及 `--metadata` 双架构 128/256 字节 inode + `e2fsck`）、`fs_fcntl.py`（双架构 + `e2fsck`）、`file_mapping.rs`（6/6）全部通过。
