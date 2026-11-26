@@ -163,19 +163,44 @@ pub fn dispatch(
             Ok(0)
         }
         sysnr::OPENAT => {
-            if a[2] & 3 == 3 {
+            const O_NOFOLLOW: usize = 0x20000;
+            const O_PATH: usize = 0x200000;
+            let path_only = a[2] & O_PATH != 0;
+            let flags = if path_only {
+                a[2] & (O_PATH | O_NOFOLLOW | 0x10000 | 0x80000)
+            } else {
+                a[2]
+            };
+            let create = flags & 64 != 0;
+            let exclusive = create && flags & 0x80 != 0;
+            let nofollow = flags & O_NOFOLLOW != 0;
+            if flags & 3 == 3 || flags & 0x10000 != 0 && create {
                 return Err(Errno::Invalid);
             }
-            if a[2] & 0x10000 != 0 && a[2] & 64 != 0 {
-                return Err(Errno::Invalid);
+            let dir = a[0] as u32 as i32 as isize as usize;
+            let input = user_string(space, a[1])?;
+            let (path, entry) = match ctx.open_path(dir, &input, !(nofollow || exclusive), create) {
+                Ok((path, entry)) => (path, Some(entry)),
+                Err(Errno::NoDevice) if !fs::mounted() => (ctx.path(dir, &input)?, None),
+                Err(e) => return Err(e),
+            };
+            if let Some(fs::ResolvedEntry::Existing(ref info)) = entry {
+                if exclusive {
+                    return Err(Errno::Exists);
+                }
+                if info.mode & 0xf000 == 0xa000 && nofollow && !path_only {
+                    return Err(Errno::Loop);
+                }
+                if flags & 0x10000 != 0 && info.mode & 0xf000 != 0x4000 {
+                    return Err(Errno::NotDir);
+                }
             }
-            let path = ctx.path(a[0], &user_string(space, a[1])?)?;
             if path == "/proc/meminfo" {
-                return ctx.open_meminfo(a[2], a[2] & 0x80000 != 0);
+                return ctx.open_meminfo(flags, flags & 0x80000 != 0);
             }
             if path == "/proc/mounts" {
                 let text = fs::procfs_text(&path)?;
-                return ctx.open_proc_text(text, a[2], a[2] & 0x80000 != 0);
+                return ctx.open_proc_text(text, flags, flags & 0x80000 != 0);
             }
             if let Some(rest) = path.strip_prefix("/proc/") {
                 if rest
@@ -183,58 +208,49 @@ pub fn dispatch(
                     .is_some_and(|(_, f)| f == "stat" || f == "cmdline" || f == "status")
                 {
                     let text = fs::procfs_text(&path)?;
-                    return ctx.open_proc_text(text, a[2], a[2] & 0x80000 != 0);
+                    return ctx.open_proc_text(text, flags, flags & 0x80000 != 0);
                 }
             }
             if path == "/dev/null" {
-                return ctx.open_devnull(a[2], a[2] & 0x80000 != 0);
+                return ctx.open_devnull(flags, flags & 0x80000 != 0);
             }
             if path == "/dev/zero" {
-                return ctx.open_devzero(a[2], a[2] & 0x80000 != 0);
+                return ctx.open_devzero(flags, flags & 0x80000 != 0);
             }
             if path == "/dev/urandom" {
-                return ctx.open_devrandom(true, a[2], a[2] & 0x80000 != 0);
+                return ctx.open_devrandom(true, flags, flags & 0x80000 != 0);
             }
             if path == "/dev/random" {
-                return ctx.open_devrandom(false, a[2], a[2] & 0x80000 != 0);
+                return ctx.open_devrandom(false, flags, flags & 0x80000 != 0);
             }
             if path == "/dev/misc/rtc" {
-                return ctx.open_rtc(a[2], a[2] & 0x80000 != 0);
+                return ctx.open_rtc(flags, flags & 0x80000 != 0);
             }
             if let Some((disk, part)) = fs::lookup_blk_node(&path) {
                 if let Ok((start, len)) = crate::drivers::partition(disk, part) {
-                    return ctx.open_devblk(disk, start, len as u64, a[2], a[2] & 0x80000 != 0);
+                    return ctx.open_devblk(disk, start, len as u64, flags, flags & 0x80000 != 0);
                 }
                 return Err(Errno::NoDevice);
             }
-            let ino = match fs::lookup(&path) {
-                Ok(ino) => {
-                    if a[2] & 0xc0 == 0xc0 {
-                        return Err(Errno::Exists);
-                    }
-                    ino
+            let (ino, mode) = match entry.ok_or(Errno::NoDevice)? {
+                fs::ResolvedEntry::Existing(info) => (info.ino as u32, info.mode),
+                fs::ResolvedEntry::Missing { parent } => {
+                    let name = path.rsplit('/').next().ok_or(Errno::NoEntry)?;
+                    let mode = 0x8000 | ctx.creation_mode(a[3]);
+                    (fs::create(parent, name, mode)?, mode)
                 }
-                Err(Errno::NoEntry) if a[2] & 64 != 0 => {
-                    let (p, name) = parent(&path)?;
-                    fs::create(p, name, 0x8000 | ctx.creation_mode(a[3]))?
-                }
-                Err(e) => return Err(e),
             };
-            let mode = fs::stat(ino)?.0;
-            if a[2] & 0x10000 != 0 && mode & 0xf000 != 0x4000 {
-                return Err(Errno::NotDir);
-            }
-            if mode & 0xf000 == 0x4000 && a[2] & 3 != 0 {
+            if mode & 0xf000 == 0x4000 && flags & 3 != 0 {
                 return Err(Errno::IsDir);
             }
-            if a[2] & 0x200 != 0 && a[2] & 3 != 0 {
+            if flags & 0x200 != 0 && flags & 3 != 0 {
                 fs::truncate(ino, 0)?;
             }
             ctx.open_inode(
                 ino,
                 path,
-                a[2],
-                a[2] & 0x80000 != 0,
+                flags,
+                flags & 0x80000 != 0,
                 mode & 0xf000 == 0x4000,
             )
         }
@@ -336,6 +352,7 @@ fn getdents64(
 ) -> Result<usize, Errno> {
     let handle = ctx.get(fd)?;
     let mut f = handle.lock();
+    f.check_access(true)?;
     let ino = f.directory()?;
     if f.detached_directory() {
         return Ok(0);

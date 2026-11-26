@@ -1,4 +1,4 @@
-//! 与后端无关的文件属性，以及保留符号链接语义的状态查询路径解析。
+//! 与后端无关的文件属性与路径解析。
 #![deny(unsafe_code)]
 use super::{ext4, fat, lookup, FAT_INODE};
 use crate::syscall::Errno;
@@ -44,6 +44,18 @@ pub(super) fn metadata(ino: u32) -> Result<Metadata, Errno> {
     if ino == super::procfs::DEVRANDOM {
         return Ok(super::procfs::random_metadata(false));
     }
+    if ino == super::procfs::MEMINFO {
+        return super::procfs::metadata();
+    }
+    if ino == super::procfs::DEVBLK {
+        return Ok(Metadata {
+            ino: ino.into(),
+            mode: 0o060600,
+            links: 1,
+            block_size: 4096,
+            ..Default::default()
+        });
+    }
     // procfs 虚拟节点（/proc、/proc/<pid>、/dev/*）无后端 inode，按统一
     // stat 结果合成，避免 resolve 逐分量解析时把虚拟节点当 ext4 处理
     if ino >= super::procfs::MISC_DIR || super::procfs::pid_ino_parts(ino).is_some() {
@@ -78,6 +90,25 @@ pub(crate) fn query(path: &str, follow: bool) -> Result<Metadata, Errno> {
 
 /// 解析绝对路径并返回规范路径及属性；保留与 query 相同的链接规则。
 pub(super) fn resolve(path: &str, follow: bool) -> Result<(String, Metadata), Errno> {
+    let (path, target) = resolve_entry(path, follow, false)?;
+    match target {
+        ResolvedEntry::Existing(info) => Ok((path, info)),
+        ResolvedEntry::Missing { .. } => Err(Errno::NoEntry),
+    }
+}
+
+/// 路径末项存在，或可在已确认的父目录下新建。
+pub(crate) enum ResolvedEntry {
+    Existing(Metadata),
+    Missing { parent: u32 },
+}
+
+/// 解析路径并保留规范名称；allow_create 只允许末项不存在。
+pub(super) fn resolve_entry(
+    path: &str,
+    follow: bool,
+    allow_create: bool,
+) -> Result<(String, ResolvedEntry), Errno> {
     let mut pending = string(path)?;
     let mut current = string("/")?;
     let mut info = metadata(lookup("/")?)?;
@@ -116,7 +147,18 @@ pub(super) fn resolve(path: &str, follow: bool) -> Result<(String, Metadata), Er
                 if candidate.len() >= 4096 {
                     return Err(Errno::NameTooLong);
                 }
-                let ino = lookup(&candidate)?;
+                let ino = match lookup(&candidate) {
+                    Ok(ino) => ino,
+                    Err(Errno::NoEntry) if allow_create && suffix.is_empty() => {
+                        return Ok((
+                            candidate,
+                            ResolvedEntry::Missing {
+                                parent: info.ino as u32,
+                            },
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                };
                 let child = metadata(ino)?;
                 if child.mode & 0xf000 == 0xa000 && (follow || !suffix.is_empty()) {
                     links += 1;
@@ -151,5 +193,5 @@ pub(super) fn resolve(path: &str, follow: bool) -> Result<(String, Metadata), Er
         }
         cursor = next;
     }
-    Ok((current, info))
+    Ok((current, ResolvedEntry::Existing(info)))
 }

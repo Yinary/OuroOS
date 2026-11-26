@@ -14,7 +14,7 @@ pub mod mapping;
 mod metadata;
 pub mod procfs;
 
-pub(crate) use metadata::{query, Metadata, Timestamp};
+pub(crate) use metadata::{query, Metadata, ResolvedEntry, Timestamp};
 
 /// 文件时间的更新方式；Omit 保留对应字段。
 #[derive(Clone, Copy)]
@@ -192,9 +192,9 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
     if path == "/dev/misc/rtc" {
         return Ok(procfs::RTC);
     }
-    if let Some(rest) = path.strip_prefix("/dev/") {
+    if path.starts_with("/dev/") {
         // mknodat 注册的块设备节点（如 /dev/vda2）优先；其余路径（如 /dev/shm）交由后端解析。
-        if lookup_blk_node(rest).is_some() {
+        if lookup_blk_node(path).is_some() {
             return Ok(procfs::DEVBLK);
         }
     }

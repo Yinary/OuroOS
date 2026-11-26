@@ -424,17 +424,40 @@ impl Context {
         if input.starts_with('/') {
             return fs::query(input, follow);
         }
-        let base = if dir as isize == -100 {
+        fs::query(&self.absolute_path(dir, input)?, follow)
+    }
+
+    fn absolute_path(&self, dir: usize, input: &str) -> Result<String, Errno> {
+        let mut path = if dir as isize == -100 {
             string(self.cwd()?)?
         } else {
             string(self.get(dir)?.lock().directory_path()?)?
         };
-        let mut path = base;
         path.try_reserve(input.len() + 1)
             .map_err(|_| Errno::NoMem)?;
-        path.push('/');
+        if path != "/" {
+            path.push('/');
+        }
         path.push_str(input);
-        fs::query(&path, follow)
+        Ok(path)
+    }
+
+    /// 解析供 openat 使用的路径，允许在已解析的父目录中创建末项。
+    pub(crate) fn open_path(
+        &self,
+        dir: usize,
+        input: &str,
+        follow: bool,
+        allow_create: bool,
+    ) -> Result<(String, fs::ResolvedEntry), Errno> {
+        if input.is_empty() {
+            return Err(Errno::NoEntry);
+        }
+        if input.starts_with('/') {
+            fs::metadata::resolve_entry(input, follow, allow_create)
+        } else {
+            fs::metadata::resolve_entry(&self.absolute_path(dir, input)?, follow, allow_create)
+        }
     }
 
     /// 返回当前工作目录路径。已删名的目录返回 ENOENT。
@@ -1041,8 +1064,7 @@ impl OpenFile {
 
     /// 依据打开模式检查读写权限，失败返回 EBADF。
     pub(crate) fn check_access(&self, reading: bool) -> Result<(), Errno> {
-        if (matches!(self.kind, Kind::DevZero | Kind::DevRandom { .. })
-            && self.flags & 0x200000 != 0)
+        if self.flags & 0x200000 != 0
             || (reading && self.flags & 3 == 1)
             || (!reading && self.flags & 3 == 0)
         {
@@ -1064,10 +1086,10 @@ impl OpenFile {
 
     /// 从起点、当前位置或文件末尾调整偏移；管道返回 ESPIPE。
     pub(crate) fn seek(&mut self, delta: isize, whence: usize) -> Result<usize, Errno> {
+        if self.flags & 0x200000 != 0 {
+            return Err(Errno::BadF);
+        }
         let base = match &self.kind {
-            Kind::DevZero | Kind::DevRandom { .. } if self.flags & 0x200000 != 0 => {
-                return Err(Errno::BadF);
-            }
             Kind::DevZero | Kind::DevRandom { .. } if whence <= 4 => return Ok(0),
             Kind::DevZero | Kind::DevRandom { .. } => return Err(Errno::Invalid),
             Kind::Inode { ino, .. } => match whence {

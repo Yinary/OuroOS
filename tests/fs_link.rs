@@ -168,11 +168,55 @@ fn cross_mount() {
     ck!(syscall3(39, mnt, 0, 0) == 0);
 }
 
+fn check_open_symlink(dir: usize) {
+    let relative = b"relative\0";
+    let fd = open_at(dir, relative, 0);
+    ck!(fd >= 0);
+    let fd = fd as usize;
+    let mut buf = [0; 16];
+    ck!(syscall3(63, fd, buf.as_mut_ptr() as usize, buf.len()) == 7);
+    ck!(&buf[..7] == b"testing");
+    ck!(syscall3(57, fd, 0, 0) == 0);
+    ck!(open_at(dir, relative, 0x20000) == -40);
+    let fd = open_at(dir, relative, 0x220000);
+    ck!(fd >= 0);
+    let fd = fd as usize;
+    ck!(syscall3(63, fd, buf.as_mut_ptr() as usize, buf.len()) == -9);
+    ck!(syscall6(
+        78,
+        [
+            fd,
+            b"\0".as_ptr() as usize,
+            buf.as_mut_ptr() as usize,
+            buf.len(),
+            0,
+            0
+        ]
+    ) == 7);
+    ck!(&buf[..7] == b"../data");
+    ck!(syscall3(57, fd, 0, 0) == 0);
+    ck!(open_at(CWD, b"/meta/loop\0", 0) == -40);
+    ck!(open_at(CWD, b"/meta/data/\0", 0) == -20);
+    let fd = open(b"/meta/dirlink/../meta/data\0", 0);
+    ck!(syscall3(57, fd, 0, 0) == 0);
+
+    ck!(symlink(b"delayed\0", dir, b"create-through\0") == 0);
+    ck!(open_at(dir, b"create-through\0", 0) == -2);
+    ck!(open_at(dir, b"create-through\0", 0xc2) == -17);
+    let fd = open_at(dir, b"create-through\0", 0x42);
+    ck!(fd >= 0 && syscall3(57, fd as usize, 0, 0) == 0);
+    ck!(stat(b"/meta/sub/delayed\0").1 == 1);
+    check_target(b"/meta/sub/create-through\0", b"delayed");
+    ck!(unlink(b"/meta/sub/create-through\0") == 0);
+    ck!(unlink(b"/meta/sub/delayed\0") == 0);
+}
+
 fn create_symbolic() {
     let dir = open(b"/meta/sub\0", 0x10000);
     ck!(symlink(b"../data\0", dir, b"relative\0") == 0);
     ck!(symlink(b"unused\0", dir, b"relative\0") == -17);
     check_target(b"/meta/sub/relative\0", b"../data");
+    check_open_symlink(dir);
     let (short, count) = stat(b"/meta/sub/relative\0");
     ck!(count == 1 && short != stat(b"/meta/data\0").0);
     ck!(link(
