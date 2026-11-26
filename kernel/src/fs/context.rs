@@ -16,7 +16,9 @@ use spin::Mutex;
 
 /// pipe 缓冲容量（对齐 Linux 默认 64KiB）；写满/读空时阻塞等待。
 const PIPE_CAPACITY: usize = 65536;
-const FD_LIMIT: usize = 1024;
+const FD_DEFAULT_SOFT: usize = 1024;
+const FD_DEFAULT_HARD: usize = 4096;
+const FD_HARD_MAX: usize = 65536;
 const OPEN_CREATION_FLAGS: usize = 0x40 | 0x80 | 0x100 | 0x200 | 0x80000;
 
 static DIRECTORIES: Mutex<Vec<Weak<DirectoryPath>>> = Mutex::new(Vec::new());
@@ -157,6 +159,7 @@ struct Descriptor {
 pub struct Context {
     cwd: Arc<DirectoryPath>,
     fds: Vec<Option<Descriptor>>,
+    nofile_limit: [usize; 2],
     umask: u16,
     /// 本进程最近一次 execve 的绝对路径（/proc/self/exe 的目标，proc(5)）。
     /// 内核内嵌启动的程序没有盘上路径，保持为空串。
@@ -186,6 +189,7 @@ impl Context {
         Ok(Self {
             cwd: directory_path(string("/")?, None)?,
             fds,
+            nofile_limit: [FD_DEFAULT_SOFT, FD_DEFAULT_HARD],
             umask: 0o022,
             exe_path: String::new(),
         })
@@ -198,9 +202,35 @@ impl Context {
         Ok(Self {
             cwd: self.cwd.clone(),
             fds,
+            nofile_limit: self.nofile_limit,
             umask: self.umask,
             exe_path: self.exe_path.clone(),
         })
+    }
+    /// 查询本进程 RLIMIT_NOFILE 的软硬限额。
+    pub(crate) fn nofile_limit(&self) -> [usize; 2] {
+        self.nofile_limit
+    }
+    /// 修改本进程 RLIMIT_NOFILE；降低不关闭已打开描述符，非特权进程不得抬高硬限额。
+    pub(crate) fn set_nofile_limit(
+        &mut self,
+        limit: [usize; 2],
+        privileged: bool,
+    ) -> Result<(), Errno> {
+        if limit[0] > limit[1] {
+            return Err(Errno::Invalid);
+        }
+        if !privileged && limit[1] > self.nofile_limit[1] {
+            return Err(Errno::Perm);
+        }
+        if limit[1] > FD_HARD_MAX {
+            return Err(Errno::Perm);
+        }
+        self.nofile_limit = limit;
+        Ok(())
+    }
+    fn fd_limit(&self) -> usize {
+        self.nofile_limit[0].min(FD_HARD_MAX)
     }
     /// 记录最近一次 execve 的绝对路径（供 /proc/self/exe 解析）。
     /// 接收调用方已分配好的 String：本方法处于 exec 提交段，无失败路径。
@@ -226,22 +256,38 @@ impl Context {
             .and_then(|f| f.as_ref().map(|d| d.handle.clone()))
             .ok_or(Errno::BadF)
     }
-    /// 安装打开文件，返回最低可用 FD；容量不足返回错误。
+    /// 安装打开文件，返回最低可用 FD；超出 RLIMIT_NOFILE 返回 EMFILE。
     pub(crate) fn install(&mut self, file: Handle, cloexec: bool) -> Result<usize, Errno> {
-        self.install_from(file, 0, cloexec)
+        self.install_at(file, 0, cloexec, false)
     }
 
-    /// 从指定下界安装到最低空闲 FD；超出上限返回 EINVAL，表满返回 EMFILE。
+    /// 从指定下界安装到最低空闲 FD；下界超出 RLIMIT_NOFILE 返回 EINVAL，表满返回 EMFILE。
     pub(crate) fn install_from(
         &mut self,
         file: Handle,
         minimum: usize,
         cloexec: bool,
     ) -> Result<usize, Errno> {
-        if minimum >= FD_LIMIT {
-            return Err(Errno::Invalid);
+        self.install_at(file, minimum, cloexec, true)
+    }
+
+    fn install_at(
+        &mut self,
+        file: Handle,
+        minimum: usize,
+        cloexec: bool,
+        reject_min_over_limit: bool,
+    ) -> Result<usize, Errno> {
+        let limit = self.fd_limit();
+        if minimum >= limit {
+            return Err(if reject_min_over_limit {
+                Errno::Invalid
+            } else {
+                Errno::TooManyFiles
+            });
         }
-        if let Some(i) = (minimum..self.fds.len()).find(|&i| self.fds[i].is_none()) {
+        let search_end = self.fds.len().min(limit);
+        if let Some(i) = (minimum..search_end).find(|&i| self.fds[i].is_none()) {
             self.fds[i] = Some(Descriptor {
                 handle: file,
                 cloexec,
@@ -249,7 +295,7 @@ impl Context {
             return Ok(i);
         }
         let i = minimum.max(self.fds.len());
-        if i >= FD_LIMIT {
+        if i >= limit {
             return Err(Errno::TooManyFiles);
         }
         self.fds
@@ -488,7 +534,7 @@ impl Context {
     /// 将打开文件复制到指定 FD，替换原描述符。
     pub(crate) fn dup_to(&mut self, from: usize, to: usize, cloexec: bool) -> Result<usize, Errno> {
         let file = self.get(from)?;
-        if to >= FD_LIMIT {
+        if to >= self.fd_limit() {
             return Err(Errno::BadF);
         }
         if to >= self.fds.len() {

@@ -388,7 +388,7 @@ pub fn dispatch(
             } else if nr == 261 && a0 != 0 && a0 != pid {
                 Err(Errno::NoProcess)
             } else {
-                memory::limit(space, resource, new_ptr, old_ptr)
+                memory::limit(space, fs, credentials, resource, new_ptr, old_ptr)
             };
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
