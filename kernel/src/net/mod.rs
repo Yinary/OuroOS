@@ -27,15 +27,32 @@ pub const SOL_SOCKET: i32 = 1;
 pub const SO_REUSEADDR: i32 = 2;
 pub const SO_TYPE: i32 = 3;
 pub const SO_ERROR: i32 = 4;
+pub const SO_DONTROUTE: i32 = 5;
 pub const SO_SNDBUF: i32 = 7;
 pub const SO_RCVBUF: i32 = 8;
 pub const SO_KEEPALIVE: i32 = 9;
+pub const SO_LINGER: i32 = 13;
 pub const SO_REUSEPORT: i32 = 15;
+pub const SO_RCVLOWAT: i32 = 18;
+pub const SO_SNDLOWAT: i32 = 19;
 pub const SO_RCVTIMEO_OLD: i32 = 20;
 pub const SO_SNDTIMEO_OLD: i32 = 21;
 pub const SO_RCVTIMEO_NEW: i32 = 66;
 pub const SO_SNDTIMEO_NEW: i32 = 67;
+
+pub const IP_TOS: i32 = 1;
+pub const IP_TTL: i32 = 2;
+pub const IP_MTU_DISCOVER: i32 = 10;
+pub const IP_RECVERR: i32 = 11;
+
 pub const TCP_NODELAY: i32 = 1;
+pub const TCP_MAXSEG: i32 = 2;
+pub const TCP_CORK: i32 = 3;
+pub const TCP_KEEPIDLE: i32 = 4;
+pub const TCP_KEEPINTVL: i32 = 5;
+pub const TCP_KEEPCNT: i32 = 6;
+pub const TCP_INFO: i32 = 11;
+pub const TCP_CONGESTION: i32 = 13;
 
 pub const MSG_PEEK: u32 = 0x2;
 pub const MSG_DONTWAIT: u32 = 0x40;
@@ -50,10 +67,11 @@ pub const SOCKADDR_IN_LEN: usize = 16;
 
 const EPHEMERAL_START: u16 = 49152;
 const EPHEMERAL_END: u16 = 65535;
-const STREAM_BUF_DEFAULT: usize = 65536;
+const STREAM_BUF_DEFAULT: usize = 131_072;
+const TCP_DEFAULT_MSS: i32 = 1460;
 const MAX_UDP_PAYLOAD: usize = 65507;
-const MAX_UDP_QUEUE_BYTES: usize = 262_144;
-const MAX_UDP_QUEUE_PACKETS: usize = 64;
+const MAX_UDP_QUEUE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_UDP_QUEUE_PACKETS: usize = 512;
 
 /// 套接字句柄标识，由全局表分配，关闭时回收。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -160,7 +178,20 @@ struct SocketOptions {
     reuse_addr: bool,
     reuse_port: bool,
     keep_alive: bool,
+    dont_route: bool,
+    linger: [i32; 2],
+    rcv_lowat: i32,
+    snd_lowat: i32,
+    ip_tos: i32,
+    ip_ttl: i32,
+    ip_mtu_discover: i32,
+    ip_recverr: bool,
     tcp_nodelay: bool,
+    tcp_maxseg: i32,
+    tcp_cork: bool,
+    tcp_keepidle: i32,
+    tcp_keepintvl: i32,
+    tcp_keepcnt: i32,
     snd_buf: usize,
     rcv_buf: usize,
     rcv_timeout: Option<Duration>,
@@ -174,7 +205,20 @@ impl Default for SocketOptions {
             reuse_addr: false,
             reuse_port: false,
             keep_alive: false,
+            dont_route: false,
+            linger: [0, 0],
+            rcv_lowat: 1,
+            snd_lowat: 1,
+            ip_tos: 0,
+            ip_ttl: 64,
+            ip_mtu_discover: 1,
+            ip_recverr: false,
             tcp_nodelay: false,
+            tcp_maxseg: TCP_DEFAULT_MSS,
+            tcp_cork: false,
+            tcp_keepidle: 7200,
+            tcp_keepintvl: 75,
+            tcp_keepcnt: 9,
             snd_buf: STREAM_BUF_DEFAULT,
             rcv_buf: STREAM_BUF_DEFAULT,
             rcv_timeout: None,
@@ -236,7 +280,8 @@ impl NetState {
         sock_type: SockType,
         addr: SocketAddrV4,
         ignore: SocketId,
-        allow_reuse: bool,
+        allow_reuse_addr: bool,
+        allow_reuse_port: bool,
     ) -> bool {
         self.sockets.iter().any(|(&id, entry)| {
             if id == ignore || entry.sock_type() != sock_type {
@@ -253,7 +298,15 @@ impl NetState {
             if !ip_overlap {
                 return false;
             }
-            if allow_reuse && entry.opts.reuse_port {
+            if allow_reuse_port && entry.opts.reuse_port {
+                return false;
+            }
+            // UDP 允许带 SO_REUSEADDR 共享端口（支持并行 UDP 流复用同一服务端口）
+            if sock_type == SockType::Dgram
+                && allow_reuse_addr
+                && (entry.opts.reuse_addr
+                    || matches!(&entry.kind, SockKind::Udp(u) if u.peer.is_some()))
+            {
                 return false;
             }
             // 已连接 TCP 套接字允许与同端口监听套接字共存（accept 派生端共享本地端口）
@@ -281,16 +334,19 @@ impl NetState {
                 ip: [0, 0, 0, 0],
                 port,
             };
-            if !self.port_in_use(sock_type, candidate, ignore, false) {
+            if !self.port_in_use(sock_type, candidate, ignore, false, false) {
                 return Ok(port);
             }
         }
         Err(Errno::AddrNotAvail)
     }
 
-    fn find_udp_receiver(&self, dst: SocketAddrV4) -> Option<SocketId> {
-        // 精确 IP 匹配优先于 0.0.0.0 通配绑定
-        let mut wildcard = None;
+    fn find_udp_receiver(&self, dst: SocketAddrV4, src: SocketAddrV4) -> Option<SocketId> {
+        // 标准 UDP 解复用顺序：先匹配已 connect 到精确对端 src 的套接字，
+        // 再回退到未 connect（peer == None）的套接字；已 connect 到其他对端的跳过。
+        let mut connected_wild = None;
+        let mut unconnected_exact = None;
+        let mut unconnected_wild = None;
         for (&id, entry) in &self.sockets {
             let SockKind::Udp(u) = &entry.kind else {
                 continue;
@@ -301,14 +357,29 @@ impl NetState {
             if local.port != dst.port {
                 continue;
             }
-            if local.ip == dst.ip && dst.ip != [0, 0, 0, 0] {
-                return Some(id);
+            let exact_ip = local.ip == dst.ip && dst.ip != [0, 0, 0, 0];
+            let wild_ip = local.ip == [0, 0, 0, 0] || dst.ip == [0, 0, 0, 0];
+            if !exact_ip && !wild_ip {
+                continue;
             }
-            if local.ip == [0, 0, 0, 0] || dst.ip == [0, 0, 0, 0] {
-                wildcard = Some(id);
+            match u.peer {
+                Some(peer) if peer == src => {
+                    if exact_ip {
+                        return Some(id);
+                    }
+                    connected_wild = Some(id);
+                }
+                Some(_) => continue,
+                None => {
+                    if exact_ip {
+                        unconnected_exact = Some(id);
+                    } else {
+                        unconnected_wild = Some(id);
+                    }
+                }
             }
         }
-        wildcard
+        connected_wild.or(unconnected_exact).or(unconnected_wild)
     }
 
     fn find_tcp_listener(&self, dst: SocketAddrV4) -> Option<SocketId> {
@@ -406,17 +477,21 @@ pub fn bind(id: SocketId, addr: SocketAddrV4) -> Result<(), Errno> {
         return Err(Errno::AddrNotAvail);
     }
     let mut net = NET.lock();
-    let (sock_type, reuse_port) = {
+    let (sock_type, reuse_addr, reuse_port) = {
         let entry = net.sockets.get(&id).ok_or(Errno::BadF)?;
         if entry.local_addr().is_some() {
             return Err(Errno::Invalid);
         }
-        (entry.sock_type(), entry.opts.reuse_port)
+        (
+            entry.sock_type(),
+            entry.opts.reuse_addr,
+            entry.opts.reuse_port,
+        )
     };
     let port = if addr.port == 0 {
         net.alloc_ephemeral_port(sock_type, id)?
     } else {
-        if net.port_in_use(sock_type, addr, id, reuse_port) {
+        if net.port_in_use(sock_type, addr, id, reuse_addr, reuse_port) {
             return Err(Errno::AddrInUse);
         }
         addr.port
@@ -699,7 +774,7 @@ pub fn sendto(
                 }
             };
             let src = sender_local.resolve_loopback();
-            if let Some(recv_id) = net.find_udp_receiver(target) {
+            if let Some(recv_id) = net.find_udp_receiver(target, src) {
                 let mut payload = Vec::new();
                 payload
                     .try_reserve_exact(data.len())
@@ -745,7 +820,13 @@ pub fn sendto(
                 return Err(Errno::Pipe);
             };
             let avail = cap.saturating_sub(rx.len());
-            if avail == 0 {
+            // 阻塞写且请求不超过接收缓冲半容时，等待足够空间整块写入，避免小包被拆成短写。
+            let min_need = if !dontwait && data.len() <= cap / 2 {
+                data.len()
+            } else {
+                1
+            };
+            if avail < min_need {
                 return Err(if dontwait {
                     Errno::Again
                 } else {
@@ -906,7 +987,7 @@ fn parse_i32(raw: &[u8]) -> Result<i32, Errno> {
     Ok(i32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]))
 }
 
-/// 设置套接字选项（SOL_SOCKET / IPPROTO_TCP 常用子集）。
+/// 设置套接字选项（SOL_SOCKET / IPPROTO_IP / IPPROTO_TCP 常用子集）。
 pub fn setsockopt(id: SocketId, level: i32, optname: i32, optval: &[u8]) -> Result<(), Errno> {
     let mut net = NET.lock();
     let entry = net.sockets.get_mut(&id).ok_or(Errno::BadF)?;
@@ -914,13 +995,29 @@ pub fn setsockopt(id: SocketId, level: i32, optname: i32, optval: &[u8]) -> Resu
         (SOL_SOCKET, SO_REUSEADDR) => entry.opts.reuse_addr = parse_i32(optval)? != 0,
         (SOL_SOCKET, SO_REUSEPORT) => entry.opts.reuse_port = parse_i32(optval)? != 0,
         (SOL_SOCKET, SO_KEEPALIVE) => entry.opts.keep_alive = parse_i32(optval)? != 0,
-        (SOL_SOCKET, SO_SNDBUF) => {
+        (SOL_SOCKET, SO_DONTROUTE) => entry.opts.dont_route = parse_i32(optval)? != 0,
+        (SOL_SOCKET, SO_LINGER) => {
+            if optval.len() < 8 {
+                return Err(Errno::Invalid);
+            }
+            entry.opts.linger = [parse_i32(&optval[0..4])?, parse_i32(&optval[4..8])?];
+        }
+        (SOL_SOCKET, SO_RCVLOWAT) => {
             let v = parse_i32(optval)?;
-            entry.opts.snd_buf = (v.max(4096) as usize).min(1024 * 1024);
+            entry.opts.rcv_lowat = v.max(1);
+        }
+        (SOL_SOCKET, SO_SNDLOWAT) => {
+            let v = parse_i32(optval)?;
+            entry.opts.snd_lowat = v.max(1);
+        }
+        (SOL_SOCKET, SO_SNDBUF) => {
+            // Linux 对请求缓冲大小翻倍以包含内核元数据开销。
+            let v = parse_i32(optval)?.max(2048) as usize;
+            entry.opts.snd_buf = v.saturating_mul(2).clamp(4096, 1024 * 1024);
         }
         (SOL_SOCKET, SO_RCVBUF) => {
-            let v = parse_i32(optval)?;
-            entry.opts.rcv_buf = (v.max(4096) as usize).min(1024 * 1024);
+            let v = parse_i32(optval)?.max(2048) as usize;
+            entry.opts.rcv_buf = v.saturating_mul(2).clamp(4096, 1024 * 1024);
         }
         (SOL_SOCKET, SO_RCVTIMEO_OLD | SO_RCVTIMEO_NEW) => {
             entry.opts.rcv_timeout = parse_timeval(optval)?;
@@ -928,11 +1025,60 @@ pub fn setsockopt(id: SocketId, level: i32, optname: i32, optval: &[u8]) -> Resu
         (SOL_SOCKET, SO_SNDTIMEO_OLD | SO_SNDTIMEO_NEW) => {
             entry.opts.snd_timeout = parse_timeval(optval)?;
         }
+        (IPPROTO_IP, IP_TOS) => entry.opts.ip_tos = parse_i32(optval)?,
+        (IPPROTO_IP, IP_TTL) => {
+            let v = parse_i32(optval)?;
+            if !(-1..=255).contains(&v) {
+                return Err(Errno::Invalid);
+            }
+            entry.opts.ip_ttl = if v == -1 { 64 } else { v };
+        }
+        (IPPROTO_IP, IP_MTU_DISCOVER) => entry.opts.ip_mtu_discover = parse_i32(optval)?,
+        (IPPROTO_IP, IP_RECVERR) => entry.opts.ip_recverr = parse_i32(optval)? != 0,
         (IPPROTO_TCP, TCP_NODELAY) => {
             if entry.sock_type() != SockType::Stream {
                 return Err(Errno::NoProtoOpt);
             }
             entry.opts.tcp_nodelay = parse_i32(optval)? != 0;
+        }
+        (IPPROTO_TCP, TCP_MAXSEG) => {
+            if entry.sock_type() != SockType::Stream {
+                return Err(Errno::NoProtoOpt);
+            }
+            let v = parse_i32(optval)?;
+            if !(88..=65535).contains(&v) {
+                return Err(Errno::Invalid);
+            }
+            entry.opts.tcp_maxseg = v;
+        }
+        (IPPROTO_TCP, TCP_CORK) => {
+            if entry.sock_type() != SockType::Stream {
+                return Err(Errno::NoProtoOpt);
+            }
+            entry.opts.tcp_cork = parse_i32(optval)? != 0;
+        }
+        (IPPROTO_TCP, TCP_KEEPIDLE) => {
+            if entry.sock_type() != SockType::Stream {
+                return Err(Errno::NoProtoOpt);
+            }
+            entry.opts.tcp_keepidle = parse_i32(optval)?.max(1);
+        }
+        (IPPROTO_TCP, TCP_KEEPINTVL) => {
+            if entry.sock_type() != SockType::Stream {
+                return Err(Errno::NoProtoOpt);
+            }
+            entry.opts.tcp_keepintvl = parse_i32(optval)?.max(1);
+        }
+        (IPPROTO_TCP, TCP_KEEPCNT) => {
+            if entry.sock_type() != SockType::Stream {
+                return Err(Errno::NoProtoOpt);
+            }
+            entry.opts.tcp_keepcnt = parse_i32(optval)?.max(1);
+        }
+        (IPPROTO_TCP, TCP_CONGESTION) => {
+            if entry.sock_type() != SockType::Stream {
+                return Err(Errno::NoProtoOpt);
+            }
         }
         _ => return Err(Errno::NoProtoOpt),
     }
@@ -953,6 +1099,17 @@ pub fn getsockopt(id: SocketId, level: i32, optname: i32, buf: &mut [u8]) -> Res
         (SOL_SOCKET, SO_REUSEADDR) => write_i32(buf, i32::from(entry.opts.reuse_addr)),
         (SOL_SOCKET, SO_REUSEPORT) => write_i32(buf, i32::from(entry.opts.reuse_port)),
         (SOL_SOCKET, SO_KEEPALIVE) => write_i32(buf, i32::from(entry.opts.keep_alive)),
+        (SOL_SOCKET, SO_DONTROUTE) => write_i32(buf, i32::from(entry.opts.dont_route)),
+        (SOL_SOCKET, SO_LINGER) => {
+            let mut bytes = [0u8; 8];
+            bytes[0..4].copy_from_slice(&entry.opts.linger[0].to_ne_bytes());
+            bytes[4..8].copy_from_slice(&entry.opts.linger[1].to_ne_bytes());
+            let n = buf.len().min(8);
+            buf[..n].copy_from_slice(&bytes[..n]);
+            Ok(n)
+        }
+        (SOL_SOCKET, SO_RCVLOWAT) => write_i32(buf, entry.opts.rcv_lowat),
+        (SOL_SOCKET, SO_SNDLOWAT) => write_i32(buf, entry.opts.snd_lowat),
         (SOL_SOCKET, SO_TYPE) => write_i32(
             buf,
             match entry.sock_type() {
@@ -979,11 +1136,73 @@ pub fn getsockopt(id: SocketId, level: i32, optname: i32, buf: &mut [u8]) -> Res
             buf[..n].copy_from_slice(&bytes[..n]);
             Ok(n)
         }
+        (IPPROTO_IP, IP_TOS) => write_i32(buf, entry.opts.ip_tos),
+        (IPPROTO_IP, IP_TTL) => write_i32(buf, entry.opts.ip_ttl),
+        (IPPROTO_IP, IP_MTU_DISCOVER) => write_i32(buf, entry.opts.ip_mtu_discover),
+        (IPPROTO_IP, IP_RECVERR) => write_i32(buf, i32::from(entry.opts.ip_recverr)),
         (IPPROTO_TCP, TCP_NODELAY) => {
             if entry.sock_type() != SockType::Stream {
                 return Err(Errno::NoProtoOpt);
             }
             write_i32(buf, i32::from(entry.opts.tcp_nodelay))
+        }
+        (IPPROTO_TCP, TCP_MAXSEG) => {
+            if entry.sock_type() != SockType::Stream {
+                return Err(Errno::NoProtoOpt);
+            }
+            write_i32(buf, entry.opts.tcp_maxseg)
+        }
+        (IPPROTO_TCP, TCP_CORK) => {
+            if entry.sock_type() != SockType::Stream {
+                return Err(Errno::NoProtoOpt);
+            }
+            write_i32(buf, i32::from(entry.opts.tcp_cork))
+        }
+        (IPPROTO_TCP, TCP_KEEPIDLE) => {
+            if entry.sock_type() != SockType::Stream {
+                return Err(Errno::NoProtoOpt);
+            }
+            write_i32(buf, entry.opts.tcp_keepidle)
+        }
+        (IPPROTO_TCP, TCP_KEEPINTVL) => {
+            if entry.sock_type() != SockType::Stream {
+                return Err(Errno::NoProtoOpt);
+            }
+            write_i32(buf, entry.opts.tcp_keepintvl)
+        }
+        (IPPROTO_TCP, TCP_KEEPCNT) => {
+            if entry.sock_type() != SockType::Stream {
+                return Err(Errno::NoProtoOpt);
+            }
+            write_i32(buf, entry.opts.tcp_keepcnt)
+        }
+        (IPPROTO_TCP, TCP_CONGESTION) => {
+            if entry.sock_type() != SockType::Stream {
+                return Err(Errno::NoProtoOpt);
+            }
+            let name = b"cubic\0";
+            let n = buf.len().min(name.len());
+            buf[..n].copy_from_slice(&name[..n]);
+            Ok(n)
+        }
+        (IPPROTO_TCP, TCP_INFO) => {
+            if entry.sock_type() != SockType::Stream {
+                return Err(Errno::NoProtoOpt);
+            }
+            // Linux struct tcp_info（linux/tcp.h）：填入状态、MSS 与发送窗口等基础字段。
+            let mut info = [0u8; 240];
+            info[0] = match entry.kind {
+                SockKind::Tcp(TcpState::Connected { .. }) => 1, // TCP_ESTABLISHED
+                SockKind::Tcp(TcpState::Listening { .. }) => 10, // TCP_LISTEN
+                _ => 7,                                         // TCP_CLOSE
+            };
+            let mss = entry.opts.tcp_maxseg as u32;
+            info[48..52].copy_from_slice(&mss.to_ne_bytes());
+            info[52..56].copy_from_slice(&mss.to_ne_bytes());
+            info[80..84].copy_from_slice(&10u32.to_ne_bytes());
+            let n = buf.len().min(info.len());
+            buf[..n].copy_from_slice(&info[..n]);
+            Ok(n)
         }
         _ => Err(Errno::NoProtoOpt),
     }
@@ -1044,6 +1263,7 @@ pub fn poll_events(id: SocketId, requested: u16) -> u16 {
             }
             if *peer_closed {
                 revents |= 0x2000 & requested; // POLLRDHUP
+                revents |= 0x104 & requested; // 对端关闭后写操作立即返回 EPIPE，不阻塞
                 if entry.shut_wr {
                     revents |= 0x10; // POLLHUP
                 }

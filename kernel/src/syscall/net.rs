@@ -20,7 +20,7 @@ use crate::{
     },
 };
 
-const MAX_OPTVAL_LEN: usize = 64;
+const MAX_OPTVAL_LEN: usize = 512;
 const MAX_SENDRECV_CHUNK: usize = 65536;
 
 /// 阻塞型套接字调用的结果：立即完成或挂起等待。
