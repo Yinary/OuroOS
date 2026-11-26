@@ -730,7 +730,7 @@ pub fn run(baseline: (usize, usize)) {
     }
     let (total, free) = mm::frame::stats();
     assert_eq!(
-        (total, free + crate::fs::cache::retained_frames()),
+        (total, free + crate::fs::retained_frames()),
         baseline,
         "frame conservation violated after all tasks exited"
     );

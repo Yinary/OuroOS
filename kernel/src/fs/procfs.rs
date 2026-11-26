@@ -80,14 +80,16 @@ pub fn pid_ino_parts(ino: u32) -> Option<(u32, u8)> {
 
 pub(super) fn meminfo() -> Result<String, Errno> {
     let (total, free) = crate::mm::frame::stats();
+    let buffers = super::block_cache::cached_kib();
     let cached = super::cache::cached_kib();
+    let available = free * 4 + buffers + cached;
     let mut out = String::new();
-    // 9 个短字段及最多四个 20 位十进制数；写入不会另行扩容。
+    // 9 个短字段及最多五个 20 位十进制数；写入不会另行扩容。
     out.try_reserve(384).map_err(|_| Errno::NoMem)?;
     write!(
         out,
-        "MemTotal: {} kB\nMemFree: {} kB\nMemAvailable: {} kB\nBuffers: 0 kB\nCached: {} kB\nSReclaimable: 0 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n",
-        total * 4, free * 4, free * 4, cached
+        "MemTotal: {} kB\nMemFree: {} kB\nMemAvailable: {} kB\nBuffers: {} kB\nCached: {} kB\nSReclaimable: 0 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n",
+        total * 4, free * 4, available, buffers, cached
     )
     .map_err(|_| Errno::Io)?;
     Ok(out)

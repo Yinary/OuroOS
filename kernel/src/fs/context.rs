@@ -993,12 +993,16 @@ impl OpenFile {
     }
 
     fn check_type(&self, first: bool) -> Result<(), Errno> {
-        if first {
-            if let Kind::Inode { ino, .. } = self.kind {
-                if fs::stat(ino)?.0 & 0xf000 == 0x4000 {
-                    return Err(Errno::IsDir);
+        if first
+            && matches!(
+                self.kind,
+                Kind::Inode {
+                    directory: Some(_),
+                    ..
                 }
-            }
+            )
+        {
+            return Err(Errno::IsDir);
         }
         Ok(())
     }
