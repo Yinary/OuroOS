@@ -62,8 +62,15 @@ impl Ext4FileSystem {
         self.block_allocator = BlockAllocator::new(&self.superblock);
         self.inode_allocator = InodeAllocator::new(&self.superblock);
         self.bitmap_cache = BitmapCache::create_default();
-        self.inodetable_cache =
+        let inode_cache =
             InodeCache::new(INODE_CACHE_MAX, Self::inode_cache_size(&self.superblock));
+        // OuroOS patch: 配置延迟 inode 校验种子，落盘编码前统一更新校验和。
+        if ext4_superblock_has_metadata_csum(&self.superblock) {
+            inode_cache.set_checksum_seed(Some(
+                crate::crc32c::ext4_crc32c_seed_from_superblock(&self.superblock),
+            ));
+        }
+        self.inodetable_cache = inode_cache;
         self.datablock_cache = DataBlockCache::new(DATABLOCK_CACHE_MAX, BLOCK_SIZE);
         Ok(())
     }
@@ -184,6 +191,12 @@ impl Ext4FileSystem {
         // Using a wrong inode size will make inode table offsets incorrect and may read zeroed inodes
         // (e.g. /dev becomes mode=0, then VFS mount fails with ENOTDIR).
         let inode_cache = InodeCache::new(INODE_CACHE_MAX, Self::inode_cache_size(&superblock));
+        // OuroOS patch: 配置延迟 inode 校验种子，落盘编码前统一更新校验和。
+        if ext4_superblock_has_metadata_csum(&superblock) {
+            inode_cache.set_checksum_seed(Some(
+                crate::crc32c::ext4_crc32c_seed_from_superblock(&superblock),
+            ));
+        }
         debug!("Inode cache initialized");
 
         let datablock_cache = DataBlockCache::new(DATABLOCK_CACHE_MAX, BLOCK_SIZE);

@@ -289,6 +289,50 @@ impl<B: BlockDevice> Jbd2Dev<B> {
         self.inner.read_block(block_id)
     }
 
+    // OuroOS patch: 块内切片直读，先检查 held 与日志待提交队列再透传到底层块缓存。
+    pub fn read_slice(
+        &mut self,
+        dst: &mut [u8],
+        block_id: AbsoluteBN,
+        offset: usize,
+    ) -> Ext4Result<()> {
+        let end = offset
+            .checked_add(dst.len())
+            .ok_or_else(Ext4Error::invalid_input)?;
+        if end > BLOCK_SIZE {
+            return Err(Ext4Error::invalid_input());
+        }
+        if self.inner.holds_block(block_id) {
+            dst.copy_from_slice(&self.inner.buffer()[offset..end]);
+            return Ok(());
+        }
+        if self.journal_use
+            && let Some(system) = self.system.as_ref()
+            && let Some(update) = system
+                .commit_queue
+                .iter()
+                .find(|queued| queued.0 == block_id)
+        {
+            dst.copy_from_slice(&update.1[offset..end]);
+            return Ok(());
+        }
+        self.inner.read_slice(dst, block_id, offset)
+    }
+
+    // OuroOS patch: 非元数据数据块切片直写，直达底层块缓存免除整块搬运。
+    pub fn write_slice(
+        &mut self,
+        src: &[u8],
+        block_id: AbsoluteBN,
+        offset: usize,
+        zero_rest: bool,
+    ) -> Ext4Result<()> {
+        if self.inner.holds_block(block_id) {
+            self.refresh_pending_held_update();
+        }
+        self.inner.write_slice(src, block_id, offset, zero_rest)
+    }
+
     /// Returns the cached block buffer.
     pub fn buffer(&self) -> &[u8] {
         self.inner.buffer()
