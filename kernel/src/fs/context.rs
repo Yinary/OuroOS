@@ -1091,7 +1091,7 @@ impl OpenFile {
     pub(crate) fn write_chunk(&mut self, data: &[u8], first: bool) -> Result<usize, Errno> {
         self.check_type(first)?;
         match &self.kind {
-            Kind::DevZero | Kind::DevRandom { .. } => Ok(data.len()),
+            Kind::DevNull | Kind::DevZero | Kind::DevRandom { .. } => Ok(data.len()),
             Kind::Output => {
                 use polyhal::debug_console::DebugConsole;
                 for &b in data {
@@ -1132,9 +1132,11 @@ impl OpenFile {
     /// 定位 I/O 只接受支持偏移的对象；流式对象返回 ESPIPE。
     pub(crate) fn check_positioned(&self) -> Result<(), Errno> {
         match self.kind {
-            Kind::Inode { .. } | Kind::MemInfo(_) | Kind::DevZero | Kind::DevRandom { .. } => {
-                Ok(())
-            }
+            Kind::Inode { .. }
+            | Kind::MemInfo(_)
+            | Kind::DevNull
+            | Kind::DevZero
+            | Kind::DevRandom { .. } => Ok(()),
             _ => Err(Errno::SeekPipe),
         }
     }
@@ -1148,6 +1150,9 @@ impl OpenFile {
         deliver: impl FnOnce(&[u8]) -> Result<usize, Errno>,
     ) -> Result<usize, Errno> {
         self.check_type(first)?;
+        if matches!(self.kind, Kind::DevNull) {
+            return Ok(0);
+        }
         if matches!(self.kind, Kind::DevRandom { .. }) {
             if !crate::entropy::ready() || !crate::entropy::fill_random(data) {
                 return Err(Errno::Again);
