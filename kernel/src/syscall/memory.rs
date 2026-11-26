@@ -392,14 +392,21 @@ pub(super) fn msync(
     Ok(0)
 }
 
-/// 内存相关 getrlimit/setrlimit/prlimit64；进程凭证模型接入前不处理其他资源。
+/// getrlimit/setrlimit/prlimit64：支持内存限额（DATA/STACK/MEMLOCK/AS）与 RLIMIT_NOFILE(7)。
 pub(super) fn limit(
     space: &mut UserAddressSpace,
+    fs: &mut crate::fs::context::Context,
+    credentials: &crate::task::Credentials,
     resource: usize,
     new_ptr: usize,
     old_ptr: usize,
 ) -> Result<usize, Errno> {
-    let old = space.memory_limit(resource).ok_or(Errno::Invalid)?;
+    const RLIMIT_NOFILE: usize = 7;
+    let old = if resource == RLIMIT_NOFILE {
+        fs.nofile_limit()
+    } else {
+        space.memory_limit(resource).ok_or(Errno::Invalid)?
+    };
     let mut next = None;
     if new_ptr != 0 {
         let mut bytes = [0; 16];
@@ -419,7 +426,11 @@ pub(super) fn limit(
         crate::mm::user_access::copy_to_user(space, old_ptr, &bytes).map_err(|_| Errno::Fault)?;
     }
     if let Some(next) = next {
-        space.set_memory_limit(resource, next).map_err(error)?;
+        if resource == RLIMIT_NOFILE {
+            fs.set_nofile_limit(next, credentials.euid == 0)?;
+        } else {
+            space.set_memory_limit(resource, next).map_err(error)?;
+        }
     }
     Ok(0)
 }

@@ -290,6 +290,8 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
     rec.signal.reset_for_exec();
     if let Some(thread) = reg.threads.iter_mut().find(|t| t.tid == pid) {
         thread.signal.reset_for_exec();
+        thread.clear_child_tid = 0;
+        thread.robust_list = 0;
     }
     rec.did_exec = true;
     crate::task::proc_table_set_cmdline(pid, cmdline);

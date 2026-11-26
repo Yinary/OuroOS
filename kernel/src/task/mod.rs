@@ -2,7 +2,7 @@
 //!（收割即删，见 §3 生命周期）、协作 + 时间片调度与等待/唤醒。
 //! 完整契约见 docs/ostd-contracts.md §3。
 
-mod futex;
+pub(crate) mod futex;
 pub mod sched;
 pub mod signal;
 // Issue 指定的 `task/mod.rs` + `task/task.rs` 布局会自然形成同名子模块。
@@ -129,6 +129,8 @@ pub struct ThreadRecord {
     /// 屏蔽字与备用栈；处置表与进程定向挂起在组记录里。
     pub signal: ThreadSig,
     pub clear_child_tid: usize,
+    /// set_robust_list(2) 登记的用户态健壮互斥锁链表头地址，0 表示未登记。
+    pub robust_list: usize,
 }
 
 /// 注册表本体。pid 0 保留（"无任务"标识）。
@@ -346,6 +348,7 @@ mod registry {
             tgid: pid,
             signal: ThreadSig::new(),
             clear_child_tid: 0,
+            robust_list: 0,
         });
     }
 
@@ -360,6 +363,7 @@ mod registry {
             tgid,
             signal,
             clear_child_tid: 0,
+            robust_list: 0,
         });
     }
 

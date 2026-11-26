@@ -46,8 +46,13 @@ pub(super) enum FutexEnd {
 /// 子进程退出唤醒全部 Children 等待者。
 #[derive(Clone, Copy, Debug)]
 pub enum WaitReason {
-    /// 绝对截止时间（nanosleep / rt_sigtimedwait）。
+    /// 绝对截止时间（nanosleep / clock_nanosleep）。
     Deadline(core::time::Duration),
+    /// rt_sigtimedwait 等待集合内信号（含已屏蔽信号）或截止时间。
+    SigTimedWait {
+        set: super::signal::SignalSet,
+        deadline: core::time::Duration,
+    },
     /// 等待子进程退出（waitpid 无可收割孩子）。
     Children,
     /// 等待任意 pipe 可读/可写。
@@ -69,7 +74,9 @@ impl WaitReason {
     /// 带期限的等待原因返回其到期时刻。
     pub fn deadline(&self) -> Option<core::time::Duration> {
         match self {
-            WaitReason::Deadline(d) | WaitReason::PollUntil(d) => Some(*d),
+            WaitReason::Deadline(d)
+            | WaitReason::PollUntil(d)
+            | WaitReason::SigTimedWait { deadline: d, .. } => Some(*d),
             WaitReason::Futex { deadline, .. } => *deadline,
             _ => None,
         }

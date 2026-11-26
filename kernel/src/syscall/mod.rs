@@ -4,6 +4,7 @@
 
 pub(crate) mod fs;
 mod memory;
+pub(crate) mod net;
 // UAPI 常量集中在本模块定义。
 pub(crate) mod signal;
 
@@ -65,6 +66,8 @@ pub mod sysnr {
     pub const SYSINFO: usize = 179;
     pub const PPOLL: usize = 73;
     pub const FUTEX: usize = 98;
+    pub const SET_ROBUST_LIST: usize = 99;
+    pub const GET_ROBUST_LIST: usize = 100;
     pub const NANOSLEEP: usize = 101;
     pub const CLOCK_GETTIME: usize = 113;
     pub const CLOCK_GETRES: usize = 114;
@@ -135,6 +138,20 @@ pub mod sysnr {
     pub const CLONE: usize = 220;
     pub const EXECVE: usize = 221;
     pub const WAIT4: usize = 260;
+    // 网络（AF_INET 本地回环套接字）
+    pub const SOCKET: usize = 198;
+    pub const BIND: usize = 200;
+    pub const LISTEN: usize = 201;
+    pub const ACCEPT: usize = 202;
+    pub const CONNECT: usize = 203;
+    pub const GETSOCKNAME: usize = 204;
+    pub const GETPEERNAME: usize = 205;
+    pub const SENDTO: usize = 206;
+    pub const RECVFROM: usize = 207;
+    pub const SETSOCKOPT: usize = 208;
+    pub const GETSOCKOPT: usize = 209;
+    pub const SHUTDOWN: usize = 210;
+    pub const ACCEPT4: usize = 242;
     // 内存
     pub const READAHEAD: usize = 213;
     pub const BRK: usize = 214;
@@ -202,6 +219,36 @@ pub enum Errno {
     NoSys,
     /// ETIMEDOUT: 等待超过期限。
     TimedOut,
+    /// ENOTSOCK: 对非套接字描述符执行套接字操作。
+    NotSock,
+    /// EDESTADDRREQ: 未指定目标地址。
+    DestAddrReq,
+    /// EMSGSIZE: 消息过长。
+    MsgSize,
+    /// EPROTOTYPE: 套接字类型与协议不匹配。
+    ProtoType,
+    /// ENOPROTOOPT: 不支持的套接字选项。
+    NoProtoOpt,
+    /// EPROTONOSUPPORT: 不支持的传输协议。
+    ProtoNoSupport,
+    /// EAFNOSUPPORT: 不支持的地址族。
+    AfNoSupport,
+    /// EADDRINUSE: 地址或端口已被占用。
+    AddrInUse,
+    /// EADDRNOTAVAIL: 无法绑定请求的地址。
+    AddrNotAvail,
+    /// ENETUNREACH: 网络不可达。
+    NetUnreach,
+    /// ECONNRESET: 对端重置连接。
+    ConnReset,
+    /// EISCONN: 套接字已连接。
+    IsConn,
+    /// ENOTCONN: 套接字未连接。
+    NotConn,
+    /// ECONNREFUSED: 连接被拒绝。
+    ConnRefused,
+    /// EINPROGRESS: 非阻塞连接正在进行中。
+    InProgress,
 }
 
 impl Errno {
@@ -243,6 +290,21 @@ impl Errno {
             Errno::Fault => 14,
             Errno::NoSys => 38,
             Errno::TimedOut => 110,
+            Self::NotSock => 88,
+            Self::DestAddrReq => 89,
+            Self::MsgSize => 90,
+            Self::ProtoType => 91,
+            Self::NoProtoOpt => 92,
+            Self::ProtoNoSupport => 93,
+            Self::AfNoSupport => 97,
+            Self::AddrInUse => 98,
+            Self::AddrNotAvail => 99,
+            Self::NetUnreach => 101,
+            Self::ConnReset => 104,
+            Self::IsConn => 106,
+            Self::NotConn => 107,
+            Self::ConnRefused => 111,
+            Self::InProgress => 115,
         }
     }
 }
@@ -342,14 +404,31 @@ pub fn dispatch(
             if ret == Err(Errno::Pipe) && (nr == sysnr::WRITE || nr == sysnr::WRITEV) {
                 signal.generate(
                     SIGPIPE,
-                    // code=0 即 SI_USER，发送者为调用进程自身。
+                    // code=0 即 SI_USER，发送者为调用进程自身（线程组号）。
                     SigInfoSlot {
-                        pid: pid as u32,
+                        pid: thread.tgid as u32,
                         ..Default::default()
                     },
                     thread.signal.blocked(),
                 );
             }
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        sysnr::SOCKET
+        | sysnr::BIND
+        | sysnr::LISTEN
+        | sysnr::GETSOCKNAME
+        | sysnr::GETPEERNAME
+        | sysnr::SETSOCKOPT
+        | sysnr::GETSOCKOPT
+        | sysnr::SHUTDOWN => {
+            let ret = self::net::dispatch_sync(
+                nr,
+                [args[0], args[1], args[2], args[3], args[4], args[5]],
+                space,
+                fs,
+            );
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
@@ -388,7 +467,7 @@ pub fn dispatch(
             } else if nr == 261 && a0 != 0 && a0 != pid {
                 Err(Errno::NoProcess)
             } else {
-                memory::limit(space, resource, new_ptr, old_ptr)
+                memory::limit(space, fs, credentials, resource, new_ptr, old_ptr)
             };
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
@@ -396,6 +475,16 @@ pub fn dispatch(
         sysnr::SET_TID_ADDRESS => {
             thread.clear_child_tid = a0;
             cx[TrapFrameArgs::RET] = pid;
+            Flow::Continue
+        }
+        sysnr::SET_ROBUST_LIST => {
+            let ret = if a1 != crate::task::futex::ROBUST_LIST_HEAD_SIZE {
+                Err(Errno::Invalid)
+            } else {
+                thread.robust_list = a0;
+                Ok(0)
+            };
+            cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
         sysnr::EXIT => Flow::Exited(a0 as i32),
@@ -520,6 +609,7 @@ pub fn dispatch(
         | sysnr::GETTID
         | sysnr::CLONE
         | sysnr::FUTEX
+        | sysnr::GET_ROBUST_LIST
         | sysnr::EXECVE
         | sysnr::WAIT4
         | sysnr::WAITID
@@ -538,7 +628,12 @@ pub fn dispatch(
         | sysnr::SETPGID
         | sysnr::GETPGID
         | sysnr::GETSID
-        | sysnr::SETSID => Flow::Process,
+        | sysnr::SETSID
+        | sysnr::ACCEPT
+        | sysnr::ACCEPT4
+        | sysnr::CONNECT
+        | sysnr::SENDTO
+        | sysnr::RECVFROM => Flow::Process,
         sysnr::GETRANDOM => {
             // getrandom(2)：flags 只认 NONBLOCK(1)/RANDOM(2)（后者与默认
             // 等价）；无种子或熵流耗尽一律 EAGAIN（无合法阻塞唤醒来源），
@@ -670,8 +765,8 @@ pub fn dispatch(
             Flow::Continue
         }
         sysnr::GETPID => {
-            // getpid(2)：总成功；pid 由进程注册表分配，见 task 契约
-            cx[TrapFrameArgs::RET] = pid;
+            // getpid(2)：返回调用线程所属的线程组号（tgid），同线程组内各线程一致。
+            cx[TrapFrameArgs::RET] = thread.tgid;
             Flow::Continue
         }
         _ => {

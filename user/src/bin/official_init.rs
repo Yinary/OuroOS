@@ -356,6 +356,7 @@ fn write_file(path: &[u8], content: &[u8]) -> bool {
 fn prepare_layout() {
     mkdir_p(b"/tmp/\0");
     mkdir_p(b"/var/tmp/\0");
+    mkdir_p(b"/dev/shm/\0");
     mkdir_p(b"/etc/\0");
     for (path, content) in [
         (&b"/etc/passwd\0"[..], ETC_PASSWD),
@@ -500,11 +501,49 @@ fn write_group_mark(kind: &[u8], tag: &[u8]) {
     let _ = sys_write(1, &line[..n]);
 }
 
+/// 返回本地评测覆盖的逐例时限（未设置时沿用默认 2 秒）。
+fn ltp_case_timeout_secs() -> u64 {
+    match option_env!("OUROOS_LTP_TIMEOUT") {
+        Some(raw) => parse_u64(raw.as_bytes())
+            .filter(|&v| v > 0)
+            .map_or(LTP_TEST_TIMEOUT_SECS, |v| v as u64),
+        None => LTP_TEST_TIMEOUT_SECS,
+    }
+}
+
+/// 本地拆例过滤：未设置 `OUROOS_LTP_FILTER` 时全部放行；设置时按逗号分隔的前缀匹配用例名。
+fn ltp_name_matches_filter(name: &[u8]) -> bool {
+    let Some(filter) = option_env!("OUROOS_LTP_FILTER") else {
+        return true;
+    };
+    let bytes = filter.as_bytes();
+    if bytes.is_empty() {
+        return true;
+    }
+    let mut start = 0usize;
+    while start <= bytes.len() {
+        let mut end = start;
+        while end < bytes.len() && bytes[end] != b',' {
+            end += 1;
+        }
+        let pat = &bytes[start..end];
+        if !pat.is_empty() && name.len() >= pat.len() && &name[..pat.len()] == pat {
+            return true;
+        }
+        if end == bytes.len() {
+            break;
+        }
+        start = end + 1;
+    }
+    false
+}
+
 /// 驱动一个 libc 目录下的 LTP 组：读出 ltp/testcases/bin 的普通文件并按名字排序，
 /// 逐例在独立会话里执行，超过逐例时限就杀掉该会话的全部进程，按官方组脚本的格式
 /// 打印 RUN 与 FAIL 行，用例超时或 /tmp 空间不足时清空 /tmp；
 /// 到 `group_deadline` 之后不再启动新用例。
 fn run_ltp(libc_dir: &[u8], libc_tag: &[u8], group_deadline: u64) {
+    let case_timeout = ltp_case_timeout_secs();
     let tag = &libc_tag[..cstr_len(libc_tag)];
     if sys_chdir(libc_dir) < 0 {
         note(b"[official-init] ltp-");
@@ -607,6 +646,9 @@ fn run_ltp(libc_dir: &[u8], libc_tag: &[u8], group_deadline: u64) {
         let name_len = index[done].1 as usize;
         done += 1;
         let name = &dirbuf[name_at..name_at + name_len];
+        if !ltp_name_matches_filter(name) {
+            continue;
+        }
         let mut plen = 0usize;
         push_bytes(&mut path, &mut plen, b"ltp/testcases/bin/");
         push_bytes(&mut path, &mut plen, name);
@@ -668,7 +710,7 @@ fn run_ltp(libc_dir: &[u8], libc_tag: &[u8], group_deadline: u64) {
                 if wr != 0 {
                     break;
                 }
-                if now_secs().saturating_sub(started) >= LTP_TEST_TIMEOUT_SECS {
+                if now_secs().saturating_sub(started) >= case_timeout {
                     timeout_killed = kill_session(pid as usize);
                     let _ = sys_kill(-pid, SIGKILL);
                     timed_out = true;
@@ -1125,6 +1167,92 @@ fn grant_exec_bit(path: &[u8]) {
     note(b"\n");
 }
 
+/// 本地拆组运行单个指定组；未识别的组名仅打印提示不中止其余组。
+fn run_selected_group(group: &[u8], started: u64) {
+    match group {
+        b"basic-musl" => run_script(b"/musl\0", 5, b". ./basic_testcode.sh\0"),
+        b"basic-glibc" => run_script(b"/glibc\0", 6, b". ./basic_testcode.sh\0"),
+        b"busybox-musl" => run_script(b"/musl\0", 5, b". ./busybox_testcode.sh\0"),
+        b"busybox-glibc" => run_script(b"/glibc\0", 6, b". ./busybox_testcode.sh\0"),
+        b"lua-musl" => run_script(b"/musl\0", 5, b". ./lua_testcode.sh\0"),
+        b"lua-glibc" => run_script(b"/glibc\0", 6, b". ./lua_testcode.sh\0"),
+        b"libcbench-musl" => run_script(b"/musl\0", 5, b". ./libcbench_testcode.sh\0"),
+        b"libcbench-glibc" => run_script(b"/glibc\0", 6, b". ./libcbench_testcode.sh\0"),
+        // 发布盘 run-static.sh / run-dynamic.sh 缺少 shebang，显式交给当前库自带 busybox sh 解释。
+        b"libctest-musl" => run_script(
+            b"/musl\0",
+            5,
+            b"./busybox echo '#### OS COMP TEST GROUP START libctest-musl ####'; ./busybox sh ./run-static.sh; ./busybox sh ./run-dynamic.sh; ./busybox echo '#### OS COMP TEST GROUP END libctest-musl ####'\0",
+        ),
+        b"libctest-glibc" => run_script(
+            b"/glibc\0",
+            6,
+            b"./busybox echo '#### OS COMP TEST GROUP START libctest-glibc ####'; ./busybox sh ./run-static.sh; ./busybox sh ./run-dynamic.sh; ./busybox echo '#### OS COMP TEST GROUP END libctest-glibc ####'\0",
+        ),
+        b"lmbench-musl" => {
+            mkdir_p(b"/code/lmbench_src/bin/build/\0");
+            let _ = cp(b"/musl/busybox\0", b"/bin/cp\0");
+            let _ = cp(
+                b"/musl/lmbench_all\0",
+                b"/code/lmbench_src/bin/build/lmbench_all\0",
+            );
+            run_script(b"/musl\0", 5, b"./busybox sh ./lmbench_testcode.sh\0");
+        }
+        b"lmbench-glibc" => {
+            mkdir_p(b"/code/lmbench_src/bin/build/\0");
+            let _ = cp(b"/musl/busybox\0", b"/bin/cp\0");
+            let _ = cp(
+                b"/glibc/lmbench_all\0",
+                b"/code/lmbench_src/bin/build/lmbench_all\0",
+            );
+            run_script(b"/glibc\0", 6, b"./busybox sh ./lmbench_testcode.sh\0");
+        }
+        b"iozone-musl" => run_script(b"/musl\0", 5, b"./busybox sh ./iozone_testcode.sh\0"),
+        b"iozone-glibc" => run_script(b"/glibc\0", 6, b"./busybox sh ./iozone_testcode.sh\0"),
+        b"iperf-musl" => run_script(b"/musl\0", 5, b"./busybox sh ./iperf_testcode.sh\0"),
+        b"iperf-glibc" => run_script(b"/glibc\0", 6, b"./busybox sh ./iperf_testcode.sh\0"),
+        b"netperf-musl" => run_script(b"/musl\0", 5, b"./busybox sh ./netperf_testcode.sh\0"),
+        b"netperf-glibc" => run_script(b"/glibc\0", 6, b"./busybox sh ./netperf_testcode.sh\0"),
+        b"cyclictest-musl" => run_script(b"/musl\0", 5, b"./busybox sh ./cyclictest_testcode.sh\0"),
+        b"cyclictest-glibc" => {
+            run_script(b"/glibc\0", 6, b"./busybox sh ./cyclictest_testcode.sh\0")
+        }
+        b"ltp-musl" => run_ltp(b"/musl\0", b"musl\0", started + LTP_MUSL_BUDGET_SECS),
+        b"ltp-glibc" => run_ltp(b"/glibc\0", b"glibc\0", started + LTP_MUSL_BUDGET_SECS),
+        _ => {
+            note(b"[official-init] unknown group in OUROOS_INIT_GROUPS: ");
+            sys_write(1, group);
+            note(b"\n");
+        }
+    }
+}
+
+/// 按逗号拆分 `OUROOS_INIT_GROUPS` 并依次运行。
+fn run_group_list(spec: &[u8], started: u64) {
+    let mut start = 0usize;
+    while start <= spec.len() {
+        let mut end = start;
+        while end < spec.len() && spec[end] != b',' {
+            end += 1;
+        }
+        let mut s = start;
+        let mut e = end;
+        while s < e && (spec[s] == b' ' || spec[s] == b'\t') {
+            s += 1;
+        }
+        while e > s && (spec[e - 1] == b' ' || spec[e - 1] == b'\t') {
+            e -= 1;
+        }
+        if s < e {
+            run_selected_group(&spec[s..e], started);
+        }
+        if end == spec.len() {
+            break;
+        }
+        start = end + 1;
+    }
+}
+
 #[no_mangle]
 extern "C" fn ouro_main() -> ! {
     let started = now_secs();
@@ -1132,6 +1260,14 @@ extern "C" fn ouro_main() -> ! {
     prepare_layout();
     for path in CHMOD_ALLOWLIST {
         grant_exec_bit(path);
+    }
+    if let Some(groups) = option_env!("OUROOS_INIT_GROUPS") {
+        note(b"[official-init] local split mode: ");
+        sys_write(1, groups.as_bytes());
+        note(b"\n");
+        run_group_list(groups.as_bytes(), started);
+        note(b"[official-init] all groups finished\n");
+        sys_exit(0)
     }
     // 测例选择：取消注释即启用。第 3 参是 sh -c 命令串（组脚本用 `. ./`）
     run_script(b"/musl\0", 5, b". ./basic_testcode.sh\0");
@@ -1142,6 +1278,8 @@ extern "C" fn ouro_main() -> ! {
     run_script(b"/glibc\0", 6, b". ./lua_testcode.sh\0");
     run_script(b"/musl\0", 5, b". ./libcbench_testcode.sh\0");
     run_script(b"/glibc\0", 6, b". ./libcbench_testcode.sh\0");
+    // 远端评测 libctest 仅计 musl 组；盘上子脚本缺 shebang，复用显式 busybox sh 入口。
+    run_selected_group(b"libctest-musl", started);
     // 只在 loongarch64 上评测 LTP，另一个架构立即到点、不启动任何用例。
     // 截止时刻从启动器开始时算起，前面各组用掉的时间计入 LTP 的预算。
     let budget: u64 = if cfg!(target_arch = "loongarch64") {
@@ -1158,7 +1296,6 @@ extern "C" fn ouro_main() -> ! {
     // run_script(b"/musl\0", 5, b"./cyclictest_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./iozone_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./iperf_testcode.sh\0");
-    // run_script(b"/musl\0", 5, b"./libctest_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./lmbench_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./ltp_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./netperf_testcode.sh\0");

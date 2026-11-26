@@ -274,14 +274,15 @@ try_lock 失败即报告“持锁跨调度”。
 | 组 | 调用 | 实现 |
 |---|---|---|
 | 文件 | getcwd、dup、dup3、fcntl、mkdirat、mknodat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、readlinkat、readahead、statfs、fstatfs、newfstatat、fstat、fsync、statx、umask、utimensat、renameat、renameat2、truncate、ftruncate、fchmodat、fchmod、fchownat、fchown | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
-| futex | WAIT、WAKE、REQUEUE、CMP_REQUEUE、WAIT_BITSET、WAKE_BITSET；PRIVATE 标志按线程组和虚拟地址匹配，共享操作按映射后备匹配，私有映射在写时复制后保留等待键；普通等待的相对超时与 bitset 等待的绝对超时都换算成单调时刻；被信号打断返回 EINTR | WAKE_OP 与 PI 系列返回 ENOSYS；线程退出清零 `clear_child_tid` 后唤醒该地址上的一个等待者 |
+| futex | WAIT、WAKE、REQUEUE、CMP_REQUEUE、WAIT_BITSET、WAKE_BITSET；PRIVATE 标志按线程组和虚拟地址匹配，共享操作按映射后备匹配，私有映射在写时复制后保留等待键；普通等待的相对超时与 bitset 等待的绝对超时都换算成单调时刻；被信号打断返回 EINTR；支持 set_robust_list/get_robust_list 与线程退出健壮锁清理 | WAKE_OP 与 PI 系列返回 ENOSYS；线程退出先遍历 robust_list 置 FUTEX_OWNER_DIED 并唤醒等待者，再清零 `clear_child_tid` 并唤醒等待者 |
 | vfork | 接受 CLONE_VM 与 CLONE_VFORK 加 SIGCHLD：子进程按复制地址空间创建，父进程挂起到子进程 exec 或退出后返回子进程号；posix_spawn 可用 | 缺陷 13：子进程按复制地址空间创建，不与父进程共享内存，见 §4.4 |
 | 进程 | exit、nanosleep、sched_yield、times、getpid、getppid、gettid、getuid、geteuid、getgid、getegid、getresuid、getresgid、getgroups、setuid、setgid、setreuid、setregid、setresuid、setresgid、setfsuid、setfsgid、setgroups、setpgid、getpgid、setsid、getsid、clone、execve、wait4、waitid、capget | `task::process_call` |
 | 资源统计 | getrusage | `task::process_call` |
 | 调度查询与亲和 | sched_getscheduler、sched_getparam、sched_get_priority_max、sched_get_priority_min、sched_rr_get_interval、sched_getaffinity、sched_setaffinity | `task::process_call` |
 | 访问检查/日志 | faccessat、faccessat2、syslog(klogctl) | `syscall/fs.rs`、`dmesg.rs` |
 | 设备/随机 | ioctl(29)（仅 RTC 设备的 RTC_RD_TIME，其余 ENOTTY）、getrandom(278) | `fs::context::ioctl`、`drivers/rtc.rs`、`entropy::fill_random` |
-| 信号 | kill、tgkill、rt_sigaction、rt_sigprocmask、rt_sigpending、rt_sigsuspend、rt_sigtimedwait、rt_sigqueueinfo、sigaltstack、rt_sigreturn | `syscall/signal.rs`、`task/signal.rs`、`sigframe/`（契约与偏差见 §4.5） |
+| 信号 | kill、tkill、tgkill、rt_sigaction、rt_sigprocmask、rt_sigpending、rt_sigsuspend、rt_sigtimedwait、rt_sigqueueinfo、sigaltstack、rt_sigreturn | `syscall/signal.rs`、`task/signal.rs`、`sigframe/`（契约与偏差见 §4.5） |
+| 网络 | socket、bind、listen、accept、accept4、connect、getsockname、getpeername、sendto、recvfrom、setsockopt、getsockopt、shutdown | `syscall/net.rs`、`net/mod.rs`（AF_INET 本地回环 UDP 与 TCP） |
 | 内存 | brk、mmap、munmap、mprotect、mremap、mincore、madvise、msync、锁页系列 | `syscall/memory.rs` |
 | 其他 | uname、gettimeofday、set_tid_address(96) | `syscall/mod.rs` |
 | 其余 | 未列出的调用号 | ENOSYS |
@@ -299,14 +300,14 @@ try_lock 失败即报告“持锁跨调度”。
 | ioctl | 仅 /dev/misc/rtc 的 RTC_RD_TIME（cmd 按 unsigned int 截断比较）；其余命令与设备一律 ENOTTY | 终端 TCGETS/TCWINSZ、FIONBIO 等未实现（more 依赖的 isatty 降级为非终端） | 未实现 |
 | read/write/readv/writev | 共用 4 KiB 可失败堆缓冲区，单次分配后复用；向量描述符先复制到内核，最多 1024 项，总长度超过 ssize_t 返回 EINVAL；每次最多搬运 0x7ffff000 字节；遇短传输、EOF 或错误停止，已有进展时返回已完成长度 | 用户缓冲区按页交付，读只推进实际交付的偏移；完整调用持有打开文件锁；OOM 返回 ENOMEM，零长度不分配数据缓冲区 | 无偏差 |
 | pread64/pwrite64/preadv/pwritev | 指定独立偏移，不修改共享文件偏移；负偏移 EINVAL，流式对象 ESPIPE；rv64/la64 原始向量定位 ABI 使用完整 pos_l，忽略 pos_h；O_APPEND 下定位写仍追加，与 Linux 已知行为一致 | 不支持 preadv2/pwritev2；Ext4 文件超限 EFBIG 独立于参数过长 E2BIG；部分错误仍按已完成字节数返回 | 未实现：preadv2/pwritev2 |
-| fcntl | 支持 F_DUPFD/F_DUPFD_CLOEXEC、F_GETFD/F_SETFD、F_GETFL/F_SETFL；从下界选最低空闲 FD，上限 1024；cloexec 属于描述符，偏移与状态由 dup/fork 共享；打开时的创建标志不保存在共享状态中 | F_SETFL 仅修改 O_APPEND/O_NONBLOCK，访问模式、创建与同步标志不变；请求 O_ASYNC/O_DIRECT/O_NOATIME 返回 EOPNOTSUPP 且不修改状态；未知命令（含锁命令）EINVAL；尚未实现 RLIMIT_NOFILE、O_PATH 专用规则、追加专用 inode 属性检查及强制 O_LARGEFILE | 未实现：文件锁、异步通知等 |
+| fcntl | 支持 F_DUPFD/F_DUPFD_CLOEXEC、F_GETFD/F_SETFD、F_GETFL/F_SETFL；从下界选最低空闲 FD，受进程 RLIMIT_NOFILE（默认软 1024 / 硬 4096）约束；cloexec 属于描述符，偏移与状态由 dup/fork 共享；打开时的创建标志不保存在共享状态中 | F_SETFL 仅修改 O_APPEND/O_NONBLOCK，访问模式、创建与同步标志不变；请求 O_ASYNC/O_DIRECT/O_NOATIME 返回 EOPNOTSUPP 且不修改状态；未知命令（含锁命令）EINVAL；尚未实现 O_PATH 专用规则、追加专用 inode 属性检查及强制 O_LARGEFILE | 未实现：文件锁、异步通知等 |
 | pipe | 容量 64 KiB；读空或空间不足当前分块时等待，O_NONBLOCK 返回 EAGAIN；总长不超过 4 KiB 的 writev 合并后写入，空间不足不写入前缀；更大请求可在分块间返回短写；无读者返回 EPIPE | SIGPIPE 与 -EPIPE 并行产生同 Linux（§4.5，默认处置下写者死于信号、见不到 EPIPE）；运行期 VecDeque 扩容的不可失败分配仍待处理；复制失败只消费已交付数据 | 缺陷 6；欠账：扩容的不可失败分配 |
 | wait4 | pid>0 指定孩子，-1 等任意孩子，0 等本进程组的孩子，<-1 等进程组 -pid 的孩子；无僵尸则阻塞，无孩子 ECHILD；WNOHANG 支持；status 按 ExitInfo：正常 `(code&255)<<8`、死于信号 `sig` | 语义接近；忽略 rusage；无 core 位 | 缺陷 4；未实现：core 位 |
 | setpgid/getpgid/setsid/getsid | fork 继承进程组与会话，exec 保留；setpgid 只能作用于自身或尚未 exec 的同会话孩子，目标组须在同一会话，会话首领不能改组；setsid 以调用者为首领建立新会话与新进程组，调用者已是进程组首领时 EPERM | 无控制终端；孤儿进程组向停止成员发 SIGHUP/SIGCONT 的规则未实现 | 未实现：控制终端与孤儿进程组规则 |
 | waitid | 支持 P_ALL、P_PID、P_PGID 与 WEXITED、WNOHANG、WNOWAIT；infop 填 si_signo、si_code、si_pid、si_status 与 CPU 时间；未指定 WNOHANG 且无僵尸时挂起；无匹配孩子 ECHILD | WSTOPPED 与 WCONTINUED 接受但不产生事件；第五参数 rusage 不填；infop 为 NULL 时返回子进程 pid | 缺陷 4、5；未实现：停止与继续事件 |
 | getrusage | 支持 RUSAGE_SELF、RUSAGE_CHILDREN、RUSAGE_THREAD；ru_utime 与 ru_stime 取自任务记账，其余字段为 0 | 无 maxrss 与缺页统计；SIGCHLD 置 IGN 时自动收割的孩子，其时间仍计入 RUSAGE_CHILDREN | 缺陷 4 |
 | sched_* 查询与亲和 | sched_setscheduler 与 sched_setparam 保存策略与优先级，并影响就绪表的选择：实时策略优先于普通策略，实时优先级数值大者先运行，SCHED_IDLE 最低；策略接受 SCHED_OTHER、SCHED_FIFO、SCHED_RR、SCHED_BATCH 与 SCHED_IDLE，实时策略的优先级限 1 到 99，其余策略必须为 0；fork、vfork 与 clone 产生的新任务继承创建者的策略、优先级与谦让值；sched_get_priority_max/min 对 SCHED_FIFO 与 SCHED_RR 返回 99/1，其余策略为 0；sched_rr_get_interval 返回一个时间片的长度；亲和掩码只含 0 号 CPU，sched_getaffinity 返回写入的字节数，sched_setaffinity 接受含 0 号 CPU 的掩码 | 普通策略的谦让值不参与选择（无 CFS 权重，仅保存并回读）；SCHED_FIFO 与 SCHED_RR 同样在时间片到期时轮转，FIFO 不续跑；无实时带宽限制；调度不读取亲和掩码 | 缺陷 7；未实现：谦让值不影响调度、实时带宽限制、亲和掩码 |
-| 身份查询 | getuid、geteuid、getgid、getegid 取自进程记录里的凭证；getresuid 与 getresgid 写出真实、有效、保存的号；getgroups 返回补充组；gettid 返回进程号，单线程下二者相同。`/proc/<pid>/stat` 的 pgrp 与 session、`/proc/<pid>/status` 的 Uid 与 Gid 取自同一来源，exec 的 AT_UID 等四项也取自凭证 | 语义兼容 | 无偏差 |
+| 身份查询 | getpid 返回线程组号（tgid），同线程组内各线程一致；gettid 返回线程号；getuid、geteuid、getgid、getegid 取自进程记录里的凭证；getresuid 与 getresgid 写出真实、有效、保存的号；getgroups 返回补充组。`/proc/<pid>/stat` 的 pgrp 与 session、`/proc/<pid>/status` 的 Uid 与 Gid 取自同一来源，exec 的 AT_UID 等四项也取自凭证 | 语义兼容 | 无偏差 |
 | 凭证切换 | setuid、setgid、setreuid、setregid、setresuid、setresgid、setfsuid、setfsgid、setgroups 按 Linux 6.12 的 `kernel/sys.c` 实现；有特权指有效用户号为 0；凭证与补充组经 fork 继承、跨 exec 保留 | 不按凭证做文件访问、kill 等权限检查；带 setuid 位或 setgid 位的可执行文件不会在 exec 时改变凭证，AT_SECURE 恒为 0；没有 capabilities 授权与用户命名空间；capget 回填固定能力集，euid 为 0 的进程 permitted 与 effective 是全集，capset 未实现 | 未实现：权限检查、setuid 位、capabilities 与用户命名空间 |
 | clone | 进程 fork：退出信号必须 SIGCHLD，另接受 CLONE_CHILD_CLEARTID 与 CLONE_CHILD_SETTID；线程：退出信号必须为 0，必须同时带 CLONE_THREAD、CLONE_SIGHAND 与 CLONE_VM，另接受 CLONE_FS、CLONE_FILES、CLONE_SYSVSEM、CLONE_SETTLS 与三个 tid 标志，CLONE_DETACHED 按 Linux 忽略，其余组合返回 EINVAL；非零 stack 设置子 SP，CLONE_SETTLS 设置 TP | 不支持只共享部分资源的组合，例如共享文件表但不共享地址空间空间；无 CLONE_PARENT_SETTID | 未实现：部分共享组合、进程创建时的 CLONE_PARENT_SETTID |
 | execve | argv/envp 各 ≤256 项、单串 ≤4095 字节；字符串总计最多 32 KiB；auxv 提供 AT_PHDR/PHENT/PHNUM、AT_BASE、AT_ENTRY、AT_PAGESZ、AT_RANDOM、AT_EXECFN、AT_UID/EUID/GID/EGID、AT_SECURE、AT_CLKTCK、AT_HWCAP、AT_FLAGS；ELF 支持 ET_EXEC 与 ET_DYN（装载基址固定 1 MiB，见 ELF 行）；PT_INTERP 请求的解释器缺失返回 ENOENT 并保留旧现场；`#!` 脚本按 binfmt_script 转交解释器（嵌套 ≤4 层，超限 ELOOP）；执行位统一校验（任一执行位缺失返回 EACCES，execve(2)；官方盘 basic/run-all.sh 为 0644，由用户态启动器按授权清单在运行副本 fchmodat 0755 并记录，见 §6.3 环境准备）；整镜像读入内核堆，镜像放不进内核堆时 ENOMEM | 无 shebang 的非 ELF 返回 ENOEXEC，动态库由用户态解释器加载，AT_EXECFN 为调用时给出的路径，三点与 Linux 一致 | 取舍，理由待补：镜像整体读入内核堆 |
@@ -316,10 +317,10 @@ try_lock 失败即报告“持锁跨调度”。
 | clock_nanosleep | CLOCK_REALTIME、MONOTONIC、BOOTTIME、TAI 可睡，支持相对期限与 TIMER_ABSTIME，其余 flags 位被忽略；被打断返回 EINTR，相对期限回写剩余时间 | CPU 时间时钟、RAW 与 COARSE 时钟上的睡眠返回 EOPNOTSUPP；Linux 支持 CPU 时间时钟上的睡眠 | 未实现：CPU 时间、RAW 与 COARSE 时钟上的睡眠 |
 | times | tms 四字段来自任务记账；返回启动以来 100Hz tick | 语义兼容 | 无偏差 |
 | uname | sysname=OuroOS、nodename=ouro、release=KERNEL_RELEASE（"6.1.0-OuroOS"，glibc 启动按 Linux 惯例解析该字段做最低内核版本检查，纯项目版本号会被判过旧）、version=OuroOS、machine=架构名、domainname=local | 合成身份信息 | 设计：合成身份，理由见左栏 |
-| gettimeofday | 返回墙钟：启动时与 RTC 的秒边界对齐，之后随单调时钟推进；tv 与 tz 可分别为空，tz 非空时写零 | 不跟随启动后 RTC 的变化；settimeofday 未实现；ext4 时间仍从卷 `s_wtime` 起算 | 未实现：settimeofday；取舍，理由待补：不跟随 RTC 变化 |
+| gettimeofday | 返回墙钟：启动时与 RTC 的秒边界对齐，之后随单调时钟推进；tv 与 tz 可分别为空，tz 非空时写零 | 不跟随启动后 RTC 的变化；settimeofday 未实现 | 未实现：settimeofday；取舍，理由待补：不跟随 RTC 变化 |
 | newfstatat/fstat/statx | 共用 FS 元数据；Ext4 返回 UID/GID、atime/mtime/ctime（含纪元扩展与纳秒）及可用的 btime；FAT 权限 0777、所有者 0，时间未接通，statx 不置对应有效位；卷设备号为内核分配的合成标识 | rv64/la64 使用 asm-generic stat 布局；旧式 stat 的缺失时间填零；statx 不报告未提供的属性、挂载 ID、DIO 对齐等扩展字段 | 未实现：FAT 的时间与权限、statx 扩展字段 |
 | umask | 仅保存 0777 权限位，返回旧值；初始 022；fork 复制且之后独立，exec 保留；openat 新建与 mkdirat 按 mode & ~umask 创建，已有文件不改权限 | 无默认 ACL 或特殊权限位支持；FAT 沿用合成 0777，不能表达每文件的 POSIX 创建权限 | 未实现：默认 ACL 与特殊权限位 |
-| utimensat | 支持 NULL times、指定秒/纳秒、UTIME_NOW/UTIME_OMIT、cwd/dirfd 相对路径、中间链接及 AT_SYMLINK_NOFOLLOW；AT_EMPTY_PATH 和 NULL path 的 FD 形式支持仍打开但已删名的 inode；双方 OMIT 不访问路径或写入，参数先经 user_access 复制 | Ext4 更新 atime/mtime 并更新 ctime，不改变 btime 或文件偏移；128 字节 inode 为秒精度，扩展 inode 支持纳秒及纪元位，指定时间越界时限制到可表示范围；FAT、管道和控制台暂 EOPNOTSUPP。尚无 UID/GID/capability 身份检查、目录搜索权限或 immutable/append-only 属性校验；Now 沿用卷 s_wtime 加启动时长，非完整 RTC 墙钟 | 未实现：身份检查、FAT 与管道上的时间更新；取舍，理由待补：UTIME_NOW 的时间来源 |
+| utimensat | 支持 NULL times、指定秒/纳秒、UTIME_NOW/UTIME_OMIT、cwd/dirfd 相对路径、中间链接及 AT_SYMLINK_NOFOLLOW；AT_EMPTY_PATH 和 NULL path 的 FD 形式支持仍打开但已删名的 inode；双方 OMIT 不访问路径或写入，参数先经 user_access 复制 | Ext4 更新 atime/mtime 并更新 ctime，不改变 btime 或文件偏移；128 字节 inode 为秒精度，扩展 inode 支持纳秒及纪元位，指定时间越界时限制到可表示范围；FAT、管道和控制台暂 EOPNOTSUPP。尚无 UID/GID/capability 身份检查、目录搜索权限或 immutable/append-only 属性校验；Now 使用 RTC 对齐的墙上时钟（无 RTC 时回退卷 s_wtime 加启动时长） | 未实现：身份检查、FAT 与管道上的时间更新 |
 | statfs/fstatfs | 共用 FS 容量快照，路径跟随链接，FD 查询不修改共享偏移；rv64/la64 均编码 120 字节 asm-generic statfs，保留区清零；返回卷类型、分配单位、总量、空闲量、普通用户可用量、inode 计数、卷标识与只读标志 | Ext4 按当前后端计数并扣除超级块记录的元数据开销，可用量扣除保留块；若卷未记录开销则总量沿用原始块数，尚未补算，可能与 Linux df 有差异。FAT 使用实际簇统计，无固定 inode 池，files/ffree 为零。管道/控制台返回 EOPNOTSUPP；flags 仅报告 ST_VALID/ST_RDONLY，FAT 按现有可写挂载模式报告；无权限搜索及配额限制统计 | 缺陷 8；未实现：权限搜索与配额统计 |
 | readlinkat | 从现有路径查询取得末项链接，读取目标文本并按 bufsiz 截断，不补 NUL；支持绝对路径、cwd/目录 FD 相对路径，绝对路径忽略 dirfd；中间链接跟随，末项不跟随；bufsiz 按 Linux int ABI 解释，非正数 EINVAL | 非空路径指向非链接返回 EINVAL；空路径查询 FD，非链接 ENOENT；坏 FD/用户缓冲区分别 EBADF/EFAULT。复用 Ext4 链接读取，目标仍限 UTF-8 且小于 4 KiB，不更新链接 atime；O_PATH 打开语义及链接 FD 的完整生命周期尚未补齐，不据此宣称完整支持 | 取舍，理由待补：目标限 UTF-8 且小于 4 KiB；未实现：O_PATH 语义、链接 atime |
 | 状态查询路径与标志 | 支持绝对路径、cwd/目录 FD 相对路径、AT_EMPTY_PATH（含 NULL）、AT_SYMLINK_NOFOLLOW、AT_NO_AUTOMOUNT；查询时逐级跟随链接，最多 40 次，保留点分量与尾斜杠约束 | 查询与重命名父目录解析共用，不代表 open/exec 已支持跟随链接；cwd/目录 FD 仍按保存的路径字符串定位；沿用项目 UTF-8 路径限制，尚无进程身份驱动的目录搜索权限检查 | 取舍，理由待补：UTF-8 路径限制；未实现：目录搜索权限检查 |
@@ -335,6 +336,7 @@ try_lock 失败即报告“持锁跨调度”。
 | renameat/renameat2 | Ext4 支持同卷普通重命名、目标替换及 RENAME_NOREPLACE；按父目录 inode 更新目录项，末项链接自身被移动，中间链接跟随；跨挂载 EXDEV，目标非空目录 ENOTEMPTY，类型冲突分别 EISDIR/ENOTDIR；被替换但仍由 FD/映射引用的 inode 延迟回收 | EXCHANGE、WHITEOUT 和未知标志 EINVAL；FAT 卷内 EOPNOTSUPP；仍由任一进程 cwd、目录 FD 或挂载点引用的目录及其祖先返回 EBUSY，保护现有路径字符串身份。单核内核态串行化与根卷锁保证操作期间无其他任务观察中间状态；保存目录块及 inode 用于失败回滚，不保证掉电原子性，设备/回滚错误后拒绝继续访问卷；身份权限及 sticky/immutable/append-only 检查未实现；复杂分配失败回收及掉电恢复未验证。目标含外部 xattr 或有块的旧式映射暂不支持替换 | 设计：被引用的目录返回 EBUSY，理由见左栏；未实现：EXCHANGE、WHITEOUT 与权限检查 |
 | unlink/unlinkat | Ext4 普通文件删名后仍可通过原 FD 访问。AT_REMOVEDIR 移除空目录名并清零链接数，工作目录和目录 FD 保留原 inode，最后一个引用释放后回收。已删目录的 getcwd 返回 ENOENT，已有 FD 可查询原 inode，getdents64 返回 EOF。 | 非空 ENOTEMPTY、非目录 ENOTDIR、根与挂载点 EBUSY。已删目录的相对路径解析及路径型 fchmod 暂不支持。FAT 有句柄时 unlink 返回 EBUSY，目录删除返回 ENOTSUP。 | 未实现：FAT 上的删除语义 |
 | getdents64 | fs 层提供目录项与续读位置，EXT4 后端按块解析，syscall 层打包 Linux dirent；单次最多 4KiB；FAT 返回 ENOTSUP | 后端目录块使用可失败堆分配；Linux 目录项打包的 4 KiB 栈缓冲区限制在不内联的 getdents64 函数内，避免普通文件 I/O 承担该栈帧；失败不推进文件偏移 | 无偏差；未实现：FAT |
+| 套接字（AF_INET 回环） | 支持 AF_INET 的 SOCK_STREAM（TCP）与 SOCK_DGRAM（UDP），支持 SOCK_NONBLOCK/SOCK_CLOEXEC、bind（含端口 0 临时端口分配）、listen、accept/accept4、connect（非阻塞 TCP 返回 EINPROGRESS 且立即入监听队列）、getsockname/getpeername、sendto/recvfrom（含 MSG_PEEK/MSG_DONTWAIT/MSG_NOSIGNAL 与 SIGPIPE）、read/write/ppoll/close/fstat（S_IFSOCK）、shutdown，以及 SOL_SOCKET（SO_REUSEADDR/SO_REUSEPORT/SO_KEEPALIVE/SO_TYPE/SO_ERROR/SO_SNDBUF/SO_RCVBUF/SO_RCVTIMEO/SO_SNDTIMEO）与 IPPROTO_TCP（TCP_NODELAY） | 仅支持本地回环（0.0.0.0 与 127.x.x.x）；无外部物理网卡、AF_UNIX/AF_INET6、sendmsg/recvmsg 与完整 TCP 拥塞/重传状态机 | 未实现：外部网卡、AF_UNIX/AF_INET6、sendmsg/recvmsg |
 | 路径 | 必须是合法 UTF-8；总长 4096 字节，单分量 255 | 非 UTF-8 文件名不可访问 | 取舍，理由待补 |
 | 其他 | stdin 读恒 EOF；fd=1/2 直通控制台；/dev/null 读 EOF、写全收（null(4)）；/dev/misc/rtc 提供墙上时钟查询（RV Goldfish RTC@0x101000 纳秒计数，LA LS7A TOY 双读一致法；ioctl RTC_RD_TIME 按 linux/rtc.h 拆 tm 字段，cmd 按 unsigned int 截断比较以兼容部分 libc 的符号扩展）；/proc/self/exe 在 exec/open 时重写为该进程最近一次 execve 的绝对路径（内嵌程序无路径时 ENOENT）；sched_yield 轮转后可能立即再次调度；getpid 总成功，getppid 返回注册表 parent | 孤儿过继 init；/proc 枚举来自 Task 维护的独立快照表（注册/退出/收割同步更新；FS 读路径经专用锁消费，锁序 REGISTRY→PROC_TABLE 单向），pid 目录含 stat/cmdline/status；cmdline 为 execve 提交后的真实 argv，未 exec 的任务以登记名近似；/proc/<pid>/stat 提供 proc(5) 全部 53 字段（CPU 记账与内存尺寸字段为 0，记账未导出为欠账）；RTC 不支持设置时间（RTC_SET_TIME ENOTTY） | 取舍，理由待补：stdin 恒 EOF、fd 1 与 2 直通控制台；未实现：RTC 设置时间、CPU 记账字段 |
 
@@ -384,8 +386,7 @@ FS 通过 `fs::mapping` 注册 MM 映射钩子：注册后，长度改变先由 
 | 缺陷 7 | §4.3 sched_* | SCHED_FIFO 线程时间片到期后与同级线程轮转 | sched(7)：SCHED_FIFO 没有时间片，线程运行到阻塞或被更高优先级抢占 |
 | 缺陷 8 | §4.3 statfs/fstatfs | 管道和控制台上返回 EOPNOTSUPP | statfs(2)：fstatfs 在管道上自 Linux 3.1 之后正常返回 |
 | 缺陷 9 | §4.5 sigpending | sigsetsize 只接受 8 | Linux 6.12 `kernel/signal.c` 的 `sys_rt_sigpending`：大于 8 才返回 EINVAL |
-| 缺陷 10 | §4.5 sigtimedwait | 只能取到等待集中未屏蔽的信号 | sigwaitinfo(2)：正常用法是先屏蔽 set 中的信号再等待 |
-| 缺陷 11 | §4.5 sa_flags | SA_NODEFER 不生效；SA_RESETHAND 与 SA_NOCLDSTOP 只保存不执行 | sigaction(2)：SA_NODEFER 表示处理函数运行期间不屏蔽本信号，SA_RESETHAND 表示进入处理函数后恢复默认处置 |
+| 缺陷 11 | §4.5 sa_flags | SA_NOCLDSTOP 只保存不执行 | sigaction(2)：子进程停止/继续状态机未实现（SA_NODEFER 与 SA_RESETHAND 已修复） |
 | 缺陷 12 | §4.5 sigaltstack | 备用栈不分线程；不检查 MINSIGSTKSZ；rt_sigreturn 不恢复登记 | sigaltstack(2)：备用栈属于线程；启用时 ss_size 小于 MINSIGSTKSZ 报 ENOMEM |
 | 缺陷 13 | §4.2 vfork | 子进程不与父进程共享地址空间 | vfork(2)：子进程与父进程共享全部内存，父进程挂起到子进程 exec 或退出 |
 
@@ -428,10 +429,10 @@ IGN 或 DFL 且默认动作属 Ign/Cont 静默丢弃。同步（硬件）信号�
 
 | 项 | 偏差 | 性质 |
 |---|---|---|
-| sa_flags | SA_NODEFER 恒加本信号位；SA_RESETHAND/SA_NOCLDSTOP 存而不执行；SA_ONSTACK 已生效（其余输入模式见 sigaltstack 行） | 缺陷 11 |
+| sa_flags | SA_NODEFER、SA_RESETHAND、SA_ONSTACK 已生效；SA_NOCLDSTOP 存而不执行（依赖停止/继续状态机） | 缺陷 11 |
 | sigaltstack | 单进程无 per-thread；MINSIGSTKSZ 不查（size=0 即禁用）；SS_ONSTACK/AUTODISARM 输入 EINVAL；rt_sigreturn 不回改登记（Linux restore_altstack 会）；登记区间不可表达返回 EFAULT，SA_ONSTACK 运行时溢出防护未做 | 缺陷 12 |
 | IGN 冲刷 | rt_sigaction 转 IGN/DFL-Ign 时无条件清除该信号的待处理位，被屏蔽的信号也清除 | 与 Linux 一致：Linux 6.12 `do_sigaction` 同样无条件冲刷，POSIX 3.3.1.3 要求被屏蔽的信号也丢弃 |
-| sigtimedwait | 等待集按 `set ∩ 未屏蔽` 判定（Linux 睡眠期临时放宽 blocked，可等"blocked 且在集"信号） | 缺陷 10 |
+| sigtimedwait | 等待集命中时直接消费等待集内信号（含已屏蔽信号），调度器信号唤醒通道同步放宽到等待集 | 与 Linux 一致（原缺陷 10 已修复） |
 | sigqueueinfo | RT 信号无排队（位图合并语义）；保留码 si_value 经 addr 槽落位 | 未实现：实时信号排队，见欠账 |
 | 终止与 core | 无 core dump：Core 类信号死亡恒 CLD_KILLED，wait status 无 0x80 位（Linux CLD_DUMPED + WCOREDUMP） | 未实现 |
 | 同步信号 si_code | 固定 SEGV_MAPERR/ILL_ILLOPC/BUS_ADRALN/TRAP_BRKPT，未细分 ACCERR/ADRERR；la handler 期间 FPU 异常回投 SIGFPE（fcsr_pending）未实现 | 未实现 |
@@ -450,7 +451,7 @@ signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综�
 |---|---|
 | 前提 | 任务时代内核态关中断；单核无合法持锁等待；lock_debug 下 try_lock 失败即报告 bug |
 | 检查 | DebugMutex 的 percpu 持锁深度及切换入口零深度检查始终启用；lock_debug 额外跟踪锁名/获取点（`#[track_caller]`） |
-| 锁序 | SCHED→FRAME；REGISTRY→{FRAME, EXIT_REPORTS, 打开文件 Handle, ROOT/MOUNTS/PAGES}；Handle→{ROOT, MOUNTS, PAGES}；PAGES→{ROOT, MOUNTS}；ROOT/MOUNTS→DISKS；SCHED→REGISTRY（信号唤醒 drain 唯一嵌套点，反向路径已核查不存在） |
+| 锁序 | SCHED→FRAME；REGISTRY→{FRAME, EXIT_REPORTS, 打开文件 Handle, ROOT/MOUNTS/PAGES, NET}；Handle→{ROOT, MOUNTS, PAGES, NET}；PAGES→{ROOT, MOUNTS}；ROOT/MOUNTS→DISKS；SCHED→REGISTRY（信号唤醒 drain 唯一嵌套点，反向路径已核查不存在） |
 | 反向 | 任何路径不得反向持有；fs/drivers 的 `spin::Mutex` 不受 DebugMutex 深度检查保护 |
 | 唤醒 | 事件方不直接取 SCHED；用无锁原子标志，在调度边界消费。futex 的唤醒与重排队在注册表锁外按锁内算好的键执行 |
 | 锁外析构 | 退出路径的 space/fs Drop 在 REGISTRY 锁外完成；exec 目前是例外 |
