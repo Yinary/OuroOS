@@ -1278,6 +1278,8 @@ extern "C" fn ouro_main() -> ! {
     run_script(b"/glibc\0", 6, b". ./lua_testcode.sh\0");
     run_script(b"/musl\0", 5, b". ./libcbench_testcode.sh\0");
     run_script(b"/glibc\0", 6, b". ./libcbench_testcode.sh\0");
+    // 远端评测 libctest 仅计 musl 组；盘上子脚本缺 shebang，复用显式 busybox sh 入口。
+    run_selected_group(b"libctest-musl", started);
     // 只在 loongarch64 上评测 LTP，另一个架构立即到点、不启动任何用例。
     // 截止时刻从启动器开始时算起，前面各组用掉的时间计入 LTP 的预算。
     let budget: u64 = if cfg!(target_arch = "loongarch64") {
@@ -1294,7 +1296,6 @@ extern "C" fn ouro_main() -> ! {
     // run_script(b"/musl\0", 5, b"./cyclictest_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./iozone_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./iperf_testcode.sh\0");
-    // run_script(b"/musl\0", 5, b"./libctest_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./lmbench_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./ltp_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./netperf_testcode.sh\0");
