@@ -9,6 +9,7 @@ use crate::{
         context::{parent, Context},
     },
     mm::{address_space::UserAddressSpace, user_access},
+    task::Credentials,
 };
 use alloc::{string::String, vec::Vec};
 
@@ -33,6 +34,7 @@ pub fn dispatch(
     a: [usize; 6],
     space: &UserAddressSpace,
     ctx: &mut Context,
+    credentials: &Credentials,
 ) -> Result<usize, Errno> {
     match nr {
         sysnr::UMASK => Ok(ctx.set_umask(a[0])),
@@ -40,18 +42,18 @@ pub fn dispatch(
         sysnr::TRUNCATE | sysnr::FTRUNCATE => truncate(nr, ctx, space, a),
         sysnr::RENAMEAT | sysnr::RENAMEAT2 => renameat(nr, ctx, space, a),
         sysnr::GETCWD => {
-            if a[1] < ctx.cwd().len() + 1 {
+            let cwd = ctx.cwd()?;
+            if a[1] < cwd.len() + 1 {
                 return Err(Errno::Range);
             }
-            user_access::copy_to_user(space, a[0], ctx.cwd().as_bytes())
-                .map_err(|_| Errno::Fault)?;
+            user_access::copy_to_user(space, a[0], cwd.as_bytes()).map_err(|_| Errno::Fault)?;
             user_access::copy_to_user(
                 space,
-                a[0].checked_add(ctx.cwd().len()).ok_or(Errno::Fault)?,
+                a[0].checked_add(cwd.len()).ok_or(Errno::Fault)?,
                 &[0],
             )
             .map_err(|_| Errno::Fault)?;
-            Ok(ctx.cwd().len() + 1)
+            Ok(cwd.len() + 1)
         }
         sysnr::DUP => ctx.install(ctx.get(a[0])?, false),
         sysnr::FCNTL => fcntl(ctx, a[0] as u32 as usize, a[1] as u32, a[2] as u32),
@@ -91,10 +93,9 @@ pub fn dispatch(
             Ok(0)
         }
         sysnr::FACCESSAT => faccessat(ctx, space, a),
+        sysnr::FCHOWNAT | sysnr::FCHOWN => chown(nr, ctx, space, a, credentials),
         sysnr::FCHMOD => fchmod(ctx, space, a),
         sysnr::FCHMODAT => fchmodat(ctx, space, a),
-        // chmod(2)：等价于 fchmodat(AT_FDCWD, path, mode)。
-        sysnr::CHMOD => fchmodat(ctx, space, [(-100isize) as usize, a[0], a[1], 0, 0, 0]),
         sysnr::MKNODAT => mknodat(ctx, space, a),
         sysnr::FACCESSAT2 => faccessat2(ctx, space, a),
         sysnr::IOCTL => ioctl(ctx, space, a),
@@ -111,18 +112,23 @@ pub fn dispatch(
             if a[2] & !0x200 != 0 {
                 return Err(Errno::NotSupported);
             }
-            let path = ctx.path(a[0], &user_string(space, a[1])?)?;
+            let input = user_string(space, a[1])?;
+            let path = ctx.path(a[0], &input)?;
             let ino = fs::lookup(&path)?;
             if a[2] & 0x200 != 0 {
-                // AT_REMOVEDIR（rmdir(2)）：仅空目录，被 cwd/目录 FD/挂载点
-                // 引用时 EBUSY；错误码先行，避免误删后再回滚
+                match input.trim_end_matches('/').rsplit('/').next() {
+                    Some(".") => return Err(Errno::Invalid),
+                    Some("..") => return Err(Errno::NotEmpty),
+                    _ => {}
+                }
                 if fs::stat(ino)?.0 & 0xf000 != 0x4000 {
                     return Err(Errno::NotDir);
                 }
-                if crate::fs::context::directory_busy(&path) || fs::contains_mount(&path) {
+                if path == "/" || fs::contains_mount(&path) {
                     return Err(Errno::Busy);
                 }
-                fs::rmdir(&path, ino)?;
+                let (p, name) = parent(&path)?;
+                fs::rmdir(p, ino, name)?;
                 return Ok(0);
             }
             let (p, name) = parent(&path)?;
@@ -147,10 +153,11 @@ pub fn dispatch(
         sysnr::GETDENTS64 => getdents64(ctx, space, a[0], a[1], a[2]),
         sysnr::CHDIR => {
             let path = ctx.path((-100isize) as usize, &user_string(space, a[0])?)?;
-            if fs::stat(fs::lookup(&path)?)?.0 & 0xf000 != 0x4000 {
+            let ino = fs::lookup(&path)?;
+            if fs::stat(ino)?.0 & 0xf000 != 0x4000 {
                 return Err(Errno::NotDir);
             }
-            ctx.set_cwd(path)?;
+            ctx.set_cwd(path, ino)?;
             Ok(0)
         }
         sysnr::OPENAT => {
@@ -179,6 +186,9 @@ pub fn dispatch(
             }
             if path == "/dev/null" {
                 return ctx.open_devnull(a[2], a[2] & 0x80000 != 0);
+            }
+            if path == "/dev/zero" {
+                return ctx.open_devzero(a[2], a[2] & 0x80000 != 0);
             }
             if path == "/dev/misc/rtc" {
                 return ctx.open_rtc(a[2], a[2] & 0x80000 != 0);
@@ -315,6 +325,9 @@ fn getdents64(
     let handle = ctx.get(fd)?;
     let mut f = handle.lock();
     let ino = f.directory()?;
+    if f.detached_directory() {
+        return Ok(0);
+    }
     let mut out = [0u8; 4096];
     let cap = count.min(out.len());
     let mut used = 0;
@@ -424,6 +437,54 @@ fn utimensat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<u
     }
     let info = ctx.query(dir, &path, flags & 0x1000 != 0, flags & 0x100 == 0)?;
     fs::update_times(info.ino as u32, times)?;
+    Ok(0)
+}
+
+/// Linux fchown/fchownat：按 FD 或路径修改 Ext4 对象的归属。
+fn chown(
+    nr: usize,
+    ctx: &Context,
+    space: &UserAddressSpace,
+    a: [usize; 6],
+    credentials: &Credentials,
+) -> Result<usize, Errno> {
+    const AT_FDCWD: isize = -100;
+    const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+    const AT_EMPTY_PATH: u32 = 0x1000;
+    const O_PATH: usize = 0x200000;
+
+    let id = |raw: usize| {
+        let value = raw as u32;
+        (value != u32::MAX).then_some(value)
+    };
+    let fd_inode = |fd, allow_path: bool| {
+        let file = ctx.get(fd)?;
+        let file = file.lock();
+        if !allow_path && file.status_flags() & O_PATH != 0 {
+            return Err(Errno::BadF);
+        }
+        file.inode().map_err(|_| Errno::NotSupported)
+    };
+
+    let (ino, uid, gid) = if nr == sysnr::FCHOWN {
+        (fd_inode(a[0] as u32 as usize, false)?, id(a[1]), id(a[2]))
+    } else {
+        let flags = a[4] as u32;
+        if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+            return Err(Errno::Invalid);
+        }
+        let dir = a[0] as u32 as i32 as isize;
+        let path = user_string(space, a[1])?;
+        let empty = flags & AT_EMPTY_PATH != 0;
+        let ino = if empty && path.is_empty() && dir != AT_FDCWD {
+            fd_inode(dir as usize, true)?
+        } else {
+            ctx.query(dir as usize, &path, empty, flags & AT_SYMLINK_NOFOLLOW == 0)?
+                .ino as u32
+        };
+        (ino, id(a[2]), id(a[3]))
+    };
+    fs::set_owner(ino, uid, gid, credentials)?;
     Ok(0)
 }
 

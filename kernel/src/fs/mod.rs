@@ -33,6 +33,29 @@ pub(crate) fn update_times(ino: u32, times: [TimeUpdate; 2]) -> Result<(), Errno
     }
 }
 
+/// 更新 Ext4 inode 的属主和属组。None 保留对应字段。
+pub(crate) fn set_owner(
+    ino: u32,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    credentials: &crate::task::Credentials,
+) -> Result<(), Errno> {
+    if ino & FAT_INODE != 0 || procfs::pid_ino_parts(ino).is_some() {
+        return Err(Errno::NotSupported);
+    }
+    let info = ext4::metadata(ino)?;
+    if credentials.euid != 0 {
+        let changes_owner = uid.is_some_and(|uid| uid != info.uid);
+        let forbidden_group = gid.is_some_and(|gid| {
+            gid != info.gid && gid != credentials.fsgid && !credentials.groups.contains(&gid)
+        });
+        if credentials.fsuid != info.uid || changes_owner || forbidden_group {
+            return Err(Errno::Perm);
+        }
+    }
+    ext4::set_owner(ino, uid, gid)
+}
+
 /// 已挂载文件系统的容量快照，块数以 block_size 字节为单位。
 pub(crate) struct FileSystemStats {
     pub kind: u64,
@@ -101,6 +124,9 @@ static DEVICE_NODES: crate::sync::DebugMutex<
 /// 核分配的块设备 major（254）。盘号/分区号必须真实存在（总线枚举取
 /// 得），否则 ENODEV。
 pub fn mknod_blk(name: &str, mode: usize, dev: u64) -> Result<(), Errno> {
+    if name == "zero" {
+        return Err(Errno::Exists);
+    }
     let major = (dev >> 8) & 0xfff;
     let minor = dev & 0xff; // minor ≤ 255 场景（本内核盘数/分区数远小于）
                             // 本内核所有 virtio-blk 固定 major 254（自分配块设备号空间）
@@ -138,6 +164,9 @@ pub fn lookup_blk_node(name: &str) -> Option<(usize, usize)> {
 pub fn lookup(path: &str) -> Result<u32, Errno> {
     if path == "/dev/null" {
         return Ok(procfs::DEVNULL);
+    }
+    if path == "/dev/zero" {
+        return Ok(procfs::DEVZERO);
     }
     if path == "/dev" {
         return Ok(procfs::DEVDIR);
@@ -193,7 +222,7 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
 
 /// 返回 inode 类型、长度、链接数和磁盘占用。
 pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
-    if ino == procfs::DEVNULL {
+    if matches!(ino, procfs::DEVNULL | procfs::DEVZERO) {
         return Ok((0o020666, 0, 1, 0));
     }
     if ino == procfs::DEVDIR || ino == procfs::MISC_DIR {
@@ -486,12 +515,13 @@ pub fn chmod_by_ino(ino: u32, path: &str, mode: u16) -> Result<(), Errno> {
 }
 
 /// 删除空目录（rmdir 语义）；FAT 未接入目录删除，返回 ENOTSUP。
-pub fn rmdir(path: &str, ino: u32) -> Result<(), Errno> {
-    if ino & FAT_INODE != 0 {
-        Err(Errno::NotSupported)
-    } else {
-        ext4::rmdir(path, ino)
+pub fn rmdir(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
+    if (parent | ino) & FAT_INODE != 0 || procfs::pid_ino_parts(ino).is_some() {
+        return Err(Errno::NotSupported);
     }
+    ext4::rmdir(parent, ino, name)?;
+    context::detach_directory(ino);
+    Ok(())
 }
 
 /// 读取文件并叠加尚未写回的共享页。

@@ -349,6 +349,16 @@ pub(super) fn update_times(ino: u32, times: [super::TimeUpdate; 2]) -> Result<()
     })
 }
 
+/// 按 inode 更新属主和属组，写入只读卷时返回 EROFS。
+pub(super) fn set_owner(ino: u32, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        rsext4::metadata::chown_inode(&mut v.device, &mut v.fs, InodeNumber::new(ino)?, uid, gid)
+    })
+}
+
 /// 查询根卷容量，空闲计数取自后端当前快照。
 pub(super) fn filesystem_stats() -> Result<super::FileSystemStats, Errno> {
     access(|v| {
@@ -598,26 +608,27 @@ pub fn chmod_by_ino(ino: u32, path: &str, mode: u16) -> Result<(), Errno> {
     })
 }
 
-/// 删除空目录（rmdir 语义）：非目录 ENOTDIR、非空 ENOTEMPTY；目录项与
-/// inode 立即回收，有进程打开该目录时拒绝（EBUSY，见契约偏差）。
-pub(super) fn rmdir(path: &str, ino: u32) -> Result<(), Errno> {
+/// 从父目录移除空目录，最后一个引用释放后回收 inode。
+pub(super) fn rmdir(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
     if !WRITABLE {
         return Err(Errno::ReadOnly);
     }
     access(|v| {
-        if v.opens.iter().any(|&(id, _)| id == ino) {
-            return Err(Ext4Error::new(rsext4::Errno::EBUSY));
+        rsext4::file::unlink_empty_directory(
+            &mut v.fs,
+            &mut v.device,
+            InodeNumber::new(parent)?,
+            InodeNumber::new(ino)?,
+            name,
+        )
+        .inspect_err(|e| {
+            if matches!(e.code, rsext4::Errno::EIO | rsext4::Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })?;
+        if !v.opens.iter().any(|&(id, _)| id == ino) {
+            reclaim_unlinked(v, ino)?;
         }
-        let ino_num = InodeNumber::new(ino)?;
-        let mut inode = v.fs.get_inode_by_num(&mut v.device, ino_num)?;
-        if !inode.is_dir() {
-            return Err(Ext4Error::not_dir());
-        }
-        if !rsext4::file::is_dir_empty(&mut v.fs, &mut v.device, &mut inode)? {
-            return Err(Ext4Error::new(rsext4::Errno::ENOTEMPTY));
-        }
-        // 目标已确认是空目录，delete_dir 只做这一层的目录项与 inode 回收
-        rsext4::file::delete_dir(&mut v.fs, &mut v.device, path)?;
         Ok(())
     })
 }
@@ -677,8 +688,7 @@ pub(super) fn rename(
         })?;
         if let Some(ino) = replaced {
             if !v.opens.iter().any(|&(id, _)| id == ino.raw()) {
-                rsext4::file::reclaim_rename_target(&mut v.fs, &mut v.device, ino)
-                    .inspect_err(|_| v.failed = true)?;
+                reclaim_unlinked(v, ino.raw())?;
             }
         }
         Ok(())
@@ -686,14 +696,8 @@ pub(super) fn rename(
 }
 
 fn reclaim_unlinked(v: &mut Volume, ino: u32) -> Ext4Result<()> {
-    let result = (|| {
-        let ino = InodeNumber::new(ino)?;
-        let mut inode = v.fs.get_inode_by_num(&mut v.device, ino)?;
-        if inode.i_links_count == 0 {
-            rsext4::file::free_inode(&mut v.fs, &mut v.device, ino, &mut inode)?;
-        }
-        Ok(())
-    })();
+    let result =
+        rsext4::file::reclaim_unlinked_inode(&mut v.fs, &mut v.device, InodeNumber::new(ino)?);
     if result.is_err() {
         v.failed = true;
     }

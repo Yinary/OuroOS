@@ -46,5 +46,6 @@ pub use io::{
 };
 pub use link::link;
 pub use rename::{mv, rename};
-// OuroOS patch: inode-based rename and deferred target reclamation.
-pub use rename::{rename_entry, reclaim_rename_target};
+// OuroOS patch: 按 inode 更新目录项并延迟回收。
+pub use rename::reclaim_unlinked_inode as reclaim_rename_target;
+pub use rename::{reclaim_unlinked_inode, rename_entry, unlink_empty_directory};

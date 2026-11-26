@@ -11,6 +11,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 /// pipe 缓冲容量（对齐 Linux 默认 64KiB）；写满/读空时阻塞等待。
@@ -20,13 +21,41 @@ const OPEN_CREATION_FLAGS: usize = 0x40 | 0x80 | 0x100 | 0x200 | 0x80000;
 
 static DIRECTORIES: Mutex<Vec<Weak<DirectoryPath>>> = Mutex::new(Vec::new());
 
-struct DirectoryPath(String);
+struct DirectoryPath {
+    path: String,
+    ino: Option<u32>,
+    detached: AtomicBool,
+}
 
-fn directory_path(path: String) -> Result<Arc<DirectoryPath>, Errno> {
+impl DirectoryPath {
+    fn path(&self) -> Result<&str, Errno> {
+        if self.detached.load(Ordering::Acquire) {
+            return Err(Errno::NoEntry);
+        }
+        Ok(&self.path)
+    }
+}
+
+impl Drop for DirectoryPath {
+    fn drop(&mut self) {
+        if let Some(ino) = self.ino {
+            fs::release(ino);
+        }
+    }
+}
+
+fn directory_path(path: String, ino: Option<u32>) -> Result<Arc<DirectoryPath>, Errno> {
+    if let Some(ino) = ino {
+        fs::retain(ino)?;
+    }
+    let path = fs::try_arc(DirectoryPath {
+        path,
+        ino,
+        detached: AtomicBool::new(false),
+    })?;
     let mut paths = DIRECTORIES.lock();
     paths.retain(|p| p.strong_count() != 0);
     paths.try_reserve(1).map_err(|_| Errno::NoMem)?;
-    let path = fs::try_arc(DirectoryPath(path))?;
     paths.push(Arc::downgrade(&path));
     Ok(path)
 }
@@ -44,7 +73,16 @@ pub(crate) fn directory_busy(path: &str) -> bool {
         .lock()
         .iter()
         .filter_map(Weak::upgrade)
-        .any(|p| contains(path, &p.0))
+        .any(|p| p.path().is_ok_and(|candidate| contains(path, candidate)))
+}
+
+/// 标记已从名字空间移除的目录；现有引用继续持有 inode。
+pub(super) fn detach_directory(ino: u32) {
+    for path in DIRECTORIES.lock().iter().filter_map(Weak::upgrade) {
+        if path.ino == Some(ino) {
+            path.detached.store(true, Ordering::Release);
+        }
+    }
 }
 
 struct Pipe {
@@ -62,11 +100,13 @@ enum Kind {
     Inode {
         ino: u32,
         path: String,
-        _directory: Option<Arc<DirectoryPath>>,
+        directory: Option<Arc<DirectoryPath>>,
     },
     MemInfo(String),
     /// /dev/null：读 EOF、写全收（见 fs::procfs::DEVNULL）
     DevNull,
+    /// /dev/zero：读返回零填充，写入丢弃。
+    DevZero,
     /// /dev/misc/rtc：仅支持 ioctl 的 RTC 查询设备
     Rtc,
     /// /dev 下的块设备节点：按节点登记的 (盘, 分区) 通用块访问
@@ -85,7 +125,11 @@ pub(crate) struct OpenFile {
 impl Drop for OpenFile {
     fn drop(&mut self) {
         match &self.kind {
-            Kind::Inode { ino, .. } => fs::release(*ino),
+            Kind::Inode {
+                ino,
+                directory: None,
+                ..
+            } => fs::release(*ino),
             Kind::Pipe { pipe, reading } => {
                 let mut p = pipe.lock();
                 if *reading {
@@ -140,7 +184,7 @@ impl Context {
             }));
         }
         Ok(Self {
-            cwd: directory_path(string("/")?)?,
+            cwd: directory_path(string("/")?, None)?,
             fds,
             umask: 0o022,
             exe_path: String::new(),
@@ -246,16 +290,9 @@ impl Context {
         let mut out = if input.starts_with('/') {
             string("/")?
         } else if dir as isize == -100 {
-            string(self.cwd())?
+            string(self.cwd()?)?
         } else {
-            let f = self.get(dir)?;
-            let f = f.lock();
-            match &f.kind {
-                Kind::Inode { ino, path, .. } if fs::stat(*ino)?.0 & 0xf000 == 0x4000 => {
-                    string(path)?
-                }
-                _ => return Err(Errno::NotDir),
-            }
+            string(self.get(dir)?.lock().directory_path()?)?
         };
         out.try_reserve(input.len() + 1).map_err(|_| Errno::NoMem)?;
         let mut parent_end = None;
@@ -315,7 +352,10 @@ impl Context {
         }
         if input.is_empty() && empty {
             if dir as isize == -100 {
-                return fs::query(self.cwd(), true);
+                if let Some(ino) = self.cwd.ino {
+                    return fs::metadata::metadata(ino);
+                }
+                return fs::query(self.cwd()?, true);
             }
             return self.get(dir)?.lock().metadata();
         }
@@ -326,15 +366,9 @@ impl Context {
             return fs::query(input, follow);
         }
         let base = if dir as isize == -100 {
-            string(self.cwd())?
+            string(self.cwd()?)?
         } else {
-            let file = self.get(dir)?;
-            let file = file.lock();
-            file.directory()?;
-            match &file.kind {
-                Kind::Inode { path, .. } => string(path)?,
-                _ => return Err(Errno::NotDir),
-            }
+            string(self.get(dir)?.lock().directory_path()?)?
         };
         let mut path = base;
         path.try_reserve(input.len() + 1)
@@ -344,14 +378,15 @@ impl Context {
         fs::query(&path, follow)
     }
 
-    /// 返回当前工作目录。
-    pub(crate) fn cwd(&self) -> &str {
-        &self.cwd.0
+    /// 返回当前工作目录路径。已删名的目录返回 ENOENT。
+    pub(crate) fn cwd(&self) -> Result<&str, Errno> {
+        self.cwd.path()
     }
 
-    /// 保存调用方已验证的绝对工作目录。
-    pub(crate) fn set_cwd(&mut self, path: String) -> Result<(), Errno> {
-        self.cwd = directory_path(path)?;
+    /// 持有调用方已验证的工作目录。根目录无需额外保留。
+    pub(crate) fn set_cwd(&mut self, path: String, ino: u32) -> Result<(), Errno> {
+        let retained = (path != "/" && ino & fs::FAT_INODE == 0).then_some(ino);
+        self.cwd = directory_path(path, retained)?;
         Ok(())
     }
 
@@ -374,15 +409,9 @@ impl Context {
         let mut base = if input.starts_with('/') {
             string("")?
         } else if dir as isize == -100 {
-            string(self.cwd())?
+            string(self.cwd()?)?
         } else {
-            let handle = self.get(dir)?;
-            let file = handle.lock();
-            file.directory()?;
-            match &file.kind {
-                Kind::Inode { path, .. } => string(path)?,
-                _ => return Err(Errno::NotDir),
-            }
+            string(self.get(dir)?.lock().directory_path()?)?
         };
         base.try_reserve(parent.len() + 1)
             .map_err(|_| Errno::NoMem)?;
@@ -495,17 +524,17 @@ impl Context {
         is_directory: bool,
     ) -> Result<usize, Errno> {
         let directory = if is_directory {
-            Some(directory_path(string(&path)?)?)
+            Some(directory_path(string(&path)?, Some(ino))?)
         } else {
+            fs::retain(ino)?;
             None
         };
-        fs::retain(ino)?;
         self.install(
             fs::try_arc(Mutex::new(OpenFile {
                 kind: Kind::Inode {
                     ino,
                     path,
-                    _directory: directory,
+                    directory,
                 },
                 offset: 0,
                 flags: flags & !OPEN_CREATION_FLAGS,
@@ -545,6 +574,14 @@ impl Context {
         self.open_special(Kind::DevNull, flags, cloexec)
     }
 
+    /// 打开 /dev/zero；独占创建已存在的节点返回 EEXIST。
+    pub(crate) fn open_devzero(&mut self, flags: usize, cloexec: bool) -> Result<usize, Errno> {
+        if flags & 0xc0 == 0xc0 {
+            return Err(Errno::Exists);
+        }
+        self.open_special(Kind::DevZero, flags, cloexec)
+    }
+
     /// fchmod(2)（fd, mode）：按已打开对象的 inode 身份改权限位，
     /// rename/unlink 后仍有效；非 inode FD 返回 ENOENT（fd 无权限位语义）。
     pub(crate) fn fchmod_fd(
@@ -559,6 +596,9 @@ impl Context {
             let Kind::Inode { ino, path, .. } = &f.kind else {
                 return Err(Errno::NoEntry);
             };
+            if f.detached_directory() {
+                return Err(Errno::NoEntry);
+            }
             (*ino, path.clone())
         };
         super::chmod_apply(path.as_str(), ino, mode, space)
@@ -714,13 +754,28 @@ impl OpenFile {
         Ok(0)
     }
 
-    /// 获取 inode，设备和管道返回 EINVAL。
-    #[cfg(not(feature = "rsext4-readonly"))]
+    /// 获取 inode；没有后端 inode 的对象返回 EINVAL。
     pub(crate) fn inode(&self) -> Result<u32, Errno> {
         match self.kind {
             Kind::Inode { ino, .. } => Ok(ino),
             _ => Err(Errno::Invalid),
         }
+    }
+
+    fn directory_path(&self) -> Result<&str, Errno> {
+        match &self.kind {
+            Kind::Inode {
+                directory: Some(dir),
+                ..
+            } => dir.path(),
+            _ => Err(Errno::NotDir),
+        }
+    }
+
+    /// 目录仍可查询 inode，但已经不再属于名字空间。
+    pub(crate) fn detached_directory(&self) -> bool {
+        matches!(&self.kind, Kind::Inode { directory: Some(dir), .. }
+            if dir.detached.load(Ordering::Acquire))
     }
 
     /// 获取目录 inode，其他对象返回 ENOTDIR。
@@ -750,6 +805,7 @@ impl OpenFile {
     /// 返回打开对象的属性快照；管道与控制台提供合成属性。
     pub(crate) fn metadata(&self) -> Result<fs::Metadata, Errno> {
         match &self.kind {
+            Kind::DevZero => Ok(super::procfs::zero_metadata()),
             Kind::Inode { ino, .. } => {
                 // procfs 虚拟节点（/proc、/dev/*、pid 派生）无后端 inode
                 // 元数据，直接按统一 stat 结果合成
@@ -799,7 +855,10 @@ impl OpenFile {
 
     /// 依据打开模式检查读写权限，失败返回 EBADF。
     pub(crate) fn check_access(&self, reading: bool) -> Result<(), Errno> {
-        if (reading && self.flags & 3 == 1) || (!reading && self.flags & 3 == 0) {
+        if (matches!(self.kind, Kind::DevZero) && self.flags & 0x200000 != 0)
+            || (reading && self.flags & 3 == 1)
+            || (!reading && self.flags & 3 == 0)
+        {
             return Err(Errno::BadF);
         }
         Ok(())
@@ -819,6 +878,9 @@ impl OpenFile {
     /// 从起点、当前位置或文件末尾调整偏移；管道返回 ESPIPE。
     pub(crate) fn seek(&mut self, delta: isize, whence: usize) -> Result<usize, Errno> {
         let base = match &self.kind {
+            Kind::DevZero if self.flags & 0x200000 != 0 => return Err(Errno::BadF),
+            Kind::DevZero if whence <= 4 => return Ok(0),
+            Kind::DevZero => return Err(Errno::Invalid),
             Kind::Inode { ino, .. } => match whence {
                 0 => 0,
                 1 => self.offset,
@@ -886,6 +948,7 @@ impl OpenFile {
                 Ok(delivered)
             }
             Kind::DevNull | Kind::Rtc => Ok(0),
+            Kind::DevZero => self.read_at(0, data, false, deliver),
             Kind::DevBlk { .. } => Ok(0), // 设备块读走专用路径（见 read_devblk）
             Kind::MemInfo(text) => {
                 let bytes = text.as_bytes().get(self.offset..).unwrap_or(&[]);
@@ -911,6 +974,7 @@ impl OpenFile {
     pub(crate) fn write_chunk(&mut self, data: &[u8], first: bool) -> Result<usize, Errno> {
         self.check_type(first)?;
         match &self.kind {
+            Kind::DevZero => Ok(data.len()),
             Kind::Output => {
                 use polyhal::debug_console::DebugConsole;
                 for &b in data {
@@ -944,10 +1008,10 @@ impl OpenFile {
         }
     }
 
-    /// 定位 I/O 只接受 inode 对象；流式对象返回 ESPIPE。
+    /// 定位 I/O 只接受支持偏移的对象；流式对象返回 ESPIPE。
     pub(crate) fn check_positioned(&self) -> Result<(), Errno> {
         match self.kind {
-            Kind::Inode { .. } | Kind::MemInfo(_) => Ok(()),
+            Kind::Inode { .. } | Kind::MemInfo(_) | Kind::DevZero => Ok(()),
             _ => Err(Errno::SeekPipe),
         }
     }
@@ -961,6 +1025,15 @@ impl OpenFile {
         deliver: impl FnOnce(&[u8]) -> Result<usize, Errno>,
     ) -> Result<usize, Errno> {
         self.check_type(first)?;
+        if matches!(self.kind, Kind::DevZero) {
+            data.fill(0);
+            let delivered = deliver(data)?;
+            return if delivered <= data.len() {
+                Ok(delivered)
+            } else {
+                Err(Errno::Invalid)
+            };
+        }
         if let Kind::DevBlk { disk, start, len } = &self.kind {
             // 块设备节点：分区起点+fd 偏移经驱动通用读
             let off = start + offset;
@@ -1003,7 +1076,7 @@ impl OpenFile {
             crate::drivers::write_bytes(*disk, off, data).map_err(|_| Errno::Io)?;
             return Ok(data.len());
         }
-        if matches!(self.kind, Kind::DevNull | Kind::Rtc) {
+        if matches!(self.kind, Kind::DevNull | Kind::DevZero | Kind::Rtc) {
             return Ok(data.len());
         }
         let ino = match self.kind {
@@ -1101,7 +1174,9 @@ pub(crate) fn poll(
                 Kind::Output => 0x104 & requested,
                 Kind::Inode { .. } | Kind::MemInfo(_) => 0x145 & requested,
                 // /dev/null 与 rtc 永远可读（EOF）可写；块节点同
-                Kind::DevNull | Kind::Rtc | Kind::DevBlk { .. } => 0x145 & requested,
+                Kind::DevNull | Kind::DevZero | Kind::Rtc | Kind::DevBlk { .. } => {
+                    0x145 & requested
+                }
                 Kind::Pipe { pipe, reading } => {
                     let p = pipe.lock();
                     if *reading {
