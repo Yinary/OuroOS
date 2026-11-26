@@ -186,3 +186,4 @@ python3 tests/run_official.py la --groups ltp-musl --ltp-filter chown,statx --lt
   - `rv`：`iozone-musl` **20.00/20**（20/20）、`iozone-glibc` **20.00/20**（20/20，单组实测耗时约 139 秒）；
   - `la`：`iozone-musl` **20.00/20**（20/20）、`iozone-glibc` **20.00/20**（20/20，双库合跑共耗时约 220 秒）。
   - 4 进程并发模式下单进程最大吞吐约 `1.1–2.7 MB/s`（低于官方 Linux 页缓存基线，当前 20 项均稳拿保底 1.0 分，合计 +80 分）；后续引入通用文件页缓存后可进一步拉高该组吞吐得分。
+  - **默认送测启用状态**：`official_init.rs` 已在默认送测流程中启用 `iozone-musl` 与 `iozone-glibc`，顺序排在 `netperf` 之后、`lmbench` 之前，以在单机总预算内优先锁定稳定的 `iozone` 得分。
