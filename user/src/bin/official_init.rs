@@ -312,6 +312,11 @@ static INSTALL_LIST: &[(&[u8], &[u8])] = &[
     (b"/bin/true\0", b"/musl/busybox\0"),
 ];
 
+/// 系统账户数据库：root 与 nobody 两个账户，供按用户名查 UID/GID 的程序使用。
+static ETC_PASSWD: &[u8] = b"root:x:0:0:root:/:/bin/sh\nnobody:x:65534:65534:nobody:/:/bin/false\n";
+/// 系统组数据库：root 与 nobody 两个组，与账户数据库中的 GID 对应。
+static ETC_GROUP: &[u8] = b"root:x:0:\nnobody:x:65534:\n";
+
 /// 逐级创建 `dst` 的父目录；已存在不算失败。
 fn mkdir_p(dst: &[u8]) {
     let dlen = cstr_len(dst);
@@ -329,9 +334,43 @@ fn mkdir_p(dst: &[u8]) {
     }
 }
 
+/// 以 `content` 新建或覆盖 `path`，权限 0644。成功返回 true。
+fn write_file(path: &[u8], content: &[u8]) -> bool {
+    let fd = sys_openat(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644);
+    if fd < 0 {
+        return false;
+    }
+    let mut off = 0usize;
+    while off < content.len() {
+        let w = sys_write(fd as usize, &content[off..]);
+        if w <= 0 {
+            sys_close(fd as usize);
+            return false;
+        }
+        off += w as usize;
+    }
+    sys_close(fd as usize);
+    true
+}
+
 fn prepare_layout() {
     mkdir_p(b"/tmp/\0");
     mkdir_p(b"/var/tmp/\0");
+    mkdir_p(b"/etc/\0");
+    for (path, content) in [
+        (&b"/etc/passwd\0"[..], ETC_PASSWD),
+        (&b"/etc/group\0"[..], ETC_GROUP),
+    ] {
+        if write_file(path, content) {
+            note(b"[official-init] wrote ");
+            sys_write(1, path);
+            note(b"\n");
+        } else {
+            note(b"[official-init] write FAILED for ");
+            sys_write(1, path);
+            note(b"\n");
+        }
+    }
     note(b"[official-init] install list begin\n");
     for (dst, src) in INSTALL_LIST {
         mkdir_p(dst);

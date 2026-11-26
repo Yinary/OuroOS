@@ -625,8 +625,10 @@ exec/spawn 从设备树启动熵派生独立的 16 字节，AT_RANDOM 指向新�
 
 LTP 组由启动器逐例驱动，不执行盘上的 ltp_testcode.sh：按名字排序遍历 ltp/testcases/bin 的普通文件，每例在独立会话里执行并套用 2 秒逐例时限，超时按会话逐进程 SIGKILL，回收等待上限 30 秒；用例超时或 /tmp 空闲低于 256 MiB 时清空 /tmp，单次最多两万次删除尝试。组结束后列出用例自建会话留下的进程，对它们发 SIGKILL 并等待退出，上限同样是 30 秒。截止时刻取启动器开始后 3400 秒，到点后不再启动新用例；该组只在 loongarch64 上启用，riscv64 上截止时刻已过、不启动任何用例并打印空的组标记，判分按两架构相加，所以该组分数只来自 loongarch64。glibc 组当前零分，调用位置保留但未启用。原版脚本无逐例时限，镜像中第一个不退出的用例是 cgroup_fj_proc，先 sigsuspend 等待信号，因此原版脚本在任何内核上都跑不到第 107 例之后；脚本也无超时保护，第 184 例 connect01 会 kill(0, SIGKILL) 终止同进程组的脚本 shell。
 
-loongarch64 实测，2026-11-26，内核含属主修改、rmdir 延迟回收、/dev/zero、capget 与致命信号结束整个线程组：musl 组 2820 例全部执行后来宾自行关机，组内 763 秒，其中 252 例超时被杀共等 430 秒；通过断言 1102 条，分布在 288 例，按判分公式折算的单架构组分约 149.6。逐例时限取 2 秒而不是 5 秒：5 秒时限下正常结束的用例里只有 alarm05 到 alarm07 需要超过 2 秒，估计共少 3 条断言，换来组内时间少约 830 秒。退出状态为 TCONF 的 795 例与 TBROK 的 613 例不计分，原因未逐例归类。glibc 组前 220 例零通过断言，未启用。
+启动器在建立根目录布局时创建 /etc，写入 /etc/passwd 与 /etc/group，各含 root 与 nobody 两个条目，nobody 的 UID 与 GID 都是 65534。镜像不带这两个文件，按用户名查 UID/GID 的程序在其中找不到 nobody，会在准备阶段以 TBROK 结束，例如 access01、setreuid 族、setfsgid 族与 chown03。写入失败时启动器在串口打印 write FAILED 行，不影响后续测例启动。
 
-本地 pre-2025 的 ltp_testcode.sh 会枚举镜像实际安装的二进制。启动器逐例驱动下，mlock01 通过 4 条，brk01 通过 1 条，mmap17 通过 1 条；mprotect01 在第 3 条断言的 mmap 处中断；mincore01 与 msync01 打印了通过断言，但属旧接口用例，不打印 Summary，不计分。TCONF、TBROK 均不计为通过；未修改测例、脚本或 uname 来绕过前置条件。
+loongarch64 实测，2026-11-26，内核含属主修改、rmdir 延迟回收、/dev/zero、capget、致命信号结束整个线程组与本次的账户数据库：musl 组 2820 例全部执行后来宾自行关机，组内约 772 秒，其中 261 例超时被杀；通过断言 1412 条，分布在 329 例，按判分公式折算的单架构组分约 178.1。另一轮相同代码上 clock_nanosleep01 的 11 条断言在 2 秒时限内完成，该轮为 1423 条、330 例、约 179.0，两轮差额只来自这一例。同一内核不写账户数据库时为 1102 条、288 例、约 149.6，组内 763 秒；差额来自 access01 的 147 条与 setreuid、setregid、setresuid、setfsgid、stat、chmod 等按用户名取凭证的用例。逐例时限取 2 秒而不是 5 秒：5 秒时限下正常结束的用例里只有 alarm05 到 alarm07 需要超过 2 秒，估计共少 3 条断言，换来组内时间少约 830 秒。退出状态为 TCONF 的 795 例与 TBROK 的 613 例不计分。glibc 组前 220 例零通过断言，未启用。
+
+本地 pre-2025 的 ltp_testcode.sh 会枚举镜像实际安装的二进制。启动器逐例驱动下，mlock01 通过 4 条，brk01 通过 1 条，mmap17 通过 1 条；mprotect01 在第 3 条断言的 mmap 处中断；mincore01 与 msync01 打印了通过断言，但属旧接口用例，不打印 Summary，不计分。判分器只汇总 Summary 段的 passed 计数，不数 TPASS 行；本镜像全量里打印 TPASS 却没有 Summary 的用例有 109 例、693 行，其中 91 例没有任何 TFAIL，这些断言不进分数。TCONF、TBROK 均不计为通过；未修改测例、脚本或 uname 来绕过前置条件。
 
 信号与 MM 联合路径：MM 先尝试修复用户缺页，再向信号模块交付未映射、权限不足或文件后备错误；内核代表 syscall 复制用户指针失败继续返回 EFAULT。
