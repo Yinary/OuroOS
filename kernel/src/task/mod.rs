@@ -119,6 +119,8 @@ pub struct ProcessRecord {
     pub did_exec: bool,
     /// 凭证；fork 继承，exec 保留。
     pub creds: Credentials,
+    /// ITIMER_REAL 定时器：(下次单调触发时刻, 重复周期)；fork 清零，exec 保留。
+    pub itimer_real: Option<(core::time::Duration, core::time::Duration)>,
 }
 
 /// 线程记录：线程私有的信号状态。地址空间等组级资源在 ProcessRecord。
@@ -301,6 +303,82 @@ pub fn proc_table_lookup(pid: u32) -> Option<(&'static str, u8, u32, Option<allo
         .map(|e| (e.name, e.state, e.ppid, e.cmdline.clone()))
 }
 
+/// 最早到期的 ITIMER_REAL 单调时刻（纳秒；u64::MAX 表示当前无活动定时器）。
+static NEXT_ITIMER_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// 在持 REGISTRY 锁下重算全局最早 ITIMER_REAL 触发时刻。
+fn recompute_next_itimer(reg: &Registry) {
+    let min_ns = reg
+        .records
+        .iter()
+        .filter(|r| r.exit.is_none())
+        .filter_map(|r| {
+            r.itimer_real
+                .map(|(d, _)| d.as_nanos().min(u64::MAX as u128) as u64)
+        })
+        .min()
+        .unwrap_or(u64::MAX);
+    NEXT_ITIMER_NS.store(min_ns, core::sync::atomic::Ordering::Release);
+}
+
+/// 返回全局最早的 ITIMER_REAL 触发时刻（无活动定时器时返回 None）。
+pub(super) fn next_itimer_deadline() -> Option<core::time::Duration> {
+    let ns = NEXT_ITIMER_NS.load(core::sync::atomic::Ordering::Acquire);
+    (ns != u64::MAX).then(|| core::time::Duration::from_nanos(ns))
+}
+
+/// 检查并触发所有已到期的 ITIMER_REAL 定时器，投递 SIGALRM。
+/// 仅在已到最早触发时刻时才加 REGISTRY 锁（调用方持有 SCHED 锁，满足 SCHED→REGISTRY 锁序）。
+pub(super) fn fire_expired_itimers(now: core::time::Duration) -> bool {
+    let now_ns = now.as_nanos().min(u64::MAX as u128) as u64;
+    if now_ns < NEXT_ITIMER_NS.load(core::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    let mut reg = REGISTRY.lock();
+    let mut fired = false;
+    let sig_bit: signal::SignalSet = 1u64 << (signal::SIGALRM - 1);
+    for idx in 0..reg.records.len() {
+        let Some((deadline, interval)) = reg.records[idx].itimer_real else {
+            continue;
+        };
+        if reg.records[idx].exit.is_some() {
+            reg.records[idx].itimer_real = None;
+            continue;
+        }
+        if now < deadline {
+            continue;
+        }
+        let tgid = reg.records[idx].pid;
+        let all_blocked = reg
+            .threads
+            .iter()
+            .filter(|t| t.tgid == tgid)
+            .all(|t| t.signal.blocked() & sig_bit != 0);
+        let blocked = if all_blocked { sig_bit } else { 0 };
+        let next = if !interval.is_zero() {
+            let mut d = deadline.saturating_add(interval);
+            if d <= now {
+                d = now.saturating_add(interval);
+            }
+            Some((d, interval))
+        } else {
+            None
+        };
+        reg.records[idx].itimer_real = next;
+        reg.records[idx].signal.generate(
+            signal::SIGALRM,
+            SigInfoSlot {
+                code: 0x80, // SI_KERNEL
+                ..Default::default()
+            },
+            blocked,
+        );
+        fired = true;
+    }
+    recompute_next_itimer(&reg);
+    fired
+}
+
 /// 注册表访问（调度器登记退出、用户循环取空间共用）。
 mod registry {
     use super::*;
@@ -336,6 +414,7 @@ mod registry {
             sid: pid,
             did_exec: false,
             creds: Credentials::root(),
+            itimer_real: None,
             user_ns: 0,
             system_ns: 0,
             child_user_ns: 0,
@@ -388,6 +467,7 @@ mod registry {
             let mut reg = REGISTRY.lock();
             let rec = reg.group_mut(pid).expect("exiting task is not registered");
             rec.exit = Some(exit);
+            let had_itimer = rec.itimer_real.take().is_some();
             // 快照置僵尸（procfs 可见的存活规则与注册表一致）
             proc_table_mark_zombie(pid);
             // 积攒终态行；容量不足时丢弃（打印非关键路径）
@@ -424,6 +504,9 @@ mod registry {
                 ..Default::default()
             };
             let taken = (rec.space.take(), rec.fs.take());
+            if had_itimer {
+                recompute_next_itimer(&reg);
+            }
             // 自动收割（IGN/SA_NOCLDWAIT）与 SIGCHLD 通知解耦：前者决定
             // 是否留僵尸并入父时间，通知统一经 generate 按处置过滤。
             // 全程持 REGISTRY 锁内联完成。

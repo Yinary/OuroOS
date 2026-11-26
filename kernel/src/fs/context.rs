@@ -109,6 +109,10 @@ enum Kind {
     DevNull,
     /// /dev/zero：读返回零填充，写入丢弃。
     DevZero,
+    /// /dev/urandom 与 /dev/random：读返回内核熵流字节，写入丢弃。
+    DevRandom {
+        urandom: bool,
+    },
     /// /dev/misc/rtc：仅支持 ioctl 的 RTC 查询设备
     Rtc,
     /// /dev 下的块设备节点：按节点登记的 (盘, 分区) 通用块访问
@@ -633,6 +637,19 @@ impl Context {
         self.open_special(Kind::DevZero, flags, cloexec)
     }
 
+    /// 打开 /dev/urandom 或 /dev/random；独占创建已存在的节点返回 EEXIST。
+    pub(crate) fn open_devrandom(
+        &mut self,
+        urandom: bool,
+        flags: usize,
+        cloexec: bool,
+    ) -> Result<usize, Errno> {
+        if flags & 0xc0 == 0xc0 {
+            return Err(Errno::Exists);
+        }
+        self.open_special(Kind::DevRandom { urandom }, flags, cloexec)
+    }
+
     /// fchmod(2)（fd, mode）：按已打开对象的 inode 身份改权限位，
     /// rename/unlink 后仍有效；非 inode FD 返回 ENOENT（fd 无权限位语义）。
     pub(crate) fn fchmod_fd(
@@ -890,7 +907,9 @@ impl OpenFile {
     /// 返回打开对象的属性快照；管道与控制台提供合成属性。
     pub(crate) fn metadata(&self) -> Result<fs::Metadata, Errno> {
         match &self.kind {
+            Kind::DevNull => Ok(super::procfs::null_metadata()),
             Kind::DevZero => Ok(super::procfs::zero_metadata()),
+            Kind::DevRandom { urandom } => Ok(super::procfs::random_metadata(*urandom)),
             Kind::Inode { ino, .. } => {
                 // procfs 虚拟节点（/proc、/dev/*、pid 派生）无后端 inode
                 // 元数据，直接按统一 stat 结果合成
@@ -946,7 +965,8 @@ impl OpenFile {
 
     /// 依据打开模式检查读写权限，失败返回 EBADF。
     pub(crate) fn check_access(&self, reading: bool) -> Result<(), Errno> {
-        if (matches!(self.kind, Kind::DevZero) && self.flags & 0x200000 != 0)
+        if (matches!(self.kind, Kind::DevZero | Kind::DevRandom { .. })
+            && self.flags & 0x200000 != 0)
             || (reading && self.flags & 3 == 1)
             || (!reading && self.flags & 3 == 0)
         {
@@ -969,9 +989,11 @@ impl OpenFile {
     /// 从起点、当前位置或文件末尾调整偏移；管道返回 ESPIPE。
     pub(crate) fn seek(&mut self, delta: isize, whence: usize) -> Result<usize, Errno> {
         let base = match &self.kind {
-            Kind::DevZero if self.flags & 0x200000 != 0 => return Err(Errno::BadF),
-            Kind::DevZero if whence <= 4 => return Ok(0),
-            Kind::DevZero => return Err(Errno::Invalid),
+            Kind::DevZero | Kind::DevRandom { .. } if self.flags & 0x200000 != 0 => {
+                return Err(Errno::BadF);
+            }
+            Kind::DevZero | Kind::DevRandom { .. } if whence <= 4 => return Ok(0),
+            Kind::DevZero | Kind::DevRandom { .. } => return Err(Errno::Invalid),
             Kind::Inode { ino, .. } => match whence {
                 0 => 0,
                 1 => self.offset,
@@ -1039,7 +1061,7 @@ impl OpenFile {
                 Ok(delivered)
             }
             Kind::DevNull | Kind::Rtc => Ok(0),
-            Kind::DevZero => self.read_at(0, data, false, deliver),
+            Kind::DevZero | Kind::DevRandom { .. } => self.read_at(0, data, false, deliver),
             Kind::DevBlk { .. } => Ok(0), // 设备块读走专用路径（见 read_devblk）
             Kind::MemInfo(text) => {
                 let bytes = text.as_bytes().get(self.offset..).unwrap_or(&[]);
@@ -1069,7 +1091,7 @@ impl OpenFile {
     pub(crate) fn write_chunk(&mut self, data: &[u8], first: bool) -> Result<usize, Errno> {
         self.check_type(first)?;
         match &self.kind {
-            Kind::DevZero => Ok(data.len()),
+            Kind::DevZero | Kind::DevRandom { .. } => Ok(data.len()),
             Kind::Output => {
                 use polyhal::debug_console::DebugConsole;
                 for &b in data {
@@ -1110,7 +1132,9 @@ impl OpenFile {
     /// 定位 I/O 只接受支持偏移的对象；流式对象返回 ESPIPE。
     pub(crate) fn check_positioned(&self) -> Result<(), Errno> {
         match self.kind {
-            Kind::Inode { .. } | Kind::MemInfo(_) | Kind::DevZero => Ok(()),
+            Kind::Inode { .. } | Kind::MemInfo(_) | Kind::DevZero | Kind::DevRandom { .. } => {
+                Ok(())
+            }
             _ => Err(Errno::SeekPipe),
         }
     }
@@ -1124,6 +1148,17 @@ impl OpenFile {
         deliver: impl FnOnce(&[u8]) -> Result<usize, Errno>,
     ) -> Result<usize, Errno> {
         self.check_type(first)?;
+        if matches!(self.kind, Kind::DevRandom { .. }) {
+            if !crate::entropy::ready() || !crate::entropy::fill_random(data) {
+                return Err(Errno::Again);
+            }
+            let delivered = deliver(data)?;
+            return if delivered <= data.len() {
+                Ok(delivered)
+            } else {
+                Err(Errno::Invalid)
+            };
+        }
         if matches!(self.kind, Kind::DevZero) {
             data.fill(0);
             let delivered = deliver(data)?;
@@ -1175,7 +1210,10 @@ impl OpenFile {
             crate::drivers::write_bytes(*disk, off, data).map_err(|_| Errno::Io)?;
             return Ok(data.len());
         }
-        if matches!(self.kind, Kind::DevNull | Kind::DevZero | Kind::Rtc) {
+        if matches!(
+            self.kind,
+            Kind::DevNull | Kind::DevZero | Kind::DevRandom { .. } | Kind::Rtc
+        ) {
             return Ok(data.len());
         }
         let ino = match self.kind {
@@ -1247,7 +1285,39 @@ pub fn executable(ctx: &Context, path: &str) -> Result<Vec<u8>, Errno> {
     Ok(data)
 }
 /// 获取 mmap 用的普通文件，权限来自打开方式。
-/// poll(2) 子集：按 fd 表状态返回就绪数；pipe 的等待由任务层处理。
+/// 单文件描述符在 poll/select 下的就绪事件计算。
+fn fd_poll_events(file: &OpenFile, requested: u16) -> u16 {
+    match &file.kind {
+        Kind::Input => 0x41 & requested,
+        Kind::Output => 0x104 & requested,
+        Kind::Inode { .. } | Kind::MemInfo(_) => 0x145 & requested,
+        // /dev/null、/dev/zero、/dev/urandom 与 rtc 永远可读可写；块节点同
+        Kind::DevNull
+        | Kind::DevZero
+        | Kind::DevRandom { .. }
+        | Kind::Rtc
+        | Kind::DevBlk { .. } => 0x145 & requested,
+        Kind::Socket(id) => crate::net::poll_events(*id, requested),
+        Kind::Pipe { pipe, reading } => {
+            let p = pipe.lock();
+            if *reading {
+                (if p.data.is_empty() {
+                    0
+                } else {
+                    0x41 & requested
+                }) | (if p.writers == 0 { 16 } else { 0 })
+            } else {
+                (if p.data.len() < PIPE_CAPACITY {
+                    0x104 & requested
+                } else {
+                    0
+                }) | (if p.readers == 0 { 8 } else { 0 })
+            }
+        }
+    }
+}
+
+/// poll(2) 子集：按 fd 表状态返回就绪数；pipe 与套接字的等待由任务层处理。
 pub(crate) fn poll(
     ctx: &Context,
     space: &UserAddressSpace,
@@ -1267,33 +1337,7 @@ pub(crate) fn poll(
         let events: u16 = if fd < 0 {
             0
         } else if let Ok(file) = ctx.get(fd as usize) {
-            let file = file.lock();
-            match &file.kind {
-                Kind::Input => 0x41 & requested,
-                Kind::Output => 0x104 & requested,
-                Kind::Inode { .. } | Kind::MemInfo(_) => 0x145 & requested,
-                // /dev/null 与 rtc 永远可读（EOF）可写；块节点同
-                Kind::DevNull | Kind::DevZero | Kind::Rtc | Kind::DevBlk { .. } => {
-                    0x145 & requested
-                }
-                Kind::Socket(id) => crate::net::poll_events(*id, requested),
-                Kind::Pipe { pipe, reading } => {
-                    let p = pipe.lock();
-                    if *reading {
-                        (if p.data.is_empty() {
-                            0
-                        } else {
-                            0x41 & requested
-                        }) | (if p.writers == 0 { 16 } else { 0 })
-                    } else {
-                        (if p.data.len() < PIPE_CAPACITY {
-                            0x104 & requested
-                        } else {
-                            0
-                        }) | (if p.readers == 0 { 8 } else { 0 })
-                    }
-                }
-            }
+            fd_poll_events(&file.lock(), requested)
         } else {
             32
         };
@@ -1304,6 +1348,109 @@ pub(crate) fn poll(
         }
     }
     Ok(ready)
+}
+
+/// pselect6(2) 的位图快照：仅在调用真正结束时才写回用户空间，
+/// 避免阻塞重试时覆盖用户原始输入位图。
+pub(crate) struct SelectSets {
+    bytes: usize,
+    read: [u8; 128],
+    write: [u8; 128],
+    except: [u8; 128],
+    pub(crate) ready: usize,
+}
+
+/// 检查 pselect6(2) 位图集合的就绪情况；遇无效 FD 立即返回 EBADF。
+pub(crate) fn select_check(
+    ctx: &Context,
+    space: &UserAddressSpace,
+    nfds: usize,
+    rfds_ptr: usize,
+    wfds_ptr: usize,
+    efds_ptr: usize,
+) -> Result<SelectSets, Errno> {
+    let nfds = nfds as u32 as i32;
+    if !(0..=1024).contains(&nfds) {
+        return Err(Errno::Invalid);
+    }
+    let nfds = nfds as usize;
+    let bytes = nfds.div_ceil(8);
+    let mut in_r = [0u8; 128];
+    let mut in_w = [0u8; 128];
+    let mut in_e = [0u8; 128];
+    if bytes > 0 {
+        if rfds_ptr != 0 {
+            user_access::copy_from_user(space, rfds_ptr, &mut in_r[..bytes])
+                .map_err(|_| Errno::Fault)?;
+        }
+        if wfds_ptr != 0 {
+            user_access::copy_from_user(space, wfds_ptr, &mut in_w[..bytes])
+                .map_err(|_| Errno::Fault)?;
+        }
+        if efds_ptr != 0 {
+            user_access::copy_from_user(space, efds_ptr, &mut in_e[..bytes])
+                .map_err(|_| Errno::Fault)?;
+        }
+    }
+    let mut out = SelectSets {
+        bytes,
+        read: [0u8; 128],
+        write: [0u8; 128],
+        except: [0u8; 128],
+        ready: 0,
+    };
+    const ALL_SELECT_MASK: u16 = 0x2147;
+    for fd in 0..nfds {
+        let idx = fd / 8;
+        let bit = 1u8 << (fd % 8);
+        let want_r = rfds_ptr != 0 && (in_r[idx] & bit != 0);
+        let want_w = wfds_ptr != 0 && (in_w[idx] & bit != 0);
+        let want_e = efds_ptr != 0 && (in_e[idx] & bit != 0);
+        if !want_r && !want_w && !want_e {
+            continue;
+        }
+        let handle = ctx.get(fd)?;
+        let ev = fd_poll_events(&handle.lock(), ALL_SELECT_MASK);
+        if want_r && (ev & (0x1 | 0x40 | 0x10 | 0x8 | 0x2000) != 0) {
+            out.read[idx] |= bit;
+            out.ready += 1;
+        }
+        if want_w && (ev & (0x4 | 0x100 | 0x8 | 0x10) != 0) {
+            out.write[idx] |= bit;
+            out.ready += 1;
+        }
+        if want_e && (ev & 0x2 != 0) {
+            out.except[idx] |= bit;
+            out.ready += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// 将 pselect6(2) 结果位图写回用户缓冲区。
+pub(crate) fn select_write_back(
+    space: &UserAddressSpace,
+    rfds_ptr: usize,
+    wfds_ptr: usize,
+    efds_ptr: usize,
+    sets: &SelectSets,
+) -> Result<(), Errno> {
+    if sets.bytes == 0 {
+        return Ok(());
+    }
+    if rfds_ptr != 0 {
+        user_access::copy_to_user(space, rfds_ptr, &sets.read[..sets.bytes])
+            .map_err(|_| Errno::Fault)?;
+    }
+    if wfds_ptr != 0 {
+        user_access::copy_to_user(space, wfds_ptr, &sets.write[..sets.bytes])
+            .map_err(|_| Errno::Fault)?;
+    }
+    if efds_ptr != 0 {
+        user_access::copy_to_user(space, efds_ptr, &sets.except[..sets.bytes])
+            .map_err(|_| Errno::Fault)?;
+    }
+    Ok(())
 }
 
 pub fn mapping(ctx: &Context, fd: usize, write: bool) -> Result<(u32, bool), Errno> {

@@ -487,6 +487,23 @@ fn run_script(libc_dir: &[u8], dir_len: usize, cmd: &[u8]) {
         n += 1;
         let _ = sys_write(2, &line[..n]);
     }
+    // 清理测试组脚本遗留的后台守护进程（如脱离会话的常驻服务），
+    // 避免占用端口影响后续组或在全部组结束后阻塞关机。
+    if sys_kill(-1, SIGKILL) == 0 {
+        let ts = [0i64, 20_000_000i64]; // 20 ms
+        for _ in 0..50 {
+            let mut s = 0usize;
+            while syscall6(
+                SYS_WAIT4,
+                [usize::MAX, &mut s as *mut usize as usize, WNOHANG, 0, 0, 0],
+            ) > 0
+            {}
+            if sys_kill(-1, 0) < 0 {
+                break;
+            }
+            let _ = syscall3(SYS_NANOSLEEP, ts.as_ptr() as usize, 0, 0);
+        }
+    }
 }
 
 /// 打印 LTP 组的开始或结束标记，`kind` 为 START 或 END。
@@ -1280,27 +1297,22 @@ extern "C" fn ouro_main() -> ! {
     run_script(b"/glibc\0", 6, b". ./libcbench_testcode.sh\0");
     // 远端评测 libctest 仅计 musl 组；盘上子脚本缺 shebang，复用显式 busybox sh 入口。
     run_selected_group(b"libctest-musl", started);
-    // 只在 loongarch64 上评测 LTP，另一个架构立即到点、不启动任何用例。
-    // 截止时刻从启动器开始时算起，前面各组用掉的时间计入 LTP 的预算。
-    let budget: u64 = if cfg!(target_arch = "loongarch64") {
-        LTP_MUSL_BUDGET_SECS
-    } else {
-        0
-    };
-    run_ltp(b"/musl\0", b"musl\0", started + budget);
-    // glibc 组：实测当前零分，保留调用方式供后续启用。
-    // let t1 = now_secs();
-    // run_ltp(b"/glibc\0", b"glibc\0", t1 + 550);
-    //
-    // 其余组（依赖尚未实现的能力，按需启用；ltp/unixbench/lmbench 耗时分钟级）：
+    run_selected_group(b"iperf-musl", started);
+    run_selected_group(b"iperf-glibc", started);
+    run_selected_group(b"netperf-musl", started);
+    run_selected_group(b"netperf-glibc", started);
+    // LTP 与其余尚未完成全量验收的测试组暂不在默认送测中启用，按需取消注释：
+    // let budget: u64 = if cfg!(target_arch = "loongarch64") {
+    //     LTP_MUSL_BUDGET_SECS
+    // } else {
+    //     0
+    // };
+    // run_ltp(b"/musl\0", b"musl\0", started + budget);
+    // run_ltp(b"/glibc\0", b"glibc\0", now_secs() + 550);
     // run_script(b"/musl\0", 5, b"./cyclictest_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./iozone_testcode.sh\0");
-    // run_script(b"/musl\0", 5, b"./iperf_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./lmbench_testcode.sh\0");
-    // run_script(b"/musl\0", 5, b"./ltp_testcode.sh\0");
-    // run_script(b"/musl\0", 5, b"./netperf_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./unixbench_testcode.sh\0");
-    //（glibc 份把第 1 参换为 b"/glibc\0"、长度换 6）
     note(b"[official-init] all groups finished\n");
     sys_exit(0)
 }
