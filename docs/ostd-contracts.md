@@ -328,7 +328,7 @@ try_lock 失败即报告“持锁跨调度”。
 | fsync | EXT4 写回该 inode 的共享页并同步 rsext4 缓存/日志 | FAT 返回 ENOTSUP | 未实现：FAT |
 | mount | fstype 接受 vfat/fat；源设备 `/dev/vd<小写字母>[0-4]`（无后缀或 0 为整盘）；flags 必须 0，data 忽略；/proc/mounts 报告根卷（按实际设备号命名）与 FAT 挂载记录 | 仅 MBR 主分区；不限于 a-d | 未实现：非 MBR 主分区、flags 与 data |
 | 设备命名与根卷 | 设备号按总线枚举顺序分配，无内容特征重排；Ext4 根卷为扫描式选择：每盘先试分区 1..4 再试整盘，取第一个可挂载的 Ext4。官方 mount 测例写死的 `/dev/vda2`（辅助盘 FAT32 分区）由用户态启动器按授权清单 mknodat 建立块设备节点（major 254，minor=(盘<<4)\|分区，见 §6.3），内核按节点登记的真实设备身份解析挂载 | 设备节点是内核注册表条目而非文件系统实体；根卷语义与设备名无绑定；辅助盘由官方 harness 自动挂为第二块盘 | 取舍，理由待补 |
-| mmap | 匿名与文件均支持 PRIVATE/SHARED；文件整页在 EOF 外允许建图，直接访问按 SIGBUS 终止；MAP_FIXED 事务替换 | 最后不足一页的尾部补零且不回写；MAP_FIXED 可覆盖用户栈；flags 白名单，MAP_DENYWRITE、MAP_EXECUTABLE 与 MAP_STACK 按 Linux 忽略 | 无偏差 |
+| mmap | 匿名映射、普通文件和 /dev/zero 均支持 PRIVATE/SHARED；/dev/zero 按需提供零页，共享写权限由打开模式决定；文件整页在 EOF 外允许建图，直接访问按 SIGBUS 终止；MAP_FIXED 事务替换 | 最后不足一页的尾部补零且不回写；MAP_FIXED 可覆盖用户栈；flags 白名单，MAP_DENYWRITE、MAP_EXECUTABLE 与 MAP_STACK 按 Linux 忽略 | 无偏差 |
 | mprotect | 支持 PROT_NONE 和 R/W/X 组合；W 隐含 R，只读 FD 建立的共享映射禁止提升写权限（EACCES） | 两架构无 NX；VMA 记录请求权限，页表执行写保护，可访问页实际带 X | 取舍，理由待补：没有执行权限保护 |
 | brk/munmap | brk 失败返回原 break；munmap 起址页对齐、长度向上取整、允许空洞 | 均无按需分页；brk 立即分配/释放物理页 | 取舍，理由待补：brk 立即分配 |
 | ELF | ET_EXEC 固定地址与 ET_DYN（装载基址 0x10_0000：官方 basic 是 intptr_t 为 32 位 int 的无重定位 PIE，Linux 高位 ELF_ET_DYN_BASE 布局下其 brk 断言同样无法通过；低位基址同时保持空指针缺页）；段相位要求 p_vaddr 与 p_offset 按页同余且按 p_align 同余（不要求各自页对齐，busybox 第二段 offset/vaddr 均非对齐但同余）；PT_INTERP 支持；不同 PT_LOAD 落到同一用户页仍拒绝 | 无 NX，PT_GNU_* 忽略；AT_PHDR 要求程序头表在首个可读 PT_LOAD 内 | 设计：装载基址取 1 MiB，理由见左栏；取舍，理由待补：程序头表位置与同页段限制 |
@@ -619,9 +619,9 @@ msync 按相交 VMA 的文件偏移选择缓存页，再同步 Ext4 后端，失
 
 测试基线是 pre-2025 的 LTP 20240524。表中状态取自启动器逐例驱动的全量运行，见下文。
 
-三层页表为信号只读返回页预留最高 1 GiB 根槽，普通用户映射上界为 2^38 − 2^30，可装入默认链接在 0x120000000 的 LoongArch 静态 ELF。exec 按继承的 STACK 软限额确定栈预留量，上限 8 MiB。mprotect 验证整段覆盖、文件写权限和限额后提交；空洞返回 ENOMEM，未对齐地址返回 EINVAL。两架构原版 mprotect01 的空洞与非对齐检查均通过；后续需要为已接入的 /dev/zero 提供 mmap，并保留只读 FD 的共享写权限上限。
+三层页表为信号只读返回页预留最高 1 GiB 根槽，普通用户映射上界为 2^38 − 2^30，可装入默认链接在 0x120000000 的 LoongArch 静态 ELF。exec 按继承的 STACK 软限额确定栈预留量，上限 8 MiB。mprotect 验证整段覆盖、文件写权限和限额后提交；空洞返回 ENOMEM，未对齐地址返回 EINVAL。/dev/zero 共享映射将 FD 的写权限上限保存在共享页对象中，权限修改前检查此上限。私有映射可写，写入不影响其他映射。
 
-exec/spawn 从设备树启动熵派生独立的 16 字节，AT_RANDOM 指向新用户栈。静态 LoongArch glibc BusyBox 重定位后使用 mprotect(PROT_READ) 关闭写权限；页表保留执行权限。QEMU 10.0.2 上 `busybox sh -c exit` 成功。/dev/zero 已支持打开、读写和设备属性查询；mmap 尚未接通。
+exec/spawn 从设备树启动熵派生独立的 16 字节，AT_RANDOM 指向新用户栈。静态 LoongArch glibc BusyBox 重定位后使用 mprotect(PROT_READ) 关闭写权限；页表保留执行权限。QEMU 10.0.2 上 `busybox sh -c exit` 成功。/dev/zero 支持打开、读写、设备属性查询及私有/共享映射。
 
 固定地址映射支持 MAP_FIXED_NOREPLACE（重叠返回 EEXIST，原数据保留）。MAP_LOCKED 使用与 mlockall 相同的限额，在建立映射后尽力预取，不改变未来映射的锁策略；没有交换空间预留账本，MAP_NORESERVE 不额外预留。MAP_POPULATE 在 VMA 建立后尽力预取；与 MAP_NONBLOCK 同用时不预取。未锁定的私有匿名 mremap 扩展只增加虚拟区间。MADV_DONTFORK/DOFORK 控制子进程是否继承该区间；WIPEONFORK/KEEPONFORK 控制私有匿名、堆、栈页在子进程内是否重新取零页。父进程内容不变。共享匿名扩展仅增加虚拟页描述，物理数据页按需分配；fork 时私有匿名、堆和栈驻留页按写时复制共享。ELF 页和已驻留的私有文件页仍在 fork 时复制；尚无换出。
 
@@ -633,6 +633,8 @@ LTP 组由启动器逐例驱动，不执行盘上的 ltp_testcode.sh：按名字
 
 loongarch64 实测，2026-11-26，内核含属主修改、rmdir 延迟回收、/dev/zero、capget、致命信号结束整个线程组与本次的账户数据库：musl 组 2820 例全部执行后来宾自行关机，组内约 772 秒，其中 261 例超时被杀；通过断言 1412 条，分布在 329 例，按判分公式折算的单架构组分约 178.1。另一轮相同代码上 clock_nanosleep01 的 11 条断言在 2 秒时限内完成，该轮为 1423 条、330 例、约 179.0，两轮差额只来自这一例。同一内核不写账户数据库时为 1102 条、288 例、约 149.6，组内 763 秒；差额来自 access01 的 147 条与 setreuid、setregid、setresuid、setfsgid、stat、chmod 等按用户名取凭证的用例。逐例时限取 2 秒而不是 5 秒：5 秒时限下正常结束的用例里只有 alarm05 到 alarm07 需要超过 2 秒，估计共少 3 条断言，换来组内时间少约 830 秒。退出状态为 TCONF 的 795 例与 TBROK 的 613 例不计分。glibc 组前 220 例零通过断言，未启用。
 
-本地 pre-2025 的 ltp_testcode.sh 会枚举镜像实际安装的二进制。启动器逐例驱动下，mlock01 通过 4 条，brk01 通过 1 条，mmap17 通过 1 条；mprotect01 在第 3 条断言的 mmap 处中断；mincore01 与 msync01 打印了通过断言，但属旧接口用例，不打印 Summary，不计分。判分器只汇总 Summary 段的 passed 计数，不数 TPASS 行；本镜像全量里打印 TPASS 却没有 Summary 的用例有 109 例、693 行，其中 91 例没有任何 TFAIL，这些断言不进分数。TCONF、TBROK 均不计为通过；未修改测例、脚本或 uname 来绕过前置条件。
+本地 pre-2025 的 ltp_testcode.sh 会枚举镜像实际安装的二进制。启动器逐例驱动下，mlock01 通过 4 条，brk01 通过 1 条，mmap17 通过 1 条；该次全量运行的 mprotect01 在第 3 条断言的 mmap 处中断；mincore01 与 msync01 打印了通过断言，但属旧接口用例，不打印 Summary，不计分。判分器只汇总 Summary 段的 passed 计数，不数 TPASS 行；本镜像全量里打印 TPASS 却没有 Summary 的用例有 109 例、693 行，其中 91 例没有任何 TFAIL，这些断言不进分数。TCONF、TBROK 均不计为通过；未修改测例、脚本或 uname 来绕过前置条件。
+
+2026-11-26 单例复测：使用 pre-20250615 镜像中的原版 musl mprotect01，riscv64 和 loongarch64 均通过 3 条断言并退出 0。只读 FD 建立的 /dev/zero 共享映射在请求增加写权限时返回 EACCES。未重跑全量 LTP。
 
 信号与 MM 联合路径：MM 先尝试修复用户缺页，再向信号模块交付未映射、权限不足或文件后备错误；内核代表 syscall 复制用户指针失败继续返回 EFAULT。

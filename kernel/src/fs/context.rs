@@ -1475,18 +1475,30 @@ pub(crate) fn select_write_back(
     Ok(())
 }
 
-pub fn mapping(ctx: &Context, fd: usize, write: bool) -> Result<(u32, bool), Errno> {
+/// 文件描述符对应的映射来源及共享写权限。
+pub(crate) enum MappingSource {
+    File { ino: u32, writable: bool },
+    Zero { writable: bool },
+}
+
+/// 检查描述符的映射权限，返回文件或零设备。
+pub(crate) fn mapping(ctx: &Context, fd: usize, write: bool) -> Result<MappingSource, Errno> {
     let handle = ctx.get(fd)?;
     let f = handle.lock();
-    if f.flags & 3 == 1 || (write && f.flags & 3 != 2) {
+    if f.flags & 0x200000 != 0 {
+        return Err(Errno::BadF);
+    }
+    let writable = f.flags & 3 == 2;
+    if f.flags & 3 == 1 || (write && !writable) {
         return Err(Errno::Access);
     }
-    if let Kind::Inode { ino, .. } = f.kind {
-        if fs::stat(ino)?.0 & 0xf000 == 0x8000 {
-            return Ok((ino, f.flags & 3 == 2));
+    match f.kind {
+        Kind::DevZero => Ok(MappingSource::Zero { writable }),
+        Kind::Inode { ino, .. } if fs::stat(ino)?.0 & 0xf000 == 0x8000 => {
+            Ok(MappingSource::File { ino, writable })
         }
+        _ => Err(Errno::NoDevice),
     }
-    Err(Errno::NoDevice)
 }
 
 /// exec 成功提交后关闭 CLOEXEC 描述符，标志不与 dup 的源 fd 共享。
