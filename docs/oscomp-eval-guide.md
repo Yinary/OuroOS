@@ -162,7 +162,7 @@ python3 tests/run_official.py la --groups ltp-musl --ltp-filter chown,statx --lt
     - `la` `lmbench-musl`：**`45.59/36`**（36/36），`lat_ctx 96` 为 **`135.00 us`**；
     - `la` `lmbench-glibc`：**`44.54/36`**（36/36），`lat_ctx 96` 为 **`64.86 us`**。
   - **已知外部行为**：原盘 `/musl/hello` 与 `/glibc/hello` 是不含 `#!/bin/sh` 的脚本，内核按 Linux `execve(2)` 返回 `ENOEXEC`；`lat_proc shell` 下 `rv` BusyBox `ash` 打印 `sh: /tmp/hello: not found`，`la` BusyBox `hush` 打印 `sh: can't execute '/tmp/hello': Exec format error`，两者均不影响 `Process fork+/bin/sh -c` 正常计时得分。
-  - **默认送测启用状态**：因不设 `ENOUGH` 时单架构双库耗时可达 30–50 分钟、且项目规则禁止在正式启动器为特定测例注入环境变量特判，当前未在 `official_init.rs` 默认送测流程中启用 `lmbench`。
+  - **默认送测启用状态**：`official_init.rs` 已在默认送测流程中启用 `lmbench-musl` 与 `lmbench-glibc`，并在 `INSTALL_LIST` 统一安装 `/bin/cp`；严格遵循不设 `ENOUGH` 等测例环境变量特判的原则，整轮耗时视远端评测机 QEMU TCG 标定稳定性而定。
 
 ### 5.3 `iperf` 与 `netperf` 修复验证结果
 
