@@ -227,6 +227,7 @@ fn access<T>(f: impl FnOnce(&mut Volume) -> Ext4Result<T>) -> Result<T, Errno> {
 fn error(err: Ext4Error) -> Errno {
     use rsext4::Errno as Ext4Errno;
     match err.code {
+        Ext4Errno::EPERM => Errno::Perm,
         Ext4Errno::ENOENT => Errno::NoEntry,
         Ext4Errno::ENOTDIR => Errno::NotDir,
         Ext4Errno::EISDIR => Errno::IsDir,
@@ -638,14 +639,66 @@ pub(super) fn rmdir(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
     })
 }
 
-/// 移除普通文件名；没有链接和打开引用时回收 inode。
+/// 创建符号链接并保存目标文本。
+pub(super) fn symlink(
+    parent: u32,
+    name: &str,
+    target: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        rsext4::file::create_symlink_inode(
+            &mut v.fs,
+            &mut v.device,
+            InodeNumber::new(parent)?,
+            name,
+            target,
+            uid,
+            gid,
+        )
+        .inspect_err(|e| {
+            use rsext4::Errno as Ext4Errno;
+            if matches!(e.code, Ext4Errno::EIO | Ext4Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })
+    })
+}
+
+/// 在父目录中添加指向已有 inode 的名称。
+pub(super) fn link(ino: u32, parent: u32, name: &str) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        rsext4::file::link_entry(
+            &mut v.fs,
+            &mut v.device,
+            InodeNumber::new(parent)?,
+            InodeNumber::new(ino)?,
+            name,
+        )
+        .inspect_err(|e| {
+            use rsext4::Errno as Ext4Errno;
+            if matches!(e.code, Ext4Errno::EIO | Ext4Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })
+    })
+}
+
+/// 移除普通文件或符号链接的名称；无链接和打开引用时回收 inode。
 pub(super) fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
     if !WRITABLE {
         return Err(Errno::ReadOnly);
     }
     access(|v| {
         let inode = InodeNumber::new(ino)?;
-        let links = rsext4::file::unlink_regular_entry(
+        let links = rsext4::file::unlink_file_entry(
             &mut v.fs,
             &mut v.device,
             InodeNumber::new(parent)?,

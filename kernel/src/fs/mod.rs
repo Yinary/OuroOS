@@ -307,6 +307,35 @@ pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
     }
 }
 
+/// 在 Ext4 父目录中添加符号链接。
+pub(crate) fn symlink(
+    parent: u32,
+    name: &str,
+    target: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<(), Errno> {
+    if parent & FAT_INODE != 0 || procfs::pid_ino_parts(parent).is_some() {
+        return Err(Errno::Perm);
+    }
+    ext4::symlink(parent, name, target, uid, gid)
+}
+
+/// 在同一 Ext4 挂载内为普通文件或符号链接添加硬链接。
+pub(crate) fn link(source: &Metadata, parent: u32, name: &str) -> Result<(), Errno> {
+    if source.dev != metadata::metadata(parent)?.dev {
+        return Err(Errno::CrossDevice);
+    }
+    let ino = source.ino as u32;
+    if ino & FAT_INODE != 0
+        || procfs::pid_ino_parts(ino).is_some()
+        || !matches!(source.mode & 0xf000, 0x8000 | 0xa000)
+    {
+        return Err(Errno::Perm);
+    }
+    ext4::link(ino, parent, name)
+}
+
 /// 在同一挂载内改名；FAT 暂不支持，跨挂载返回 EXDEV。
 pub(crate) fn rename(
     old: u32,

@@ -62,13 +62,14 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / "target/fs-validation/stat")
     parser.add_argument("--metadata", action="store_true", help="验证 umask 和 utimensat")
     parser.add_argument("--rename", action="store_true", help="验证 renameat 和 renameat2")
+    parser.add_argument("--link", action="store_true", help="验证 linkat 与符号链接删名")
     parser.add_argument("--devzero", action="store_true", help="验证 /dev/zero 设备读写")
     parser.add_argument("--rmdir", action="store_true", help="验证空目录删除及引用释放")
     parser.add_argument("--chown", action="store_true", help="验证 fchown 与 fchownat")
     parser.add_argument("--truncate", action="store_true", help="验证 truncate 和 ftruncate")
     parser.add_argument("--readonly", action="store_true", help="metadata 专项要求只读内核")
     args = parser.parse_args()
-    if sum((args.metadata, args.rename, args.truncate, args.chown, args.rmdir, args.devzero)) > 1:
+    if sum((args.metadata, args.rename, args.truncate, args.chown, args.rmdir, args.devzero, args.link)) > 1:
         parser.error("一次只能选择一组专项")
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -76,6 +77,7 @@ def main():
     shutil.copytree(ROOT / "user", user, dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns("target"))
     program = ("fs_truncate.rs" if args.truncate else "fs_rename.rs" if args.rename
+               else "fs_link.rs" if args.link
                else "fs_metadata.rs" if args.metadata else "fs_chown.rs" if args.chown
                else "fs_rmdir.rs" if args.rmdir else "fs_devzero.rs" if args.devzero
                else "fs_stat.rs")
@@ -216,6 +218,7 @@ def main():
                  "-device", f"{device},drive=disk"], out / f"{stem}.log")
             text = (out / f"{stem}.log").read_text(errors="replace")
             markers = (("TRUNCATE PASS:",) if args.truncate else
+                       ("LINK PASS:",) if args.link else
                        ("CHOWN PASS:",) if args.chown else
                        ("RMDIR PASS:",) if args.rmdir else
                        ("DEVZERO PASS:",) if args.devzero else
@@ -261,8 +264,19 @@ def main():
                 run(["debugfs", "-R", f"testi <{inode[1]}>", str(ext)], log)
                 if "is not in use" not in log.read_text():
                     raise RuntimeError(f"{stem}: 最后一个目录引用释放后 inode 仍已分配")
+            if args.link:
+                inodes = re.findall(r"LINK FREED INODE: (\d+)", text)
+                symlinks = re.findall(r"SYMLINK FREED INODE: (\d+)", text)
+                if len(set(inodes)) != 3 or len(set(symlinks)) != 2:
+                    raise RuntimeError(f"{stem}: 缺少待核对的文件或符号链接 inode")
+                for inode in sorted(set(inodes + symlinks)):
+                    log = out / f"{stem}-reclaim-{inode}.log"
+                    run(["debugfs", "-R", f"testi <{inode}>", str(ext)], log)
+                    if "is not in use" not in log.read_text():
+                        raise RuntimeError(f"{stem}: inode {inode} 未回收")
             run(["e2fsck", "-fn", str(ext)], out / f"{stem}-after-fsck.log")
             suite = ("truncate" if args.truncate else "rename" if args.rename
+                     else "link" if args.link
                      else "metadata" if args.metadata else "chown" if args.chown
                      else "rmdir" if args.rmdir else "devzero" if args.devzero
                      else "status queries")

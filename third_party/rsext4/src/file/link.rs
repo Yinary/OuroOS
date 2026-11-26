@@ -1,4 +1,69 @@
-use super::{delete::remove_inodeentry_from_parentdir, *};
+//! 硬链接的目录项与 inode 更新。
+use super::{
+    delete::{find_named_entry_in_parent, remove_inodeentry_from_parentdir, rollback_entry_insert},
+    *,
+};
+
+// OuroOS patch: 使用调用方已解析的 inode 添加目录项，失败时恢复链接数。
+/// 在父目录中为已存在的普通文件或符号链接 增加一个名称。
+pub fn link_entry<B: BlockDevice>(
+    fs: &mut Ext4FileSystem,
+    dev: &mut Jbd2Dev<B>,
+    parent: InodeNumber,
+    source: InodeNumber,
+    name: &str,
+) -> Ext4Result<()> {
+    const LINK_MAX: u16 = 65_000;
+    if fs.readonly {
+        return Err(Ext4Error::read_only());
+    }
+    if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\0']) {
+        return Err(Ext4Error::invalid_input());
+    }
+    if name.len() > 255 {
+        return Err(Ext4Error::new(Errno::ENAMETOOLONG));
+    }
+    let inode = fs.get_inode_by_num(dev, source)?;
+    let kind = match inode.i_mode & Ext4Inode::S_IFMT {
+        Ext4Inode::S_IFREG => Ext4DirEntry2::EXT4_FT_REG_FILE,
+        Ext4Inode::S_IFLNK => Ext4DirEntry2::EXT4_FT_SYMLINK,
+        _ => return Err(Ext4Error::new(Errno::EPERM)),
+    };
+    if inode.i_flags & (Ext4Inode::EXT4_IMMUTABLE_FL | Ext4Inode::EXT4_APPEND_FL) != 0 {
+        return Err(Ext4Error::new(Errno::EPERM));
+    }
+    if inode.i_links_count == 0 {
+        return Err(Ext4Error::not_found());
+    }
+    let original_dir = fs.get_inode_by_num(dev, parent)?;
+    match find_named_entry_in_parent(fs, dev, parent, &original_dir, name.as_bytes()) {
+        Ok(_) => return Err(Ext4Error::already_exists()),
+        Err(e) if e.code == Errno::ENOENT => {}
+        Err(e) => return Err(e),
+    }
+    if inode.i_links_count >= LINK_MAX {
+        return Err(Ext4Error::new(Errno::EMLINK));
+    }
+
+    let mut dir = original_dir;
+    let inserted = insert_dir_entry(fs, dev, parent, &mut dir, source, name, kind);
+    let result = match inserted {
+        Ok(()) => fs
+            .set_inode_links_count(dev, source, inode.i_links_count + 1)
+            .map(|_| ()),
+        Err(error) if no_space_before_insert(error) => return Err(error),
+        Err(error) => Err(error),
+    };
+    if result.is_err() {
+        rollback_entry_insert(fs, dev, parent, source, name, &original_dir, &dir)
+            .map_err(|_| Ext4Error::io())?;
+        if inserted.is_ok() {
+            fs.modify_inode(dev, source, |out| *out = inode)
+                .map_err(|_| Ext4Error::io())?;
+        }
+    }
+    result
+}
 
 /// Create a hard link.
 pub fn link<B: BlockDevice>(

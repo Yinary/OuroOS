@@ -449,7 +449,7 @@ impl Context {
         Ok(())
     }
 
-    fn rename_path(&self, dir: usize, input: &str) -> Result<(String, u32, String), Errno> {
+    fn entry_path(&self, dir: usize, input: &str) -> Result<(String, u32, String), Errno> {
         if input.is_empty() {
             return Err(Errno::NoEntry);
         }
@@ -495,6 +495,65 @@ impl Context {
         Ok((canonical, info.ino as u32, string(name)?))
     }
 
+    fn new_entry_path(&self, dir: usize, path: &str) -> Result<(u32, String), Errno> {
+        if path.ends_with('/') || matches!(path.rsplit('/').next(), Some("." | "..")) {
+            let trimmed = path.trim_end_matches('/');
+            let target = if trimmed.is_empty() { "/" } else { trimmed };
+            self.query(dir, target, false, false)?;
+            return Err(Errno::Exists);
+        }
+        let (_, parent, name) = self.entry_path(dir, path)?;
+        Ok((parent, name))
+    }
+
+    /// 在指定目录下创建符号链接，目标文本由读取或跟随链接时使用。
+    pub(crate) fn symlink(
+        &self,
+        dir: usize,
+        path: &str,
+        target: &str,
+        credentials: &crate::task::Credentials,
+    ) -> Result<(), Errno> {
+        if target.is_empty() {
+            return Err(Errno::NoEntry);
+        }
+        let (parent, name) = self.new_entry_path(dir, path)?;
+        fs::symlink(parent, &name, target, credentials.fsuid, credentials.fsgid)
+    }
+
+    /// 将源 inode 添加到目标父目录，按 follow 决定是否跟随源路径末项。
+    pub(crate) fn link(
+        &self,
+        old_dir: usize,
+        old: &str,
+        new_dir: usize,
+        new: &str,
+        follow: bool,
+    ) -> Result<(), Errno> {
+        let source = self.query(old_dir, old, false, follow)?;
+        let (parent, name) = self.new_entry_path(new_dir, new)?;
+        fs::link(&source, parent, &name)
+    }
+
+    /// 删除末项名称，符号链接按其自身的 inode 处理。
+    pub(crate) fn unlink(&self, dir: usize, input: &str) -> Result<(), Errno> {
+        let path = input.trim_end_matches('/');
+        let path = if path.is_empty() && !input.is_empty() {
+            "/"
+        } else {
+            path
+        };
+        let source = self.query(dir, path, false, false)?;
+        if source.mode & 0xf000 == 0x4000 {
+            return Err(Errno::IsDir);
+        }
+        if input.ends_with('/') {
+            return Err(Errno::NotDir);
+        }
+        let (_, parent, name) = self.entry_path(dir, input)?;
+        fs::unlink(parent, source.ino as u32, &name)
+    }
+
     /// 重命名文件或目录；拒绝移动仍由 cwd、目录 FD 或挂载引用的目录树。
     pub(crate) fn rename(
         &self,
@@ -504,8 +563,8 @@ impl Context {
         new: &str,
         no_replace: bool,
     ) -> Result<(), Errno> {
-        let (old_path, old_parent, old_name) = self.rename_path(old_dir, old)?;
-        let (new_path, new_parent, new_name) = self.rename_path(new_dir, new)?;
+        let (old_path, old_parent, old_name) = self.entry_path(old_dir, old)?;
+        let (new_path, new_parent, new_name) = self.entry_path(new_dir, new)?;
         let source = fs::query(&old_path, false)?;
         let target = match fs::query(&new_path, false) {
             Ok(info) => Some(info),

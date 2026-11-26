@@ -1,0 +1,235 @@
+//! 验证 Ext4 硬链接、符号链接创建与删名及 inode 回收。
+#![no_std]
+#![no_main]
+
+use user::{define_user_entry, sys_exit, sys_write, syscall3, syscall6};
+
+const CWD: usize = -100isize as usize;
+const FOLLOW: usize = 0x400;
+
+fn number(mut value: u64) {
+    let mut digits = [0; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    sys_write(1, &digits[start..]);
+    sys_write(1, b"\n");
+}
+
+macro_rules! ck {
+    ($condition:expr) => {
+        if !($condition) {
+            sys_write(1, b"LINK FAIL line ");
+            number(u64::from(line!()));
+            sys_exit(1);
+        }
+    };
+}
+
+fn link(from: usize, old: &[u8], to: usize, new: &[u8], flags: usize) -> isize {
+    syscall6(
+        37,
+        [
+            from,
+            old.as_ptr() as usize,
+            to,
+            new.as_ptr() as usize,
+            flags,
+            0,
+        ],
+    )
+}
+
+fn unlink(path: &[u8]) -> isize {
+    syscall3(35, CWD, path.as_ptr() as usize, 0)
+}
+
+fn symlink(target: &[u8], dir: usize, path: &[u8]) -> isize {
+    syscall3(36, target.as_ptr() as usize, dir, path.as_ptr() as usize)
+}
+
+fn open(path: &[u8], flags: usize) -> usize {
+    let fd = open_at(CWD, path, flags);
+    ck!(fd >= 0);
+    fd as usize
+}
+
+fn open_at(dir: usize, path: &[u8], flags: usize) -> isize {
+    syscall6(56, [dir, path.as_ptr() as usize, flags, 0o644, 0, 0])
+}
+
+fn stat(path: &[u8]) -> (u64, u32) {
+    let mut out = [0; 128];
+    ck!(syscall6(
+        79,
+        [
+            CWD,
+            path.as_ptr() as usize,
+            out.as_mut_ptr() as usize,
+            0x100,
+            0,
+            0
+        ]
+    ) == 0);
+    (
+        u64::from_ne_bytes(core::array::from_fn(|i| out[8 + i])),
+        u32::from_ne_bytes(core::array::from_fn(|i| out[20 + i])),
+    )
+}
+
+fn check_target(path: &[u8], target: &[u8]) {
+    let mut out = [0; 128];
+    ck!(syscall6(
+        78,
+        [
+            CWD,
+            path.as_ptr() as usize,
+            out.as_mut_ptr() as usize,
+            out.len(),
+            0,
+            0
+        ]
+    ) == target.len() as isize);
+    ck!(&out[..target.len()] == target);
+}
+
+fn regular() {
+    let fd = open(b"/original\0", 0x42);
+    sys_write(fd, b"shared");
+    let dir = open(b"/meta\0", 0x10000);
+    ck!(link(999, b"/original\0", dir, b"alias\0", 0) == 0);
+    let (ino, count) = stat(b"/original\0");
+    ck!(count == 2 && stat(b"/meta/alias\0") == (ino, 2));
+    ck!(link(dir, b"alias\0", CWD, b"/original\0", 0) == -17);
+    ck!(link(CWD, b"/original\0", CWD, b"/meta/dirlink/new-alias\0", 0) == 0);
+    ck!(stat(b"/meta/new-alias\0") == (ino, 3));
+    ck!(unlink(b"/meta/dirlink/new-alias\0") == 0);
+    ck!(unlink(b"/original\0") == 0 && stat(b"/meta/alias\0") == (ino, 1));
+
+    let alias = open(b"/meta/alias\0", 0);
+    let mut data = [0; 6];
+    ck!(syscall3(63, alias, data.as_mut_ptr() as usize, data.len()) == 6 && &data == b"shared");
+    ck!(unlink(b"/meta/alias\0") == 0);
+    ck!(syscall3(62, fd, 0, 0) == 0);
+    ck!(syscall3(63, fd, data.as_mut_ptr() as usize, data.len()) == 6 && &data == b"shared");
+    ck!(syscall3(57, alias, 0, 0) == 0 && syscall3(57, fd, 0, 0) == 0);
+    ck!(syscall3(57, dir, 0, 0) == 0);
+    sys_write(1, b"LINK FREED INODE: ");
+    number(ino);
+}
+
+fn symbolic() {
+    // 短目标内嵌于 inode，长目标占用数据块。
+    let mut long = [b'/'; 100];
+    long[90..].copy_from_slice(b"/meta/data");
+    for (old, new, target) in [
+        (
+            b"/meta/abs\0".as_slice(),
+            b"/short-alias\0".as_slice(),
+            b"/meta/data".as_slice(),
+        ),
+        (
+            b"/meta/long\0".as_slice(),
+            b"/long-alias\0".as_slice(),
+            long.as_slice(),
+        ),
+    ] {
+        let (ino, count) = stat(old);
+        ck!(count == 1);
+        ck!(link(CWD, old, CWD, new, 0) == 0 && stat(new) == (ino, 2));
+        ck!(unlink(old) == 0 && stat(new) == (ino, 1));
+        check_target(new, target);
+        ck!(link(CWD, new, CWD, b"/followed\0", FOLLOW) == 0);
+        ck!(stat(b"/followed\0") == stat(b"/meta/data\0"));
+        ck!(unlink(new) == 0 && unlink(b"/followed\0") == 0);
+        ck!(stat(b"/meta/data\0").1 == 1);
+        sys_write(1, b"LINK FREED INODE: ");
+        number(ino);
+    }
+    ck!(link(CWD, b"/meta/dangling\0", CWD, b"/missing-link\0", FOLLOW) == -2);
+    ck!(link(CWD, b"/meta/dangling\0", CWD, b"/missing-link\0", 0) == 0);
+    check_target(b"/missing-link\0", b"missing");
+    ck!(unlink(b"/missing-link\0") == 0);
+}
+
+fn cross_mount() {
+    let dev = b"/dev/vda2\0".as_ptr() as usize;
+    let mnt = b"/mnt\0".as_ptr() as usize;
+    ck!(syscall6(33, [CWD, dev, 0o60600, (254 << 8) | 2, 0, 0]) == 0);
+    ck!(syscall6(40, [dev, mnt, b"vfat\0".as_ptr() as usize, 0, 0, 0]) == 0);
+    ck!(link(CWD, b"/meta/data\0", CWD, b"/mnt/alias\0", 0) == -18);
+    ck!(symlink(b"data\0", CWD, b"/mnt/symlink\0") == -1);
+    ck!(syscall3(39, mnt, 0, 0) == 0);
+}
+
+fn create_symbolic() {
+    let dir = open(b"/meta/sub\0", 0x10000);
+    ck!(symlink(b"../data\0", dir, b"relative\0") == 0);
+    ck!(symlink(b"unused\0", dir, b"relative\0") == -17);
+    check_target(b"/meta/sub/relative\0", b"../data");
+    let (short, count) = stat(b"/meta/sub/relative\0");
+    ck!(count == 1 && short != stat(b"/meta/data\0").0);
+    ck!(link(
+        CWD,
+        b"/meta/sub/relative\0",
+        CWD,
+        b"/created-follow\0",
+        FOLLOW
+    ) == 0);
+    ck!(stat(b"/created-follow\0") == stat(b"/meta/data\0"));
+
+    let mut long = [b'a'; 61];
+    long[60] = 0;
+    ck!(symlink(&long, 999, b"/created-long\0") == 0);
+    let (long_ino, count) = stat(b"/created-long\0");
+    ck!(count == 1 && long_ino != short);
+    check_target(b"/created-long\0", &long[..60]);
+    ck!(link(CWD, b"/created-long\0", CWD, b"/created-alias\0", FOLLOW) == -2);
+    ck!(link(CWD, b"/created-long\0", CWD, b"/created-alias\0", 0) == 0);
+    ck!(stat(b"/created-alias\0") == (long_ino, 2));
+    ck!(unlink(b"/created-long\0") == 0);
+    check_target(b"/created-alias\0", &long[..60]);
+    ck!(unlink(b"/created-alias\0") == 0);
+    ck!(unlink(b"/meta/sub/relative\0") == 0);
+    ck!(unlink(b"/created-follow\0") == 0 && stat(b"/meta/data\0").1 == 1);
+    ck!(syscall3(57, dir, 0, 0) == 0);
+    ck!(symlink(b"\0", CWD, b"/bad\0") == -2);
+    ck!(symlink(b"x\0", 999, b"bad\0") == -9);
+    ck!(symlink(b"x\0", CWD, b"/missing/bad\0") == -2);
+    ck!(symlink(b"x\0", CWD, b"/missing/\0") == -2);
+    ck!(symlink(b"x\0", CWD, b"/meta/data/\0") == -17);
+    for ino in [short, long_ino] {
+        sys_write(1, b"SYMLINK FREED INODE: ");
+        number(ino);
+    }
+}
+
+fn run() -> ! {
+    let before = stat(b"/meta/data\0");
+    ck!(link(CWD, b"/meta\0", CWD, b"/alias\0", 0) == -1);
+    ck!(link(CWD, b"/meta/data\0", CWD, b"/alias\0", 1) == -22);
+    ck!(link(CWD, b"/meta/data\0", 999, b"alias\0", 0) == -9);
+    ck!(link(CWD, b"/meta/data\0", CWD, b"/missing/alias\0", 0) == -2);
+    ck!(link(CWD, b"/meta/data\0", CWD, b"/meta/abs\0", 0) == -17);
+    ck!(link(CWD, b"/meta/data\0", CWD, b"/alias/\0", 0) == -2);
+    ck!(link(CWD, b"/meta/data\0", CWD, b"/meta/data/\0", 0) == -17);
+    ck!(link(CWD, b"/meta/data\0", CWD, b"/meta/dangling/\0", 0) == -17);
+    ck!(unlink(b"/meta/abs/\0") == -20);
+    ck!(stat(b"/meta/data\0") == before);
+    if syscall6(56, [CWD, b"/small-inode\0".as_ptr() as usize, 0, 0, 0, 0]) == -2 {
+        cross_mount();
+    }
+    regular();
+    symbolic();
+    create_symbolic();
+    sys_write(1, b"LINK PASS: creation, resolution and reclamation\n");
+    sys_exit(0);
+}
+
+define_user_entry!(run);

@@ -1,4 +1,5 @@
-use super::*;
+//! 文件与符号链接的 inode 分配和目录项发布。
+use super::{delete::rollback_entry_insert, *};
 
 // OuroOS patch: create a regular file by parent inode.
 /// Creates an empty regular file in an existing, linear directory.
@@ -86,6 +87,129 @@ fn discard_unpublished_inode<B: BlockDevice>(
     }
 }
 
+fn store_inline_symlink(inode: &mut Ext4Inode, target: &[u8]) {
+    let mut raw = [0; 60];
+    raw[..target.len()].copy_from_slice(target);
+    for (word, chunk) in inode.i_block.iter_mut().zip(raw.chunks_exact(4)) {
+        *word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+}
+
+// OuroOS patch: 按父 inode 创建符号链接，失败时撤销目录项及子 inode 分配。
+/// 在父目录下创建符号链接。目标文本直接保存，长度须小于一个文件系统块。
+pub fn create_symlink_inode<B: BlockDevice>(
+    fs: &mut Ext4FileSystem,
+    dev: &mut Jbd2Dev<B>,
+    parent: InodeNumber,
+    name: &str,
+    target: &str,
+    uid: u32,
+    gid: u32,
+) -> Ext4Result<()> {
+    if fs.readonly {
+        return Err(Ext4Error::read_only());
+    }
+    if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\0']) {
+        return Err(Ext4Error::invalid_input());
+    }
+    if target.is_empty() {
+        return Err(Ext4Error::not_found());
+    }
+    if name.len() > Ext4DirEntry2::MAX_NAME_LEN as usize || target.len() >= BLOCK_SIZE {
+        return Err(Ext4Error::new(Errno::ENAMETOOLONG));
+    }
+    let original = fs.get_inode_by_num(dev, parent)?;
+    match find_named_entry_in_parent(fs, dev, parent, &original, name.as_bytes()) {
+        Ok(_) => return Err(Ext4Error::already_exists()),
+        Err(e) if e.code == Errno::ENOENT => {}
+        Err(e) => return Err(e),
+    }
+    if original.i_flags & Ext4Inode::EXT4_IMMUTABLE_FL != 0 {
+        return Err(Ext4Error::new(Errno::EPERM));
+    }
+    if target.len() >= 60 && !fs.superblock.has_extents() {
+        return Err(Ext4Error::unsupported());
+    }
+
+    let ino = fs.alloc_inode(dev)?;
+    let mut inode = Ext4Inode::empty_for_reuse(fs.default_inode_extra_isize());
+    inode.i_links_count = 1;
+    inode.i_size_lo = target.len() as u32;
+    let mode = Ext4Inode::S_IFLNK | 0o777;
+    inode.i_flags =
+        Ext4Inode::mask_flags_for_mode(mode, original.i_flags & Ext4Inode::EXT4_FL_INHERITED);
+    let mut update = Ext4InodeMetadataUpdate::create(mode);
+    update.uid = Some(uid);
+    update.gid = Some(if original.i_mode & Ext4Inode::S_ISGID != 0 {
+        original.gid()
+    } else {
+        gid
+    });
+    if fs
+        .superblock
+        .has_feature_ro_compat(Ext4Superblock::EXT4_FEATURE_RO_COMPAT_PROJECT)
+        && original.i_flags & Ext4Inode::EXT4_PROJINHERIT_FL != 0
+    {
+        update.projid = Some(original.i_projid);
+    }
+    let mut block = None;
+    let prepared = (|| {
+        if target.len() < 60 {
+            store_inline_symlink(&mut inode, target.as_bytes());
+        } else {
+            let data_block = fs.alloc_block(dev)?;
+            block = Some(data_block);
+            fs.datablock_cache
+                .modify_new_via_journal(dev, data_block, |data| {
+                    data.fill(0);
+                    data[..target.len()].copy_from_slice(target.as_bytes());
+                })?;
+            inode.i_blocks_lo = (BLOCK_SIZE / 512) as u32;
+            inode.i_flags |= Ext4Inode::EXT4_EXTENTS_FL;
+            inode.write_extend_header();
+            ExtentTree::with_checksum(&mut inode, &fs.superblock, ino).insert_extent(
+                fs,
+                Ext4Extent::new(0, data_block.raw(), 1),
+                dev,
+            )?;
+        }
+        fs.finalize_inode_update(dev, ino, &mut inode, update)
+    })();
+    let failure = match prepared {
+        Ok(()) => {
+            let mut dir = original;
+            let e = match insert_dir_entry(
+                fs,
+                dev,
+                parent,
+                &mut dir,
+                ino,
+                name,
+                Ext4DirEntry2::EXT4_FT_SYMLINK,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            };
+            if !no_space_before_insert(e) {
+                rollback_entry_insert(fs, dev, parent, ino, name, &original, &dir)
+                    .map_err(|_| Ext4Error::io())?;
+            }
+            e
+        }
+        Err(e) => e,
+    };
+    // 清空已写入的 inode 槽，再归还位图中的 inode 和数据块。
+    let empty = Ext4Inode::empty_for_reuse(fs.default_inode_extra_isize());
+    fs.modify_inode(dev, ino, |out| *out = empty)
+        .map_err(|_| Ext4Error::io())?;
+    if let Some(block) = block {
+        fs.datablock_cache.invalidate(block);
+        fs.free_block(dev, block).map_err(|_| Ext4Error::io())?;
+    }
+    fs.free_inode(dev, ino).map_err(|_| Ext4Error::io())?;
+    Err(failure)
+}
+
 /// Create a symbolic link (root-owned).
 pub fn create_symbol_link<B: BlockDevice>(
     device: &mut Jbd2Dev<B>,
@@ -162,12 +286,7 @@ pub fn create_symbol_link_with_owner<B: BlockDevice>(
         new_inode.i_block = [0; 15];
     } else if target_len < 60 {
         // Fast symlink: store the target directly inside `i_block`.
-        let mut raw = [0u8; 60];
-        raw[..target_len].copy_from_slice(target_bytes);
-        for i in 0..15 {
-            new_inode.i_block[i] =
-                u32::from_le_bytes([raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]]);
-        }
+        store_inline_symlink(&mut new_inode, target_bytes);
         new_inode.i_blocks_lo = 0;
         new_inode.l_i_blocks_high = 0;
     } else {

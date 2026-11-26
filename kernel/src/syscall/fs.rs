@@ -108,31 +108,33 @@ pub fn dispatch(
             fs::fat::unmount(&target)?;
             Ok(0)
         }
+        sysnr::LINKAT => linkat(ctx, space, a),
+        sysnr::SYMLINKAT => symlinkat(ctx, space, a, credentials),
         sysnr::UNLINKAT => {
             if a[2] & !0x200 != 0 {
                 return Err(Errno::NotSupported);
             }
             let input = user_string(space, a[1])?;
-            let path = ctx.path(a[0], &input)?;
-            let ino = fs::lookup(&path)?;
-            if a[2] & 0x200 != 0 {
-                match input.trim_end_matches('/').rsplit('/').next() {
-                    Some(".") => return Err(Errno::Invalid),
-                    Some("..") => return Err(Errno::NotEmpty),
-                    _ => {}
-                }
-                if fs::stat(ino)?.0 & 0xf000 != 0x4000 {
-                    return Err(Errno::NotDir);
-                }
-                if path == "/" || fs::contains_mount(&path) {
-                    return Err(Errno::Busy);
-                }
-                let (p, name) = parent(&path)?;
-                fs::rmdir(p, ino, name)?;
+            let dir = a[0] as u32 as i32 as isize as usize;
+            if a[2] == 0 {
+                ctx.unlink(dir, &input)?;
                 return Ok(0);
             }
+            let path = ctx.path(dir, &input)?;
+            let ino = fs::lookup(&path)?;
+            match input.trim_end_matches('/').rsplit('/').next() {
+                Some(".") => return Err(Errno::Invalid),
+                Some("..") => return Err(Errno::NotEmpty),
+                _ => {}
+            }
+            if fs::stat(ino)?.0 & 0xf000 != 0x4000 {
+                return Err(Errno::NotDir);
+            }
+            if path == "/" || fs::contains_mount(&path) {
+                return Err(Errno::Busy);
+            }
             let (p, name) = parent(&path)?;
-            fs::unlink(p, ino, name)?;
+            fs::rmdir(p, ino, name)?;
             Ok(0)
         }
         sysnr::PIPE2 => {
@@ -374,6 +376,43 @@ fn getdents64(
     user_access::copy_to_user(space, output, &out[..used]).map_err(|_| Errno::Fault)?;
     f.set_offset(offset);
     Ok(used)
+}
+
+/// Linux symlinkat：在指定目录下创建保存 UTF-8 目标的符号链接。
+fn symlinkat(
+    ctx: &Context,
+    space: &UserAddressSpace,
+    a: [usize; 6],
+    credentials: &Credentials,
+) -> Result<usize, Errno> {
+    let target = user_string(space, a[0])?;
+    let path = user_string(space, a[2])?;
+    ctx.symlink(
+        a[1] as u32 as i32 as isize as usize,
+        &path,
+        &target,
+        credentials,
+    )?;
+    Ok(0)
+}
+
+/// Linux linkat：按路径创建硬链接，可跟随源路径末项的符号链接。
+fn linkat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
+    const AT_SYMLINK_FOLLOW: u32 = 0x400;
+    let flags = a[4] as u32;
+    if flags & !AT_SYMLINK_FOLLOW != 0 {
+        return Err(Errno::Invalid);
+    }
+    let old = user_string(space, a[1])?;
+    let new = user_string(space, a[3])?;
+    ctx.link(
+        a[0] as u32 as i32 as isize as usize,
+        &old,
+        a[2] as u32 as i32 as isize as usize,
+        &new,
+        flags & AT_SYMLINK_FOLLOW != 0,
+    )?;
+    Ok(0)
 }
 
 /// Linux renameat/renameat2：支持普通改名及 NOREPLACE；交换和 whiteout 暂不支持。

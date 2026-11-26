@@ -34,17 +34,19 @@ pub use blocks::build_file_block_mapping_with_inode_num;
 pub use create::{create_symbol_link, create_symbol_link_with_owner, mkfile, mkfile_with_owner};
 // OuroOS patch: create a regular file by parent inode.
 pub use create::create_regular_inode;
+// OuroOS patch: create a symbolic link by parent inode.
+pub use create::create_symlink_inode;
 pub use delete::{
     delete_dir, delete_file, free_inode, is_dir_empty, remove_inodeentry_from_parentdir, unlink,
 };
 // OuroOS patch: separate directory-entry removal from inode reclamation.
-pub use delete::unlink_regular_entry;
+pub use delete::unlink_file_entry;
 // OuroOS patch: reuse directory-entry lookup for mkdir.
 pub(crate) use delete::find_named_entry_in_parent;
 pub use io::{
     read_file, read_inode_data_into, truncate, truncate_inode, write_file, write_inode_data,
 };
-pub use link::link;
+pub use link::{link, link_entry};
 pub use rename::{mv, rename};
 // OuroOS patch: 按 inode 更新目录项并延迟回收。
 pub use rename::reclaim_unlinked_inode as reclaim_rename_target;

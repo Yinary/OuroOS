@@ -31,6 +31,8 @@ pub mod sysnr {
     pub const FCNTL: usize = 25;
     pub const MKDIRAT: usize = 34;
     pub const UNLINKAT: usize = 35;
+    pub const SYMLINKAT: usize = 36;
+    pub const LINKAT: usize = 37;
     pub const RENAMEAT: usize = 38;
     pub const UMOUNT2: usize = 39;
     pub const MOUNT: usize = 40;
@@ -361,6 +363,8 @@ pub fn dispatch(
         | sysnr::FCNTL
         | sysnr::MKDIRAT
         | sysnr::UNLINKAT
+        | sysnr::SYMLINKAT
+        | sysnr::LINKAT
         | sysnr::RENAMEAT
         | sysnr::RENAMEAT2
         | sysnr::UMOUNT2
