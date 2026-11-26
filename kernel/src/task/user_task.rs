@@ -1395,18 +1395,13 @@ fn kill_or_tgkill(parent: Pid, nr: usize, args: [usize; 6]) -> Result<usize, Err
         if sig == 0 {
             return Ok(0);
         }
-        if let Some(tid_index) = reg.threads.iter().position(|t| t.tid == target) {
-            let group = &reg.records[index];
-            let thread = &mut reg.threads[tid_index];
-            super::signal::generate_thread(&group.signal, &mut thread.signal, sig as u8, slot);
-        } else {
-            let blocked = reg
-                .threads
-                .iter()
-                .find(|t| t.tgid == target)
-                .map_or(0, |t| t.signal.blocked());
-            reg.records[index].signal.generate(sig as u8, slot, blocked);
-        }
+        // 进程定向：排入线程组的待处理集合，任一未屏蔽它的线程都可取走。
+        let blocked = reg
+            .threads
+            .iter()
+            .find(|t| t.tgid == target)
+            .map_or(0, |t| t.signal.blocked());
+        reg.records[index].signal.generate(sig as u8, slot, blocked);
         return Ok(0);
     }
     let caller_pgid = reg.group(parent).map(|r| r.pgid).ok_or(Errno::NoProcess)?;
