@@ -87,6 +87,9 @@ pub(super) fn detach_directory(ino: u32) {
     }
 }
 
+/// 下一个新建管道的唯一实例号；单调递增，0 保留表示槽位空闲。
+static NEXT_PIPE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
 struct Pipe {
     data: VecDeque<u8>,
     readers: usize,
@@ -96,6 +99,7 @@ enum Kind {
     Input,
     Output,
     Pipe {
+        id: u64,
         pipe: Arc<Mutex<Pipe>>,
         reading: bool,
     },
@@ -138,7 +142,7 @@ impl Drop for OpenFile {
                 directory: None,
                 ..
             } => fs::release(*ino),
-            Kind::Pipe { pipe, reading } => {
+            Kind::Pipe { id, pipe, reading } => {
                 let mut p = pipe.lock();
                 if *reading {
                     p.readers -= 1;
@@ -146,8 +150,8 @@ impl Drop for OpenFile {
                     p.writers -= 1;
                 }
                 // 对端计数变化可能使等待者可读（EOF）或写失败（EPIPE），
-                // 请求唤醒；无锁原子标志，可在任意持锁环境下调用。
-                crate::task::sched::request_pipe_wake();
+                // 按管道实例定向唤醒；无锁原子槽位，可在任意持锁环境下调用。
+                crate::task::sched::request_pipe_id_wake(*id);
             }
             Kind::Socket(id) => {
                 crate::net::close(*id);
@@ -745,10 +749,21 @@ impl Context {
         self.install(fs::try_arc(Mutex::new(file))?, cloexec)
     }
 
+    /// 若 `fd` 指向管道端，返回其唯一实例号，供调度器定向等待。
+    pub(crate) fn pipe_id(&self, fd: usize) -> Option<u64> {
+        let handle = self.get(fd).ok()?;
+        let file = handle.lock();
+        match file.kind {
+            Kind::Pipe { id, .. } => Some(id),
+            _ => None,
+        }
+    }
+
     /// 创建管道两端，安装失败时回收已安装的 FD。
     pub(crate) fn pipe(&mut self, flags: usize) -> Result<(usize, usize), Errno> {
         let mut data = VecDeque::new();
         data.try_reserve(4096).map_err(|_| Errno::NoMem)?;
+        let id = NEXT_PIPE_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let pipe = fs::try_arc(Mutex::new(Pipe {
             data,
             readers: 1,
@@ -756,6 +771,7 @@ impl Context {
         }))?;
         let r = fs::try_arc(Mutex::new(OpenFile {
             kind: Kind::Pipe {
+                id,
                 pipe: pipe.clone(),
                 reading: true,
             },
@@ -764,6 +780,7 @@ impl Context {
         }))?;
         let w = fs::try_arc(Mutex::new(OpenFile {
             kind: Kind::Pipe {
+                id,
                 pipe,
                 reading: false,
             },
@@ -1039,7 +1056,7 @@ impl OpenFile {
         self.check_type(first)?;
         match &self.kind {
             Kind::Input => Ok(0),
-            Kind::Pipe { pipe, .. } => {
+            Kind::Pipe { id, pipe, .. } => {
                 let mut p = pipe.lock();
                 if p.data.is_empty() {
                     return if p.writers == 0 {
@@ -1057,7 +1074,7 @@ impl OpenFile {
                     return Err(Errno::Invalid);
                 }
                 p.data.drain(..delivered);
-                crate::task::sched::request_pipe_wake();
+                crate::task::sched::request_pipe_id_wake(*id);
                 Ok(delivered)
             }
             Kind::DevNull | Kind::Rtc => Ok(0),
@@ -1099,7 +1116,7 @@ impl OpenFile {
                 }
                 Ok(data.len())
             }
-            Kind::Pipe { pipe, .. } => {
+            Kind::Pipe { id, pipe, .. } => {
                 let mut p = pipe.lock();
                 if p.readers == 0 {
                     return Err(Errno::Pipe);
@@ -1108,7 +1125,7 @@ impl OpenFile {
                     return Err(nonblock_or_wait(self.flags));
                 }
                 p.data.extend(data);
-                crate::task::sched::request_pipe_wake();
+                crate::task::sched::request_pipe_id_wake(*id);
                 Ok(data.len())
             }
             Kind::Socket(id) => {
@@ -1303,7 +1320,7 @@ fn fd_poll_events(file: &OpenFile, requested: u16) -> u16 {
         | Kind::Rtc
         | Kind::DevBlk { .. } => 0x145 & requested,
         Kind::Socket(id) => crate::net::poll_events(*id, requested),
-        Kind::Pipe { pipe, reading } => {
+        Kind::Pipe { pipe, reading, .. } => {
             let p = pipe.lock();
             if *reading {
                 (if p.data.is_empty() {
