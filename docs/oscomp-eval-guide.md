@@ -134,16 +134,19 @@ python3 tests/run_official.py la --groups ltp-musl --ltp-filter chown,statx --lt
 
 测试基线：`dev` 分支 `b40bf5c`，使用 QEMU 10.0.2 + QCOW2 覆盖层本地拆组运行。
 
-### 5.1 `libctest` 摸底结果
+### 5.1 `libctest` 摸底与修复验证结果
 
-- **实测范围**：`rv` `libctest-musl`（60 秒超时）、`rv` `libctest-glibc`（25 秒超时）、`la` `libctest-musl`（25 秒超时）。
-- **现象**：三个配置表现完全一致——`run-static.sh` 经 `busybox sh` 正常拉起 `runtest.exe` 并顺序执行每个用例（`argv`、`basename`、`clocale_mbfuncs`、`clock_gettime` 等），但**几乎每例均空等 5 秒后打印**：
-  ```text
-  src/common/runtest.c:86: <用例名> kill failed: No such process
-  ```
-  导致所有用例在判分器中均未输出 `Pass!`（计 0 分）。此外，`rv` `libctest-glibc` 的 `clocale_mbfuncs` 还额外打印了 `mbrtowc`/`btowc` 字节转换失败（glibc 默认 C locale 与 musl 测试预期的差异）。
-- **已验证根因**：检查原盘 `runtest.exe` 字符串与源码路径确认，`runtest.exe` 先屏蔽 `SIGCHLD`，再调用 `rt_sigtimedwait` 带 5 秒超时等待子进程退出。这直接命中 [docs/ostd-contracts.md](file:///home/hoyouu/OuroOS/docs/ostd-contracts.md#L387) 已登记的 **缺陷 10**（`sigtimedwait` 当前只能取到未屏蔽信号）：子进程实际瞬间正常退出，但被屏蔽的 `SIGCHLD` 无法被 `sigtimedwait` 消费，等满 5 秒超时后进入 `runtest.c:86` 对已退出子进程调用 `kill(-pid, SIGKILL)` 报 `ESRCH`。
-- **下一步优先级**：优先修复 **缺陷 10（`rt_sigtimedwait` 支持消费已屏蔽等待集信号）** 后再重跑 `libctest` 四配置，即可立即暴露出 220 项的真实通过率与次级缺口。
+- **首轮基线（`dev` `b40bf5c`）**：三配置（`rv`/`la` `musl`、`rv` `glibc`）均因 [docs/ostd-contracts.md](file:///home/hoyouu/OuroOS/docs/ostd-contracts.md) 原缺陷 10（`rt_sigtimedwait` 无法消费已屏蔽的 `SIGCHLD`）在 `runtest.exe` 空等 5 秒超时后报 `kill failed: No such process`，判分器全组 0/880。
+- **修复后实测结果（`oscomp/libctest`，QEMU 10.0.2 + QCOW2 覆盖层，双架构全量跑完）**：
+  - `rv` `libctest-musl`：**`217/220`**（全部 217 项盘上可执行测例 100% 通过）
+  - `la` `libctest-musl`：**`217/220`**（全部 217 项盘上可执行测例 100% 通过）
+  - `rv` `libctest-glibc`：**`179/220`**
+  - `la` `libctest-glibc`：**`179/220`**
+  - 四配置合计：**`792/880`**（相较基线提升 +792 分）。
+- **剩余未通过项的已验证归因（宿主 Linux 下以 `qemu-riscv64` 直接运行原盘二进制核对）**：
+  1. **盘上脚本未收录（3 项 × 4 配置 = 12 分）**：`static crypt`、`dynamic crypt`、`static pleval` 在发布盘 `run-static.sh` / `run-dynamic.sh` 中不存在，实际可运行上限为每配置 217 项。
+  2. **发布盘缺少动态库 `libgcc_s.so.1`（3 项 × 2 架构 = 6 分）**：`glibc` 动态版 `pthread_cancel`、`pthread_cancel_points`、`pthread_exit_cancel` 在线程取消展开阶段尝试加载 `libgcc_s.so.1` 失败中止。
+  3. **glibc 运行库 / locale 与 musl 测例预期差异（35 项 × 2 架构 = 70 分）**：`clocale_mbfuncs`、`daemon_failure`、`dn_expand_empty`、`dn_expand_ptr_0`、`fgetwc_buffering`、`fnmatch`、`fscanf`、`fwscanf`、`mbc`、`regex_ere_backref`、`regex_escaped_high_byte`、`setvbuf_unget`、`sscanf`、`strftime`、`strtol`、`swprintf`、`wcstol`（静态与动态共 34 项）及静态 `pthread_cancel_points` 的非阻塞 `pthread_join` 断言，在宿主 Linux 上运行发布盘 `glibc` 原版二进制同样失败或超时。
 
 ### 5.2 `lmbench` 摸底结果
 
