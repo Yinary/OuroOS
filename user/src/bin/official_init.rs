@@ -356,6 +356,7 @@ fn write_file(path: &[u8], content: &[u8]) -> bool {
 fn prepare_layout() {
     mkdir_p(b"/tmp/\0");
     mkdir_p(b"/var/tmp/\0");
+    mkdir_p(b"/dev/shm/\0");
     mkdir_p(b"/etc/\0");
     for (path, content) in [
         (&b"/etc/passwd\0"[..], ETC_PASSWD),
