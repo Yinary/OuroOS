@@ -65,6 +65,8 @@ pub mod sysnr {
     pub const SYSINFO: usize = 179;
     pub const PPOLL: usize = 73;
     pub const FUTEX: usize = 98;
+    pub const SET_ROBUST_LIST: usize = 99;
+    pub const GET_ROBUST_LIST: usize = 100;
     pub const NANOSLEEP: usize = 101;
     pub const CLOCK_GETTIME: usize = 113;
     pub const CLOCK_GETRES: usize = 114;
@@ -398,6 +400,16 @@ pub fn dispatch(
             cx[TrapFrameArgs::RET] = pid;
             Flow::Continue
         }
+        sysnr::SET_ROBUST_LIST => {
+            let ret = if a1 != crate::task::futex::ROBUST_LIST_HEAD_SIZE {
+                Err(Errno::Invalid)
+            } else {
+                thread.robust_list = a0;
+                Ok(0)
+            };
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
         sysnr::EXIT => Flow::Exited(a0 as i32),
         sysnr::EXIT_GROUP => Flow::ExitedGroup(a0 as i32),
         sysnr::READAHEAD => {
@@ -520,6 +532,7 @@ pub fn dispatch(
         | sysnr::GETTID
         | sysnr::CLONE
         | sysnr::FUTEX
+        | sysnr::GET_ROBUST_LIST
         | sysnr::EXECVE
         | sysnr::WAIT4
         | sysnr::WAITID

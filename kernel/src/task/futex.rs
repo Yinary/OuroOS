@@ -23,6 +23,86 @@ const FUTEX_WAKE_BITSET: usize = 10;
 const FUTEX_PRIVATE_FLAG: usize = 128;
 const FUTEX_CLOCK_REALTIME: usize = 256;
 const FUTEX_BITSET_MATCH_ANY: u32 = 0xffff_ffff;
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+const ROBUST_LIST_LIMIT: usize = 2048;
+
+/// Linux 64 位 struct robust_list_head 的字节数（list.next、futex_offset、list_op_pending）。
+pub const ROBUST_LIST_HEAD_SIZE: usize = 24;
+
+/// 线程退出时遍历其健壮锁链表：把本线程持有的锁置 FUTEX_OWNER_DIED，
+/// 并收集需要唤醒等待者的 futex 键（由调用方在释放 REGISTRY 锁后执行唤醒）。
+pub fn collect_robust_list_wakes(
+    space: &UserAddressSpace,
+    tgid: Pid,
+    tid: Pid,
+    head: usize,
+) -> alloc::vec::Vec<FutexKey> {
+    let mut wakes = alloc::vec::Vec::new();
+    if head == 0 {
+        return wakes;
+    }
+    let mut raw = [0u8; ROBUST_LIST_HEAD_SIZE];
+    if user_access::copy_from_user(space, head, &mut raw).is_err() {
+        return wakes;
+    }
+    let mut entry = usize::from_ne_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
+    let futex_offset = isize::from_ne_bytes(raw[8..16].try_into().unwrap_or([0; 8]));
+    let pending = usize::from_ne_bytes(raw[16..24].try_into().unwrap_or([0; 8]));
+    let pending_addr = pending & !1;
+
+    let mut handle_death = |entry_raw: usize| {
+        let pi = (entry_raw & 1) != 0;
+        let addr = (entry_raw & !1).wrapping_add_signed(futex_offset);
+        if addr == 0 || addr % core::mem::align_of::<u32>() != 0 {
+            return;
+        }
+        let Ok(uval) = read_word(space, addr) else {
+            return;
+        };
+        if (uval & FUTEX_TID_MASK) != (tid as u32) {
+            return;
+        }
+        let nval = (uval & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+        if user_access::copy_to_user(space, addr, &nval.to_ne_bytes()).is_err() {
+            return;
+        }
+        if (uval & FUTEX_WAITERS) != 0 || pi {
+            let priv_key = space.futex_key(tgid, addr, true);
+            let shared_key = space.futex_key(tgid, addr, false);
+            if let Some(k) = priv_key {
+                if wakes.try_reserve(1).is_ok() {
+                    wakes.push(k);
+                }
+            }
+            if let Some(k) = shared_key {
+                if priv_key != Some(k) && wakes.try_reserve(1).is_ok() {
+                    wakes.push(k);
+                }
+            }
+        }
+    };
+
+    let mut count = 0usize;
+    while (entry & !1) != head && (entry & !1) != 0 && count < ROBUST_LIST_LIMIT {
+        let entry_addr = entry & !1;
+        let mut next_bytes = [0u8; 8];
+        if user_access::copy_from_user(space, entry_addr, &mut next_bytes).is_err() {
+            break;
+        }
+        let next = usize::from_ne_bytes(next_bytes);
+        if entry_addr != pending_addr {
+            handle_death(entry);
+        }
+        entry = next;
+        count += 1;
+    }
+    if pending_addr != 0 {
+        handle_death(pending);
+    }
+    wakes
+}
 
 /// futex 一次处理的结果。
 pub enum FutexStep {

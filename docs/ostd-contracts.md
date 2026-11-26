@@ -274,7 +274,7 @@ try_lock 失败即报告“持锁跨调度”。
 | 组 | 调用 | 实现 |
 |---|---|---|
 | 文件 | getcwd、dup、dup3、fcntl、mkdirat、mknodat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、readlinkat、readahead、statfs、fstatfs、newfstatat、fstat、fsync、statx、umask、utimensat、renameat、renameat2、truncate、ftruncate、fchmodat、fchmod、fchownat、fchown | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
-| futex | WAIT、WAKE、REQUEUE、CMP_REQUEUE、WAIT_BITSET、WAKE_BITSET；PRIVATE 标志按线程组和虚拟地址匹配，共享操作按映射后备匹配，私有映射在写时复制后保留等待键；普通等待的相对超时与 bitset 等待的绝对超时都换算成单调时刻；被信号打断返回 EINTR | WAKE_OP 与 PI 系列返回 ENOSYS；线程退出清零 `clear_child_tid` 后唤醒该地址上的一个等待者 |
+| futex | WAIT、WAKE、REQUEUE、CMP_REQUEUE、WAIT_BITSET、WAKE_BITSET；PRIVATE 标志按线程组和虚拟地址匹配，共享操作按映射后备匹配，私有映射在写时复制后保留等待键；普通等待的相对超时与 bitset 等待的绝对超时都换算成单调时刻；被信号打断返回 EINTR；支持 set_robust_list/get_robust_list 与线程退出健壮锁清理 | WAKE_OP 与 PI 系列返回 ENOSYS；线程退出先遍历 robust_list 置 FUTEX_OWNER_DIED 并唤醒等待者，再清零 `clear_child_tid` 并唤醒等待者 |
 | vfork | 接受 CLONE_VM 与 CLONE_VFORK 加 SIGCHLD：子进程按复制地址空间创建，父进程挂起到子进程 exec 或退出后返回子进程号；posix_spawn 可用 | 缺陷 13：子进程按复制地址空间创建，不与父进程共享内存，见 §4.4 |
 | 进程 | exit、nanosleep、sched_yield、times、getpid、getppid、gettid、getuid、geteuid、getgid、getegid、getresuid、getresgid、getgroups、setuid、setgid、setreuid、setregid、setresuid、setresgid、setfsuid、setfsgid、setgroups、setpgid、getpgid、setsid、getsid、clone、execve、wait4、waitid、capget | `task::process_call` |
 | 资源统计 | getrusage | `task::process_call` |

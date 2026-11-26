@@ -500,6 +500,32 @@ pub(super) fn exit_group_current(exit: ExitInfo) -> ! {
         (task.pid, task.tgid, task.name)
     };
     log::debug!("thread group of '{}' (pid {}) exiting", name, pid);
+    let robust_wakes = {
+        let reg = REGISTRY.lock();
+        let mut wakes = alloc::vec::Vec::new();
+        if let Some(space) = reg.group(tgid).and_then(|r| r.space.as_ref()) {
+            let space = space.as_space();
+            for thread in reg
+                .threads
+                .iter()
+                .filter(|t| t.tgid == tgid && t.robust_list != 0)
+            {
+                let list = super::futex::collect_robust_list_wakes(
+                    space,
+                    tgid,
+                    thread.tid,
+                    thread.robust_list,
+                );
+                if wakes.try_reserve(list.len()).is_ok() {
+                    wakes.extend(list);
+                }
+            }
+        }
+        wakes
+    };
+    for key in robust_wakes {
+        wake_futex(key, 1, u32::MAX, None);
+    }
     registry::record_exit(tgid, exit);
     request_children_wake();
     wake_vfork(pid);
@@ -560,10 +586,21 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
         (task.pid, task.tgid, task.name)
     };
     log::debug!("task '{}' (pid {}) exiting", name, pid);
-    let key = {
+    let (robust_wakes, clear_key) = {
         let reg = REGISTRY.lock();
-        let clear = reg.thread(pid).map_or(0, |t| t.clear_child_tid);
-        if clear == 0 {
+        let (clear, robust) = reg
+            .thread(pid)
+            .map_or((0, 0), |t| (t.clear_child_tid, t.robust_list));
+        let robust_wakes = if robust == 0 {
+            alloc::vec::Vec::new()
+        } else {
+            reg.group(pid)
+                .and_then(|r| r.space.as_ref())
+                .map_or_else(alloc::vec::Vec::new, |s| {
+                    super::futex::collect_robust_list_wakes(s.as_space(), tgid, pid, robust)
+                })
+        };
+        let clear_key = if clear == 0 {
             None
         } else {
             reg.group(pid).and_then(|r| r.space.as_ref()).and_then(|s| {
@@ -574,9 +611,13 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
                 crate::mm::user_access::copy_to_user(space, clear, &[0; 4]).ok()?;
                 space.futex_key(tgid, clear, false)
             })
-        }
+        };
+        (robust_wakes, clear_key)
     };
-    if let Some(key) = key {
+    for key in robust_wakes {
+        wake_futex(key, 1, u32::MAX, None);
+    }
+    if let Some(key) = clear_key {
         wake_futex(key, 1, u32::MAX, None);
     }
     if let Some(info) = registry::record_thread_exit(pid, exit) {

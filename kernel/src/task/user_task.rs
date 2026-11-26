@@ -1069,6 +1069,45 @@ fn process_call(
                 )),
             }
         }
+        sysnr::GET_ROBUST_LIST => {
+            let raw_pid = args[0] as u32 as i32;
+            if raw_pid < 0 {
+                Err(Errno::Invalid)
+            } else {
+                let target = if raw_pid == 0 {
+                    parent
+                } else {
+                    raw_pid as usize
+                };
+                let reg = REGISTRY.lock();
+                match (reg.group(parent), reg.thread(target)) {
+                    (Some(caller_group), Some(target_thread)) => {
+                        if target_thread.tgid != caller_group.pid && caller_group.creds.euid != 0 {
+                            Err(Errno::Perm)
+                        } else if let Some(space) = caller_group.space.as_ref() {
+                            let space = space.as_space();
+                            user_access::copy_to_user(
+                                space,
+                                args[1],
+                                &target_thread.robust_list.to_ne_bytes(),
+                            )
+                            .and_then(|()| {
+                                user_access::copy_to_user(
+                                    space,
+                                    args[2],
+                                    &super::futex::ROBUST_LIST_HEAD_SIZE.to_ne_bytes(),
+                                )
+                            })
+                            .map(|()| 0)
+                            .map_err(|_| Errno::Fault)
+                        } else {
+                            Err(Errno::NoProcess)
+                        }
+                    }
+                    _ => Err(Errno::NoProcess),
+                }
+            }
+        }
         sysnr::WAIT4 => {
             // wait4(2)：pid > 0 指定孩子，-1 等任意孩子，0 等本进程组，
             // 其余负值等进程组 -pid 的孩子；无可收割孩子时挂起，无孩子 ECHILD。
