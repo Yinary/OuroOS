@@ -169,7 +169,7 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
         return Ok(procfs::DEVZERO);
     }
     if path == "/dev" {
-        return Ok(procfs::DEVDIR);
+        return Ok(ext4::lookup("/dev").unwrap_or(procfs::DEVDIR));
     }
     if path == "/dev/misc" {
         return Ok(procfs::MISC_DIR);
@@ -178,11 +178,10 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
         return Ok(procfs::RTC);
     }
     if let Some(rest) = path.strip_prefix("/dev/") {
-        // mknodat 注册的块设备节点（如 /dev/vda2）
+        // mknodat 注册的块设备节点（如 /dev/vda2）优先；其余路径（如 /dev/shm）交由后端解析。
         if lookup_blk_node(rest).is_some() {
             return Ok(procfs::DEVBLK);
         }
-        return Err(Errno::NoEntry);
     }
     if path == "/proc" {
         return Ok(procfs::DIR);
@@ -272,6 +271,17 @@ pub(crate) fn read_link(ino: u32) -> Result<alloc::string::String, Errno> {
 
 /// 在指定父目录下创建新对象。
 pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
+    if parent == procfs::DEVDIR {
+        let dev_ino = match ext4::lookup("/dev") {
+            Ok(ino) => ino,
+            Err(Errno::NoEntry) => {
+                let root = ext4::lookup("/")?;
+                ext4::create(root, "dev", 0o040755)?
+            }
+            Err(e) => return Err(e),
+        };
+        return ext4::create(dev_ino, name, mode);
+    }
     if parent & FAT_INODE != 0 {
         fat::create(parent, name, mode)
     } else {
