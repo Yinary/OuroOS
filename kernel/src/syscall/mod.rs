@@ -55,6 +55,7 @@ pub mod sysnr {
     pub const READLINKAT: usize = 78;
     pub const FSTATAT: usize = 79;
     pub const FSTAT: usize = 80;
+    pub const SYNC: usize = 81;
     pub const FSYNC: usize = 82;
     pub const UTIMENSAT: usize = 88;
     pub const UMASK: usize = 166;
@@ -141,6 +142,11 @@ pub mod sysnr {
     pub const CLONE: usize = 220;
     pub const EXECVE: usize = 221;
     pub const WAIT4: usize = 260;
+    // System V 共享内存
+    pub const SHMGET: usize = 194;
+    pub const SHMCTL: usize = 195;
+    pub const SHMAT: usize = 196;
+    pub const SHMDT: usize = 197;
     // 网络（AF_INET 本地回环套接字）
     pub const SOCKET: usize = 198;
     pub const BIND: usize = 200;
@@ -380,6 +386,7 @@ pub fn dispatch(
         | sysnr::READLINKAT
         | sysnr::FSTAT
         | sysnr::FSTATAT
+        | sysnr::SYNC
         | sysnr::FSYNC
         | sysnr::UTIMENSAT
         | sysnr::UMASK
@@ -501,6 +508,16 @@ pub fn dispatch(
         }
         sysnr::BRK => {
             cx[TrapFrameArgs::RET] = space.brk(a0);
+            Flow::Continue
+        }
+        sysnr::SHMGET | sysnr::SHMCTL | sysnr::SHMAT | sysnr::SHMDT => {
+            let ret = match nr {
+                sysnr::SHMGET => memory::shmget(a0, a1, a2, thread.tgid, credentials),
+                sysnr::SHMCTL => memory::shmctl(space, a0, a1, a2),
+                sysnr::SHMAT => memory::shmat(space, a0, a1, a2, thread.tgid),
+                _ => memory::shmdt(space, a0, thread.tgid),
+            };
+            cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
         sysnr::MUNMAP

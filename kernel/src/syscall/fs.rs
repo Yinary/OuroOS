@@ -236,6 +236,10 @@ pub fn dispatch(
                 mode & 0xf000 == 0x4000,
             )
         }
+        sysnr::SYNC => {
+            let _ = fs::sync();
+            Ok(0)
+        }
         #[cfg(not(feature = "rsext4-readonly"))]
         sysnr::FSYNC => {
             let handle = ctx.get(a[0])?;

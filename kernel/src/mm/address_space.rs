@@ -144,6 +144,14 @@ impl Page {
     }
 }
 
+/// 地址空间内已挂接的 System V 共享内存段记录（用于 shmdt、fork 继承与退出回收）。
+#[derive(Clone, Copy)]
+struct ShmAttachment {
+    start: usize,
+    shmid: usize,
+    pages: usize,
+}
+
 /// 一个用户地址空间，创建/运行/销毁均在同一核；数据页不允许外部释放。
 pub struct UserAddressSpace {
     pt: RefCell<UserPageTable>,
@@ -151,6 +159,7 @@ pub struct UserAddressSpace {
     truncations: Cell<usize>,
     pages: Vec<Page>,
     areas: Vec<VmArea>,
+    shm_attachments: Vec<ShmAttachment>,
     heap_start: usize,
     program_break: usize,
     limits: [[usize; 2]; 4],
@@ -621,6 +630,7 @@ impl UserAddressSpace {
             truncations: Cell::new(file::truncations()),
             pages: Vec::new(),
             areas: Vec::new(),
+            shm_attachments: Vec::new(),
             heap_start: 0,
             program_break: 0,
             limits: [[usize::MAX; 2]; 4],
@@ -1381,6 +1391,7 @@ impl UserAddressSpace {
         let mut child = Self::new()?;
         reserve(&mut child.areas, self.areas.len())?;
         reserve(&mut child.pages, self.pages.len())?;
+        reserve(&mut child.shm_attachments, self.shm_attachments.len())?;
         child
             .areas
             .extend(self.areas.iter().filter(|a| !a.no_fork).copied());
@@ -1424,13 +1435,21 @@ impl UserAddressSpace {
         child.limits = self.limits;
         child.heap_start = self.heap_start;
         child.program_break = self.program_break;
+        // 全部可失败步骤均已提交后，再继承 SHM 挂接记录并递增段表引用计数。
+        child
+            .shm_attachments
+            .extend_from_slice(&self.shm_attachments);
+        for att in &child.shm_attachments {
+            super::shm::on_fork_attach(att.shmid);
+        }
         super::fence_icache();
         Ok(child)
     }
-    /// 建立可跨 fork 共享的匿名页；引用元数据与数据页均可失败分配。
-    pub fn map_shared_anonymous(
+    /// 将已有共享匿名对象首页 `first` 起的 `count` 页映射到用户空间。
+    pub(crate) fn map_shared_pages(
         &mut self,
         start: usize,
+        first: &SharedPage,
         count: usize,
         flags: MappingFlags,
         fixed: bool,
@@ -1445,11 +1464,47 @@ impl UserAddressSpace {
         }
         let mut frames = Vec::new();
         reserve(&mut frames, count)?;
-        let first = SharedPage::first()?;
         for i in 0..count {
             frames.push(Backing::AnonymousShared(first.following(i)?));
         }
         self.map_backed_kind(start, frames, flags, fixed, AreaKind::SharedAnonymous)
+    }
+    /// 建立可跨 fork 共享的匿名页；引用元数据与数据页均可失败分配。
+    pub fn map_shared_anonymous(
+        &mut self,
+        start: usize,
+        count: usize,
+        flags: MappingFlags,
+        fixed: bool,
+    ) -> Result<(), MapError> {
+        let first = SharedPage::first()?;
+        self.map_shared_pages(start, &first, count, flags, fixed)
+    }
+    /// 挂接 System V 共享内存段：预留挂接表槽位后映射共享页，失败时保持原状。
+    pub(crate) fn attach_shm(
+        &mut self,
+        shmid: usize,
+        start: usize,
+        first: &SharedPage,
+        count: usize,
+        flags: MappingFlags,
+        fixed: bool,
+    ) -> Result<(), MapError> {
+        reserve(&mut self.shm_attachments, 1)?;
+        self.map_shared_pages(start, first, count, flags, fixed)?;
+        self.shm_attachments.push(ShmAttachment {
+            start,
+            shmid,
+            pages: count,
+        });
+        Ok(())
+    }
+    /// 按挂接起始地址解除 System V 共享内存段映射，返回被解除的 shmid。
+    pub(crate) fn detach_shm(&mut self, start: usize) -> Option<usize> {
+        let idx = self.shm_attachments.iter().position(|a| a.start == start)?;
+        let att = self.shm_attachments.swap_remove(idx);
+        let _ = self.unmap(att.start, att.pages);
+        Some(att.shmid)
     }
 
     /// 事务安装文件页；FIXED 只有在全部页表与元数据准备成功后替换。
@@ -1829,6 +1884,9 @@ impl UserAddressSpace {
 }
 impl Drop for UserAddressSpace {
     fn drop(&mut self) {
+        for att in self.shm_attachments.drain(..) {
+            super::shm::detach(att.shmid, 0);
+        }
         // 先停用，再释放数据页/页表；不依赖调用方记住每个错误返回点。
         if self.pt.borrow_mut().is_active() {
             self.pt.borrow_mut().deactivate();

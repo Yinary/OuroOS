@@ -106,6 +106,15 @@ pub(crate) fn sync_inode(ino: u32) -> Result<(), Errno> {
     ext4::sync()
 }
 
+/// 同步全部已挂载可写文件系统缓存。
+pub(crate) fn sync() -> Result<(), Errno> {
+    #[cfg(not(feature = "rsext4-readonly"))]
+    {
+        ext4::sync()?;
+    }
+    Ok(())
+}
+
 /// 在任务退出后同步并卸载可写 Ext4 根卷。
 #[cfg(not(feature = "rsext4-readonly"))]
 pub fn shutdown() -> Result<(), Errno> {
