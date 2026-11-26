@@ -124,6 +124,7 @@ enum Kind {
         disk: usize,
         start: usize,
         len: u64,
+        rdev: u64,
     },
     /// 本地回环套接字句柄
     Socket(crate::net::SocketId),
@@ -787,11 +788,22 @@ impl Context {
     ) -> Result<usize, Errno> {
         // _IOR('p', 0x09, struct rtc_time)：32 位方向/大小/类型/序号编码
         const RTC_RD_TIME: usize = 0x8024_7009;
+        // _IOR(0x12, 114, size_t)：返回块设备视图的字节数。
+        const BLKGETSIZE64: usize = 0x8008_1272;
         let file = self.get(fd)?;
         let f = file.lock();
         // ioctl(2) 的 cmd 是 unsigned int：部分 libc（如 musl）把负的 int
         // 常量符号扩展到 64 位寄存器，比较前统一截断为 32 位
-        if !matches!(f.kind, Kind::Rtc) || (cmd as u32) as usize != RTC_RD_TIME {
+        let cmd = (cmd as u32) as usize;
+        if let (BLKGETSIZE64, Kind::DevBlk { len, .. }) = (cmd, &f.kind) {
+            if f.flags & 0x200000 != 0 {
+                return Err(Errno::BadF);
+            }
+            crate::mm::user_access::copy_to_user(space, arg, &len.to_ne_bytes())
+                .map_err(|_| Errno::Fault)?;
+            return Ok(0);
+        }
+        if !matches!(f.kind, Kind::Rtc) || cmd != RTC_RD_TIME {
             return Err(Errno::InappropriateIoctl);
         }
         let Some(secs) = crate::drivers::rtc::read_utc_seconds() else {
@@ -815,6 +827,7 @@ impl Context {
     pub(crate) fn open_devblk(
         &mut self,
         disk: usize,
+        part: usize,
         start: usize,
         len: u64,
         flags: usize,
@@ -827,8 +840,16 @@ impl Context {
             // O_APPEND|O_DIRECT 未支持（块访问按 offset 语义）
             return Err(Errno::Invalid);
         }
+        if flags & 3 != 0 {
+            fs::check_raw_disk_write(disk)?;
+        }
         let file = OpenFile {
-            kind: Kind::DevBlk { disk, start, len },
+            kind: Kind::DevBlk {
+                disk,
+                start,
+                len,
+                rdev: (254 << 8) | (((disk << 4) | part) as u64),
+            },
             offset: 0,
             flags: flags & !OPEN_CREATION_FLAGS,
         };
@@ -1026,6 +1047,14 @@ impl OpenFile {
             Kind::DevNull => Ok(super::procfs::null_metadata()),
             Kind::DevZero => Ok(super::procfs::zero_metadata()),
             Kind::DevRandom { urandom } => Ok(super::procfs::random_metadata(*urandom)),
+            Kind::DevBlk { rdev, .. } => Ok(fs::Metadata {
+                ino: super::procfs::DEVBLK.into(),
+                rdev: *rdev,
+                mode: 0o060600,
+                links: 1,
+                block_size: 4096,
+                ..Default::default()
+            }),
             Kind::Inode { ino, .. } => {
                 // procfs 虚拟节点（/proc、/dev/*、pid 派生）无后端 inode
                 // 元数据，直接按统一 stat 结果合成
@@ -1177,7 +1206,6 @@ impl OpenFile {
             }
             Kind::DevNull | Kind::Rtc => Ok(0),
             Kind::DevZero | Kind::DevRandom { .. } => self.read_at(0, data, false, deliver),
-            Kind::DevBlk { .. } => Ok(0), // 设备块读走专用路径（见 read_devblk）
             Kind::MemInfo(text) => {
                 let bytes = text.as_bytes().get(self.offset..).unwrap_or(&[]);
                 let count = data.len().min(bytes.len());
@@ -1188,7 +1216,7 @@ impl OpenFile {
                 self.offset = self.offset.checked_add(delivered).ok_or(Errno::Invalid)?;
                 Ok(delivered)
             }
-            Kind::Inode { .. } => {
+            Kind::Inode { .. } | Kind::DevBlk { .. } => {
                 let count = self.read_at(self.offset, data, false, deliver)?;
                 self.offset = self.offset.checked_add(count).ok_or(Errno::Invalid)?;
                 Ok(count)
@@ -1230,6 +1258,11 @@ impl OpenFile {
                 let nonblock = self.flags & 0x800 != 0;
                 crate::net::sendto(*id, data, 0, None, nonblock)
             }
+            Kind::DevBlk { .. } => {
+                let count = self.write_at(self.offset, data, false)?;
+                self.offset = self.offset.checked_add(count).ok_or(Errno::Invalid)?;
+                Ok(count)
+            }
             Kind::Inode { ino, .. } => {
                 let offset = if self.flags & 0x400 != 0 {
                     fs::stat(*ino)?.1 as usize
@@ -1251,7 +1284,8 @@ impl OpenFile {
             | Kind::MemInfo(_)
             | Kind::DevNull
             | Kind::DevZero
-            | Kind::DevRandom { .. } => Ok(()),
+            | Kind::DevRandom { .. }
+            | Kind::DevBlk { .. } => Ok(()),
             _ => Err(Errno::SeekPipe),
         }
     }
@@ -1288,14 +1322,17 @@ impl OpenFile {
                 Err(Errno::Invalid)
             };
         }
-        if let Kind::DevBlk { disk, start, len } = &self.kind {
-            // 块设备节点：分区起点+fd 偏移经驱动通用读
-            let off = start + offset;
-            if offset.saturating_add(data.len()) > *len as usize {
-                return Err(Errno::Range);
+        if let Kind::DevBlk {
+            disk, start, len, ..
+        } = &self.kind
+        {
+            let count = data.len().min((*len as usize).saturating_sub(offset));
+            if count == 0 {
+                return Ok(0);
             }
-            crate::drivers::read_bytes(*disk, off, data).map_err(|_| Errno::Io)?;
-            let delivered = deliver(&data[..data.len()])?;
+            let off = start.checked_add(offset).ok_or(Errno::Range)?;
+            crate::drivers::read_bytes(*disk, off, &mut data[..count]).map_err(|_| Errno::Io)?;
+            let delivered = deliver(&data[..count])?;
             return Ok(delivered);
         }
         if let Kind::MemInfo(text) = &self.kind {
@@ -1322,13 +1359,18 @@ impl OpenFile {
     /// 写给定位置且不改变共享偏移；O_APPEND 沿用 Linux 的追加行为。
     pub(crate) fn write_at(&self, offset: usize, data: &[u8], first: bool) -> Result<usize, Errno> {
         self.check_type(first)?;
-        if let Kind::DevBlk { disk, start, len } = &self.kind {
-            let off = start + offset;
-            if offset.saturating_add(data.len()) > *len as usize {
-                return Err(Errno::Range);
+        if let Kind::DevBlk {
+            disk, start, len, ..
+        } = &self.kind
+        {
+            fs::check_raw_disk_write(*disk)?;
+            let count = data.len().min((*len as usize).saturating_sub(offset));
+            if count == 0 {
+                return Err(Errno::NoSpace);
             }
-            crate::drivers::write_bytes(*disk, off, data).map_err(|_| Errno::Io)?;
-            return Ok(data.len());
+            let off = start.checked_add(offset).ok_or(Errno::Range)?;
+            crate::drivers::write_bytes(*disk, off, &data[..count]).map_err(|_| Errno::Io)?;
+            return Ok(count);
         }
         if matches!(
             self.kind,

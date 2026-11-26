@@ -147,6 +147,11 @@ pub(super) fn root_disk_name() -> char {
     (b'a' + ROOT_DISK_ID.load(core::sync::atomic::Ordering::Relaxed) as u8) as char
 }
 
+/// 检查根卷是否占用该块设备。
+pub(super) fn uses_disk(disk: usize) -> bool {
+    mounted() && ROOT_DISK_ID.load(core::sync::atomic::Ordering::Relaxed) == disk
+}
+
 fn try_mount(id: usize, start: usize, len: usize) -> Result<(), Errno> {
     if len < BLOCK_SIZE {
         return Err(Errno::Invalid);

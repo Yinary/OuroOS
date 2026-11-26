@@ -227,8 +227,18 @@ pub fn dispatch(
                 return ctx.open_rtc(flags, flags & 0x80000 != 0);
             }
             if let Some((disk, part)) = fs::lookup_blk_node(&path) {
+                if credentials.euid != 0 && !path_only {
+                    return Err(Errno::Access);
+                }
                 if let Ok((start, len)) = crate::drivers::partition(disk, part) {
-                    return ctx.open_devblk(disk, start, len as u64, flags, flags & 0x80000 != 0);
+                    return ctx.open_devblk(
+                        disk,
+                        part,
+                        start,
+                        len as u64,
+                        flags,
+                        flags & 0x80000 != 0,
+                    );
                 }
                 return Err(Errno::NoDevice);
             }
@@ -951,6 +961,9 @@ fn mknodat(
     }
     if mode & 0xf000 != 0o060000 {
         return Err(Errno::NotSupported); // 非 S_IFBLK
+    }
+    if credentials.euid != 0 {
+        return Err(Errno::Perm);
     }
     let path = ctx.path(dir, &user_string(space, a[1])?)?;
     if !path.starts_with("/dev/") {

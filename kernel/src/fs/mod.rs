@@ -320,6 +320,17 @@ pub(crate) fn create_fifo(
     ext4::create_fifo(parent, name, mode, owner)
 }
 
+/// 确认块设备当前没有已挂载卷，供原始写入路径检查。
+pub(crate) fn check_raw_disk_write(disk: usize) -> Result<(), Errno> {
+    if cfg!(feature = "rsext4-readonly") {
+        return Err(Errno::ReadOnly);
+    }
+    if ext4::uses_disk(disk) || fat::uses_disk(disk) {
+        return Err(Errno::Busy);
+    }
+    Ok(())
+}
+
 /// 在 Ext4 父目录中添加符号链接。
 pub(crate) fn symlink(
     parent: u32,

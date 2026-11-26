@@ -291,13 +291,13 @@ try_lock 失败即报告“持锁跨调度”。
 
 | 调用/类别 | 当前实现 | Linux 对照 / 说明 | 性质 |
 |---|---|---|---|
-| mknodat | S_IFIFO 在 Ext4 上创建持久节点，应用 umask，支持状态查询、硬链接和删名。S_IFBLK 在 /dev 下登记已存在的盘或分区，major 为 254，同名 EEXIST。 | 块设备节点由内核注册表管理。FIFO 的数据端点和阻塞打开仍未实现，O_PATH 可持有节点，数据打开返回 EOPNOTSUPP。S_IFCHR/S_IFSOCK 返回 EOPNOTSUPP。 | 未实现：FIFO 数据传输及其他设备类型 |
+| mknodat | S_IFIFO 在 Ext4 上创建持久节点，应用 umask，支持状态查询、硬链接和删名。S_IFBLK 由特权调用方在 /dev 下登记已存在的盘或分区，major 为 254，同名 EEXIST。 | 块设备节点由内核注册表管理。FIFO 的数据端点和阻塞打开仍未实现，O_PATH 可持有节点，数据打开返回 EOPNOTSUPP。S_IFCHR/S_IFSOCK 返回 EOPNOTSUPP。 | 未实现：FIFO 数据传输及其他设备类型 |
 | faccessat/faccessat2 | 按路径检查存在性；X_OK 要求文件有任一执行位（无执行位 EACCES），R_OK/W_OK 放行，不按凭证检查；flags 仅接受 AT_EACCESS/AT_SYMLINK_NOFOLLOW，NOFOLLOW 暂与跟随一致 | 不按 uid/gid 做权限检查 | 缺陷 1；未实现：NOFOLLOW 暂与跟随一致 |
 | fchown/fchownat | Ext4 按 FD 或路径修改属主和属组，两个 ID 独立接受 -1 保留。支持 AT_SYMLINK_NOFOLLOW、空字符串配合 AT_EMPTY_PATH，以及已删名但仍打开的 inode。普通属主可保留原属主并改到原属组、文件系统组或补充组。 | 特权沿用进程有效 UID 为 0 的规则，普通属主按文件系统 UID 判断。暂未接入 CAP_CHOWN、目录搜索授权、FAT、虚拟对象或空指针形式的 AT_EMPTY_PATH。沿用后端 ctime、set-ID 位及日志更新规则。 | 缺陷 2；未实现 |
 | fchmod/fchmodat | 保留 07777 权限位（含 setuid/setgid/sticky），类型位由 inode 持有；仅普通文件与目录可改。fchmod 按已打开对象的 inode 身份生效（rename/unlink 后仍有效，管道/procfs FD 返回 ENOENT）；fchmodat 按路径且总是跟随符号链接，不读取第四个参数，fchmodat2 未实现；FAT 卷返回 ENOTSUP | 通用调用表没有 chmod，libc 的 chmod 走 fchmodat；无属主校验与 ACL | 缺陷 2；未实现：ACL |
 | syslog/klogctl | 按 man 2 action 编码：READ(2) 消耗式游标读取、READ_ALL(3) 全量、READ_CLEAR(4) 读后清空、CLEAR(5)、OPEN/CLOSE(0/1) 无操作返回 0、console 开关(6/7)无操作、SET_CONSOLE_LEVEL(8) 仅接受 1..=8 并记录（不变更实际输出）、SIZE_UNREAD(9)/SIZE_BUFFER(10) 返回未读/容量；其余 EINVAL | 日志环上限 8 KiB，只收集显式登记事件（启动报告/终态/panic），无内核分级日志 | 未实现：内核分级日志 |
 | getrandom | 设备树 rng-seed 播种 ChaCha20 流（单次请求上限 64 KiB，可失败分配）；flags 仅接受 GRND_NONBLOCK/GRND_RANDOM；无种子时一律 EAGAIN（无合法阻塞唤醒来源），绝不以时间/常量伪造熵 | 缺少可信启动熵时 execve 返回 EIO，保留旧映像；启动阶段若因此无法创建任何用户任务，内核同步文件系统并关机。 | 设计：不伪造熵；未实现：等待熵就绪 |
-| ioctl | 仅 /dev/misc/rtc 的 RTC_RD_TIME（cmd 按 unsigned int 截断比较）；其余命令与设备一律 ENOTTY | 终端 TCGETS/TCWINSZ、FIONBIO 等未实现（more 依赖的 isatty 降级为非终端） | 未实现 |
+| ioctl | /dev/misc/rtc 支持 RTC_RD_TIME，块设备支持 BLKGETSIZE64，返回所打开盘或分区的字节容量。cmd 按 unsigned int 截断比较，其余命令与设备组合返回 ENOTTY | 终端 TCGETS/TCWINSZ、FIONBIO 等未实现（more 依赖的 isatty 降级为非终端） | 未实现 |
 | read/write/readv/writev | 共用 4 KiB 可失败堆缓冲区，单次分配后复用；向量描述符先复制到内核，最多 1024 项，总长度超过 ssize_t 返回 EINVAL；每次最多搬运 0x7ffff000 字节；遇短传输、EOF 或错误停止，已有进展时返回已完成长度 | 用户缓冲区按页交付，读只推进实际交付的偏移；完整调用持有打开文件锁；OOM 返回 ENOMEM，零长度不分配数据缓冲区 | 无偏差 |
 | pread64/pwrite64/preadv/pwritev | 指定独立偏移，不修改共享文件偏移；负偏移 EINVAL，流式对象 ESPIPE；rv64/la64 原始向量定位 ABI 使用完整 pos_l，忽略 pos_h；O_APPEND 下定位写仍追加，与 Linux 已知行为一致 | 不支持 preadv2/pwritev2；Ext4 文件超限 EFBIG 独立于参数过长 E2BIG；部分错误仍按已完成字节数返回 | 未实现：preadv2/pwritev2 |
 | fcntl | 支持 F_DUPFD/F_DUPFD_CLOEXEC、F_GETFD/F_SETFD、F_GETFL/F_SETFL；从下界选最低空闲 FD，受进程 RLIMIT_NOFILE（默认软 1024 / 硬 4096）约束；cloexec 属于描述符，偏移与状态由 dup/fork 共享；打开时的创建标志不保存在共享状态中 | F_SETFL 仅修改 O_APPEND/O_NONBLOCK，访问模式、创建与同步标志不变；请求 O_ASYNC/O_DIRECT/O_NOATIME 返回 EOPNOTSUPP 且不修改状态；未知命令（含锁命令）EINVAL；尚未实现 O_PATH 专用规则、追加专用 inode 属性检查及强制 O_LARGEFILE | 未实现：文件锁、异步通知等 |
@@ -328,6 +328,7 @@ try_lock 失败即报告“持锁跨调度”。
 | statx 同步与 mask | 本地卷按当前 inode 缓存查询；接受 AS_STAT/FORCE_SYNC/DONT_SYNC，后两者不触发远端同步或额外文件数据写回；互斥同步标志、未知 flags、保留 mask 位 0x80000000 返回 EINVAL，其余未知 mask 位忽略 | 返回 mask 反映实际提供字段，可以多于请求；缺失时间不标有效，填零；当前 atime 更新策略仍沿用 rsext4 挂载选项 | 无偏差 |
 | fsync | EXT4 写回该 inode 的共享页并同步 rsext4 缓存/日志 | FAT 返回 ENOTSUP | 未实现：FAT |
 | mount | fstype 接受 vfat/fat；源设备 `/dev/vd<小写字母>[0-4]`（无后缀或 0 为整盘）；flags 必须 0，data 忽略；/proc/mounts 报告根卷（按实际设备号命名）与 FAT 挂载记录 | 仅 MBR 主分区；不限于 a-d | 未实现：非 MBR 主分区、flags 与 data |
+| 原始块设备读写 | 已注册块设备支持顺序和定位读写。有效 UID 为 0 的进程可打开数据描述符。按分区容量截断跨尾请求，读至末尾返回 EOF，末尾继续写返回 ENOSPC。 | 根卷或 FAT 卷占用的磁盘禁止原始写入，返回 EBUSY。只读构建返回 EROFS。 | 块设备专用同步、Ext4 非根卷挂载和只读重挂载待完善。 |
 | 设备命名与根卷 | 设备号按总线枚举顺序分配，无内容特征重排；Ext4 根卷为扫描式选择：每盘先试分区 1..4 再试整盘，取第一个可挂载的 Ext4。官方 mount 测例写死的 `/dev/vda2`（辅助盘 FAT32 分区）由用户态启动器按授权清单 mknodat 建立块设备节点（major 254，minor=(盘<<4)\|分区，见 §6.3），内核按节点登记的真实设备身份解析挂载 | 设备节点是内核注册表条目而非文件系统实体；根卷语义与设备名无绑定；辅助盘由官方 harness 自动挂为第二块盘 | 取舍，理由待补 |
 | mmap | 匿名映射、普通文件和 /dev/zero 均支持 PRIVATE/SHARED；/dev/zero 按需提供零页，共享写权限由打开模式决定；文件整页在 EOF 外允许建图，直接访问按 SIGBUS 终止；MAP_FIXED 事务替换 | 最后不足一页的尾部补零且不回写；MAP_FIXED 可覆盖用户栈；flags 白名单，MAP_DENYWRITE、MAP_EXECUTABLE 与 MAP_STACK 按 Linux 忽略 | 无偏差 |
 | mprotect | 支持 PROT_NONE 和 R/W/X 组合；W 隐含 R，只读 FD 建立的共享映射禁止提升写权限（EACCES） | 两架构无 NX；VMA 记录请求权限，页表执行写保护，可访问页实际带 X | 取舍，理由待补：没有执行权限保护 |
@@ -352,13 +353,13 @@ try_lock 失败即报告“持锁跨调度”。
 
 FD 控制依据：[F_DUPFD](https://man7.org/linux/man-pages/man2/F_DUPFD.2const.html)、[F_GETFD/F_SETFD](https://man7.org/linux/man-pages/man2/F_GETFD.2const.html) 与 [F_GETFL/F_SETFL](https://man7.org/linux/man-pages/man2/F_GETFL.2const.html)。FD 表扩容使用可失败分配；成功 exec 关闭 cloexec，失败 exec 保留描述符。
 
-符号链接创建依据见 [symlinkat(2)](https://man7.org/linux/man-pages/man2/symlinkat.2.html)。硬链接与删名依据见 [linkat(2)](https://man7.org/linux/man-pages/man2/linkat.2.html) 和 [unlinkat(2)](https://man7.org/linux/man-pages/man2/unlinkat.2.html)。
-
 创建掩码与时间更新依据：[umask(2)](https://man7.org/linux/man-pages/man2/umask.2.html)、[utimensat(2)](https://man7.org/linux/man-pages/man2/utimensat.2.html) 与 [Linux v6.12 utimes ABI](https://github.com/torvalds/linux/blob/v6.12/fs/utimes.c)。双方 OMIT 的提前成功及 NULL path 的 FD 形式按原始系统调用处理；只核对语义，未复制实现代码。
 
 容量查询依据：[statfs(2)](https://man7.org/linux/man-pages/man2/statfs.2.html) 与 [asm-generic statfs UAPI](https://github.com/torvalds/linux/blob/v6.12/include/uapi/asm-generic/statfs.h)。仅按 ABI 独立编码；Ext4 fsid 取 UUID 前八字节，FAT 取卷序号，均作为不透明标识。
 
 链接读取依据：[readlink(2)](https://man7.org/linux/man-pages/man2/readlink.2.html) 与 [Linux v6.12 readlinkat ABI/空路径行为](https://github.com/torvalds/linux/blob/v6.12/fs/stat.c)。仅核对公开语义，未复制实现代码。
+
+符号链接创建依据见 [symlinkat(2)](https://man7.org/linux/man-pages/man2/symlinkat.2.html)。硬链接与删名依据见 [linkat(2)](https://man7.org/linux/man-pages/man2/linkat.2.html) 和 [unlinkat(2)](https://man7.org/linux/man-pages/man2/unlinkat.2.html)。
 
 截断依据：[truncate(2)](https://man7.org/linux/man-pages/man2/truncate.2.html)。按公开语义检查路径、FD、长度和偏移；存活共享映射下拒绝改长属于当前兼容性限制，不代表 Linux 的完整映射截断行为。
 
