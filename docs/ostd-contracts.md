@@ -273,7 +273,7 @@ try_lock 失败即报告“持锁跨调度”。
 
 | 组 | 调用 | 实现 |
 |---|---|---|
-| 文件 | getcwd、dup、dup3、fcntl、mkdirat、mknodat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、readlinkat、readahead、statfs、fstatfs、newfstatat、fstat、fsync、statx、umask、utimensat、renameat、renameat2、truncate、ftruncate、fchmodat、fchmod、fchownat、fchown | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
+| 文件 | getcwd、dup、dup3、fcntl、mkdirat、mknodat、unlinkat、mount、umount2、chdir、openat、close、pipe2、getdents64、lseek、read、write、readv、writev、pread64、pwrite64、preadv、pwritev、readlinkat、readahead、statfs、fstatfs、newfstatat、fstat、sync、fsync、statx、umask、utimensat、renameat、renameat2、truncate、ftruncate、fchmodat、fchmod、fchownat、fchown | `syscall/fs.rs` 处理用户参数与 ABI，`fs::context` 管理 FD 与文件操作 |
 | futex | WAIT、WAKE、REQUEUE、CMP_REQUEUE、WAIT_BITSET、WAKE_BITSET；PRIVATE 标志按线程组和虚拟地址匹配，共享操作按映射后备匹配，私有映射在写时复制后保留等待键；普通等待的相对超时与 bitset 等待的绝对超时都换算成单调时刻；被信号打断返回 EINTR；支持 set_robust_list/get_robust_list 与线程退出健壮锁清理 | WAKE_OP 与 PI 系列返回 ENOSYS；线程退出先遍历 robust_list 置 FUTEX_OWNER_DIED 并唤醒等待者，再清零 `clear_child_tid` 并唤醒等待者 |
 | vfork | 接受 CLONE_VM 与 CLONE_VFORK 加 SIGCHLD：子进程按复制地址空间创建，父进程挂起到子进程 exec 或退出后返回子进程号；posix_spawn 可用 | 缺陷 13：子进程按复制地址空间创建，不与父进程共享内存，见 §4.4 |
 | 进程 | exit、nanosleep、sched_yield、times、getpid、getppid、gettid、getuid、geteuid、getgid、getegid、getresuid、getresgid、getgroups、setuid、setgid、setreuid、setregid、setresuid、setresgid、setfsuid、setfsgid、setgroups、setpgid、getpgid、setsid、getsid、clone、execve、wait4、waitid、capget、pselect6、ppoll、getitimer、setitimer | `task::process_call` |
@@ -283,7 +283,7 @@ try_lock 失败即报告“持锁跨调度”。
 | 设备/随机 | ioctl(29)（仅 RTC 设备的 RTC_RD_TIME，其余 ENOTTY）、getrandom(278)、/dev/urandom 与 /dev/random | `fs::context::ioctl`、`drivers/rtc.rs`、`entropy::fill_random` |
 | 信号 | kill、tkill、tgkill、rt_sigaction、rt_sigprocmask、rt_sigpending、rt_sigsuspend、rt_sigtimedwait、rt_sigqueueinfo、sigaltstack、rt_sigreturn | `syscall/signal.rs`、`task/signal.rs`、`sigframe/`（契约与偏差见 §4.5） |
 | 网络 | socket、bind、listen、accept、accept4、connect、getsockname、getpeername、sendto、recvfrom、setsockopt、getsockopt、shutdown | `syscall/net.rs`、`net/mod.rs`（AF_INET 本地回环 UDP 与 TCP） |
-| 内存 | brk、mmap、munmap、mprotect、mremap、mincore、madvise、msync、锁页系列 | `syscall/memory.rs` |
+| 内存 | brk、mmap、munmap、mprotect、mremap、mincore、madvise、msync、锁页系列、shmget、shmctl、shmat、shmdt | `syscall/memory.rs`、`mm/shm.rs` |
 | 其他 | uname、gettimeofday、set_tid_address(96) | `syscall/mod.rs` |
 | 其余 | 未列出的调用号 | ENOSYS |
 
@@ -338,6 +338,8 @@ try_lock 失败即报告“持锁跨调度”。
 | getdents64 | fs 层提供目录项与续读位置，EXT4 后端按块解析，syscall 层打包 Linux dirent；单次最多 4KiB；FAT 返回 ENOTSUP | 后端目录块使用可失败堆分配；Linux 目录项打包的 4 KiB 栈缓冲区限制在不内联的 getdents64 函数内，避免普通文件 I/O 承担该栈帧；失败不推进文件偏移 | 无偏差；未实现：FAT |
 | 套接字（AF_INET 回环） | 支持 AF_INET 的 SOCK_STREAM（TCP）与 SOCK_DGRAM（UDP），支持 SOCK_NONBLOCK/SOCK_CLOEXEC、bind（含端口 0 临时端口分配与 UDP SO_REUSEADDR 共享端口）、listen、accept/accept4、connect（非阻塞 TCP 返回 EINPROGRESS 且立即入监听队列；UDP 按精确对端优先解复用）、getsockname/getpeername、sendto/recvfrom（含 MSG_PEEK/MSG_DONTWAIT/MSG_NOSIGNAL 与 SIGPIPE；阻塞 TCP 小包整块写入防短写）、read/write/ppoll/pselect6/close/fstat（S_IFSOCK）、shutdown，以及 SOL_SOCKET（SO_REUSEADDR/SO_REUSEPORT/SO_KEEPALIVE/SO_DONTROUTE/SO_LINGER/SO_RCVLOWAT/SO_SNDLOWAT/SO_TYPE/SO_ERROR/SO_SNDBUF/SO_RCVBUF/SO_RCVTIMEO/SO_SNDTIMEO）、IPPROTO_IP（IP_TOS/IP_TTL/IP_MTU_DISCOVER/IP_RECVERR）与 IPPROTO_TCP（TCP_NODELAY/TCP_MAXSEG/TCP_CORK/TCP_KEEPIDLE/TCP_KEEPINTVL/TCP_KEEPCNT/TCP_INFO/TCP_CONGESTION） | 仅支持本地回环（0.0.0.0 与 127.x.x.x）；无外部物理网卡、AF_UNIX/AF_INET6、sendmsg/recvmsg 与完整 TCP 拥塞/重传状态机 | 未实现：外部网卡、AF_UNIX/AF_INET6、sendmsg/recvmsg |
 | pselect6 / getitimer / setitimer | pselect6 支持最多 1024 个 FD 的 read/write/except 位图、可选相对超时与临时信号掩码（被打断返回 EINTR，不走 SA_RESTART）；getitimer/setitimer 支持 ITIMER_REAL 单次与周期触发 SIGALRM（fork 清零、exec 保留、退出清理） | ITIMER_VIRTUAL 与 ITIMER_PROF 返回 EOPNOTSUPP；超过 1024 FD 的位图返回 EINVAL | 未实现：ITIMER_VIRTUAL、ITIMER_PROF |
+| System V 共享内存（shmget/shmctl/shmat/shmdt） | 全局段表复用 `mm::shared::SharedPage` 与 `AreaKind::SharedAnonymous`；支持 `IPC_PRIVATE` 与具名 key（`IPC_CREAT`/`IPC_EXCL`）、`shmat`（含 `SHM_RDONLY`/`SHM_RND`/`SHM_REMAP`/`SHM_EXEC`）、`shmdt` 与 `shmctl`（`IPC_RMID`/`IPC_STAT`/`IPC_SET`，兼容剥离 `IPC_64` 标志）；`IPC_RMID` 立即解绑 key 并在 `nattch` 归零后回收，已挂接映射与 `fork` 继承映射持续有效直到解除或进程退出；`shmid64_ds` 按 asm-generic 64 位 112 字节编码 | 单段上限 256 MiB，总段数上限 1024；未实现 `IPC_INFO`/`SHM_INFO`/`SHM_STAT`/`SHM_LOCK`/`SHM_UNLOCK` 与按 uid/gid 的 IPC 权限校验 | 未实现：IPC_INFO、SHM_LOCK 与凭证权限校验 |
+| sync | 同步已挂载可写 Ext4 根卷缓存并返回 0 | 语义兼容（无独立写回线程，同步落盘） | 无偏差 |
 | 路径 | 必须是合法 UTF-8；总长 4096 字节，单分量 255 | 非 UTF-8 文件名不可访问 | 取舍，理由待补 |
 | 其他 | stdin 读恒 EOF；fd=1/2 直通控制台；/dev/null（rdev 1:3）读与 pread 恒返回 EOF、写与 pwrite 丢弃并返回请求长度（null(4)）；/dev/urandom（1:9）与 /dev/random（1:8）读返回熵流、写丢弃；/dev/misc/rtc 提供墙上时钟查询（RV Goldfish RTC@0x101000 纳秒计数，LA LS7A TOY 双读一致法；ioctl RTC_RD_TIME 按 linux/rtc.h 拆 tm 字段，cmd 按 unsigned int 截断比较以兼容部分 libc 的符号扩展）；/proc/self/exe 在 exec/open 时重写为该进程最近一次 execve 的绝对路径（内嵌程序无路径时 ENOENT）；sched_yield 轮转后可能立即再次调度；getpid 总成功，getppid 返回注册表 parent | 孤儿过继 init；/proc 枚举来自 Task 维护的独立快照表（注册/退出/收割同步更新；FS 读路径经专用锁消费，锁序 REGISTRY→PROC_TABLE 单向），pid 目录含 stat/cmdline/status；cmdline 为 execve 提交后的真实 argv，未 exec 的任务以登记名近似；/proc/<pid>/stat 提供 proc(5) 全部 53 字段（CPU 记账与内存尺寸字段为 0，记账未导出为欠账）；RTC 不支持设置时间（RTC_SET_TIME ENOTTY） | 取舍，理由待补：stdin 恒 EOF、fd 1 与 2 直通控制台；未实现：RTC 设置时间、CPU 记账字段 |
 
@@ -452,7 +454,7 @@ signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综�
 |---|---|
 | 前提 | 任务时代内核态关中断；单核无合法持锁等待；lock_debug 下 try_lock 失败即报告 bug |
 | 检查 | DebugMutex 的 percpu 持锁深度及切换入口零深度检查始终启用；lock_debug 额外跟踪锁名/获取点（`#[track_caller]`） |
-| 锁序 | SCHED→FRAME；REGISTRY→{FRAME, EXIT_REPORTS, 打开文件 Handle, ROOT/MOUNTS/PAGES, NET}；Handle→{ROOT, MOUNTS, PAGES, NET}；PAGES→{ROOT, MOUNTS}；ROOT/MOUNTS→DISKS；SCHED→REGISTRY（信号唤醒 drain 与到期 ITIMER_REAL 触发的唯一嵌套方向，反向路径已核查不存在） |
+| 锁序 | SCHED→FRAME；REGISTRY→{FRAME, EXIT_REPORTS, SHM_TABLE, 打开文件 Handle, ROOT/MOUNTS/PAGES, NET}；Handle→{ROOT, MOUNTS, PAGES, NET}；PAGES→{ROOT, MOUNTS}；ROOT/MOUNTS→DISKS；SCHED→REGISTRY（信号唤醒 drain 与到期 ITIMER_REAL 触发的唯一嵌套方向，反向路径已核查不存在） |
 | 反向 | 任何路径不得反向持有；fs/drivers 的 `spin::Mutex` 不受 DebugMutex 深度检查保护 |
 | 唤醒 | 事件方不直接取 SCHED；用无锁原子标志，在调度边界消费。futex 的唤醒与重排队在注册表锁外按锁内算好的键执行 |
 | 锁外析构 | 退出路径的 space/fs Drop 在 REGISTRY 锁外完成；exec 目前是例外 |

@@ -175,3 +175,15 @@ python3 tests/run_official.py la --groups ltp-musl --ltp-filter chown,statx --lt
 - **实测结果（全部 8 组、44/44 子项 100% 通过）**：
   - `rv`：`iperf-musl` **6.38/6**（6/6）、`iperf-glibc` **6.37/6**（6/6）、`netperf-musl` **8.08/5**（5/5）、`netperf-glibc` **8.08/5**（5/5）；
   - `la`：`iperf-musl` **6.91/6**（6/6）、`iperf-glibc` **6.89/6**（6/6）、`netperf-musl` **8.57/5**（5/5）、`netperf-glibc` **8.68/5**（5/5）。
+
+### 5.4 `iozone` 摸底与修复验证结果
+
+- **首轮基线（`dev` `ba9e2b4`）**：双架构四配置下第 1 条自动模式 `./iozone -a -r 1k -s 4m` 均在约 10 秒内通过，但其余 7 条 4 进程计分命令（共 20 项）全部因缺少 `shmget(194)` 报 `Unable to get shared memory segment(shmget) ... Error 38` 退出（0/20）。
+- **系统调用审计与修复（`ipc/sysv-shm` 分支）**：
+  1. 宿主 Linux `qemu-riscv64 -strace` 与动态符号核对确认 `iozone` 共调用 33 个系统调用，仅缺 System V 共享内存（`shmget` 194、`shmctl` 195、`shmat` 196、`shmdt` 197）与 `sync`（81）。
+  2. 新增 `kernel/src/mm/shm.rs` 全局共享内存段表，直接复用 `mm::shared::SharedPage` 与 `AreaKind::SharedAnonymous` 的缺页和 `fork` 共享机制，支持 `IPC_RMID` 延迟释放与 `UserAddressSpace` 的 `fork`/`Drop` 挂接计数配平；同时接入 `sync(81)` 转发至 Ext4 全局同步。
+- **修复后实测结果（QEMU 10.0.2 + QCOW2 覆盖层，全部 4 配置 80/80 子项 100% 通过）**：
+  - `rv`：`iozone-musl` **20.00/20**（20/20）、`iozone-glibc` **20.00/20**（20/20，单组实测耗时约 139 秒）；
+  - `la`：`iozone-musl` **20.00/20**（20/20）、`iozone-glibc` **20.00/20**（20/20，双库合跑共耗时约 220 秒）。
+  - 4 进程并发模式下单进程最大吞吐约 `1.1–2.7 MB/s`（低于官方 Linux 页缓存基线，当前 20 项均稳拿保底 1.0 分，合计 +80 分）；后续引入通用文件页缓存后可进一步拉高该组吞吐得分。
+  - **默认送测启用状态**：`official_init.rs` 已在默认送测流程中启用 `iozone-musl` 与 `iozone-glibc`，顺序排在 `netperf` 之后、`lmbench` 之前，以在单机总预算内优先锁定稳定的 `iozone` 得分。

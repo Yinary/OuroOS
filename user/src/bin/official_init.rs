@@ -1300,6 +1300,8 @@ extern "C" fn ouro_main() -> ! {
     run_selected_group(b"iperf-glibc", started);
     run_selected_group(b"netperf-musl", started);
     run_selected_group(b"netperf-glibc", started);
+    run_selected_group(b"iozone-musl", started);
+    run_selected_group(b"iozone-glibc", started);
     run_selected_group(b"lmbench-musl", started);
     run_selected_group(b"lmbench-glibc", started);
     // LTP 与其余尚未完成全量验收的测试组暂不在默认送测中启用，按需取消注释：
@@ -1311,7 +1313,6 @@ extern "C" fn ouro_main() -> ! {
     // run_ltp(b"/musl\0", b"musl\0", started + budget);
     // run_ltp(b"/glibc\0", b"glibc\0", now_secs() + 550);
     // run_script(b"/musl\0", 5, b"./cyclictest_testcode.sh\0");
-    // run_script(b"/musl\0", 5, b"./iozone_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./unixbench_testcode.sh\0");
     note(b"[official-init] all groups finished\n");
     sys_exit(0)
