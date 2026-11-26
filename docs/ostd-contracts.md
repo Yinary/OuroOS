@@ -252,7 +252,7 @@ try_lock 失败即报告“持锁跨调度”。
 
 | 欠账 | 现状 / 计划 |
 |---|---|
-| pipe/子进程唤醒的精确订阅 | 当前宽松匹配 + Mesa 重执行；新增 pipe 状态变化必须补 `request_pipe_wake`，否则等待者可能永久挂起 |
+| pipe/子进程唤醒的精确订阅 | 单管道阻塞读写已改为按管道实例号定向唤醒（`WaitReason::PipeId`，16 槽无锁原子队列，槽满退回全局广播）；`ppoll`/`pselect6`、套接字与子进程退出仍用宽松匹配 + Mesa 重执行，新增状态变化须补 `request_pipe_wake`/`request_pipe_id_wake` |
 | 锁序图 | lockdep 式环检测 |
 | polyhal 本体 vendor | 修 #8；la idle 封装 |
 
@@ -339,7 +339,7 @@ try_lock 失败即报告“持锁跨调度”。
 | 套接字（AF_INET 回环） | 支持 AF_INET 的 SOCK_STREAM（TCP）与 SOCK_DGRAM（UDP），支持 SOCK_NONBLOCK/SOCK_CLOEXEC、bind（含端口 0 临时端口分配与 UDP SO_REUSEADDR 共享端口）、listen、accept/accept4、connect（非阻塞 TCP 返回 EINPROGRESS 且立即入监听队列；UDP 按精确对端优先解复用）、getsockname/getpeername、sendto/recvfrom（含 MSG_PEEK/MSG_DONTWAIT/MSG_NOSIGNAL 与 SIGPIPE；阻塞 TCP 小包整块写入防短写）、read/write/ppoll/pselect6/close/fstat（S_IFSOCK）、shutdown，以及 SOL_SOCKET（SO_REUSEADDR/SO_REUSEPORT/SO_KEEPALIVE/SO_DONTROUTE/SO_LINGER/SO_RCVLOWAT/SO_SNDLOWAT/SO_TYPE/SO_ERROR/SO_SNDBUF/SO_RCVBUF/SO_RCVTIMEO/SO_SNDTIMEO）、IPPROTO_IP（IP_TOS/IP_TTL/IP_MTU_DISCOVER/IP_RECVERR）与 IPPROTO_TCP（TCP_NODELAY/TCP_MAXSEG/TCP_CORK/TCP_KEEPIDLE/TCP_KEEPINTVL/TCP_KEEPCNT/TCP_INFO/TCP_CONGESTION） | 仅支持本地回环（0.0.0.0 与 127.x.x.x）；无外部物理网卡、AF_UNIX/AF_INET6、sendmsg/recvmsg 与完整 TCP 拥塞/重传状态机 | 未实现：外部网卡、AF_UNIX/AF_INET6、sendmsg/recvmsg |
 | pselect6 / getitimer / setitimer | pselect6 支持最多 1024 个 FD 的 read/write/except 位图、可选相对超时与临时信号掩码（被打断返回 EINTR，不走 SA_RESTART）；getitimer/setitimer 支持 ITIMER_REAL 单次与周期触发 SIGALRM（fork 清零、exec 保留、退出清理） | ITIMER_VIRTUAL 与 ITIMER_PROF 返回 EOPNOTSUPP；超过 1024 FD 的位图返回 EINVAL | 未实现：ITIMER_VIRTUAL、ITIMER_PROF |
 | 路径 | 必须是合法 UTF-8；总长 4096 字节，单分量 255 | 非 UTF-8 文件名不可访问 | 取舍，理由待补 |
-| 其他 | stdin 读恒 EOF；fd=1/2 直通控制台；/dev/null（rdev 1:3）读 EOF、写全收（null(4)）；/dev/urandom（1:9）与 /dev/random（1:8）读返回熵流、写丢弃；/dev/misc/rtc 提供墙上时钟查询（RV Goldfish RTC@0x101000 纳秒计数，LA LS7A TOY 双读一致法；ioctl RTC_RD_TIME 按 linux/rtc.h 拆 tm 字段，cmd 按 unsigned int 截断比较以兼容部分 libc 的符号扩展）；/proc/self/exe 在 exec/open 时重写为该进程最近一次 execve 的绝对路径（内嵌程序无路径时 ENOENT）；sched_yield 轮转后可能立即再次调度；getpid 总成功，getppid 返回注册表 parent | 孤儿过继 init；/proc 枚举来自 Task 维护的独立快照表（注册/退出/收割同步更新；FS 读路径经专用锁消费，锁序 REGISTRY→PROC_TABLE 单向），pid 目录含 stat/cmdline/status；cmdline 为 execve 提交后的真实 argv，未 exec 的任务以登记名近似；/proc/<pid>/stat 提供 proc(5) 全部 53 字段（CPU 记账与内存尺寸字段为 0，记账未导出为欠账）；RTC 不支持设置时间（RTC_SET_TIME ENOTTY） | 取舍，理由待补：stdin 恒 EOF、fd 1 与 2 直通控制台；未实现：RTC 设置时间、CPU 记账字段 |
+| 其他 | stdin 读恒 EOF；fd=1/2 直通控制台；/dev/null（rdev 1:3）读与 pread 恒返回 EOF、写与 pwrite 丢弃并返回请求长度（null(4)）；/dev/urandom（1:9）与 /dev/random（1:8）读返回熵流、写丢弃；/dev/misc/rtc 提供墙上时钟查询（RV Goldfish RTC@0x101000 纳秒计数，LA LS7A TOY 双读一致法；ioctl RTC_RD_TIME 按 linux/rtc.h 拆 tm 字段，cmd 按 unsigned int 截断比较以兼容部分 libc 的符号扩展）；/proc/self/exe 在 exec/open 时重写为该进程最近一次 execve 的绝对路径（内嵌程序无路径时 ENOENT）；sched_yield 轮转后可能立即再次调度；getpid 总成功，getppid 返回注册表 parent | 孤儿过继 init；/proc 枚举来自 Task 维护的独立快照表（注册/退出/收割同步更新；FS 读路径经专用锁消费，锁序 REGISTRY→PROC_TABLE 单向），pid 目录含 stat/cmdline/status；cmdline 为 execve 提交后的真实 argv，未 exec 的任务以登记名近似；/proc/<pid>/stat 提供 proc(5) 全部 53 字段（CPU 记账与内存尺寸字段为 0，记账未导出为欠账）；RTC 不支持设置时间（RTC_SET_TIME ENOTTY） | 取舍，理由待补：stdin 恒 EOF、fd 1 与 2 直通控制台；未实现：RTC 设置时间、CPU 记账字段 |
 
 
 
