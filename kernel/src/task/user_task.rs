@@ -198,6 +198,10 @@ pub fn user_task_entry() -> ! {
                             ) {
                                 Ok(new_blocked) => {
                                     thread.signal.setmask(new_blocked);
+                                    if d.flags & crate::syscall::signal::SA_RESETHAND != 0 {
+                                        rec.signal
+                                            .set_disposition(sig, SignalDisposition::default());
+                                    }
                                     None
                                 }
                                 Err(_) => Some(ExitInfo::Signaled {
@@ -1313,17 +1317,21 @@ fn queue_info(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
     let pid = args[0] as u32 as i32;
     let sig = args[1] as u32;
     let mut raw = [0u8; 128];
-    let ok = REGISTRY
-        .lock()
-        .group(parent)
-        .and_then(|r| r.space.as_ref())
-        .is_some_and(|s| user_access::copy_from_user(s.as_space(), args[2], &mut raw).is_ok());
+    let (sender_tgid, ok) = {
+        let reg = REGISTRY.lock();
+        let tgid = reg.group(parent).map_or(parent, |r| r.pid);
+        let ok = reg
+            .group(parent)
+            .and_then(|r| r.space.as_ref())
+            .is_some_and(|s| user_access::copy_from_user(s.as_space(), args[2], &mut raw).is_ok());
+        (tgid, ok)
+    };
     if !ok {
         return Err(Errno::Fault);
     }
     let code = i32::from_ne_bytes(raw[8..12].try_into().unwrap_or([0; 4]));
-    // 内核保留 si_code 只能对自身使用。
-    if (code >= 0 || code == SI_TKILL) && pid != parent as i32 {
+    // 内核保留 si_code 只能对自身线程组使用。
+    if (code >= 0 || code == SI_TKILL) && pid != sender_tgid as i32 {
         return Err(Errno::Perm);
     }
     if sig > 64 {
@@ -1366,14 +1374,15 @@ fn kill_or_tgkill(parent: Pid, nr: usize, args: [usize; 6]) -> Result<usize, Err
     if sig > 64 {
         return Err(Errno::Invalid);
     }
-    let slot = SigInfoSlot {
-        // kill(2) 恒 SI_USER(=0)；tgkill 发内核保留码 SI_TKILL。
-        code: if nr == sysnr::KILL { 0 } else { SI_TKILL },
-        pid: parent as u32,
-        ..Default::default()
-    };
     let mut locked = REGISTRY.lock();
     let reg = &mut *locked;
+    let sender_tgid = reg.group(parent).map_or(parent, |r| r.pid);
+    let slot = SigInfoSlot {
+        // kill(2) 恒 SI_USER(=0)；tkill/tgkill 发内核保留码 SI_TKILL，si_pid 为发送者线程组号。
+        code: if nr == sysnr::KILL { 0 } else { SI_TKILL },
+        pid: sender_tgid as u32,
+        ..Default::default()
+    };
     if nr == sysnr::TKILL {
         let tid = args[0] as u32 as i32;
         if tid <= 0 {

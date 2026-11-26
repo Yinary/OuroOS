@@ -344,9 +344,9 @@ pub fn dispatch(
             if ret == Err(Errno::Pipe) && (nr == sysnr::WRITE || nr == sysnr::WRITEV) {
                 signal.generate(
                     SIGPIPE,
-                    // code=0 即 SI_USER，发送者为调用进程自身。
+                    // code=0 即 SI_USER，发送者为调用进程自身（线程组号）。
                     SigInfoSlot {
-                        pid: pid as u32,
+                        pid: thread.tgid as u32,
                         ..Default::default()
                     },
                     thread.signal.blocked(),
@@ -683,8 +683,8 @@ pub fn dispatch(
             Flow::Continue
         }
         sysnr::GETPID => {
-            // getpid(2)：总成功；pid 由进程注册表分配，见 task 契约
-            cx[TrapFrameArgs::RET] = pid;
+            // getpid(2)：返回调用线程所属的线程组号（tgid），同线程组内各线程一致。
+            cx[TrapFrameArgs::RET] = thread.tgid;
             Flow::Continue
         }
         _ => {

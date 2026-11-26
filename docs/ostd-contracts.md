@@ -384,7 +384,7 @@ FS 通过 `fs::mapping` 注册 MM 映射钩子：注册后，长度改变先由 
 | 缺陷 7 | §4.3 sched_* | SCHED_FIFO 线程时间片到期后与同级线程轮转 | sched(7)：SCHED_FIFO 没有时间片，线程运行到阻塞或被更高优先级抢占 |
 | 缺陷 8 | §4.3 statfs/fstatfs | 管道和控制台上返回 EOPNOTSUPP | statfs(2)：fstatfs 在管道上自 Linux 3.1 之后正常返回 |
 | 缺陷 9 | §4.5 sigpending | sigsetsize 只接受 8 | Linux 6.12 `kernel/signal.c` 的 `sys_rt_sigpending`：大于 8 才返回 EINVAL |
-| 缺陷 11 | §4.5 sa_flags | SA_NODEFER 不生效；SA_RESETHAND 与 SA_NOCLDSTOP 只保存不执行 | sigaction(2)：SA_NODEFER 表示处理函数运行期间不屏蔽本信号，SA_RESETHAND 表示进入处理函数后恢复默认处置 |
+| 缺陷 11 | §4.5 sa_flags | SA_NOCLDSTOP 只保存不执行 | sigaction(2)：子进程停止/继续状态机未实现（SA_NODEFER 与 SA_RESETHAND 已修复） |
 | 缺陷 12 | §4.5 sigaltstack | 备用栈不分线程；不检查 MINSIGSTKSZ；rt_sigreturn 不恢复登记 | sigaltstack(2)：备用栈属于线程；启用时 ss_size 小于 MINSIGSTKSZ 报 ENOMEM |
 | 缺陷 13 | §4.2 vfork | 子进程不与父进程共享地址空间 | vfork(2)：子进程与父进程共享全部内存，父进程挂起到子进程 exec 或退出 |
 
@@ -427,7 +427,7 @@ IGN 或 DFL 且默认动作属 Ign/Cont 静默丢弃。同步（硬件）信号�
 
 | 项 | 偏差 | 性质 |
 |---|---|---|
-| sa_flags | SA_NODEFER 恒加本信号位；SA_RESETHAND/SA_NOCLDSTOP 存而不执行；SA_ONSTACK 已生效（其余输入模式见 sigaltstack 行） | 缺陷 11 |
+| sa_flags | SA_NODEFER、SA_RESETHAND、SA_ONSTACK 已生效；SA_NOCLDSTOP 存而不执行（依赖停止/继续状态机） | 缺陷 11 |
 | sigaltstack | 单进程无 per-thread；MINSIGSTKSZ 不查（size=0 即禁用）；SS_ONSTACK/AUTODISARM 输入 EINVAL；rt_sigreturn 不回改登记（Linux restore_altstack 会）；登记区间不可表达返回 EFAULT，SA_ONSTACK 运行时溢出防护未做 | 缺陷 12 |
 | IGN 冲刷 | rt_sigaction 转 IGN/DFL-Ign 时无条件清除该信号的待处理位，被屏蔽的信号也清除 | 与 Linux 一致：Linux 6.12 `do_sigaction` 同样无条件冲刷，POSIX 3.3.1.3 要求被屏蔽的信号也丢弃 |
 | sigtimedwait | 等待集命中时直接消费等待集内信号（含已屏蔽信号），调度器信号唤醒通道同步放宽到等待集 | 与 Linux 一致（原缺陷 10 已修复） |
