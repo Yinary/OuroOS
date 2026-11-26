@@ -152,5 +152,16 @@ python3 tests/run_official.py la --groups ltp-musl --ltp-filter chown,statx --lt
 
 - **实测范围**：`rv` `lmbench-musl`（120 秒超时）、`rv` `lmbench-glibc`（20 秒超时）、`la` `lmbench-musl`（20 秒超时）。
 - **现象**：三个配置均打印 `latency measurements` 后，卡死在第一条命令 `./lmbench_all lat_syscall -P 1 null`，直至外部超时终止，无任何子项输出（0/36）。
-- **已验证根因**：对原盘 `lmbench_all` 做符号检查与 `benchmp_parent` 反汇编确认，`lmbench` 公共测试框架 `benchmp_parent` 通过 4 处 `select()` 调用（RISC-V / LoongArch 通用应用二进制接口（Application Binary Interface，ABI）下对应 `pselect6`，系统调用号 72）在父子进程管道间同步，且公共框架还链接了 `setitimer`（调用号 103）与 `alarm`。核对 [kernel/src/syscall/mod.rs](file:///home/hoyouu/OuroOS/kernel/src/syscall/mod.rs) 确认 `pselect6`（72）与 `setitimer`（103）均未实现（返回 `ENOSYS`），导致 `benchmp_parent` 在首轮同步阶段即无法推进。
-- **下一步优先级**：基于现有 `ppoll`（73）实现 `pselect6`（72），并评估补齐 `setitimer`（103）/ `SIGALRM` 后，再对 `lmbench` 做完整摸底。
+- **已验证根因**：对原盘 `lmbench_all` 做符号检查与 `benchmp_parent` 反汇编确认，`lmbench` 公共测试框架 `benchmp_parent` 通过 4 处 `select()` 调用（RISC-V / LoongArch 通用应用二进制接口（Application Binary Interface，ABI）下对应 `pselect6`，系统调用号 72）在父子进程管道间同步，且公共框架还链接了 `setitimer`（调用号 103）与 `alarm`。后续在 `net/loopback-stack` 分支已补齐 `pselect6`（72）与 `ITIMER_REAL` `setitimer`（103），可在此基础上进一步摸底 `lmbench`。
+
+### 5.3 `iperf` 与 `netperf` 修复验证结果
+
+- **实测范围**：`net/loopback-stack` 分支，QEMU 10.0.2 + QCOW2 覆盖层，双架构四组全量运行（`iperf-musl`、`iperf-glibc`、`netperf-musl`、`netperf-glibc`）。
+- **已解决的关键缺口**：
+  1. `/dev/urandom` 与 `/dev/random` 字符设备（`iperf3` 生成 cookie 依赖）及 `/dev/null` 标准设备号 `makedev(1, 3)`（glibc `daemon()` 严格校验）；
+  2. `pselect6(72)`（`iperf3` 与 `netserver`/`netperf` 主事件循环依赖）与 `setitimer(103)`/`getitimer(102)` 的 `ITIMER_REAL` + `SIGALRM`（`netperf` 测试时长控制依赖）；
+  3. 扩展本地回环 `AF_INET` 套接字选项（`SO_DONTROUTE`、`SO_LINGER`、`SO_RCVLOWAT`/`SO_SNDLOWAT`、`SO_SNDBUF`/`SO_RCVBUF` 翻倍语义、`IP_TOS`/`IP_TTL`/`IP_MTU_DISCOVER`/`IP_RECVERR`、`TCP_MAXSEG`/`TCP_CORK`/`TCP_KEEP*`/`TCP_INFO`/`TCP_CONGESTION`）、UDP `SO_REUSEADDR` 同端口绑定与对端优先解复用（支撑 `PARALLEL_UDP`）、阻塞 TCP 小包整块写入防短写（支撑 `netperf TCP_STREAM`）；
+  4. `official_init.rs` 在测试组脚本退出后清理脱离会话的遗留后台守护进程（`iperf_testcode.sh` 启动的 `iperf3 -s -D` 未自行终止，避免占端口影响后续组或阻塞关机）。
+- **实测结果（全部 8 组、44/44 子项 100% 通过）**：
+  - `rv`：`iperf-musl` **6.38/6**（6/6）、`iperf-glibc` **6.37/6**（6/6）、`netperf-musl` **8.08/5**（5/5）、`netperf-glibc` **8.08/5**（5/5）；
+  - `la`：`iperf-musl` **6.91/6**（6/6）、`iperf-glibc` **6.89/6**（6/6）、`netperf-musl` **8.57/5**（5/5）、`netperf-glibc` **8.68/5**（5/5）。
