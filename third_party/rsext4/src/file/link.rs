@@ -5,7 +5,7 @@ use super::{
 };
 
 // OuroOS patch: 使用调用方已解析的 inode 添加目录项，失败时恢复链接数。
-/// 在父目录中为已存在的普通文件或符号链接 增加一个名称。
+/// 在父目录中为已存在的普通文件、符号链接或 FIFO 增加一个名称。
 pub fn link_entry<B: BlockDevice>(
     fs: &mut Ext4FileSystem,
     dev: &mut Jbd2Dev<B>,
@@ -27,6 +27,7 @@ pub fn link_entry<B: BlockDevice>(
     let kind = match inode.i_mode & Ext4Inode::S_IFMT {
         Ext4Inode::S_IFREG => Ext4DirEntry2::EXT4_FT_REG_FILE,
         Ext4Inode::S_IFLNK => Ext4DirEntry2::EXT4_FT_SYMLINK,
+        Ext4Inode::S_IFIFO => Ext4DirEntry2::EXT4_FT_FIFO,
         _ => return Err(Ext4Error::new(Errno::EPERM)),
     };
     if inode.i_flags & (Ext4Inode::EXT4_IMMUTABLE_FL | Ext4Inode::EXT4_APPEND_FL) != 0 {

@@ -10,11 +10,42 @@ pub fn create_regular_inode<B: BlockDevice>(
     name: &str,
     mode: u16,
 ) -> Ext4Result<InodeNumber> {
+    if mode & Ext4Inode::S_IFMT != Ext4Inode::S_IFREG {
+        return Err(Ext4Error::unsupported());
+    }
+    create_empty_inode(device, fs, parent, name, mode, None)
+}
+
+// OuroOS patch: 按父 inode 创建无盘上数据块的 FIFO。
+/// 创建命名管道节点，管道数据由内核打开时管理。
+pub fn create_fifo_inode<B: BlockDevice>(
+    device: &mut Jbd2Dev<B>,
+    fs: &mut Ext4FileSystem,
+    parent: InodeNumber,
+    name: &str,
+    mode: u16,
+    owner: (u32, u32),
+) -> Ext4Result<InodeNumber> {
+    create_empty_inode(
+        device,
+        fs,
+        parent,
+        name,
+        Ext4Inode::S_IFIFO | (mode & 0o7777),
+        Some(owner),
+    )
+}
+
+fn create_empty_inode<B: BlockDevice>(
+    device: &mut Jbd2Dev<B>,
+    fs: &mut Ext4FileSystem,
+    parent: InodeNumber,
+    name: &str,
+    mode: u16,
+    owner: Option<(u32, u32)>,
+) -> Ext4Result<InodeNumber> {
     if fs.readonly {
         return Err(Ext4Error::read_only());
-    }
-    if mode & 0xf000 != Ext4Inode::S_IFREG {
-        return Err(Ext4Error::unsupported());
     }
     if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\0']) {
         return Err(Ext4Error::invalid_input());
@@ -36,30 +67,62 @@ pub fn create_regular_inode<B: BlockDevice>(
         }
     }
 
+    let original = dir;
     let ino = fs.alloc_inode(device)?;
     let mut inode = Ext4Inode::empty_for_reuse(fs.default_inode_extra_isize());
     inode.i_links_count = 1;
-    inode.i_flags = Ext4Inode::mask_flags_for_mode(mode, dir.i_flags & Ext4Inode::EXT4_FL_INHERITED);
-    if fs.superblock.has_extents() {
+    inode.i_flags =
+        Ext4Inode::mask_flags_for_mode(mode, dir.i_flags & Ext4Inode::EXT4_FL_INHERITED);
+    let fifo = mode & Ext4Inode::S_IFMT == Ext4Inode::S_IFIFO;
+    if !fifo && fs.superblock.has_extents() {
         inode.i_flags |= Ext4Inode::EXT4_EXTENTS_FL;
         inode.write_extend_header();
     }
-    if let Err(error) =
-        fs.finalize_inode_update(device, ino, &mut inode, Ext4InodeMetadataUpdate::create(mode))
-    {
-        discard_unpublished_inode(fs, device, ino, &[]);
+    let mut update = Ext4InodeMetadataUpdate::create(mode);
+    if let Some((uid, gid)) = owner {
+        update.uid = Some(uid);
+        update.gid = Some(if dir.i_mode & Ext4Inode::S_ISGID != 0 {
+            dir.gid()
+        } else {
+            gid
+        });
+    }
+    if let Err(error) = fs.finalize_inode_update(device, ino, &mut inode, update) {
+        if fifo {
+            discard_new_fifo(fs, device, ino).map_err(|_| Ext4Error::io())?;
+        } else {
+            discard_unpublished_inode(fs, device, ino, &[]);
+        }
         return Err(error);
     }
-    if let Err(error) =
-        insert_dir_entry(fs, device, parent, &mut dir, ino, name, Ext4DirEntry2::EXT4_FT_REG_FILE)
-    {
-        // OuroOS patch: reclaim the child only when insertion failed before publication.
-        if no_space_before_insert(error) {
+    let kind = if fifo {
+        Ext4DirEntry2::EXT4_FT_FIFO
+    } else {
+        Ext4DirEntry2::EXT4_FT_REG_FILE
+    };
+    if let Err(error) = insert_dir_entry(fs, device, parent, &mut dir, ino, name, kind) {
+        if fifo {
+            if !no_space_before_insert(error) {
+                rollback_entry_insert(fs, device, parent, ino, name, &original, &dir)
+                    .map_err(|_| Ext4Error::io())?;
+            }
+            discard_new_fifo(fs, device, ino).map_err(|_| Ext4Error::io())?;
+        } else if no_space_before_insert(error) {
             free_inode(fs, device, ino, &mut inode)?;
         }
         return Err(error);
     }
     Ok(ino)
+}
+
+fn discard_new_fifo<B: BlockDevice>(
+    fs: &mut Ext4FileSystem,
+    dev: &mut Jbd2Dev<B>,
+    ino: InodeNumber,
+) -> Ext4Result<()> {
+    let empty = Ext4Inode::empty_for_reuse(fs.default_inode_extra_isize());
+    fs.modify_inode(dev, ino, |out| *out = empty)?;
+    fs.free_inode(dev, ino)
 }
 
 fn discard_unpublished_inode_blocks<B: BlockDevice>(

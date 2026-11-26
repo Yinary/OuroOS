@@ -467,6 +467,34 @@ pub(super) fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
     })
 }
 
+/// 创建不分配数据块的 FIFO 节点。
+pub(super) fn create_fifo(
+    parent: u32,
+    name: &str,
+    mode: u16,
+    owner: (u32, u32),
+) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        rsext4::file::create_fifo_inode(
+            &mut v.device,
+            &mut v.fs,
+            InodeNumber::new(parent)?,
+            name,
+            mode,
+            owner,
+        )
+        .map(|_| ())
+        .inspect_err(|e| {
+            if matches!(e.code, rsext4::Errno::EIO | rsext4::Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })
+    })
+}
+
 /// 按块读取 Ext4 目录，逐项交付解析结果。
 pub(super) fn read_dir(
     ino: u32,

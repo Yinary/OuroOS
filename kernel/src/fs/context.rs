@@ -529,6 +529,23 @@ impl Context {
         Ok((parent, name))
     }
 
+    /// 在指定目录下创建 FIFO 节点，权限应用进程的 umask。
+    pub(crate) fn create_fifo(
+        &self,
+        dir: usize,
+        path: &str,
+        mode: usize,
+        credentials: &crate::task::Credentials,
+    ) -> Result<(), Errno> {
+        let (parent, name) = self.new_entry_path(dir, path)?;
+        fs::create_fifo(
+            parent,
+            &name,
+            self.creation_mode(mode),
+            (credentials.fsuid, credentials.fsgid),
+        )
+    }
+
     /// 在指定目录下创建符号链接，目标文本由读取或跟随链接时使用。
     pub(crate) fn symlink(
         &self,

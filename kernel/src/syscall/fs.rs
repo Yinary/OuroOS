@@ -96,7 +96,7 @@ pub fn dispatch(
         sysnr::FCHOWNAT | sysnr::FCHOWN => chown(nr, ctx, space, a, credentials),
         sysnr::FCHMOD => fchmod(ctx, space, a),
         sysnr::FCHMODAT => fchmodat(ctx, space, a),
-        sysnr::MKNODAT => mknodat(ctx, space, a),
+        sysnr::MKNODAT => mknodat(ctx, space, a, credentials),
         sysnr::FACCESSAT2 => faccessat2(ctx, space, a),
         sysnr::IOCTL => ioctl(ctx, space, a),
 
@@ -242,6 +242,9 @@ pub fn dispatch(
             };
             if mode & 0xf000 == 0x4000 && flags & 3 != 0 {
                 return Err(Errno::IsDir);
+            }
+            if mode & 0xf000 == 0x1000 && !path_only {
+                return Err(Errno::NotSupported);
             }
             if flags & 0x200 != 0 && flags & 3 != 0 {
                 fs::truncate(ino, 0)?;
@@ -932,13 +935,24 @@ fn apply_chmod(path: &str, ino: u32, mode: usize) -> Result<usize, Errno> {
 
 /// mknodat(2)：仅支持 S_IFBLK 节点注册（授权清单在用户态启动器维护），
 /// 登记 (盘, 分区) 身份供 mount 与通用块访问解析；其余类型 EOPNOTSUPP。
-fn mknodat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
+fn mknodat(
+    ctx: &Context,
+    space: &UserAddressSpace,
+    a: [usize; 6],
+    credentials: &Credentials,
+) -> Result<usize, Errno> {
     // mknodat(dirfd, pathname, mode, dev)：mode 在 a[2]
     let mode = a[2];
+    let dir = a[0] as u32 as i32 as isize as usize;
+    if mode & 0xf000 == 0o010000 {
+        let path = user_string(space, a[1])?;
+        ctx.create_fifo(dir, &path, mode, credentials)?;
+        return Ok(0);
+    }
     if mode & 0xf000 != 0o060000 {
         return Err(Errno::NotSupported); // 非 S_IFBLK
     }
-    let path = ctx.path(a[0], &user_string(space, a[1])?)?;
+    let path = ctx.path(dir, &user_string(space, a[1])?)?;
     if !path.starts_with("/dev/") {
         return Err(Errno::Invalid); // 设备节点必须在 /dev 下
     }

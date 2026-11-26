@@ -307,6 +307,19 @@ pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
     }
 }
 
+/// 在 Ext4 上创建命名管道节点，权限已由调用方应用 umask。
+pub(crate) fn create_fifo(
+    parent: u32,
+    name: &str,
+    mode: u16,
+    owner: (u32, u32),
+) -> Result<(), Errno> {
+    if parent & FAT_INODE != 0 || procfs::pid_ino_parts(parent).is_some() {
+        return Err(Errno::NotSupported);
+    }
+    ext4::create_fifo(parent, name, mode, owner)
+}
+
 /// 在 Ext4 父目录中添加符号链接。
 pub(crate) fn symlink(
     parent: u32,
@@ -329,7 +342,7 @@ pub(crate) fn link(source: &Metadata, parent: u32, name: &str) -> Result<(), Err
     let ino = source.ino as u32;
     if ino & FAT_INODE != 0
         || procfs::pid_ino_parts(ino).is_some()
-        || !matches!(source.mode & 0xf000, 0x8000 | 0xa000)
+        || !matches!(source.mode & 0xf000, 0x8000 | 0xa000 | 0x1000)
     {
         return Err(Errno::Perm);
     }

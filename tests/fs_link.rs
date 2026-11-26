@@ -272,6 +272,20 @@ fn run() -> ! {
     regular();
     symbolic();
     create_symbolic();
+    let fifo = b"/meta/test-fifo\0";
+    let alias = b"/fifo-alias\0";
+    let args = [CWD, fifo.as_ptr() as usize, 0o010666, 0, 0, 0];
+    ck!(syscall6(33, args) == 0 && syscall6(33, args) == -17);
+    let ino = stat(fifo).0;
+    ck!(link(CWD, fifo, CWD, alias, 0) == 0);
+    ck!(stat(alias) == (ino, 2));
+    ck!(unlink(fifo) == 0 && stat(alias) == (ino, 1));
+    let fd = open(alias, 0x200000);
+    let mut attrs = [0u8; 128];
+    ck!(syscall3(80, fd, attrs.as_mut_ptr() as usize, 0) == 0);
+    let mode = u32::from_ne_bytes(core::array::from_fn(|i| attrs[16 + i]));
+    ck!(mode == 0o010644);
+    ck!(syscall3(57, fd, 0, 0) == 0 && unlink(alias) == 0);
     sys_write(1, b"LINK PASS: creation, resolution and reclamation\n");
     sys_exit(0);
 }
