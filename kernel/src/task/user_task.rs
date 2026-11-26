@@ -664,7 +664,7 @@ fn park_check_signals(
             }
             // SA_RESTART：pipe 读写与 wait 的等待不完成不睡，信号留给循环顶检查点。
             // ppoll 与 pselect6 被 handler 信号打断一律以 -EINTR 完成。
-            WaitReason::Pipe | WaitReason::Children
+            WaitReason::Pipe | WaitReason::PipeId(_) | WaitReason::Children
                 if d.flags & SA_RESTART != 0
                     && frame[TrapFrameArgs::SYSCALL] != sysnr::PPOLL
                     && frame[TrapFrameArgs::SYSCALL] != sysnr::PSELECT6 =>

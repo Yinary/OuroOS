@@ -55,8 +55,10 @@ pub enum WaitReason {
     },
     /// 等待子进程退出（waitpid 无可收割孩子）。
     Children,
-    /// 等待任意 pipe 可读/可写。
+    /// 等待任意 pipe/套接字可读或可写。
     Pipe,
+    /// 等待指定管道实例可读或可写，避免多管道场景下的惊群唤醒。
+    PipeId(u64),
     /// 等待任意可投递信号（rt_sigsuspend），仅经 WAKE_SIGNALS 通道唤醒。
     Signal,
     /// ppoll 同时等待管道变化或截止时间。

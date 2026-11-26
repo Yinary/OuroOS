@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::{
     cell::Cell,
     ptr::{addr_of, addr_of_mut},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use polyhal::kcontext::KContext;
@@ -36,14 +36,50 @@ static WAKE_CHILDREN: AtomicBool = AtomicBool::new(false);
 static WAKE_PIPES: AtomicBool = AtomicBool::new(false);
 static WAKE_SIGNALS: AtomicBool = AtomicBool::new(false);
 
+/// 定向管道唤醒槽位容量；槽满时退回全局 WAKE_PIPES 广播，保证不丢唤醒。
+const PIPE_WAKE_SLOTS: usize = 16;
+static WAKE_PIPE_IDS: [AtomicU64; PIPE_WAKE_SLOTS] = [const { AtomicU64::new(0) }; PIPE_WAKE_SLOTS];
+
 /// 请求唤醒等待子进程的任务（子进程退出时调用）。
 pub fn request_children_wake() {
     WAKE_CHILDREN.store(true, Ordering::Release);
 }
 
-/// 请求唤醒 pipe 等待者（pipe 读/写/对端关闭时调用）。
+/// 请求广播唤醒全部管道/套接字等待者（套接字或回退路径调用）。
 pub fn request_pipe_wake() {
     WAKE_PIPES.store(true, Ordering::Release);
+}
+
+/// 请求唤醒等待指定管道实例的任务；槽满或编号无效时退回广播。
+pub fn request_pipe_id_wake(id: u64) {
+    if id == 0 {
+        request_pipe_wake();
+        return;
+    }
+    for slot in &WAKE_PIPE_IDS {
+        let cur = slot.load(Ordering::Acquire);
+        if cur == id {
+            return;
+        }
+        if cur == 0
+            && slot
+                .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return;
+        }
+    }
+    request_pipe_wake();
+}
+
+/// 是否有待消费的异步唤醒请求。
+fn has_pending_wake() -> bool {
+    WAKE_CHILDREN.load(Ordering::Acquire)
+        || WAKE_PIPES.load(Ordering::Acquire)
+        || WAKE_SIGNALS.load(Ordering::Acquire)
+        || WAKE_PIPE_IDS
+            .iter()
+            .any(|slot| slot.load(Ordering::Acquire) != 0)
 }
 
 /// 请求唤醒有可投递信号的等待任务（信号实际入队后调用）。
@@ -81,13 +117,30 @@ pub fn resume_check() {
         let mut slot = SCHED.lock();
         let s = slot.as_mut().expect("scheduler not initialized");
         let now = monotonic();
-        let expired = s.current.as_ref().is_some_and(|task| now >= task.slice_end);
         let events = timer::events();
         let woke = if s.last_timer_event != events {
             s.last_timer_event = events;
             let before = s.ready.len();
             s.wake_expired();
             s.ready.len() > before
+        } else {
+            false
+        };
+        let expired = if let Some(task) = s.current.as_mut() {
+            if now >= task.slice_end {
+                if s.ready.is_empty() && !has_pending_wake() {
+                    // 无其他就绪任务与待消费唤醒时直接续期时间片，避免空转切回自身。
+                    let slice_end = now + SLICE;
+                    task.slice_end = slice_end;
+                    let timed = matches!(task.body, Some(TaskBody::User { .. }));
+                    timer::set_slice_end(timed.then_some(slice_end));
+                    false
+                } else {
+                    true
+                }
+            } else {
+                false
+            }
         } else {
             false
         };
@@ -192,7 +245,33 @@ impl Scheduler {
             self.move_waiting(|_, r| matches!(r, WaitReason::Children));
         }
         if WAKE_PIPES.swap(false, Ordering::AcqRel) {
-            self.move_waiting(|_, r| matches!(r, WaitReason::Pipe | WaitReason::PollUntil(_)));
+            for slot in &WAKE_PIPE_IDS {
+                slot.store(0, Ordering::Release);
+            }
+            self.move_waiting(|_, r| {
+                matches!(
+                    r,
+                    WaitReason::Pipe | WaitReason::PipeId(_) | WaitReason::PollUntil(_)
+                )
+            });
+        } else {
+            let mut ids = [0u64; PIPE_WAKE_SLOTS];
+            let mut count = 0usize;
+            for slot in &WAKE_PIPE_IDS {
+                let id = slot.swap(0, Ordering::AcqRel);
+                if id != 0 {
+                    ids[count] = id;
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                let active = &ids[..count];
+                self.move_waiting(|_, r| match r {
+                    WaitReason::PipeId(id) => active.contains(id),
+                    WaitReason::Pipe | WaitReason::PollUntil(_) => true,
+                    _ => false,
+                });
+            }
         }
         if WAKE_SIGNALS.swap(false, Ordering::AcqRel) {
             // 信号唤醒：持 REGISTRY 锁按可投递性搬回等待者（锁序

@@ -148,11 +148,21 @@ python3 tests/run_official.py la --groups ltp-musl --ltp-filter chown,statx --lt
   2. **发布盘缺少动态库 `libgcc_s.so.1`（3 项 × 2 架构 = 6 分）**：`glibc` 动态版 `pthread_cancel`、`pthread_cancel_points`、`pthread_exit_cancel` 在线程取消展开阶段尝试加载 `libgcc_s.so.1` 失败中止。
   3. **glibc 运行库 / locale 与 musl 测例预期差异（35 项 × 2 架构 = 70 分）**：`clocale_mbfuncs`、`daemon_failure`、`dn_expand_empty`、`dn_expand_ptr_0`、`fgetwc_buffering`、`fnmatch`、`fscanf`、`fwscanf`、`mbc`、`regex_ere_backref`、`regex_escaped_high_byte`、`setvbuf_unget`、`sscanf`、`strftime`、`strtol`、`swprintf`、`wcstol`（静态与动态共 34 项）及静态 `pthread_cancel_points` 的非阻塞 `pthread_join` 断言，在宿主 Linux 上运行发布盘 `glibc` 原版二进制同样失败或超时。
 
-### 5.2 `lmbench` 摸底结果
+### 5.2 `lmbench` 摸底与修复验证结果
 
-- **实测范围**：`rv` `lmbench-musl`（120 秒超时）、`rv` `lmbench-glibc`（20 秒超时）、`la` `lmbench-musl`（20 秒超时）。
-- **现象**：三个配置均打印 `latency measurements` 后，卡死在第一条命令 `./lmbench_all lat_syscall -P 1 null`，直至外部超时终止，无任何子项输出（0/36）。
-- **已验证根因**：对原盘 `lmbench_all` 做符号检查与 `benchmp_parent` 反汇编确认，`lmbench` 公共测试框架 `benchmp_parent` 通过 4 处 `select()` 调用（RISC-V / LoongArch 通用应用二进制接口（Application Binary Interface，ABI）下对应 `pselect6`，系统调用号 72）在父子进程管道间同步，且公共框架还链接了 `setitimer`（调用号 103）与 `alarm`。后续在 `net/loopback-stack` 分支已补齐 `pselect6`（72）与 `ITIMER_REAL` `setitimer`（103），可在此基础上进一步摸底 `lmbench`。
+- **首轮基线（`dev` `b40bf5c`）**：三配置均打印 `latency measurements` 后卡死在 `lat_syscall -P 1 null`（0/36）。根因是 `benchmp_parent` 依赖 `pselect6(72)` 与 `setitimer(103)`，该部分已在 `net/loopback-stack`（`147f98b`）补齐。
+- **二次摸底与内核修复（`oscomp/lmbench` 分支，基线 `147f98b`）**：
+  1. **修复 `/dev/null` 写与定位读写语义**：`OpenFile::write_chunk` 原漏匹配 `Kind::DevNull`，导致 `lat_syscall write` 报 `Bad file descriptor`；同步补齐 `check_positioned` 与 `read_at` 对 `/dev/null` 的支持（对齐 Linux `null(4)`）。
+  2. **管道按实例定向唤醒与单任务续期**：为每个管道分配唯一实例号并新增 `WaitReason::PipeId(u64)`，通过 16 槽无锁原子队列定向唤醒（槽满退回广播），消除 `lat_ctx` 最高 96 进程环路中的多管道惊群效应；同时在 `resume_check` 中就绪队列为空且无待消费唤醒时直接续期时间片。
+- **验证口径与实测结果（QEMU 10.0.2 + QCOW2 覆盖层）**：
+  - **无环境变量改动的原版脚本验证（未设 `ENOUGH`）**：实测 `rv` 的 `null`/`read`/`write` 与 `la` 的 `null`/`read` 均正常推进无挂死，但每条 `./lmbench_all` 子命令在 QEMU 极小代码生成器（Tiny Code Generator，TCG）下常耗 50–60 秒。对照宿主 Linux 下直接运行 `/usr/bin/qemu-riscv64 lmbench_all lat_syscall -P 1 null` 同样耗时 45.8–47.1 秒，反汇编确认根因是 `init_timing()` 对 `[1.015, 1.02, 1.035]` 倍率要求线性误差不超过 0.5%，QEMU TCG 抖动易令四档候选 `[5000, 10000, 50000, 100000]` 微秒全部失败并回退到 `enough = 1,000,000` 微秒（1 秒），导致 `l_overhead()` 与 `benchmp()` 各执行 11 轮 1 秒循环；整组 24 条子命令累计约需 15–25 分钟（单架构双库约 30–50 分钟）。
+  - **全量 36 项功能覆盖诊断（本地临时设置 `ENOUGH=5000` 缩短标定窗口，验证后已还原，未写入正式启动器）**：双架构四配置全部 144/144 子项 100% 通过无崩溃与挂死：
+    - `rv` `lmbench-musl`：**`43.88/36`**（36/36），`lat_ctx 96` 延迟由定向唤醒前的 `3440.87 us` 降至 **`309.94 us`**（降低约 91%）；
+    - `rv` `lmbench-glibc`：**`43.79/36`**（36/36），`lat_ctx 96` 延迟由 `2481.23 us` 降至 **`264.63 us`**（降低约 89%）；
+    - `la` `lmbench-musl`：**`45.59/36`**（36/36），`lat_ctx 96` 为 **`135.00 us`**；
+    - `la` `lmbench-glibc`：**`44.54/36`**（36/36），`lat_ctx 96` 为 **`64.86 us`**。
+  - **已知外部行为**：原盘 `/musl/hello` 与 `/glibc/hello` 是不含 `#!/bin/sh` 的脚本，内核按 Linux `execve(2)` 返回 `ENOEXEC`；`lat_proc shell` 下 `rv` BusyBox `ash` 打印 `sh: /tmp/hello: not found`，`la` BusyBox `hush` 打印 `sh: can't execute '/tmp/hello': Exec format error`，两者均不影响 `Process fork+/bin/sh -c` 正常计时得分。
+  - **默认送测启用状态**：`official_init.rs` 已在默认送测流程中启用 `lmbench-musl` 与 `lmbench-glibc`，并在 `INSTALL_LIST` 统一安装 `/bin/cp`；严格遵循不设 `ENOUGH` 等测例环境变量特判的原则，整轮耗时视远端评测机 QEMU TCG 标定稳定性而定。
 
 ### 5.3 `iperf` 与 `netperf` 修复验证结果
 

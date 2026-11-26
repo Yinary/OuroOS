@@ -307,6 +307,7 @@ static INSTALL_LIST: &[(&[u8], &[u8])] = &[
     (b"/busybox\0", b"/musl/busybox\0"),
     (b"/bin/busybox\0", b"/musl/busybox\0"),
     (b"/bin/ls\0", b"/musl/busybox\0"),
+    (b"/bin/cp\0", b"/musl/busybox\0"),
     (b"/bin/sleep\0", b"/musl/busybox\0"),
     (b"/bin/basename\0", b"/musl/busybox\0"),
     (b"/bin/true\0", b"/musl/busybox\0"),
@@ -1208,7 +1209,6 @@ fn run_selected_group(group: &[u8], started: u64) {
         ),
         b"lmbench-musl" => {
             mkdir_p(b"/code/lmbench_src/bin/build/\0");
-            let _ = cp(b"/musl/busybox\0", b"/bin/cp\0");
             let _ = cp(
                 b"/musl/lmbench_all\0",
                 b"/code/lmbench_src/bin/build/lmbench_all\0",
@@ -1217,7 +1217,6 @@ fn run_selected_group(group: &[u8], started: u64) {
         }
         b"lmbench-glibc" => {
             mkdir_p(b"/code/lmbench_src/bin/build/\0");
-            let _ = cp(b"/musl/busybox\0", b"/bin/cp\0");
             let _ = cp(
                 b"/glibc/lmbench_all\0",
                 b"/code/lmbench_src/bin/build/lmbench_all\0",
@@ -1301,6 +1300,8 @@ extern "C" fn ouro_main() -> ! {
     run_selected_group(b"iperf-glibc", started);
     run_selected_group(b"netperf-musl", started);
     run_selected_group(b"netperf-glibc", started);
+    run_selected_group(b"lmbench-musl", started);
+    run_selected_group(b"lmbench-glibc", started);
     // LTP 与其余尚未完成全量验收的测试组暂不在默认送测中启用，按需取消注释：
     // let budget: u64 = if cfg!(target_arch = "loongarch64") {
     //     LTP_MUSL_BUDGET_SECS
@@ -1311,7 +1312,6 @@ extern "C" fn ouro_main() -> ! {
     // run_ltp(b"/glibc\0", b"glibc\0", now_secs() + 550);
     // run_script(b"/musl\0", 5, b"./cyclictest_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./iozone_testcode.sh\0");
-    // run_script(b"/musl\0", 5, b"./lmbench_testcode.sh\0");
     // run_script(b"/musl\0", 5, b"./unixbench_testcode.sh\0");
     note(b"[official-init] all groups finished\n");
     sys_exit(0)

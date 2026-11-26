@@ -399,8 +399,11 @@ pub fn dispatch(
                 fs,
                 credentials,
             );
-            // pipe 无数据/无空间且非 O_NONBLOCK：转为阻塞等待
+            // pipe/套接字无数据或无空间且非 O_NONBLOCK：转为阻塞等待；单管道按实例定向等待。
             if ret == Err(Errno::WouldBlock) {
+                if let Some(id) = fs.pipe_id(args[0]) {
+                    return Flow::Wait(WaitReason::PipeId(id));
+                }
                 return Flow::Wait(WaitReason::Pipe);
             }
             // 向无读者的管道写入：SIGPIPE 入队并与 -EPIPE 返回并行。
