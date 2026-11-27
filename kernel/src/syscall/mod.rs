@@ -29,6 +29,7 @@ pub mod sysnr {
     pub const DUP3: usize = 24;
     pub const IOCTL: usize = 29;
     pub const FCNTL: usize = 25;
+    pub const FLOCK: usize = 32;
     pub const MKDIRAT: usize = 34;
     pub const UNLINKAT: usize = 35;
     pub const SYMLINKAT: usize = 36;
@@ -96,6 +97,7 @@ pub mod sysnr {
     pub const SET_TID_ADDRESS: usize = 96;
     pub const WAITID: usize = 95;
     pub const GETRUSAGE: usize = 165;
+    pub const PRCTL: usize = 167;
     pub const SCHED_SETPARAM: usize = 118;
     pub const SCHED_SETSCHEDULER: usize = 119;
     pub const SCHED_GETSCHEDULER: usize = 120;
@@ -363,6 +365,7 @@ pub fn dispatch(
         | sysnr::DUP
         | sysnr::DUP3
         | sysnr::FCNTL
+        | sysnr::FLOCK
         | sysnr::MKDIRAT
         | sysnr::UNLINKAT
         | sysnr::SYMLINKAT
@@ -412,9 +415,13 @@ pub fn dispatch(
                 space,
                 fs,
                 credentials,
+                thread.tgid as u32,
             );
-            // pipe/套接字无数据或无空间且非 O_NONBLOCK：按实例定向阻塞等待。
+            // pipe/套接字/文件锁无数据或锁冲突且阻塞：等待唤醒。
             if ret == Err(Errno::WouldBlock) {
+                if matches!(nr, sysnr::FCNTL | sysnr::FLOCK) {
+                    return Flow::Wait(WaitReason::Pipe);
+                }
                 if let Some(id) = fs.wait_id(args[0]) {
                     return Flow::Wait(WaitReason::PipeId(id));
                 }
@@ -650,6 +657,7 @@ pub fn dispatch(
         | sysnr::WAIT4
         | sysnr::WAITID
         | sysnr::GETRUSAGE
+        | sysnr::PRCTL
         | sysnr::SCHED_SETPARAM
         | sysnr::SCHED_SETSCHEDULER
         | sysnr::SCHED_GETSCHEDULER
