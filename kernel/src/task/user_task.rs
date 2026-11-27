@@ -1185,12 +1185,16 @@ fn process_call(
                 }
             }
         }
+        sysnr::CLOCK_SETTIME => clock_settime(parent, args),
         sysnr::CLOCK_GETTIME => clock_gettime(parent, args),
         sysnr::CLOCK_GETRES => clock_getres(parent, args),
         sysnr::CLOCK_NANOSLEEP => match clock_nanosleep(parent, sleep_deadline, args) {
             SleepStep::Done(result) => result,
             SleepStep::Wait(until) => return ProcessResult::Wait(WaitReason::Deadline(until)),
         },
+        sysnr::SETTIMEOFDAY => set_time_of_day(parent, args),
+        sysnr::GETRLIMIT | sysnr::SETRLIMIT | sysnr::PRLIMIT64 => prlimit_call(parent, nr, args),
+        sysnr::PRCTL => prctl_call(parent, args),
         sysnr::TIMES => {
             let reg = REGISTRY.lock();
             if let Some(rec) = reg.group(parent) {
@@ -1427,7 +1431,6 @@ fn process_call(
         }
         sysnr::WAITID => return waitid(parent, frame, args),
         sysnr::GETRUSAGE => get_rusage(parent, args),
-        sysnr::PRCTL => prctl(parent, args),
         sysnr::SCHED_SETSCHEDULER => sched_setscheduler(parent, args),
         sysnr::SCHED_SETPARAM => sched_setparam(parent, args),
         sysnr::SCHED_GETSCHEDULER => sched_getscheduler(parent, args[0]),
@@ -1442,6 +1445,7 @@ fn process_call(
         sysnr::SETPGID => set_pg_id(parent, args),
         sysnr::GETPGID => get_pg_or_sid(parent, args[0], false),
         sysnr::CAPGET => capget(parent, args),
+        sysnr::CAPSET => capset(parent, args),
         sysnr::GETSID => get_pg_or_sid(parent, args[0], true),
         sysnr::SETSID => set_sid(parent),
         sysnr::KILL | sysnr::TKILL | sysnr::TGKILL => kill_or_tgkill(parent, nr, args),
@@ -2105,6 +2109,473 @@ fn write_timespec(parent: Pid, ptr: usize, value: core::time::Duration) -> Resul
         .map(|()| 0)
 }
 
+/// clock_settime(2)：仅支持特权进程设置 CLOCK_REALTIME(0)；其余时钟或非法时间返回 EINVAL。
+fn clock_settime(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let clockid = args[0] as u32 as i32;
+    if clockid != 0 {
+        return Err(Errno::Invalid);
+    }
+    let [sec, nsec] = read_timespec(parent, args[1])?;
+    if !(0..=crate::time::MAX_SETTOD_SEC).contains(&sec) || !(0..1_000_000_000).contains(&nsec) {
+        return Err(Errno::Invalid);
+    }
+    let privileged = REGISTRY
+        .lock()
+        .group(parent)
+        .ok_or(Errno::NoProcess)?
+        .creds
+        .has_cap(super::CAP_SYS_TIME);
+    if !privileged {
+        return Err(Errno::Perm);
+    }
+    crate::time::set_realtime(core::time::Duration::new(sec as u64, nsec as u32));
+    Ok(0)
+}
+
+/// settimeofday(2)：设置墙钟（tv 非空时）并校验可选 tz；需要 CAP_SYS_TIME。
+/// 不修改单调时钟，也不回溯重排正在睡眠的 CLOCK_REALTIME 定时任务。
+fn set_time_of_day(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let (tv_ptr, tz_ptr) = (args[0], args[1]);
+    let (tv, privileged) = {
+        let reg = REGISTRY.lock();
+        let rec = reg.group(parent).ok_or(Errno::NoProcess)?;
+        let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+        let tv = if tv_ptr != 0 {
+            let mut raw = [0u8; 16];
+            user_access::copy_from_user(space, tv_ptr, &mut raw).map_err(|_| Errno::Fault)?;
+            let sec = i64::from_ne_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
+            let usec = i64::from_ne_bytes(raw[8..16].try_into().unwrap_or([0; 8]));
+            Some([sec, usec])
+        } else {
+            None
+        };
+        if tz_ptr != 0 {
+            let mut tz = [0u8; 8];
+            user_access::copy_from_user(space, tz_ptr, &mut tz).map_err(|_| Errno::Fault)?;
+        }
+        (tv, rec.creds.has_cap(super::CAP_SYS_TIME))
+    };
+    if tv.is_none() && tz_ptr == 0 {
+        return Ok(0);
+    }
+    if let Some([_, usec]) = tv {
+        if !(0..1_000_000).contains(&usec) {
+            return Err(Errno::Invalid);
+        }
+    }
+    if !privileged {
+        return Err(Errno::Perm);
+    }
+    if let Some([sec, usec]) = tv {
+        if !(0..=crate::time::MAX_SETTOD_SEC).contains(&sec) {
+            return Err(Errno::Invalid);
+        }
+        crate::time::set_realtime(core::time::Duration::new(sec as u64, (usec as u32) * 1000));
+    }
+    Ok(0)
+}
+
+/// 读取进程某项资源限额：DATA/STACK/MEMLOCK/AS 委派地址空间，NOFILE 委派文件上下文，其余取进程记录。
+fn read_process_rlimit(rec: &super::ProcessRecord, resource: usize) -> Result<[u64; 2], Errno> {
+    match resource {
+        7 => {
+            let lim = rec.fs.as_ref().ok_or(Errno::NoProcess)?.nofile_limit();
+            Ok([lim[0] as u64, lim[1] as u64])
+        }
+        2 | 3 | 8 | 9 => {
+            let lim = rec
+                .space
+                .as_ref()
+                .ok_or(Errno::NoProcess)?
+                .as_space()
+                .memory_limit(resource)
+                .ok_or(Errno::Invalid)?;
+            Ok([lim[0] as u64, lim[1] as u64])
+        }
+        r if r < super::RLIM_NLIMITS => Ok(rec.rlimits[r]),
+        _ => Err(Errno::Invalid),
+    }
+}
+
+/// 写入进程某项资源限额；同时同步内存与文件子系统中的限额副本。
+fn write_process_rlimit(
+    rec: &mut super::ProcessRecord,
+    resource: usize,
+    limit: [u64; 2],
+    privileged: bool,
+) -> Result<(), Errno> {
+    match resource {
+        7 => {
+            rec.fs
+                .as_mut()
+                .ok_or(Errno::NoProcess)?
+                .set_nofile_limit([limit[0] as usize, limit[1] as usize], privileged)?;
+            rec.rlimits[7] = limit;
+            Ok(())
+        }
+        2 | 3 | 8 | 9 => {
+            rec.space
+                .as_mut()
+                .ok_or(Errno::NoProcess)?
+                .0
+                .set_memory_limit(resource, [limit[0] as usize, limit[1] as usize])
+                .map_err(|_| Errno::Invalid)?;
+            rec.rlimits[resource] = limit;
+            Ok(())
+        }
+        r if r < super::RLIM_NLIMITS => {
+            rec.rlimits[r] = limit;
+            Ok(())
+        }
+        _ => Err(Errno::Invalid),
+    }
+}
+
+/// getrlimit(2) / setrlimit(2) / prlimit64(2)：支持全部 16 项 Linux 资源限额与跨进程查询修改。
+/// DATA/STACK/MEMLOCK/AS 与 NOFILE 实时生效；其余资源限额保存、回读并跨 fork/exec 继承。
+fn prlimit_call(parent: Pid, nr: usize, args: [usize; 6]) -> Result<usize, Errno> {
+    let (pid_arg, resource, new_ptr, old_ptr) = match nr {
+        sysnr::GETRLIMIT => {
+            let res = args[0] as u32 as usize;
+            if res >= super::RLIM_NLIMITS {
+                return Err(Errno::Invalid);
+            }
+            if args[1] == 0 {
+                return Err(Errno::Fault);
+            }
+            (0i32, res, 0usize, args[1])
+        }
+        sysnr::SETRLIMIT => {
+            let res = args[0] as u32 as usize;
+            if res >= super::RLIM_NLIMITS {
+                return Err(Errno::Invalid);
+            }
+            if args[1] == 0 {
+                return Err(Errno::Fault);
+            }
+            (0i32, res, args[1], 0usize)
+        }
+        _ => {
+            let pid = args[0] as u32 as i32;
+            if pid < 0 {
+                return Err(Errno::NoProcess);
+            }
+            let res = args[1] as u32 as usize;
+            if res >= super::RLIM_NLIMITS {
+                return Err(Errno::Invalid);
+            }
+            (pid, res, args[2], args[3])
+        }
+    };
+    let mut reg = REGISTRY.lock();
+    let caller_idx = reg.group_index(parent).ok_or(Errno::NoProcess)?;
+    let new_limit = if new_ptr != 0 {
+        let space = reg.records[caller_idx]
+            .space
+            .as_ref()
+            .ok_or(Errno::NoProcess)?
+            .as_space();
+        let mut raw = [0u8; 16];
+        user_access::copy_from_user(space, new_ptr, &mut raw).map_err(|_| Errno::Fault)?;
+        let soft = u64::from_ne_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
+        let hard = u64::from_ne_bytes(raw[8..16].try_into().unwrap_or([0; 8]));
+        if soft > hard {
+            return Err(Errno::Invalid);
+        }
+        Some([soft, hard])
+    } else {
+        None
+    };
+    let target_idx = if pid_arg == 0 {
+        caller_idx
+    } else {
+        reg.group_index(pid_arg as usize)
+            .filter(|&i| reg.records[i].exit.is_none())
+            .ok_or(Errno::NoProcess)?
+    };
+    let privileged = reg.records[caller_idx]
+        .creds
+        .has_cap(super::CAP_SYS_RESOURCE);
+    if target_idx != caller_idx && !privileged {
+        let c = &reg.records[caller_idx].creds;
+        let t = &reg.records[target_idx].creds;
+        let same_owner = c.ruid == t.ruid
+            && c.ruid == t.euid
+            && c.ruid == t.suid
+            && c.rgid == t.rgid
+            && c.rgid == t.egid
+            && c.rgid == t.sgid;
+        if !same_owner {
+            return Err(Errno::Perm);
+        }
+    }
+    let old = read_process_rlimit(&reg.records[target_idx], resource)?;
+    if let Some(next) = new_limit {
+        if !privileged && next[1] > old[1] {
+            return Err(Errno::Perm);
+        }
+        write_process_rlimit(&mut reg.records[target_idx], resource, next, privileged)?;
+    }
+    if old_ptr != 0 {
+        let mut raw = [0u8; 16];
+        raw[0..8].copy_from_slice(&old[0].to_ne_bytes());
+        raw[8..16].copy_from_slice(&old[1].to_ne_bytes());
+        let space = reg.records[caller_idx]
+            .space
+            .as_ref()
+            .ok_or(Errno::NoProcess)?
+            .as_space();
+        if user_access::copy_to_user(space, old_ptr, &raw).is_err() {
+            if new_limit.is_some() {
+                let _ = write_process_rlimit(&mut reg.records[target_idx], resource, old, true);
+            }
+            return Err(Errno::Fault);
+        }
+    }
+    Ok(0)
+}
+
+/// 逐字节读取用户态线程名（最多 15 字节并在末尾补 NUL），避免页末短串越界触发误报 EFAULT。
+fn read_user_comm(space: &UserAddressSpace, mut ptr: usize) -> Result<[u8; 16], Errno> {
+    let mut comm = [0u8; 16];
+    for slot in comm.iter_mut().take(15) {
+        let mut byte = [0u8; 1];
+        user_access::copy_from_user(space, ptr, &mut byte).map_err(|_| Errno::Fault)?;
+        if byte[0] == 0 {
+            break;
+        }
+        *slot = byte[0];
+        ptr = ptr.checked_add(1).ok_or(Errno::Fault)?;
+    }
+    Ok(comm)
+}
+
+/// prctl(2)：支持 PDEATHSIG、DUMPABLE、KEEPCAPS、TIMING、NAME、ENDIAN、SECCOMP(只读)、
+/// CAPBSET、SECUREBITS、TIMERSLACK、CHILD_SUBREAPER、NO_NEW_PRIVS、TID_ADDRESS 与 THP_DISABLE。
+/// 未实现选项返回 EINVAL。
+fn prctl_call(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    const PR_SET_PDEATHSIG: i32 = 1;
+    const PR_GET_PDEATHSIG: i32 = 2;
+    const PR_GET_DUMPABLE: i32 = 3;
+    const PR_SET_DUMPABLE: i32 = 4;
+    const PR_GET_KEEPCAPS: i32 = 7;
+    const PR_SET_KEEPCAPS: i32 = 8;
+    const PR_GET_TIMING: i32 = 13;
+    const PR_SET_TIMING: i32 = 14;
+    const PR_SET_NAME: i32 = 15;
+    const PR_GET_NAME: i32 = 16;
+    const PR_GET_ENDIAN: i32 = 19;
+    const PR_GET_SECCOMP: i32 = 21;
+    const PR_CAPBSET_READ: i32 = 23;
+    const PR_CAPBSET_DROP: i32 = 24;
+    const PR_GET_SECUREBITS: i32 = 27;
+    const PR_SET_SECUREBITS: i32 = 28;
+    const PR_SET_TIMERSLACK: i32 = 29;
+    const PR_GET_TIMERSLACK: i32 = 30;
+    const PR_SET_CHILD_SUBREAPER: i32 = 36;
+    const PR_GET_CHILD_SUBREAPER: i32 = 37;
+    const PR_SET_NO_NEW_PRIVS: i32 = 38;
+    const PR_GET_NO_NEW_PRIVS: i32 = 39;
+    const PR_GET_TID_ADDRESS: i32 = 40;
+    const PR_SET_THP_DISABLE: i32 = 41;
+    const PR_GET_THP_DISABLE: i32 = 42;
+    const PR_ENDIAN_LITTLE: i32 = 1;
+    const SECUREBITS_MASK: usize = 0xff;
+
+    let option = args[0] as u32 as i32;
+    let (arg2, arg3, arg4, arg5) = (args[1], args[2], args[3], args[4]);
+    let mut locked = REGISTRY.lock();
+    let reg = &mut *locked;
+    let idx = reg.group_index(parent).ok_or(Errno::NoProcess)?;
+    let t_idx = reg
+        .threads
+        .iter()
+        .position(|t| t.tid == parent)
+        .ok_or(Errno::NoProcess)?;
+    match option {
+        PR_SET_PDEATHSIG => {
+            if arg2 > 64 {
+                return Err(Errno::Invalid);
+            }
+            reg.threads[t_idx].pdeath_signal = arg2 as u8;
+            Ok(0)
+        }
+        PR_GET_PDEATHSIG => {
+            let sig = reg.threads[t_idx].pdeath_signal as i32;
+            let space = reg.records[idx]
+                .space
+                .as_ref()
+                .ok_or(Errno::NoProcess)?
+                .as_space();
+            user_access::copy_to_user(space, arg2, &sig.to_ne_bytes()).map_err(|_| Errno::Fault)?;
+            Ok(0)
+        }
+        PR_GET_DUMPABLE => Ok(reg.records[idx].dumpable as usize),
+        PR_SET_DUMPABLE => {
+            if arg2 != 0 && arg2 != 1 {
+                return Err(Errno::Invalid);
+            }
+            reg.records[idx].dumpable = arg2 as u8;
+            Ok(0)
+        }
+        PR_GET_KEEPCAPS => Ok(usize::from(reg.records[idx].keepcaps)),
+        PR_SET_KEEPCAPS => {
+            if arg2 != 0 && arg2 != 1 {
+                return Err(Errno::Invalid);
+            }
+            reg.records[idx].keepcaps = arg2 != 0;
+            Ok(0)
+        }
+        PR_GET_TIMING => Ok(0),
+        PR_SET_TIMING => {
+            if arg2 != 0 {
+                return Err(Errno::Invalid);
+            }
+            Ok(0)
+        }
+        PR_SET_NAME => {
+            let space = reg.records[idx]
+                .space
+                .as_ref()
+                .ok_or(Errno::NoProcess)?
+                .as_space();
+            let comm = read_user_comm(space, arg2)?;
+            reg.threads[t_idx].comm = comm;
+            let tgid = reg.records[idx].pid;
+            if parent == tgid {
+                super::proc_table_set_comm(tgid, comm);
+            }
+            Ok(0)
+        }
+        PR_GET_NAME => {
+            let comm = reg.threads[t_idx].comm;
+            let space = reg.records[idx]
+                .space
+                .as_ref()
+                .ok_or(Errno::NoProcess)?
+                .as_space();
+            user_access::copy_to_user(space, arg2, &comm).map_err(|_| Errno::Fault)?;
+            Ok(0)
+        }
+        PR_GET_ENDIAN => {
+            let space = reg.records[idx]
+                .space
+                .as_ref()
+                .ok_or(Errno::NoProcess)?
+                .as_space();
+            user_access::copy_to_user(space, arg2, &PR_ENDIAN_LITTLE.to_ne_bytes())
+                .map_err(|_| Errno::Fault)?;
+            Ok(0)
+        }
+        PR_GET_SECCOMP => Ok(0),
+        PR_CAPBSET_READ => {
+            if arg2 > super::CAP_LAST_CAP as usize {
+                return Err(Errno::Invalid);
+            }
+            Ok(usize::from((reg.records[idx].cap_bset >> arg2) & 1 != 0))
+        }
+        PR_CAPBSET_DROP => {
+            if arg2 > super::CAP_LAST_CAP as usize {
+                return Err(Errno::Invalid);
+            }
+            if !reg.records[idx].creds.has_cap(super::CAP_SETPCAP) {
+                return Err(Errno::Perm);
+            }
+            reg.records[idx].cap_bset &= !(1u64 << arg2);
+            Ok(0)
+        }
+        PR_GET_SECUREBITS => Ok(reg.records[idx].securebits as usize),
+        PR_SET_SECUREBITS => {
+            if !reg.records[idx].creds.has_cap(super::CAP_SETPCAP) {
+                return Err(Errno::Perm);
+            }
+            if arg2 & !SECUREBITS_MASK != 0 {
+                return Err(Errno::Invalid);
+            }
+            let old = reg.records[idx].securebits;
+            let new = arg2 as u32;
+            // 每对 (bit, lock_bit)：已锁定的位不可翻转，锁位本身亦不可撤销。
+            for pair in 0..4u32 {
+                let bit = 1u32 << (pair * 2);
+                let lock = 1u32 << (pair * 2 + 1);
+                if old & lock != 0 && ((new & lock == 0) || (new & bit != old & bit)) {
+                    return Err(Errno::Perm);
+                }
+            }
+            reg.records[idx].securebits = new;
+            Ok(0)
+        }
+        PR_SET_TIMERSLACK => {
+            let slack = if arg2 == 0 {
+                reg.threads[t_idx].default_timer_slack_ns
+            } else {
+                arg2 as u64
+            };
+            reg.threads[t_idx].timer_slack_ns = slack;
+            let tgid = reg.records[idx].pid;
+            if parent == tgid {
+                super::proc_table_set_timer_slack(tgid, slack);
+            }
+            Ok(0)
+        }
+        PR_GET_TIMERSLACK => Ok(reg.threads[t_idx].timer_slack_ns as usize),
+        PR_SET_CHILD_SUBREAPER => {
+            reg.records[idx].child_subreaper = arg2 != 0;
+            Ok(0)
+        }
+        PR_GET_CHILD_SUBREAPER => {
+            let val = i32::from(reg.records[idx].child_subreaper);
+            let space = reg.records[idx]
+                .space
+                .as_ref()
+                .ok_or(Errno::NoProcess)?
+                .as_space();
+            user_access::copy_to_user(space, arg2, &val.to_ne_bytes()).map_err(|_| Errno::Fault)?;
+            Ok(0)
+        }
+        PR_SET_NO_NEW_PRIVS => {
+            if arg2 != 1 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(Errno::Invalid);
+            }
+            reg.threads[t_idx].no_new_privs = true;
+            let tgid = reg.records[idx].pid;
+            super::proc_table_set_no_new_privs(tgid, true);
+            Ok(0)
+        }
+        PR_GET_NO_NEW_PRIVS => {
+            if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(Errno::Invalid);
+            }
+            Ok(usize::from(reg.threads[t_idx].no_new_privs))
+        }
+        PR_GET_TID_ADDRESS => {
+            let addr = reg.threads[t_idx].clear_child_tid;
+            let space = reg.records[idx]
+                .space
+                .as_ref()
+                .ok_or(Errno::NoProcess)?
+                .as_space();
+            user_access::copy_to_user(space, arg2, &addr.to_ne_bytes())
+                .map_err(|_| Errno::Fault)?;
+            Ok(0)
+        }
+        PR_SET_THP_DISABLE => {
+            if arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(Errno::Invalid);
+            }
+            reg.records[idx].thp_disable = arg2 != 0;
+            Ok(0)
+        }
+        PR_GET_THP_DISABLE => {
+            if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(Errno::Invalid);
+            }
+            Ok(usize::from(reg.records[idx].thp_disable))
+        }
+        _ => Err(Errno::Invalid),
+    }
+}
+
 /// clock_gettime(2)：按 clockid 取时间并写入 timespec。支持 REALTIME、MONOTONIC、
 /// BOOTTIME 三类时钟与进程、线程的 CPU 时间，未知 clockid 返回 EINVAL。
 fn clock_gettime(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
@@ -2229,9 +2700,8 @@ fn get_res_id(parent: Pid, args: [usize; 6], want_gid: bool) -> Result<usize, Er
     Ok(0)
 }
 
-/// capget(2)（header, data）：按头部版本号回填目标进程的能力集，返回 0。
-/// euid 为 0 的进程 permitted 与 effective 是全集，其余位为空；版本不认识时把
-/// 0x20080522 写回头部并返回 EINVAL。数据指针为空返回 0，pid 为负或地址不可访问报错。
+/// capget(2)（header, data）：按头部版本号回填目标进程的真实能力集，返回 0。
+/// 版本不认识时把 0x20080522 写回头部并返回 EINVAL。数据指针为空返回 0，pid 为负或地址不可访问报错。
 fn capget(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
     let reg = REGISTRY.lock();
     let caller = reg.group(parent).ok_or(Errno::NoProcess)?;
@@ -2259,24 +2729,25 @@ fn capget(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
     if pid < 0 {
         return Err(Errno::Invalid);
     }
-    let euid = if pid == 0 || pid as usize == parent {
-        caller.creds.euid
+    let target = if pid == 0 || pid as usize == parent {
+        caller
     } else {
         reg.group(pid as usize)
             .or_else(|| reg.thread(pid as usize).and_then(|t| reg.group(t.tgid)))
             .ok_or(Errno::NoProcess)?
-            .creds
-            .euid
     };
-    let (effective, permitted, inheritable) = if euid == 0 {
-        (
-            [0xffff_ffffu32, 0x0000_01ffu32],
-            [0xffff_ffffu32, 0x0000_01ffu32],
-            [0u32, 0u32],
-        )
-    } else {
-        ([0u32; 2], [0u32; 2], [0u32; 2])
-    };
+    let effective = [
+        target.creds.cap_effective as u32,
+        (target.creds.cap_effective >> 32) as u32,
+    ];
+    let permitted = [
+        target.creds.cap_permitted as u32,
+        (target.creds.cap_permitted >> 32) as u32,
+    ];
+    let inheritable = [
+        target.creds.cap_inheritable as u32,
+        (target.creds.cap_inheritable >> 32) as u32,
+    ];
     let mut bytes = [0u8; 24];
     let flat = effective
         .iter()
@@ -2287,6 +2758,70 @@ fn capget(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
         dst.copy_from_slice(&value.to_ne_bytes());
     }
     user_access::copy_to_user(space, args[1], &bytes[..words * 12]).map_err(|_| Errno::Fault)?;
+    Ok(0)
+}
+
+/// capset(2)（header, data）：按 Linux `kernel/capability.c` 校验并更新当前进程能力集。
+/// 仅允许操作调用进程自身（pid 为 0 或等于调用者 tid），禁止超出允许集或非法抬高能力。
+fn capset(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let mut reg = REGISTRY.lock();
+    let idx = reg.group_index(parent).ok_or(Errno::NoProcess)?;
+    let space = reg.records[idx]
+        .space
+        .as_ref()
+        .ok_or(Errno::NoProcess)?
+        .as_space();
+    let mut header = [0u8; 8];
+    user_access::copy_from_user(space, args[0], &mut header).map_err(|_| Errno::Fault)?;
+    let version = u32::from_ne_bytes([header[0], header[1], header[2], header[3]]);
+    let pid = i32::from_ne_bytes([header[4], header[5], header[6], header[7]]);
+    let words = match version {
+        0x1998_0330 => 1usize,
+        0x2007_1026 | 0x2008_0522 => 2usize,
+        _ => {
+            user_access::copy_to_user(space, args[0], &0x2008_0522u32.to_ne_bytes())
+                .map_err(|_| Errno::Fault)?;
+            return Err(Errno::Invalid);
+        }
+    };
+    if pid != 0 && pid as usize != parent {
+        return Err(Errno::Perm);
+    }
+    let mut bytes = [0u8; 24];
+    user_access::copy_from_user(space, args[1], &mut bytes[..words * 12])
+        .map_err(|_| Errno::Fault)?;
+    let word = |off: usize| {
+        u32::from_ne_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]) as u64
+    };
+    let (eff, perm, inh) = if words == 1 {
+        (word(0), word(4), word(8))
+    } else {
+        (
+            word(0) | (word(12) << 32),
+            word(4) | (word(16) << 32),
+            word(8) | (word(20) << 32),
+        )
+    };
+    let eff = eff & super::CAP_FULL_SET;
+    let perm = perm & super::CAP_FULL_SET;
+    let inh = inh & super::CAP_FULL_SET;
+    let rec = &mut reg.records[idx];
+    let old_eff = rec.creds.cap_effective;
+    let old_perm = rec.creds.cap_permitted;
+    let old_inh = rec.creds.cap_inheritable;
+    // Linux cap_capset 规则：有效集须为新允许集子集，新允许集须为旧允许集子集；
+    // 继承集新增位无 CAP_SETPCAP 时只能来自旧允许集，有 CAP_SETPCAP 时可来自能力边界集。
+    let allowed_inh = if (old_eff >> super::CAP_SETPCAP) & 1 != 0 {
+        old_inh | old_perm | rec.cap_bset
+    } else {
+        old_inh | old_perm
+    };
+    if (eff & !perm) != 0 || (perm & !old_perm) != 0 || (inh & !allowed_inh) != 0 {
+        return Err(Errno::Perm);
+    }
+    rec.creds.cap_effective = eff;
+    rec.creds.cap_permitted = perm;
+    rec.creds.cap_inheritable = inh;
     Ok(0)
 }
 
@@ -2363,7 +2898,9 @@ fn set_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
     let value = args[0] as u32;
     let mut reg = REGISTRY.lock();
     let rec = reg.group_mut(parent).ok_or(Errno::NoProcess)?;
-    let mut ids = IdSet::load(&rec.creds, gid);
+    let old = IdSet::load(&rec.creds, gid);
+    let mut ids = old;
+    let keepcaps = rec.keepcaps;
     let privileged = rec.creds.euid == 0;
     if privileged {
         ids.real = value;
@@ -2374,6 +2911,10 @@ fn set_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
     ids.effective = value;
     ids.fs = value;
     ids.store(&mut rec.creds, gid);
+    if !gid {
+        rec.creds
+            .sync_uid_transition(old.real, old.effective, old.saved, keepcaps);
+    }
     proc_sync_holding(&reg.records, parent);
     Ok(0)
 }
@@ -2386,6 +2927,7 @@ fn set_re_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
     let mut reg = REGISTRY.lock();
     let rec = reg.group_mut(parent).ok_or(Errno::NoProcess)?;
     let old = IdSet::load(&rec.creds, gid);
+    let keepcaps = rec.keepcaps;
     let privileged = rec.creds.euid == 0;
     if real_arg != u32::MAX && real_arg != old.real && real_arg != old.effective && !privileged {
         return Err(Errno::Perm);
@@ -2421,6 +2963,10 @@ fn set_re_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
         fs: effective,
     }
     .store(&mut rec.creds, gid);
+    if !gid {
+        rec.creds
+            .sync_uid_transition(old.real, old.effective, old.saved, keepcaps);
+    }
     proc_sync_holding(&reg.records, parent);
     Ok(0)
 }
@@ -2431,6 +2977,7 @@ fn set_res_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> 
     let mut reg = REGISTRY.lock();
     let rec = reg.group_mut(parent).ok_or(Errno::NoProcess)?;
     let old = IdSet::load(&rec.creds, gid);
+    let keepcaps = rec.keepcaps;
     if rec.creds.euid != 0 {
         for value in requested {
             if value != u32::MAX
@@ -2464,6 +3011,10 @@ fn set_res_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> 
         fs: effective,
     }
     .store(&mut rec.creds, gid);
+    if !gid {
+        rec.creds
+            .sync_uid_transition(old.real, old.effective, old.saved, keepcaps);
+    }
     proc_sync_holding(&reg.records, parent);
     Ok(0)
 }
@@ -2797,33 +3348,39 @@ fn fork_user(
                 }
                 core::cmp::Ordering::Equal => {}
             }
-            let (pgid, sid, comm, dumpable, no_new_privs, keep_caps, timer_slack_ns) = {
+            let (pgid, sid, rlimits, dumpable, keepcaps, thp_disable, cap_bset, securebits) = {
                 let p = &reg.records[pi];
                 (
                     p.pgid,
                     p.sid,
-                    p.comm,
+                    p.rlimits,
                     p.dumpable,
-                    p.no_new_privs,
-                    p.keep_caps,
-                    p.timer_slack_ns,
+                    p.keepcaps,
+                    p.thp_disable,
+                    p.cap_bset,
+                    p.securebits,
                 )
             };
-            // 子进程继承备用栈与进程属性；pdeath_sig 与 child_subreaper 按 Linux fork 规则清零。
+            // 子进程继承备用栈，pending/info 清零；child_subreaper 按 prctl(2) 在 fork 时清零。
             let child = &mut reg.records[ci];
             child.parent = parent;
             child.fs = Some(fs);
             child.pgid = pgid;
             child.sid = sid;
             child.creds = creds;
-            child.comm = comm;
+            child.rlimits = rlimits;
             child.dumpable = dumpable;
-            child.no_new_privs = no_new_privs;
-            child.keep_caps = keep_caps;
-            child.timer_slack_ns = timer_slack_ns;
+            child.keepcaps = keepcaps;
+            child.child_subreaper = false;
+            child.thp_disable = thp_disable;
+            child.cap_bset = cap_bset;
+            child.securebits = securebits;
         }
         let parent_thread = reg.threads.iter().position(|t| t.tid == parent);
         let child_thread = reg.threads.iter().position(|t| t.tid == pid);
+        let mut child_comm = super::comm_from_bytes(b"child");
+        let mut child_nnp = false;
+        let mut child_slack = super::DEFAULT_TIMER_SLACK_NS;
         if let (Some(pi), Some(ci)) = (parent_thread, child_thread) {
             match pi.cmp(&ci) {
                 core::cmp::Ordering::Less => {
@@ -2836,9 +3393,27 @@ fn fork_user(
                 }
                 core::cmp::Ordering::Equal => {}
             }
+            let (comm, timer_slack_ns, no_new_privs) = {
+                let pt = &reg.threads[pi];
+                (pt.comm, pt.timer_slack_ns, pt.no_new_privs)
+            };
+            // pdeath_signal 按 prctl(2) 在 fork 时清零；comm/no_new_privs 继承；
+            // timer_slack_ns 与 default_timer_slack_ns 按 Linux fork 规则均取父当前值。
+            let ct = &mut reg.threads[ci];
+            ct.comm = comm;
+            ct.pdeath_signal = 0;
+            ct.timer_slack_ns = timer_slack_ns;
+            ct.default_timer_slack_ns = timer_slack_ns;
+            ct.no_new_privs = no_new_privs;
+            child_comm = comm;
+            child_nnp = no_new_privs;
+            child_slack = timer_slack_ns;
         }
+        super::proc_table_push(pid, "child", parent, true);
+        super::proc_table_set_comm(pid, child_comm);
+        super::proc_table_set_no_new_privs(pid, child_nnp);
+        super::proc_table_set_timer_slack(pid, child_slack);
     }
-    super::proc_table_push(pid, "child", parent, true);
     {
         let mut locked = REGISTRY.lock();
         let reg = &mut *locked;
@@ -2971,122 +3546,4 @@ fn fork_thread(
     }
     sched::enqueue(task);
     Ok(tid)
-}
-
-/// Linux prctl(2)：支持 PDEATHSIG、DUMPABLE、KEEPCAPS、NAME、CAPBSET_READ、TIMERSLACK、
-/// CHILD_SUBREAPER 与 NO_NEW_PRIVS；其余未实现选项返回 EINVAL。
-fn prctl(caller: Pid, args: [usize; 6]) -> Result<usize, Errno> {
-    const PR_SET_PDEATHSIG: i32 = 1;
-    const PR_GET_PDEATHSIG: i32 = 2;
-    const PR_GET_DUMPABLE: i32 = 3;
-    const PR_SET_DUMPABLE: i32 = 4;
-    const PR_GET_KEEPCAPS: i32 = 7;
-    const PR_SET_KEEPCAPS: i32 = 8;
-    const PR_SET_NAME: i32 = 15;
-    const PR_GET_NAME: i32 = 16;
-    const PR_CAPBSET_READ: i32 = 23;
-    const PR_SET_TIMERSLACK: i32 = 29;
-    const PR_GET_TIMERSLACK: i32 = 30;
-    const PR_SET_CHILD_SUBREAPER: i32 = 36;
-    const PR_GET_CHILD_SUBREAPER: i32 = 37;
-    const PR_SET_NO_NEW_PRIVS: i32 = 38;
-    const PR_GET_NO_NEW_PRIVS: i32 = 39;
-
-    let option = args[0] as u32 as i32;
-    let mut locked = REGISTRY.lock();
-    let rec = locked.group_mut(caller).ok_or(Errno::NoProcess)?;
-    match option {
-        PR_SET_PDEATHSIG => {
-            if args[1] > 64 {
-                return Err(Errno::Invalid);
-            }
-            rec.pdeath_sig = args[1] as u8;
-            Ok(0)
-        }
-        PR_GET_PDEATHSIG => {
-            let sig = i32::from(rec.pdeath_sig);
-            let space = rec.space.as_ref().ok_or(Errno::Fault)?.as_space();
-            crate::mm::user_access::copy_to_user(space, args[1], &sig.to_ne_bytes())
-                .map_err(|_| Errno::Fault)?;
-            Ok(0)
-        }
-        PR_GET_DUMPABLE => Ok(usize::from(rec.dumpable)),
-        PR_SET_DUMPABLE => {
-            if args[1] != 0 && args[1] != 1 {
-                return Err(Errno::Invalid);
-            }
-            rec.dumpable = args[1] as u8;
-            Ok(0)
-        }
-        PR_GET_KEEPCAPS => Ok(usize::from(rec.keep_caps)),
-        PR_SET_KEEPCAPS => {
-            if args[1] > 1 {
-                return Err(Errno::Invalid);
-            }
-            rec.keep_caps = args[1] != 0;
-            Ok(0)
-        }
-        PR_SET_NAME => {
-            let space = rec.space.as_ref().ok_or(Errno::Fault)?.as_space();
-            let mut buf = [0u8; 16];
-            for i in 0..15 {
-                let mut byte = [0u8; 1];
-                crate::mm::user_access::copy_from_user(
-                    space,
-                    args[1].checked_add(i).ok_or(Errno::Fault)?,
-                    &mut byte,
-                )
-                .map_err(|_| Errno::Fault)?;
-                if byte[0] == 0 {
-                    break;
-                }
-                buf[i] = byte[0];
-            }
-            rec.comm = buf;
-            Ok(0)
-        }
-        PR_GET_NAME => {
-            let comm = rec.comm;
-            let space = rec.space.as_ref().ok_or(Errno::Fault)?.as_space();
-            crate::mm::user_access::copy_to_user(space, args[1], &comm)
-                .map_err(|_| Errno::Fault)?;
-            Ok(0)
-        }
-        PR_CAPBSET_READ => {
-            if args[1] > 40 {
-                return Err(Errno::Invalid);
-            }
-            Ok(1)
-        }
-        PR_SET_TIMERSLACK => {
-            rec.timer_slack_ns = if args[1] == 0 { 50_000 } else { args[1] as u64 };
-            Ok(0)
-        }
-        PR_GET_TIMERSLACK => Ok(rec.timer_slack_ns as usize),
-        PR_SET_CHILD_SUBREAPER => {
-            rec.child_subreaper = args[1] != 0;
-            Ok(0)
-        }
-        PR_GET_CHILD_SUBREAPER => {
-            let val = i32::from(rec.child_subreaper);
-            let space = rec.space.as_ref().ok_or(Errno::Fault)?.as_space();
-            crate::mm::user_access::copy_to_user(space, args[1], &val.to_ne_bytes())
-                .map_err(|_| Errno::Fault)?;
-            Ok(0)
-        }
-        PR_SET_NO_NEW_PRIVS => {
-            if args[1] != 1 || args[2] != 0 || args[3] != 0 || args[4] != 0 {
-                return Err(Errno::Invalid);
-            }
-            rec.no_new_privs = true;
-            Ok(0)
-        }
-        PR_GET_NO_NEW_PRIVS => {
-            if args[1] != 0 || args[2] != 0 || args[3] != 0 || args[4] != 0 {
-                return Err(Errno::Invalid);
-            }
-            Ok(usize::from(rec.no_new_privs))
-        }
-        _ => Err(Errno::Invalid),
-    }
 }

@@ -396,53 +396,6 @@ pub(super) fn msync(
     Ok(0)
 }
 
-/// getrlimit/setrlimit/prlimit64：支持全部 16 项 Linux RLIMIT_* 资源（含内存限额、NOFILE 与 CORE/CPU/FSIZE/NPROC 等）。
-pub(super) fn limit(
-    space: &mut UserAddressSpace,
-    fs: &mut crate::fs::context::Context,
-    credentials: &crate::task::Credentials,
-    resource: usize,
-    new_ptr: usize,
-    old_ptr: usize,
-) -> Result<usize, Errno> {
-    const RLIMIT_NOFILE: usize = 7;
-    let old = if resource == RLIMIT_NOFILE {
-        fs.nofile_limit()
-    } else if let Some(v) = space.memory_limit(resource) {
-        v
-    } else {
-        fs.extra_limit(resource).ok_or(Errno::Invalid)?
-    };
-    let mut next = None;
-    if new_ptr != 0 {
-        let mut bytes = [0; 16];
-        crate::mm::user_access::copy_from_user(space, new_ptr, &mut bytes)
-            .map_err(|_| Errno::Fault)?;
-        let soft = usize::from_ne_bytes(bytes[..8].try_into().map_err(|_| Errno::Invalid)?);
-        let hard = usize::from_ne_bytes(bytes[8..].try_into().map_err(|_| Errno::Invalid)?);
-        if soft > hard {
-            return Err(Errno::Invalid);
-        }
-        next = Some([soft, hard]);
-    }
-    if old_ptr != 0 {
-        let mut bytes = [0; 16];
-        bytes[..8].copy_from_slice(&old[0].to_ne_bytes());
-        bytes[8..].copy_from_slice(&old[1].to_ne_bytes());
-        crate::mm::user_access::copy_to_user(space, old_ptr, &bytes).map_err(|_| Errno::Fault)?;
-    }
-    if let Some(next) = next {
-        if resource == RLIMIT_NOFILE {
-            fs.set_nofile_limit(next, credentials.euid == 0)?;
-        } else if space.memory_limit(resource).is_some() {
-            space.set_memory_limit(resource, next).map_err(error)?;
-        } else {
-            fs.set_extra_limit(resource, next, credentials.euid == 0)?;
-        }
-    }
-    Ok(0)
-}
-
 /// 普通文件的有界预读建议。通过存储后端读入，不占用调用者文件游标。
 pub(super) fn readahead(
     ctx: &crate::fs::context::Context,
