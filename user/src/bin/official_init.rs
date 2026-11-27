@@ -1302,6 +1302,8 @@ extern "C" fn ouro_main() -> ! {
     run_selected_group(b"netperf-glibc", started);
     run_selected_group(b"iozone-musl", started);
     run_selected_group(b"iozone-glibc", started);
+    run_selected_group(b"cyclictest-musl", started);
+    run_selected_group(b"cyclictest-glibc", started);
     run_selected_group(b"lmbench-musl", started);
     run_selected_group(b"lmbench-glibc", started);
     // LTP 与其余尚未完成全量验收的测试组暂不在默认送测中启用，按需取消注释：
