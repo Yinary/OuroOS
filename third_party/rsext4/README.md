@@ -33,3 +33,8 @@ Cargo 清单移除了随上游测试程序提供的目标。内核默认启用�
   标准工具重放；未支持特性组合仍拒绝。已知上游缺陷：目录块经数据块缓存
   直写 home 块、绕过日志（data=writeback 式），断电窗口可留下指向未分配
   inode 的目录项，标准 e2fsck 会清理。
+- 读写热路径优化（`fs/io-cache`）：
+  1. `BlockDevice` 新增带默认实现的 `read_slice`/`write_slice`，`BlockDev`、`Jbd2Dev` 与 `DataBlockCache::read_block_slice`/`write_block_slice` 在未命中 32 块小缓存时透传底层块缓存切片直读直写，免除 4 KiB 堆分配、小缓存淘汰抖动与整块搬运；`write_block_static` 整块写回跳过冗余读块；
+  2. `file/io.rs` 单块读直接走 `resolve_inode_block` 免除 `Vec<ExtentRun>` 堆分配，新增 `write_regular_inode_data` 合并类型校验与旧长度返回；
+  3. `metadata/apply.rs` 采用 Linux `mount(8)` 默认 `relatime` 语义（仅当 `atime <= mtime/ctime` 或超过 24 小时才更新 `atime`）并复用已加载 inode；
+  4. `cache/inode_table.rs` 与 `checksum/inode.rs` 优化命中单次 `BTreeMap` 查找，并将元数据校验和计算延迟至 `InodeCache` 落盘编码前统一执行（复用挂载时预计算的超级块校验种子与 256 字节栈缓冲），落盘结果与原逐次重算位级一致。

@@ -687,6 +687,42 @@ fn rw(nr: usize, a: [usize; 6], space: &UserAddressSpace, ctx: &Context) -> Resu
     }
 }
 
+/// `transfer` 复用的单槽 4 KiB 堆暂存池，避免高频小读写每次堆分配与清零，
+/// 同时维持 16 KiB 内核栈预算（docs/ostd-contracts.md §8）。
+static IO_SCRATCH: spin::Mutex<Option<Vec<u8>>> = spin::Mutex::new(None);
+
+struct ScratchBuf(Vec<u8>);
+
+impl ScratchBuf {
+    fn acquire(cap: usize) -> Result<Self, Errno> {
+        if let Some(mut buf) = IO_SCRATCH.lock().take() {
+            if buf.len() >= cap {
+                return Ok(Self(buf));
+            }
+            buf.clear();
+            buf.try_reserve_exact(4096).map_err(|_| Errno::NoMem)?;
+            buf.resize(4096, 0);
+            return Ok(Self(buf));
+        }
+        let alloc_len = 4096.max(cap);
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(alloc_len).map_err(|_| Errno::NoMem)?;
+        buf.resize(alloc_len, 0);
+        Ok(Self(buf))
+    }
+}
+
+impl Drop for ScratchBuf {
+    fn drop(&mut self) {
+        if self.0.len() == 4096 {
+            let mut pool = IO_SCRATCH.lock();
+            if pool.is_none() {
+                *pool = Some(core::mem::take(&mut self.0));
+            }
+        }
+    }
+}
+
 /// 复用可失败分配的 4 KiB 缓冲区；发生部分传输后返回已完成长度。
 #[inline(never)]
 fn transfer(
@@ -708,9 +744,9 @@ fn transfer(
     if total == 0 {
         return Ok(0);
     }
-    let mut chunk = Vec::new();
-    chunk.try_reserve_exact(4096).map_err(|_| Errno::NoMem)?;
-    chunk.resize(4096, 0);
+    let cap = total.min(4096);
+    let mut scratch = ScratchBuf::acquire(cap)?;
+    let chunk = &mut scratch.0[..cap];
     let mut done = 0;
     while done < total {
         let want = (total - done).min(chunk.len());

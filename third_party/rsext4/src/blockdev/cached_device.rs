@@ -145,6 +145,60 @@ impl<B: BlockDevice> BlockDev<B> {
         Ok(())
     }
 
+    // OuroOS patch: 块内切片直读，优先命中 held 缓冲，未命中直通底层 BlockDevice::read_slice。
+    pub fn read_slice(
+        &mut self,
+        dst: &mut [u8],
+        block_id: AbsoluteBN,
+        offset: usize,
+    ) -> Ext4Result<()> {
+        let end = offset
+            .checked_add(dst.len())
+            .ok_or_else(Ext4Error::invalid_input)?;
+        if end > self.dev.block_size() as usize {
+            return Err(Ext4Error::invalid_input());
+        }
+        if self.held.block_id == Some(block_id) {
+            dst.copy_from_slice(&self.held.buffer.as_slice()[offset..end]);
+            return Ok(());
+        }
+        self.dev.read_slice(dst, block_id, offset)
+    }
+
+    // OuroOS patch: 块内切片直写，命中 held 时同步更新 held 缓冲并直写底层块缓存。
+    pub fn write_slice(
+        &mut self,
+        src: &[u8],
+        block_id: AbsoluteBN,
+        offset: usize,
+        zero_rest: bool,
+    ) -> Ext4Result<()> {
+        if self.dev.is_readonly() {
+            return Err(Ext4Error::read_only());
+        }
+        let bs = self.dev.block_size() as usize;
+        let end = offset
+            .checked_add(src.len())
+            .ok_or_else(Ext4Error::invalid_input)?;
+        if end > bs {
+            return Err(Ext4Error::invalid_input());
+        }
+        if self.held.block_id == Some(block_id) {
+            if self.held.dirty {
+                self.flush_held()?;
+            }
+            let buf = self.held.buffer.as_mut_slice();
+            if zero_rest && (offset != 0 || end != bs) {
+                buf.fill(0);
+            }
+            buf[offset..end].copy_from_slice(src);
+            self.dev.write_slice(src, block_id, offset, zero_rest)?;
+            self.held.dirty = false;
+            return Ok(());
+        }
+        self.dev.write_slice(src, block_id, offset, zero_rest)
+    }
+
     /// Returns the held buffer (read-only view of the last accessed
     /// block).
     pub fn buffer(&self) -> &[u8] {

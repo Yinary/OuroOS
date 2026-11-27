@@ -89,8 +89,11 @@ fn rust_main(hartid: usize) {
     println!("{}", boot_line);
     dmesg::append(&boot_line);
 
-    // 任务时代基线：全部任务退出后帧统计必须回到这里（帧守恒断言）
-    let baseline = mm::frame::stats();
+    // 任务时代基线：全部任务退出后帧统计（含文件系统可回收缓存帧）必须回到这里
+    let baseline = {
+        let (total, free) = mm::frame::stats();
+        (total, free + fs::retained_frames())
+    };
 
     // 孵化用户任务。
     task::init();

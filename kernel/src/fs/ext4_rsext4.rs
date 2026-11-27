@@ -1,5 +1,6 @@
 //! rsext4 根卷和有界分区块设备适配。
 //! 使用 rsext4 0.8.1（Apache-2.0），来源见 docs/third-party.md。
+use super::block_cache::BlockCache;
 use crate::{drivers, syscall::Errno};
 use alloc::vec::Vec;
 use rsext4::{
@@ -23,7 +24,7 @@ struct Partition {
 
 struct Volume {
     fs: Ext4FileSystem,
-    device: Jbd2Dev<Partition>,
+    device: Jbd2Dev<BlockCache<Partition>>,
     opens: Vec<(u32, usize)>,
     failed: bool,
 }
@@ -198,7 +199,7 @@ fn try_mount(id: usize, start: usize, len: usize) -> Result<(), Errno> {
         len,
         time_base: i64::from(u32at(48)),
     };
-    let mut device = Jbd2Dev::initial_jbd2dev(0, partition, journal);
+    let mut device = Jbd2Dev::initial_jbd2dev(0, BlockCache::new(partition), journal);
     let options = MountOptions {
         readonly: !WRITABLE,
         replay_journal: false,
@@ -530,14 +531,29 @@ pub(super) fn read_dir(
 
 /// 将数据写到普通文件的指定偏移。
 pub(super) fn write_raw(ino: u32, offset: usize, data: &[u8]) -> Result<usize, Errno> {
+    write_raw_with_old_size(ino, offset, data).map(|(n, _)| n)
+}
+
+/// 将数据写到普通文件的指定偏移，并在同一次锁内返回写入前的文件长度。
+pub(super) fn write_raw_with_old_size(
+    ino: u32,
+    offset: usize,
+    data: &[u8],
+) -> Result<(usize, u64), Errno> {
     if !WRITABLE {
         return Err(Errno::ReadOnly);
     }
     offset.checked_add(data.len()).ok_or(Errno::Invalid)?;
     access(|v| {
-        let ino = regular_inode(v, ino)?;
-        rsext4::file::write_inode_data(&mut v.device, &mut v.fs, ino, offset as u64, data)?;
-        Ok(data.len())
+        let ino = InodeNumber::new(ino)?;
+        let old_size = rsext4::file::write_regular_inode_data(
+            &mut v.device,
+            &mut v.fs,
+            ino,
+            offset as u64,
+            data,
+        )?;
+        Ok((data.len(), old_size))
     })
 }
 

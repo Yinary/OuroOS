@@ -31,34 +31,73 @@ impl From<super::address_space::MapError> for AccessError {
     }
 }
 
-/// 第一遍校验整段，并缓存每页的物理地址与页内长度；缓存分配失败时
-/// 返回 None，由调用方退回逐页两遍处理。缓存内容不跨调用保存。
+/// 栈上小页表缓存上限：覆盖 4 页（≤12 KiB 跨越），避免常规 1~4 KiB 读写每轮堆分配。
+const INLINE_PAGES: usize = 4;
+
+/// 第一遍校验整段并记录物理页与页内长度；短传输直接落栈数组（零堆分配），
+/// 长传输退回 `Vec` 或两遍慢路径。缓存内容不跨调用保存。
+enum PreparedPages {
+    Inline {
+        entries: [(PhysAddr, usize); INLINE_PAGES],
+        len: usize,
+    },
+    Heap(Vec<(PhysAddr, usize)>),
+}
+
+impl PreparedPages {
+    #[inline]
+    fn as_slice(&self) -> &[(PhysAddr, usize)] {
+        match self {
+            Self::Inline { entries, len } => &entries[..*len],
+            Self::Heap(vec) => vec.as_slice(),
+        }
+    }
+}
+
 fn prepare_pages(
     space: &UserAddressSpace,
     vaddr: usize,
     len: usize,
     required: MappingFlags,
-) -> Result<Option<Vec<(PhysAddr, usize)>>, AccessError> {
+) -> Result<Option<PreparedPages>, AccessError> {
     let end = check_span(vaddr, len)?;
     if len == 0 {
-        return Ok(Some(Vec::new()));
+        return Ok(Some(PreparedPages::Inline {
+            entries: [(PhysAddr::new(0), 0); INLINE_PAGES],
+            len: 0,
+        }));
     }
     let first = vaddr / PAGE_SIZE;
     let last = (end - 1) / PAGE_SIZE;
     let pages = last - first + 1;
+    if pages <= INLINE_PAGES {
+        let mut entries = [(PhysAddr::new(0), 0); INLINE_PAGES];
+        let mut va = vaddr;
+        let mut count = 0usize;
+        while va < end {
+            let paddr = space.ensure_and_translate(va, required)?;
+            let n = ((va / PAGE_SIZE + 1) * PAGE_SIZE).min(end) - va;
+            entries[count] = (paddr, n);
+            count += 1;
+            va += n;
+        }
+        return Ok(Some(PreparedPages::Inline {
+            entries,
+            len: count,
+        }));
+    }
     let mut cache = Vec::new();
     if cache.try_reserve(pages).is_err() {
         return Ok(None);
     }
     let mut va = vaddr;
     while va < end {
-        space.ensure_access(va, required)?;
-        let (paddr, _) = space.translate(va).ok_or(AccessError::Fault)?;
+        let paddr = space.ensure_and_translate(va, required)?;
         let n = ((va / PAGE_SIZE + 1) * PAGE_SIZE).min(end) - va;
         cache.push((paddr, n));
         va += n;
     }
-    Ok(Some(cache))
+    Ok(Some(PreparedPages::Heap(cache)))
 }
 
 /// 把 `src` 写入用户地址 `[vaddr, vaddr+src.len())`。
@@ -68,7 +107,7 @@ pub fn copy_to_user(space: &UserAddressSpace, vaddr: usize, src: &[u8]) -> Resul
     if let Some(cache) = prepare_pages(space, vaddr, src.len(), MappingFlags::U | MappingFlags::W)?
     {
         let mut done = 0usize;
-        for (paddr, n) in cache {
+        for &(paddr, n) in cache.as_slice() {
             // SAFETY: prepare_pages 已确认本页属于用户且可写；dst 为本页的
             // 内核直接映射地址，n 不越过页尾，src 与 dst 不重叠。
             unsafe {
@@ -145,7 +184,7 @@ fn copy_from_user_with_flags(
 ) -> Result<(), AccessError> {
     if let Some(cache) = prepare_pages(space, vaddr, dst.len(), required)? {
         let mut done = 0usize;
-        for (paddr, n) in cache {
+        for &(paddr, n) in cache.as_slice() {
             // SAFETY: prepare_pages 已确认本页属于用户且可读；src 为本页的
             // 内核直接映射地址，n 不越过页尾，src 与 dst 不重叠。
             unsafe {

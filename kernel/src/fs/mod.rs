@@ -7,12 +7,18 @@ mod ext4;
 
 pub use ext4::mounted;
 
+pub mod block_cache;
 pub mod cache;
 pub mod context;
 pub mod fat;
 pub mod mapping;
 mod metadata;
 pub mod procfs;
+
+/// 仍被文件系统页缓存与块缓存持有的物理页帧总数（任务退出帧守恒自检用）。
+pub(crate) fn retained_frames() -> usize {
+    cache::retained_frames() + block_cache::retained_frames()
+}
 
 pub(crate) use metadata::{query, Metadata, Timestamp};
 
@@ -561,21 +567,20 @@ pub fn read(ino: u32, offset: usize, data: &mut [u8]) -> Result<usize, Errno> {
 }
 /// 写磁盘后同步共享页。
 pub fn write(ino: u32, offset: usize, data: &[u8]) -> Result<usize, Errno> {
-    let old = stat(ino)?.1 as usize;
-    let n = write_raw(ino, offset, data)?;
+    let (n, old) = if ino & FAT_INODE != 0 {
+        let old = fat::stat(ino)?.1 as usize;
+        let n = fat::write(ino, offset, data)?;
+        (n, old)
+    } else {
+        let (n, old) = ext4::write_raw_with_old_size(ino, offset, data)?;
+        (n, old as usize)
+    };
     let end = offset.checked_add(n).ok_or(Errno::Invalid)?;
     if end > old {
         cache::resize_inode(ino, old, end);
         mapping::commit_resize(ino, old as u64, end as u64);
     }
-    let mut buf = [0; 4096];
-    let mut done = 0;
-    while done < n {
-        let k = (n - done).min(buf.len());
-        buf[..k].copy_from_slice(&data[done..done + k]);
-        cache::coherent(ino, offset + done, &mut buf[..k], true);
-        done += k;
-    }
+    cache::coherent_write(ino, offset, &data[..n]);
     Ok(n)
 }
 

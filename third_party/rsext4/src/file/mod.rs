@@ -43,6 +43,7 @@ pub use delete::unlink_regular_entry;
 pub(crate) use delete::find_named_entry_in_parent;
 pub use io::{
     read_file, read_inode_data_into, truncate, truncate_inode, write_file, write_inode_data,
+    write_regular_inode_data,
 };
 pub use link::link;
 pub use rename::{mv, rename};

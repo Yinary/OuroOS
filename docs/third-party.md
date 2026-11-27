@@ -39,3 +39,11 @@ LoongArch 关机使用 PolyHAL 0.4.0（MIT）中 QEMU virt GED 的寄存器地�
 - BoarOS（GPL-2.0，github/gitlab 同期参赛作品）仅参考其公开文档中的
   思路与测例勘误（辅助盘分区布局、解释器别名路径、LA musl 调度包装
   ENOSYS 等事实），未复制任何代码。
+
+## 本轮块缓存与读写热路径涉及的第三方补丁（2026-11-26）
+
+- `third_party/rsext4`（Apache-2.0，rsext4 0.8.1）新增补丁（均标注 `// OuroOS patch:`，明细见 `third_party/rsext4/README.md`）：
+  - `BlockDevice::{read_slice, write_slice}` 默认方法及 `BlockDev`/`Jbd2Dev`/`DataBlockCache` 块内切片直读直写透传、`write_block_static` 整块写回免多余读块；
+  - `file/io.rs` 单块读免 `Vec<ExtentRun>` 堆分配与 `write_regular_inode_data` 合并加载；
+  - `metadata/apply.rs` 按 Linux `mount(8)` 默认 `relatime` 语义更新 `atime`；
+  - `cache/inode_table.rs` 与 `checksum/inode.rs` 命中单次查找及落盘编码前延迟更新 inode CRC32C（思路参考 Linux Ext4 `ext4_do_update_inode`，未复制 GPL 源码）。

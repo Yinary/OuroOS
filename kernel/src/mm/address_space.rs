@@ -516,6 +516,34 @@ impl UserAddressSpace {
         }
     }
 
+    /// 校验访问权限并在已驻留快路径直接返回物理地址，避免用户拷贝二次遍历页表。
+    pub fn ensure_and_translate(
+        &self,
+        va: usize,
+        required: MappingFlags,
+    ) -> Result<PhysAddr, MapError> {
+        let area = self.area_at(va).ok_or(MapError::NotMapped)?;
+        let actual = if area.flags.intersects(MappingFlags::RWX) {
+            area.flags | MappingFlags::X
+        } else {
+            area.flags
+        };
+        if !actual.contains(required) {
+            return Err(MapError::PermissionDenied);
+        }
+        self.refresh_files();
+        let page_va = va / PAGE_SIZE * PAGE_SIZE;
+        if let Some((pa, flags)) = self.pt.borrow().translate(page_va) {
+            if flags.contains(required) {
+                return Ok(PhysAddr::new(pa.raw() + va % PAGE_SIZE));
+            }
+        }
+        self.ensure_access(va, required)?;
+        self.translate(va)
+            .map(|(pa, _)| pa)
+            .ok_or(MapError::NotMapped)
+    }
+
     /// 为访问准备物理页；按区域权限处理匿名和文件后备缺页。
     pub fn ensure_access(&self, va: usize, required: MappingFlags) -> Result<(), MapError> {
         let area = self.area_at(va).ok_or(MapError::NotMapped)?;

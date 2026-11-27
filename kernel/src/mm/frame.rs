@@ -170,6 +170,16 @@ impl OwnedFrame {
     pub fn addr(&self) -> PhysAddr {
         self.pa
     }
+    /// 独占借用整页只读字节视图；`&mut self` 保证无 `FrameRef` 共享别名与用户映射。
+    pub fn as_slice(&mut self) -> &[u8] {
+        // SAFETY: self 独占已分配整页，直映虚拟地址有效且在 `&mut self` 借用期内无其他别名。
+        unsafe { core::slice::from_raw_parts(direct_map_addr(self.pa) as *const u8, PAGE_SIZE) }
+    }
+    /// 独占借用整页可写字节视图；`&mut self` 保证无 `FrameRef` 共享别名与用户映射。
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: self 独占已分配整页，直映虚拟地址有效且在 `&mut self` 借用期内无其他别名。
+        unsafe { core::slice::from_raw_parts_mut(direct_map_addr(self.pa) as *mut u8, PAGE_SIZE) }
+    }
     /// 从所拥有的页复制字节到内核缓冲区；越过页边界返回 InvalidRange。
     pub fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), FrameError> {
         if offset > PAGE_SIZE || out.len() > PAGE_SIZE - offset {

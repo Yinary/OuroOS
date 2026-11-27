@@ -167,14 +167,16 @@ impl Ext4FileSystem {
             BLOCK_SIZE,
         )?;
 
-        let sb = self.superblock;
+        // OuroOS patch: 启用多级缓存且 InodeCache 已配置校验种子时，延迟到落盘编码时重算 CRC32C。
+        let needs_inline_csum = !USE_MULTILEVEL_CACHE || !self.inodetable_cache.has_checksum_seed();
+        let sb = &self.superblock;
         let inode_size = self.inode_disk_size() as usize;
-        let has_csum = ext4_superblock_has_metadata_csum(&sb);
+        let has_csum = needs_inline_csum && ext4_superblock_has_metadata_csum(sb);
 
-        let wrapped_f = move |inode: &mut Ext4Inode| {
+        let wrapped_f = |inode: &mut Ext4Inode| {
             f(inode);
             if has_csum {
-                ext4_update_inode_checksum(&sb, inode_num, inode.i_generation, inode, inode_size);
+                ext4_update_inode_checksum(sb, inode_num, inode.i_generation, inode, inode_size);
             }
         };
 
