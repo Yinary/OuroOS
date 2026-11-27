@@ -14,6 +14,7 @@ pub mod event;
 pub mod fat;
 pub mod locks;
 pub mod mapping;
+pub mod memfd;
 mod metadata;
 pub mod procfs;
 
@@ -107,6 +108,9 @@ pub fn init() -> Result<(), Errno> {
 /// 写回 inode 的共享页和 Ext4 卷缓存。
 #[cfg(not(feature = "rsext4-readonly"))]
 pub(crate) fn sync_inode(ino: u32) -> Result<(), Errno> {
+    if memfd::is_memfd_ino(ino) {
+        return cache::sync_inode(ino);
+    }
     if ino & FAT_INODE != 0 {
         return Err(Errno::NotSupported);
     }
@@ -409,6 +413,9 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
             _ => Ok((0o100444, procfs::pid_timerslack(pid)?.len() as u64, 1, 0)),
         };
     }
+    if memfd::is_memfd_ino(ino) {
+        return memfd::stat(ino);
+    }
     if ino & FAT_INODE != 0 {
         fat::stat(ino)
     } else {
@@ -418,6 +425,20 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
 
 /// 查询 inode 所属卷的容量；失败返回对应后端错误。
 pub(crate) fn filesystem_stats(ino: u32) -> Result<FileSystemStats, Errno> {
+    if memfd::is_memfd_ino(ino) {
+        let (total, free) = crate::mm::frame::stats();
+        return Ok(FileSystemStats {
+            kind: 0x0102_1994,
+            block_size: 4096,
+            blocks: total as u64,
+            free_blocks: free as u64,
+            available_blocks: free as u64,
+            files: 4096,
+            free_files: 4096,
+            id: 0x0102_1994,
+            flags: 0x20,
+        });
+    }
     if ino & FAT_INODE != 0 {
         fat::filesystem_stats(ino)
     } else {
@@ -522,7 +543,9 @@ pub(crate) fn rename(
 
 /// 读取文件指定偏移，EOF 返回零。
 pub fn read_raw(ino: u32, offset: usize, data: &mut [u8]) -> Result<usize, Errno> {
-    if ino & FAT_INODE != 0 {
+    if memfd::is_memfd_ino(ino) {
+        memfd::read_raw(ino, offset, data)
+    } else if ino & FAT_INODE != 0 {
         fat::read(ino, offset, data)
     } else {
         ext4::read_raw(ino, offset, data)
@@ -601,7 +624,9 @@ pub(crate) fn metadata(ino: u32) -> Result<Metadata, Errno> {
 
 /// 写入文件指定偏移，返回实际字节数。
 pub fn write_raw(ino: u32, offset: usize, data: &[u8]) -> Result<usize, Errno> {
-    if ino & FAT_INODE != 0 {
+    if memfd::is_memfd_ino(ino) {
+        memfd::write_raw_with_old_size(ino, offset, data).map(|(n, _)| n)
+    } else if ino & FAT_INODE != 0 {
         fat::write(ino, offset, data)
     } else {
         ext4::write_raw(ino, offset, data)
@@ -623,7 +648,9 @@ pub fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
         }
         mapping::prepare_resize(ino, current, length)?;
     }
-    let result = if ino & FAT_INODE != 0 {
+    let result = if memfd::is_memfd_ino(ino) {
+        memfd::truncate(ino, length)
+    } else if ino & FAT_INODE != 0 {
         if length == 0 {
             fat::truncate(ino)
         } else {
@@ -642,6 +669,9 @@ pub fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
 /// 同步指定 inode 的共享文件页范围。
 #[cfg(not(feature = "rsext4-readonly"))]
 pub fn sync_mapping(ino: u32, offset: usize, length: usize) -> Result<(), Errno> {
+    if memfd::is_memfd_ino(ino) {
+        return cache::sync_span(ino, offset, length);
+    }
     if ino & FAT_INODE != 0 {
         return Err(Errno::NotSupported);
     }
@@ -651,12 +681,18 @@ pub fn sync_mapping(ino: u32, offset: usize, length: usize) -> Result<(), Errno>
 
 /// 只读构建没有可写回的后端。
 #[cfg(feature = "rsext4-readonly")]
-pub fn sync_mapping(_ino: u32, _offset: usize, _length: usize) -> Result<(), Errno> {
+pub fn sync_mapping(ino: u32, offset: usize, length: usize) -> Result<(), Errno> {
+    if memfd::is_memfd_ino(ino) {
+        return cache::sync_span(ino, offset, length);
+    }
     Err(Errno::ReadOnly)
 }
 
 /// 持有 inode 的打开引用。
 pub fn retain(ino: u32) -> Result<(), Errno> {
+    if memfd::is_memfd_ino(ino) {
+        return memfd::retain(ino);
+    }
     // procfs 虚拟节点（/proc、/proc/<pid>、/dev/*）无后端引用计数
     if procfs::is_virtual_ino(ino) {
         return Ok(());
@@ -670,6 +706,10 @@ pub fn retain(ino: u32) -> Result<(), Errno> {
 
 /// 释放 inode 的打开引用。
 pub fn release(ino: u32) {
+    if memfd::is_memfd_ino(ino) {
+        memfd::release(ino);
+        return;
+    }
     if procfs::is_virtual_ino(ino) {
         return;
     }
@@ -803,6 +843,9 @@ pub fn chmod_apply(
 /// chmod(2) 底层：按 inode 身份更新权限位（fd 与路径解析殊途同归到
 /// inode）；FAT 卷不支持（权限位为固定 0777 合成）。
 pub fn chmod_by_ino(ino: u32, path: &str, mode: u16) -> Result<(), Errno> {
+    if memfd::is_memfd_ino(ino) {
+        return memfd::chmod(ino, mode);
+    }
     if ino & FAT_INODE != 0 {
         return Err(Errno::NotSupported);
     }
@@ -828,7 +871,10 @@ pub fn read(ino: u32, offset: usize, data: &mut [u8]) -> Result<usize, Errno> {
 }
 /// 写磁盘后同步共享页。
 pub fn write(ino: u32, offset: usize, data: &[u8]) -> Result<usize, Errno> {
-    let (n, old) = if ino & FAT_INODE != 0 {
+    let (n, old) = if memfd::is_memfd_ino(ino) {
+        memfd::check_write_seal(ino, offset, data.len())?;
+        memfd::write_raw_with_old_size(ino, offset, data)?
+    } else if ino & FAT_INODE != 0 {
         let old = fat::stat(ino)?.1 as usize;
         let n = fat::write(ino, offset, data)?;
         (n, old)

@@ -120,7 +120,7 @@ fn mmap_region(
             space.find_free(addr, n).map_err(error)?
         };
         use crate::mm::file::{FilePage, MappingFile, Mode};
-        let file = MappingFile::new(ino)?;
+        let file = MappingFile::new_for_map(ino, shared && prot & 2 != 0)?;
         let mode = if shared {
             Mode::Shared { writable }
         } else {

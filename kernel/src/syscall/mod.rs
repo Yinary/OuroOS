@@ -45,6 +45,7 @@ pub mod sysnr {
     pub const FSTATFS: usize = 44;
     pub const TRUNCATE: usize = 45;
     pub const FTRUNCATE: usize = 46;
+    pub const FALLOCATE: usize = 47;
     pub const CHDIR: usize = 49;
     pub const FCHDIR: usize = 50;
     pub const OPENAT: usize = 56;
@@ -74,6 +75,7 @@ pub mod sysnr {
     pub const UTIMENSAT: usize = 88;
     pub const UMASK: usize = 166;
     pub const RENAMEAT2: usize = 276;
+    pub const MEMFD_CREATE: usize = 279;
     pub const FADVISE64: usize = 223;
     pub const COPY_FILE_RANGE: usize = 285;
     pub const STATX: usize = 291;
@@ -423,9 +425,11 @@ pub fn dispatch(
         | sysnr::FSTATFS
         | sysnr::TRUNCATE
         | sysnr::FTRUNCATE
+        | sysnr::FALLOCATE
         | sysnr::CHDIR
         | sysnr::FCHDIR
         | sysnr::OPENAT
+        | sysnr::MEMFD_CREATE
         | sysnr::CLOSE
         | sysnr::PIPE2
         | sysnr::GETDENTS64

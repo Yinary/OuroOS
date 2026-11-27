@@ -57,6 +57,9 @@ pub(super) fn metadata(ino: u32) -> Result<Metadata, Errno> {
             ..Default::default()
         });
     }
+    if super::memfd::is_memfd_ino(ino) {
+        return super::memfd::metadata(ino);
+    }
     if ino & FAT_INODE != 0 {
         fat::metadata(ino)
     } else {
