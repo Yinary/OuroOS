@@ -147,8 +147,9 @@ pub mod sysnr {
     pub const SHMCTL: usize = 195;
     pub const SHMAT: usize = 196;
     pub const SHMDT: usize = 197;
-    // 网络（AF_INET 本地回环套接字）
+    // 网络（AF_INET 本地回环与 AF_UNIX 匿名套接字）
     pub const SOCKET: usize = 198;
+    pub const SOCKETPAIR: usize = 199;
     pub const BIND: usize = 200;
     pub const LISTEN: usize = 201;
     pub const ACCEPT: usize = 202;
@@ -406,9 +407,9 @@ pub fn dispatch(
                 fs,
                 credentials,
             );
-            // pipe/套接字无数据或无空间且非 O_NONBLOCK：转为阻塞等待；单管道按实例定向等待。
+            // pipe/套接字无数据或无空间且非 O_NONBLOCK：按实例定向阻塞等待。
             if ret == Err(Errno::WouldBlock) {
-                if let Some(id) = fs.pipe_id(args[0]) {
+                if let Some(id) = fs.wait_id(args[0]) {
                     return Flow::Wait(WaitReason::PipeId(id));
                 }
                 return Flow::Wait(WaitReason::Pipe);
@@ -429,6 +430,7 @@ pub fn dispatch(
             Flow::Continue
         }
         sysnr::SOCKET
+        | sysnr::SOCKETPAIR
         | sysnr::BIND
         | sysnr::LISTEN
         | sysnr::GETSOCKNAME

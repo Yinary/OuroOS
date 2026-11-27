@@ -749,12 +749,13 @@ impl Context {
         self.install(fs::try_arc(Mutex::new(file))?, cloexec)
     }
 
-    /// 若 `fd` 指向管道端，返回其唯一实例号，供调度器定向等待。
-    pub(crate) fn pipe_id(&self, fd: usize) -> Option<u64> {
+    /// 若 `fd` 指向管道端或套接字，返回其定向唤醒键，供调度器精准唤醒。
+    pub(crate) fn wait_id(&self, fd: usize) -> Option<u64> {
         let handle = self.get(fd).ok()?;
         let file = handle.lock();
         match file.kind {
             Kind::Pipe { id, .. } => Some(id),
+            Kind::Socket(id) => Some(id.wake_id()),
             _ => None,
         }
     }
