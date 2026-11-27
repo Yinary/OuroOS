@@ -171,18 +171,9 @@ pub fn dispatch(
             if path == "/proc/meminfo" {
                 return ctx.open_meminfo(a[2], a[2] & 0x80000 != 0);
             }
-            if path == "/proc/mounts" {
+            if fs::is_procfs_text(&path) {
                 let text = fs::procfs_text(&path)?;
                 return ctx.open_proc_text(text, a[2], a[2] & 0x80000 != 0);
-            }
-            if let Some(rest) = path.strip_prefix("/proc/") {
-                if rest
-                    .split_once('/')
-                    .is_some_and(|(_, f)| f == "stat" || f == "cmdline" || f == "status")
-                {
-                    let text = fs::procfs_text(&path)?;
-                    return ctx.open_proc_text(text, a[2], a[2] & 0x80000 != 0);
-                }
             }
             if path == "/dev/null" {
                 return ctx.open_devnull(a[2], a[2] & 0x80000 != 0);

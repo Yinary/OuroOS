@@ -73,6 +73,7 @@ pub mod sysnr {
     pub const NANOSLEEP: usize = 101;
     pub const GETITIMER: usize = 102;
     pub const SETITIMER: usize = 103;
+    pub const CLOCK_SETTIME: usize = 112;
     pub const CLOCK_GETTIME: usize = 113;
     pub const CLOCK_GETRES: usize = 114;
     pub const CLOCK_NANOSLEEP: usize = 115;
@@ -109,6 +110,12 @@ pub mod sysnr {
     pub const GETSID: usize = 156;
     pub const SETSID: usize = 157;
     pub const UNAME: usize = 160;
+    pub const SETHOSTNAME: usize = 161;
+    pub const SETDOMAINNAME: usize = 162;
+    pub const GETRLIMIT: usize = 163;
+    pub const SETRLIMIT: usize = 164;
+    pub const PRCTL: usize = 167;
+    pub const GETCPU: usize = 168;
     pub const GETPID: usize = 172;
     pub const GETPPID: usize = 173;
     pub const GETRESUID: usize = 148;
@@ -129,11 +136,14 @@ pub mod sysnr {
     pub const GETEGID: usize = 177;
     pub const GETTID: usize = 178;
     pub const GETTIMEOFDAY: usize = 169;
+    pub const SETTIMEOFDAY: usize = 170;
+    pub const PRLIMIT64: usize = 261;
     pub const FACCESSAT: usize = 48;
     pub const FCHMODAT: usize = 53;
     pub const FCHOWNAT: usize = 54;
     pub const FCHOWN: usize = 55;
     pub const CAPGET: usize = 90;
+    pub const CAPSET: usize = 91;
     pub const MKNODAT: usize = 33;
     pub const FCHMOD: usize = 52;
     pub const SYSLOG: usize = 116;
@@ -469,22 +479,6 @@ pub fn dispatch(
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
-        163 | 164 | 261 => {
-            let (resource, new_ptr, old_ptr) = match nr {
-                163 => (a0, 0, a1),
-                164 => (a0, a1, 0),
-                _ => (a1, a2, args[3]),
-            };
-            let ret = if (nr == 163 || nr == 164) && a1 == 0 {
-                Err(Errno::Fault)
-            } else if nr == 261 && a0 != 0 && a0 != pid {
-                Err(Errno::NoProcess)
-            } else {
-                memory::limit(space, fs, credentials, resource, new_ptr, old_ptr)
-            };
-            cx[TrapFrameArgs::RET] = to_abi(ret);
-            Flow::Continue
-        }
         sysnr::SET_TID_ADDRESS => {
             thread.clear_child_tid = a0;
             cx[TrapFrameArgs::RET] = pid;
@@ -610,15 +604,22 @@ pub fn dispatch(
         | sysnr::NANOSLEEP
         | sysnr::GETITIMER
         | sysnr::SETITIMER
+        | sysnr::CLOCK_SETTIME
         | sysnr::CLOCK_GETTIME
         | sysnr::CLOCK_GETRES
         | sysnr::CLOCK_NANOSLEEP
+        | sysnr::GETRLIMIT
+        | sysnr::SETRLIMIT
+        | sysnr::PRLIMIT64
+        | sysnr::PRCTL
+        | sysnr::SETTIMEOFDAY
         | sysnr::TIMES
         | sysnr::GETPPID
         | sysnr::GETRESUID
         | sysnr::GETRESGID
         | sysnr::GETGROUPS
         | sysnr::CAPGET
+        | sysnr::CAPSET
         | sysnr::SETREGID
         | sysnr::SETGID
         | sysnr::SETREUID
@@ -747,22 +748,67 @@ pub fn dispatch(
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
+        sysnr::SETHOSTNAME | sysnr::SETDOMAINNAME => {
+            // sethostname(2) / setdomainname(2)：需要 CAP_SYS_ADMIN，长度限 0..=64 字节。
+            let ret = if !credentials.has_cap(crate::task::CAP_SYS_ADMIN) {
+                Err(Errno::Perm)
+            } else if a1 > UTS_MAX_LEN {
+                Err(Errno::Invalid)
+            } else {
+                let mut buf = [0u8; UTS_MAX_LEN];
+                let copied = if a1 == 0 {
+                    Ok(())
+                } else {
+                    user_access::copy_from_user(space, a0, &mut buf[..a1]).map_err(|_| Errno::Fault)
+                };
+                copied.map(|()| {
+                    let mut uts = UTS_NAMES.lock();
+                    let target = if nr == sysnr::SETHOSTNAME {
+                        &mut uts.nodename
+                    } else {
+                        &mut uts.domainname
+                    };
+                    target.fill(0);
+                    target[..a1].copy_from_slice(&buf[..a1]);
+                    0
+                })
+            };
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        sysnr::GETCPU => {
+            // getcpu(2)：单核内核恒返回 CPU 0、NUMA 节点 0；第三参数 tcache 忽略。
+            let ret = (|| {
+                if a0 != 0 {
+                    user_access::copy_to_user(space, a0, &0u32.to_ne_bytes())
+                        .map_err(|_| Errno::Fault)?;
+                }
+                if a1 != 0 {
+                    user_access::copy_to_user(space, a1, &0u32.to_ne_bytes())
+                        .map_err(|_| Errno::Fault)?;
+                }
+                Ok(0)
+            })();
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
         sysnr::UNAME | sysnr::GETTIMEOFDAY => {
             let ret = if nr == sysnr::UNAME {
                 let mut data = [0u8; 390];
-                for (i, text) in [
-                    crate::config::KERNEL_NAME,
-                    "ouro",
-                    crate::config::KERNEL_RELEASE,
-                    crate::config::KERNEL_NAME,
-                    crate::config::ARCH_NAME,
-                    "local",
-                ]
-                .iter()
-                .enumerate()
-                {
-                    data[i * 65..i * 65 + text.len()].copy_from_slice(text.as_bytes());
-                }
+                let (nodename, domainname) = {
+                    let uts = UTS_NAMES.lock();
+                    (uts.nodename, uts.domainname)
+                };
+                data[0..crate::config::KERNEL_NAME.len()]
+                    .copy_from_slice(crate::config::KERNEL_NAME.as_bytes());
+                data[65..130].copy_from_slice(&nodename);
+                data[130..130 + crate::config::KERNEL_RELEASE.len()]
+                    .copy_from_slice(crate::config::KERNEL_RELEASE.as_bytes());
+                data[195..195 + crate::config::KERNEL_NAME.len()]
+                    .copy_from_slice(crate::config::KERNEL_NAME.as_bytes());
+                data[260..260 + crate::config::ARCH_NAME.len()]
+                    .copy_from_slice(crate::config::ARCH_NAME.as_bytes());
+                data[325..390].copy_from_slice(&domainname);
                 user_access::copy_to_user(space, a0, &data)
                     .map(|_| 0)
                     .map_err(|_| Errno::Fault)
@@ -801,6 +847,38 @@ pub fn dispatch(
         }
     }
 }
+
+/// UTS 主机名与域名最大字节数（Linux __NEW_UTS_LEN = 64，utsname 每字段 65 字节含 NUL）。
+const UTS_MAX_LEN: usize = 64;
+
+/// 全局 UTS 主机名与域名状态；叶锁，锁序 REGISTRY → UTS_NAMES。
+struct UtsNames {
+    nodename: [u8; 65],
+    domainname: [u8; 65],
+}
+
+impl UtsNames {
+    const fn new() -> Self {
+        let mut nodename = [0u8; 65];
+        nodename[0] = b'o';
+        nodename[1] = b'u';
+        nodename[2] = b'r';
+        nodename[3] = b'o';
+        let mut domainname = [0u8; 65];
+        domainname[0] = b'l';
+        domainname[1] = b'o';
+        domainname[2] = b'c';
+        domainname[3] = b'a';
+        domainname[4] = b'l';
+        Self {
+            nodename,
+            domainname,
+        }
+    }
+}
+
+static UTS_NAMES: crate::sync::DebugMutex<UtsNames> =
+    crate::sync::DebugMutex::new("UTS_NAMES", UtsNames::new());
 
 /// Result → Linux ABI 返回值：Ok(n) → n；Err(e) → -errno
 pub(crate) fn to_abi(ret: Result<usize, Errno>) -> usize {

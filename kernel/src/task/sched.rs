@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::{
     cell::Cell,
     ptr::{addr_of, addr_of_mut},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use polyhal::kcontext::KContext;
@@ -29,6 +29,14 @@ use super::{
 /// 单核 + 内核关中断下仅被调度器与当前任务自身访问。
 #[polyhal::percpu]
 static CURRENT: Cell<usize> = Cell::new(0);
+/// 当前任务的线程组号（0 = idle）；供 procfs 解析 `/proc/self` 无锁读取。
+static CURRENT_TGID: AtomicUsize = AtomicUsize::new(0);
+
+/// 读取当前运行任务的线程组号；idle 或尚未启动任务时返回 None。
+pub fn current_tgid() -> Option<u32> {
+    let tgid = CURRENT_TGID.load(Ordering::Relaxed);
+    (tgid != 0).then_some(tgid as u32)
+}
 
 /// 事件方（fs 层、退出路径）请求唤醒的合并标志；无锁置位，
 /// 在下一次调度边界统一消费。避免 fs 层在 REGISTRY 锁内反向取 SCHED。
@@ -208,10 +216,12 @@ impl Scheduler {
         task.slice_end = slice_end;
         let timed = matches!(task.body, Some(TaskBody::User { .. }));
         let pid = task.pid;
+        let tgid = task.tgid;
         let ptr: *mut Task = &mut *task;
         let context = task.context_ptr() as *const KContext;
         self.current = Some(task);
         set_current(ptr);
+        CURRENT_TGID.store(tgid, Ordering::Relaxed);
         sync::set_holder(pid);
         timer::set_slice_end(timed.then_some(slice_end));
         context
@@ -521,6 +531,7 @@ pub(super) fn park(reason: WaitReason) -> Option<FutexEnd> {
             Some(next) => s.promote(next),
             None => {
                 set_current(core::ptr::null_mut());
+                CURRENT_TGID.store(0, Ordering::Relaxed);
                 sync::set_holder(0);
                 timer::set_slice_end(None);
                 addr_of!(s.idle_ctx)
@@ -650,6 +661,7 @@ pub(super) fn exit_group_current(exit: ExitInfo) -> ! {
             }
             None => {
                 set_current(core::ptr::null_mut());
+                CURRENT_TGID.store(0, Ordering::Relaxed);
                 sync::set_holder(0);
                 timer::set_slice_end(None);
                 (from, addr_of!(s.idle_ctx))
@@ -743,6 +755,7 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
             }
             None => {
                 set_current(core::ptr::null_mut());
+                CURRENT_TGID.store(0, Ordering::Relaxed);
                 sync::set_holder(0);
                 timer::set_slice_end(None);
                 (from, addr_of!(s.idle_ctx))
