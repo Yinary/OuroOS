@@ -61,6 +61,119 @@ pub fn create_regular_inode<B: BlockDevice>(
     Ok(ino)
 }
 
+// OuroOS patch: create a symbolic link by parent inode without requiring the target to exist.
+/// Creates a symbolic link in an existing, linear directory.
+pub fn create_symlink_inode<B: BlockDevice>(
+    device: &mut Jbd2Dev<B>,
+    fs: &mut Ext4FileSystem,
+    parent: InodeNumber,
+    name: &str,
+    target: &str,
+) -> Ext4Result<InodeNumber> {
+    if fs.readonly {
+        return Err(Ext4Error::read_only());
+    }
+    if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\0']) {
+        return Err(Ext4Error::invalid_input());
+    }
+    if name.len() > Ext4DirEntry2::MAX_NAME_LEN as usize {
+        return Err(Ext4Error::new(Errno::ENAMETOOLONG));
+    }
+    if target.is_empty() {
+        return Err(Ext4Error::not_found());
+    }
+    if target.contains('\0') {
+        return Err(Ext4Error::invalid_input());
+    }
+    if target.len() >= BLOCK_SIZE {
+        return Err(Ext4Error::new(Errno::ENAMETOOLONG));
+    }
+    let mut dir = fs.get_inode_by_num(device, parent)?;
+    if !dir.is_dir() {
+        return Err(Ext4Error::not_dir());
+    }
+    if dir.i_flags & Ext4Inode::EXT4_INDEX_FL != 0 {
+        return Err(Ext4Error::unsupported());
+    }
+    for block in resolve_inode_blocks(fs, device, &mut dir)?.into_values() {
+        let cached = fs.datablock_cache.get_or_load(device, block)?;
+        if crate::entries::classic_dir::find_entry(&cached.data, name.as_bytes()).is_some() {
+            return Err(Ext4Error::already_exists());
+        }
+    }
+
+    let ino = fs.alloc_inode(device)?;
+    let target_bytes = target.as_bytes();
+    let target_len = target_bytes.len();
+    let symlink_mode = Ext4Inode::S_IFLNK | 0o777;
+    let mut inode = Ext4Inode::empty_for_reuse(fs.default_inode_extra_isize());
+    inode.i_links_count = 1;
+    inode.i_size_lo = target_len as u32;
+    inode.i_size_high = 0;
+    inode.i_flags = Ext4Inode::mask_flags_for_mode(
+        symlink_mode,
+        dir.i_flags & Ext4Inode::EXT4_FL_INHERITED,
+    );
+
+    let mut data_blocks: Vec<AbsoluteBN> = Vec::new();
+    if target_len < 60 {
+        inode.i_flags &= !Ext4Inode::EXT4_EXTENTS_FL;
+        let mut raw = [0u8; 60];
+        raw[..target_len].copy_from_slice(target_bytes);
+        for i in 0..15 {
+            inode.i_block[i] =
+                u32::from_le_bytes([raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]]);
+        }
+        inode.i_blocks_lo = 0;
+        inode.l_i_blocks_high = 0;
+    } else {
+        let blk = match fs.alloc_block(device) {
+            Ok(b) => b,
+            Err(e) => {
+                discard_unpublished_inode(fs, device, ino, &[]);
+                return Err(e);
+            }
+        };
+        if let Err(e) = fs.datablock_cache.modify_new(device, blk, |data| {
+            data.fill(0);
+            data[..target_len].copy_from_slice(target_bytes);
+        }) {
+            fs.datablock_cache.invalidate(blk);
+            let _ = fs.free_block(device, blk);
+            discard_unpublished_inode(fs, device, ino, &[]);
+            return Err(e);
+        }
+        data_blocks.push(blk);
+        inode.i_blocks_lo = (BLOCK_SIZE / 512) as u32;
+        inode.l_i_blocks_high = 0;
+        if let Err(e) =
+            build_file_block_mapping_with_inode_num(fs, &mut inode, ino, &data_blocks, device)
+        {
+            discard_unpublished_inode(fs, device, ino, &data_blocks);
+            return Err(e);
+        }
+    }
+
+    if let Err(error) = fs.finalize_inode_update(
+        device,
+        ino,
+        &mut inode,
+        Ext4InodeMetadataUpdate::create(symlink_mode),
+    ) {
+        discard_unpublished_inode(fs, device, ino, &data_blocks);
+        return Err(error);
+    }
+    if let Err(error) =
+        insert_dir_entry(fs, device, parent, &mut dir, ino, name, Ext4DirEntry2::EXT4_FT_SYMLINK)
+    {
+        if no_space_before_insert(error) {
+            free_inode(fs, device, ino, &mut inode)?;
+        }
+        return Err(error);
+    }
+    Ok(ino)
+}
+
 fn discard_unpublished_inode_blocks<B: BlockDevice>(
     fs: &mut Ext4FileSystem,
     device: &mut Jbd2Dev<B>,

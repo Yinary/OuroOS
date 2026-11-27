@@ -36,8 +36,8 @@ static WAKE_CHILDREN: AtomicBool = AtomicBool::new(false);
 static WAKE_PIPES: AtomicBool = AtomicBool::new(false);
 static WAKE_SIGNALS: AtomicBool = AtomicBool::new(false);
 
-/// 定向管道唤醒槽位容量；槽满时退回全局 WAKE_PIPES 广播，保证不丢唤醒。
-const PIPE_WAKE_SLOTS: usize = 16;
+/// 定向管道/套接字唤醒槽位容量；槽满时退回全局 WAKE_PIPES 广播，保证不丢唤醒。
+const PIPE_WAKE_SLOTS: usize = 64;
 static WAKE_PIPE_IDS: [AtomicU64; PIPE_WAKE_SLOTS] = [const { AtomicU64::new(0) }; PIPE_WAKE_SLOTS];
 
 /// 定向 System V IPC 唤醒槽位；槽满或键无效时退回全局 WAKE_IPC_ALL 广播。

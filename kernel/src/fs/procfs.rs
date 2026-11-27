@@ -56,19 +56,39 @@ pub(super) const DEVBLK: u32 = u32::MAX - 7;
 pub(super) const MISC_DIR: u32 = u32::MAX - 6;
 /// /proc/mounts（df 等读取，格式见 mounts(5)）
 pub(super) const MOUNTS: u32 = u32::MAX - 4;
-/// /proc/sys 与 /proc/sys/kernel 目录及只读 IPC 限额节点。
+/// /proc/sys 目录
 pub(super) const SYS_DIR: u32 = u32::MAX - 11;
+/// /proc/sys/kernel 目录
 pub(super) const SYS_KERNEL_DIR: u32 = u32::MAX - 12;
-pub(super) const SYS_MSGMNI: u32 = u32::MAX - 13;
-pub(super) const SYS_MSGMAX: u32 = u32::MAX - 14;
-pub(super) const SYS_MSGMNB: u32 = u32::MAX - 15;
-pub(super) const SYS_SEM: u32 = u32::MAX - 16;
-/// /proc/sysvipc 目录及其下 msg/sem 只读快照。
-pub(super) const SYSVIPC_DIR: u32 = u32::MAX - 17;
-pub(super) const SYSVIPC_MSG: u32 = u32::MAX - 18;
-pub(super) const SYSVIPC_SEM: u32 = u32::MAX - 19;
-/// 固定 procfs/devfs 虚拟 inode 下界（[VIRTUAL_MIN..=u32::MAX] 均无磁盘后端）。
-pub(super) const VIRTUAL_MIN: u32 = u32::MAX - 31;
+/// /proc/sys/kernel/pid_max
+pub(super) const PID_MAX: u32 = u32::MAX - 13;
+/// /proc/version
+pub(super) const VERSION: u32 = u32::MAX - 14;
+/// /proc/self 目录
+pub(super) const SELF_DIR: u32 = u32::MAX - 15;
+/// /proc/self/maps
+pub(super) const SELF_MAPS: u32 = u32::MAX - 16;
+/// /proc/self/fd 目录
+pub(super) const SELF_FD_DIR: u32 = u32::MAX - 17;
+/// /proc/sys/kernel/tainted 文件
+pub(super) const TAINTED: u32 = u32::MAX - 18;
+/// /proc/sys/fs 目录
+pub(super) const SYS_FS_DIR: u32 = u32::MAX - 19;
+/// /proc/sys/fs/pipe-max-size 文件
+pub(super) const PIPE_MAX_SIZE_NODE: u32 = u32::MAX - 20;
+/// /proc/sys/kernel/{msgmni,msgmax,msgmnb,sem} 与 /proc/sysvipc/{msg,sem} 只读节点。
+pub(super) const SYS_MSGMNI: u32 = u32::MAX - 21;
+pub(super) const SYS_MSGMAX: u32 = u32::MAX - 22;
+pub(super) const SYS_MSGMNB: u32 = u32::MAX - 23;
+pub(super) const SYS_SEM: u32 = u32::MAX - 24;
+pub(super) const SYSVIPC_DIR: u32 = u32::MAX - 25;
+pub(super) const SYSVIPC_MSG: u32 = u32::MAX - 26;
+pub(super) const SYSVIPC_SEM: u32 = u32::MAX - 27;
+
+/// 判断 inode 是否属于虚拟节点区间（固定虚拟节点或 /proc/<pid> 派生节点）。
+pub(super) fn is_virtual_ino(ino: u32) -> bool {
+    ino >= SYSVIPC_SEM || pid_ino_parts(ino).is_some()
+}
 
 /// /proc/sys/kernel/{msgmni,msgmax,msgmnb,sem} 只读快照（与 ipc 模块限额常量同源）。
 pub(super) fn sys_kernel_ipc(name: &str) -> Result<String, Errno> {
@@ -95,6 +115,56 @@ pub(super) fn sys_kernel_ipc(name: &str) -> Result<String, Errno> {
             );
         }
         _ => return Err(Errno::NoEntry),
+    }
+    Ok(out)
+}
+
+/// /proc/sys/kernel/pid_max 内容。
+pub(super) fn pid_max() -> &'static str {
+    "32768\n"
+}
+
+/// /proc/sys/kernel/tainted 内容（0 表示无内核污染）。
+pub(super) fn tainted() -> &'static str {
+    "0\n"
+}
+
+/// /proc/sys/fs/pipe-max-size 内容（与 context::PIPE_MAX_SIZE = 1 MiB 一致）。
+pub(super) fn pipe_max_size() -> &'static str {
+    "1048576\n"
+}
+
+/// /proc/version 内容。
+pub(super) fn version() -> &'static str {
+    "Linux version 6.1.0-OuroOS (ouroos@build) (rustc) #1 SMP\n"
+}
+
+/// 生成当前进程的 /proc/self/maps 快照（proc(5) 标准行格式，地址按 Linux %08lx 排版）。
+pub(crate) fn format_maps(
+    space: &crate::mm::address_space::UserAddressSpace,
+) -> Result<String, Errno> {
+    use polyhal::pagetable::MappingFlags as F;
+    let areas = space.areas();
+    let mut out = String::new();
+    out.try_reserve(areas.len().saturating_mul(64))
+        .map_err(|_| Errno::NoMem)?;
+    for area in areas {
+        let r = if area.flags.contains(F::R) { 'r' } else { '-' };
+        let w = if area.flags.contains(F::W) { 'w' } else { '-' };
+        let x = if area.flags.contains(F::X) { 'x' } else { '-' };
+        let s = if matches!(
+            area.kind,
+            crate::mm::address_space::AreaKind::SharedAnonymous
+        ) {
+            's'
+        } else {
+            'p'
+        };
+        let _ = writeln!(
+            out,
+            "{:08x}-{:08x} {}{}{}{} 00000000 00:00 0",
+            area.start, area.end, r, w, x, s
+        );
     }
     Ok(out)
 }

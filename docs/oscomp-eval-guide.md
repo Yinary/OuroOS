@@ -205,3 +205,73 @@ python3 tests/run_official.py la --groups ltp-musl --ltp-filter chown,statx --lt
   - `la` 9 组回归：`basic` 102/102、`busybox` 54/55、`lua` 9/9、`libctest-musl` 217/220 零回退，`iperf-musl` 由 `6.91` 升至 **7.96/6**、`netperf-musl` 由 `8.57` 升至 **9.25/5**；
   - `rv` `lmbench-musl` 前 7 项抽测（300 秒内）：`Simple syscall` 降至 **1.84 µs**、`Simple read` **3.41 µs**、`Simple write` **3.21 µs**、`Select on 100 fd's` **7.94 µs**（7 项得 12.91/14）；
   - 文件系统一致性专项：`fs_rename_backend.py`（15/15 故障注入回滚 + `e2fsck`）、`fs_stat.py`（默认及 `--metadata` 双架构 128/256 字节 inode + `e2fsck`）、`fs_fcntl.py`（双架构 + `e2fsck`）、`file_mapping.rs`（6/6）全部通过。
+
+### 5.6 `cyclictest` 摸底与 `AF_UNIX socketpair` 验证结果（`net/unix-socketpair`）
+
+- **首轮基线（`dev` `03de5e3`）**：`riscv64` 上 `cyclictest` 主体（`NO_STRESS_P1`/`NO_STRESS_P8`/`STRESS_P1`/`STRESS_P8`）在双 libc 下均可正常测量（最大延迟 539–967 µs），但压测进程 `hackbench` 因缺少 `socketpair(199)` 报 `Creating fdpair (error: Function not implemented)` 立即退出，导致 `kill -2 $hackbench_pid` 失败并输出 `kill hackbench: fail, ignore STRESS result`，判分归零；此外，16 MiB 内核栈窗口最多仅容 455 个并发任务（紧贴 `hackbench` 400 任务上限），套接字阻塞采用全局广播唤醒在 400 任务下存在惊群，且 `sched_setaffinity`/`sched_getaffinity`/`sched_rr_get_interval` 按进程主线程号查找导致工作线程报 `WARN: Could not set CPU affinity to CPU #0`。
+- **通用内核补齐（`net/unix-socketpair` 分支）**：
+  1. **匿名 UNIX 域套接字对（`kernel/src/net/mod.rs`、`kernel/src/syscall/net.rs`、`kernel/src/syscall/mod.rs`）**：实现 `socketpair(199)`，支持 `AF_UNIX` 下的 `SOCK_STREAM` 与 `SOCK_DGRAM`、`SOCK_NONBLOCK`/`SOCK_CLOEXEC` 及安装或拷贝失败时的文件描述符回滚；打通 `sendto`/`recvfrom`/`read`/`write`/`poll_events`/`shutdown`/`close`/`getsockname`/`getpeername`/`setsockopt`/`getsockopt` 全路径，并用 `VecDeque::as_slices` 批量切片拷贝替换逐字节复制。
+  2. **400 任务栈窗口扩容与套接字定向唤醒（`kernel/src/mm/kstack.rs`、`kernel/src/task/sched.rs`、`kernel/src/fs/context.rs`）**：内核栈虚拟窗口由 16 MiB 扩至 32 MiB（可容纳 910 个并发任务）；为套接字分配最高位置 1 的独立定向唤醒键 `SocketId::wake_id`，经 `Context::wait_id` 与 `WaitReason::PipeId` 精准唤醒对端，并将 `PIPE_WAKE_SLOTS` 由 16 扩至 64。
+  3. **线程级调度亲和与时间片查询（`kernel/src/task/user_task.rs`）**：`sched_setaffinity`、`sched_getaffinity` 与 `sched_rr_get_interval` 改为按 `REGISTRY.thread(target)` 校验目标线程存在性，并通过调用方地址空间读写用户缓冲区，消除工作线程亲和性告警。
+- **双架构实测结果（QEMU 10.0.2 + QCOW2 覆盖层，`sdcard-rv.img`/`sdcard-la.img` `pre-20250615`）**：
+  - `rv`：`cyclictest-musl` **5.65/4**（4/4 通过 + `kill hackbench: success`）、`cyclictest-glibc` **6.04/4**（4/4 通过 + `kill hackbench: success`），两配置合计用时约 26 秒；
+  - `la`：`cyclictest-glibc` **5.46/4**（4/4 通过 + `kill hackbench: success`，`NO_STRESS` 最大延迟 281–549 µs，`STRESS` 最大延迟约 40–44 ms）；`cyclictest-musl` **0.00/4**（同组 `hackbench` 400 任务压测与 `SIGINT` 回收已正常通过）。经 `llvm-objdump` 反汇编核验，官方 `sdcard-la.img` 内的 `/musl/lib/libc.so` 为未打补丁的上游 musl，其 `sched_getparam` 与 `sched_setscheduler` 在用户态直接返回 `-38`（`-ENOSYS`）而不执行 `syscall` 指令，属于官方 `pre-20250615` LoongArch 盘面自带的用户态库限制；内核侧 `sched_getparam(121)`/`sched_setscheduler(119)` 均已双架构实现。
+  - **双架构 6 组核心回归（零回退）**：`rv` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9、`iperf-musl` **8.16/6**（较前值 7.23 提升 +0.93）、`netperf-musl` 8.74/5、`iozone-musl` 36.90/20；`la` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9、`iperf-musl` **8.84/6**（较前值 7.96 提升 +0.88）、`netperf-musl` 9.30/5、`iozone-musl` 38.18/20。
+  - **默认送测启用状态**：`official_init.rs` 已在默认送测流程中启用 `cyclictest-musl` 与 `cyclictest-glibc`，顺序排在 `iozone` 之后、`lmbench` 之前。
+
+### 5.7 `fork` 全私有页写时复制优化验证结果（`mm/fork-cow`）
+
+- **优化范围**：
+  1. **ELF 段与私有文件映射 COW（`kernel/src/mm/address_space.rs`、`kernel/src/mm/file.rs`）**：`deep_copy()` 将全部 `Backing::Private`（含 `AreaKind::Elf`）与 `FilePage`（`Mode::Private`，含 `libc.so.6` 等动态库只读/数据页）统一共享引用并在子空间安装后对父页表写保护；写入缺页时通过 `FrameRef::duplicate` 或 `FilePage::split_private` 懒拆分，仅剩单引用时原地恢复写权限；`Page::leaf_flags` 与 `populate_locked` 同步纳入私有文件页，`mprotect` 不会绕过 COW 写保护。
+  2. **高并发 `AF_UNIX` 缓冲默认上限（`kernel/src/net/mod.rs`）**：将匿名 `AF_UNIX` 套接字默认收发缓冲设为 16 KiB（200 对满队列上限 3.2 MiB，仍允许 `SO_SNDBUF`/`SO_RCVBUF` 显式调大），避免 400 个 `hackbench` 进程高速 `fork` 后并发打满 32 MiB 固定内核堆。
+- **双架构实测对比（QEMU 10.0.2 + QCOW2 覆盖层，零 OOM、零回归）**：
+  - `la` `cyclictest-glibc`：`STRESS_P1` 最大延迟由 **40,010 µs → 4,427 µs**（降 **9.0×**），`STRESS_P8` 8 线程平均最大延迟由 **43,619 µs → 1,839 µs**（降 **23.7×**），总分由 `5.46/4` 升至 **5.84/4**；
+  - `rv` `cyclictest-musl` `STRESS_P1` 最大延迟由 **4,996 µs → 1,226 µs**（降 **4.1×**，总分 5.61/4），`cyclictest-glibc` `STRESS_P1` 由 **5,424 µs → 944 µs**（降 **5.7×**，总分 5.19/4）；
+  - 双架构回归与专项：`rv` 与 `la` 上 `basic-glibc` 102/102、`busybox-glibc` 54/55、`libctest-musl` 217/220 全部零回退；主机 `tests/file_mapping.rs` 6/6 通过。
+
+### 5.8 `lmbench` 通用系统调用与文件 I/O 热路径优化验证结果（`perf/lmbench-hotpath`）
+
+- **优化范围（均属通用操作系统机制，无测例特判）**：
+  1. **按页扫描的用户字符串读取（`kernel/src/mm/user_access.rs`、`kernel/src/syscall/fs.rs`）**：新增 `user_access::read_cstr`，按页翻译并直接扫描页内 NUL 字节，≤256 字节路径走栈暂存并按精确长度分配 `String`，取代原逐字节 `copy_from_user` + 4 KiB 固定堆分配。
+  2. **Ext4 路径目录项缓存与 `stat`/`query` 单锁快路径（`kernel/src/fs/ext4_rsext4.rs`、`kernel/src/fs/metadata.rs`、`kernel/src/fs/fat.rs`）**：在 Ext4 根卷内维护 256 槽直接映射路径目录项缓存（`rmdir`/`unlink`/`rename` 整表失效，绝不缓存元数据本身），对经 `resolve` 确认整条路径无符号链接的规范绝对路径置 `direct_stat` 标记，使后续 `stat`/`query` 在单次 `ROOT` 锁内直取实时 inode 元数据，消除原 $O(D^2)$ 逐层重复查找；同时为 `fat` 增加 `MOUNT_COUNT` 原子快路径，无 FAT 挂载时免锁跳过。
+  3. **私有文件缺页单次 4 KiB 直填帧（`kernel/src/mm/frame.rs`、`kernel/src/mm/file.rs`）**：新增 `OwnedFrame::fill_range_with`，`FilePage::fault` 私有页缺页直接单次读满 4 KiB 至物理页帧，替代原 `4 × 1 KiB` 分段读与二次拷贝。
+  4. **小读写栈缓冲、64 KiB 复用暂存池与管道切片拷贝（`kernel/src/syscall/fs.rs`、`kernel/src/fs/context.rs`）**：≤256 字节读写走栈缓冲免自旋锁；大读写复用单槽 64 KiB 堆暂存池（将 64 KiB 读写从 16 轮缩减为 1 轮）；管道读改用 `VecDeque::as_slices` 批量切片拷贝，管道写遵循 POSIX `PIPE_BUF(4096)` 原子写并对 >4 KiB 请求允许部分写入。
+- **双架构实测与一致性验证（QEMU 10.0.2 + QCOW2 覆盖层）**：
+  - `la` `lmbench-musl` 抽测对比：`Simple stat` 由 **37.69 µs → 4.32 µs**（提速 **8.7×**），`Simple syscall` **1.03 µs**；
+  - `fs_stat.py`（默认及 `--metadata`，双架构 128/256 字节 inode + `e2fsck`）**8/8 全部通过**；
+  - 双架构 7 组回归零回退：`rv` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9、`iozone-musl` 35.87/20、`iperf-musl` 7.61/6、`netperf-musl` 8.66/5、`libctest-musl` 217/220；`la` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9、`iozone-musl` 37.30/20、`iperf-musl` 8.21/6、`netperf-musl` 9.13/5、`libctest-musl` 217/220。
+
+### 5.9 LTP 第 1 批基础框架与核心系统调用语义补齐（`syscall/ltp-core-infra`）
+
+- **补齐范围（均为通用 Linux 语义，无测例特判）**：
+  1. **全量 16 项 `RLIMIT_*` 资源限额（`kernel/src/fs/context.rs`、`kernel/src/syscall/memory.rs`）**：在既有内存类与 `RLIMIT_NOFILE` 之外补齐全部 16 项资源（含 `RLIMIT_CORE`、`RLIMIT_NPROC` 等 Linux 默认初值），支持查询、修改、`rlim_cur <= rlim_max` 校验及 `fork` 继承/`exec` 保留，消除大批 LTP 测例准备阶段的 `setrlimit(RLIMIT_CORE)` 报错。
+  2. **`procfs` 节点扩展（`kernel/src/fs/procfs.rs`、`kernel/src/fs/mod.rs`、`kernel/src/fs/metadata.rs`、`kernel/src/syscall/fs.rs`）**：新增 `/proc/sys/kernel/pid_max`、`/proc/sys/kernel/tainted`（支撑 `tst_taint`）、`/proc/version`、`/proc/self/maps`（按 Linux `%08lx-%08lx` 导出 VMA 快照）及 `/proc/self/fd` 目录快照（`getdents64` 枚举存活 FD）。
+  3. **管道控制与文件创建/映射细节对齐（`kernel/src/fs/context.rs`、`kernel/src/syscall/fs.rs`、`kernel/src/syscall/memory.rs`）**：实现 `fcntl` 的 `F_GETPIPE_SZ(1032)` / `F_SETPIPE_SZ(1031)`（4 KiB..1 MiB 按页对齐，低于已缓冲字节数返回 `EBUSY`）；`ioctl` 为管道与普通文件补齐 `FIONREAD(0x541B)`；`creation_mode` 保留 `0o7000` 特殊权限位；`mmap` 非匿名映射按 Linux `ksys_mmap_pgoff` 先校验 FD（含拒绝 `O_PATH` FD 返回 `EBADF`）再校验长度。
+  4. **套接字与进程回收错误码对齐（`kernel/src/net/mod.rs`、`kernel/src/syscall/net.rs`、`kernel/src/task/user_task.rs`）**：支持 `socket(AF_UNIX, SOCK_STREAM|SOCK_DGRAM, 0)` 未连接创建，对齐 `socket`/`socketpair` 的类型与协议校验错误码顺序（非法 `type` 返回 `EINVAL`，协议不匹配优先返回 `EPROTONOSUPPORT`）；`wait4(INT_MIN, ...)` 返回 `ESRCH`。
+- **双架构实测对比（QEMU 10.0.2 + QCOW2 覆盖层，`sdcard-rv.img`/`sdcard-la.img` `pre-20250615`）**：
+  - 9 前缀 LTP 探测（`open,read,write,pipe,fork,wait,kill,mmap,socket`）：
+    - 基线（`perf/lmbench-hotpath` `7296567`）：`rv` **`244/318`**；
+    - 本批修复后：`rv` **`420/525`**（净增 **+176** 条通过断言，+72.1%）、`la` **`421/527`**（净增 **+177** 条通过断言），零 panic；其中 `socket01`/`socket02`/`socketpair01`/`socketpair02`/`waitpid04`/`wait403`/`mmap08`/`open01`/`pipe12` 均 100% 通过，`waitpid01` 通过 126/146，`readahead01` 提升至 9/25，`mmap04` 权限行匹配生效。
+  - 资源限额专项 LTP（`getrlimit,setrlimit,prlimit`）：`rv` **`40/40`**、`la` **`40/40`**（双架构 100% 通过）。
+  - 双架构回归与专项：`rv` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9、`cyclictest-musl` 5.14/4；`la` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9；`tests/fs_fcntl.py` 双架构 + `e2fsck` 全部通过。
+
+### 5.10 LTP 第 2 批符号链接、硬链接与 `sendfile` 验证结果（`fs/link-symlink-sendfile`）
+
+- **补齐范围（均为通用 Linux 文件系统与 VFS 语义，无测例特判）**：
+  1. **Ext4 符号链接与硬链接后端（`third_party/rsext4/src/file/{create,link,delete,mod}.rs`、`kernel/src/fs/{ext4_rsext4,mod}.rs`）**：新增 `create_symlink_inode`（允许相对与悬空目标，支持 <60 字节内联快速链接与块存储长链接）与 `link_inode`（按 inode 创建非目录硬链接，支持 `EPERM`/`EMLINK` 检查与失败回滚）；扩展 `unlink_regular_entry` 放行符号链接，并在 `free_inode` 中跳过内联快速符号链接的块指针遍历，防止破坏 Ext4 块分配表。
+  2. **`symlinkat(36)`、`linkat(37)` 与路径符号链接跟随（`kernel/src/fs/{context,metadata}.rs`、`kernel/src/syscall/{fs,mod}.rs`）**：接入 `symlinkat` 与 `linkat`（支持 `AT_SYMLINK_FOLLOW` 与 `AT_EMPTY_PATH`）；统一 `openat`/`mkdirat`/`chdir`/`unlinkat` 走中间符号链接跟随解析，`openat` 支持 `O_NOFOLLOW`（命中链接返回 `ELOOP`，配 `O_PATH` 允许打开链接本身）及悬空链接配合 `O_CREAT` 创建目标文件；`unlinkat` 末项不跟随且非法标志返回 `EINVAL`；`fs::resolve` 保留规范路径 `fast_metadata` 单锁快路径。
+  3. **`sendfile(71)` 内核搬运（`kernel/src/syscall/{fs,mod}.rs`、`kernel/src/fs/context.rs`）**：复用 64 KiB `IO_SCRATCH` 暂存池在两 FD 间搬运字节，校验读写模式、`O_PATH`、`O_APPEND`（返回 `EINVAL`）与可定位输入端，支持可选 `offset` 指针、同一 FD 自拷贝、管道/套接字短写偏移回退、零进度定向阻塞唤醒与 `SIGPIPE`。
+- **双架构实测与一致性验证（QEMU 10.0.2 + QCOW2 覆盖层，`sdcard-rv.img`/`sdcard-la.img` `pre-20250615`）**：
+  - 6 前缀专项 LTP（`symlink,link,readlink,sendfile,open,unlink`）：`rv` **`113/149`**、`la` **`111/149`**，零 panic；其中 14/14 可运行 `sendfile*`（`sendfile02`–`08` 及其 `_64` 变体，仅 `sendfile09*` 因需 5 GiB 空间报 `TCONF`）、`link02`/`link05`、`symlink02`/`symlink04`、`readlink01`/`readlinkat01`、`open01`/`open03`/`open04`/`open07`/`open09`/`openat01`、`unlink07`/`unlinkat01` 全部 100% 通过。
+  - 双架构核心回归与文件系统一致性：`rv` 与 `la` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9 零回退；`tests/fs_stat.py`（默认及 `--metadata`，双架构 128/256 字节 inode + `e2fsck`）**8/8 全部通过**。
+
+### 5.11 LTP 第 3 批建议性文件锁与 `prctl` 验证结果（`fs/file-locks-and-prctl`）
+
+- **补齐范围（均为通用 Linux 语义，无测例特判）**：
+  1. **建议性文件锁表（`kernel/src/fs/locks.rs`、`kernel/src/fs/context.rs`、`kernel/src/syscall/{fs,mod}.rs`）**：为每个打开文件描述分配单调唯一 `ofd_id`，实现 BSD `flock(32)`（`LOCK_SH`/`LOCK_EX`/`LOCK_UN`/`LOCK_NB`）与 `fcntl(25)` 的 POSIX 记录锁（`F_GETLK`/`F_SETLK`/`F_SETLKW`，按线程组归属，关闭同文件任一 FD 或进程退出自动释放）及 OFD 记录锁（`F_OFD_GETLK`/`F_OFD_SETLK`/`F_OFD_SETLKW`，按打开文件描述归属，最后引用释放）；支持字节区间拆分、合并、最小起始偏移冲突返回（对齐 Linux `posix_test_lock`）与阻塞锁调度等待唤醒；同步在 `procfs` 暴露 `/proc/sys/fs/pipe-max-size`（`"1048576\n"`）。
+  2. **`prctl(167)` 核心选项与子进程收割（`kernel/src/task/{mod,exec,user_task}.rs`、`kernel/src/syscall/mod.rs`）**：支持 `PR_SET_PDEATHSIG`/`PR_GET_PDEATHSIG`（父进程退出向直接存活子进程投递信号，`fork` 清零）、`PR_SET_DUMPABLE`/`PR_GET_DUMPABLE`、`PR_SET_KEEPCAPS`/`PR_GET_KEEPCAPS`、`PR_SET_NAME`/`PR_GET_NAME`（16 字节 NUL 结尾进程名，`exec` 同步基名）、`PR_CAPBSET_READ`、`PR_SET_TIMERSLACK`/`PR_GET_TIMERSLACK`、`PR_SET_CHILD_SUBREAPER`/`PR_GET_CHILD_SUBREAPER`（孤儿与僵尸优先过继最近存活 subreaper 祖先，`fork` 清零）与 `PR_SET_NO_NEW_PRIVS`/`PR_GET_NO_NEW_PRIVS`（置位不可撤销，`fork`/`exec` 继承）。
+- **双架构实测对比（QEMU 10.0.2 + QCOW2 覆盖层，`sdcard-rv.img`/`sdcard-la.img` `pre-20250615`）**：
+  - 3 前缀专项 LTP（`fcntl,flock,prctl`）：
+    - 改动前基线（`fs/link-symlink-sendfile`）：`la` **`41/97`**（`fcntl` 40/68、`flock` 1/15、`prctl` 0/14）；
+    - 本批修复后：`rv` **`118/139`**、`la` **`118/139`**（双架构净增 **+77** 条通过断言，+187.8%，零 panic）；其中 `flock` 全部 **19/19（100%）**、`fcntl` 达 **80/94**（含 `fcntl11`/`fcntl21`/`fcntl30` 及其 `_64` 变体）、`prctl` 达 **19/26**。
+  - 双架构核心回归与专项：`rv` 与 `la` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9 零回退；`tests/fs_fcntl.py` 双架构 + `e2fsck` 全部通过。

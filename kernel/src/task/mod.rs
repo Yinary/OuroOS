@@ -121,6 +121,20 @@ pub struct ProcessRecord {
     pub creds: Credentials,
     /// ITIMER_REAL 定时器：(下次单调触发时刻, 重复周期)；fork 清零，exec 保留。
     pub itimer_real: Option<(core::time::Duration, core::time::Duration)>,
+    /// prctl(PR_SET_NAME / PR_GET_NAME) 16 字节 NUL 结尾进程名。
+    pub comm: [u8; 16],
+    /// prctl(PR_SET_PDEATHSIG)：父进程退出时向本进程发送的信号编号，0 表示禁用；fork 清零。
+    pub pdeath_sig: u8,
+    /// prctl(PR_SET_DUMPABLE / PR_GET_DUMPABLE)：默认 1（可转储）。
+    pub dumpable: u8,
+    /// prctl(PR_SET_NO_NEW_PRIVS)：置位后不可撤销，fork/exec 继承。
+    pub no_new_privs: bool,
+    /// prctl(PR_SET_CHILD_SUBREAPER)：接管后代孤儿进程；fork 清零。
+    pub child_subreaper: bool,
+    /// prctl(PR_SET_KEEPCAPS)：fork 继承，exec 清零。
+    pub keep_caps: bool,
+    /// prctl(PR_SET_TIMERSLACK / PR_GET_TIMERSLACK)：定时器宽容纳秒数，默认 50_000。
+    pub timer_slack_ns: u64,
 }
 
 /// 线程记录：线程私有的信号状态。地址空间等组级资源在 ProcessRecord。
@@ -414,6 +428,9 @@ mod registry {
     /// 登记一个进程记录（孵化提交段）。
     pub fn register(pid: Pid, name: &'static str, space: Option<LocalSpace>) {
         let mut reg = REGISTRY.lock();
+        let mut comm = [0u8; 16];
+        let copy_len = name.len().min(15);
+        comm[..copy_len].copy_from_slice(&name.as_bytes()[..copy_len]);
         reg.records.push(ProcessRecord {
             pid,
             name,
@@ -425,6 +442,13 @@ mod registry {
             did_exec: false,
             creds: Credentials::root(),
             itimer_real: None,
+            comm,
+            pdeath_sig: 0,
+            dumpable: 1,
+            no_new_privs: false,
+            child_subreaper: false,
+            keep_caps: false,
+            timer_slack_ns: 50_000,
             user_ns: 0,
             system_ns: 0,
             child_user_ns: 0,
@@ -552,31 +576,84 @@ mod registry {
                     None => false,
                 }
             };
-            // 孤儿即收：清理已退出孩子及过继 init 的任务，自动收割的记录一并移除。
+            // 查最近存活的 child_subreaper 祖先；无则过继 init。
+            let reaper = {
+                let mut cur = reg.thread(parent_pid).map_or(parent_pid, |t| t.tgid);
+                let mut found = init;
+                for _ in 0..64 {
+                    if cur == 0 || cur == init {
+                        break;
+                    }
+                    let Some(anc) = reg.records.iter().find(|r| r.pid == cur) else {
+                        break;
+                    };
+                    if anc.exit.is_none() && anc.child_subreaper {
+                        found = anc.pid;
+                        break;
+                    }
+                    if anc.parent == cur {
+                        break;
+                    }
+                    cur = anc.parent;
+                }
+                found
+            };
+            // 若无 subreaper 则直接清理已退出孩子；有 subreaper 时将活/僵孩子一并过继给它。
+            let drop_zombies = reaper == init;
             let removed: alloc::vec::Vec<u32> = reg
                 .records
                 .iter()
                 .filter(|r| {
-                    r.parent == pid && r.exit.is_some() || (r.pid == pid && (orphan || auto_reap))
+                    (drop_zombies && r.parent == pid && r.exit.is_some())
+                        || (r.pid == pid && (orphan || auto_reap))
                 })
                 .map(|r| r.pid as u32)
                 .collect();
             reg.records.retain(|r| {
-                !(r.parent == pid && r.exit.is_some() || (r.pid == pid && (orphan || auto_reap)))
+                !((drop_zombies && r.parent == pid && r.exit.is_some())
+                    || (r.pid == pid && (orphan || auto_reap)))
             });
             for pid in &removed {
                 reg.remove_thread(*pid as Pid);
             }
             proc_table_remove_all(|p| removed.contains(&p));
+            let mut pdeath_targets: alloc::vec::Vec<(Pid, u8)> = alloc::vec::Vec::new();
+            let mut adopted_zombie = false;
             for child in reg.records.iter_mut().filter(|r| r.parent == pid) {
-                child.parent = init;
+                child.parent = reaper;
+                if child.exit.is_some() {
+                    adopted_zombie = true;
+                } else if child.pdeath_sig != 0 {
+                    let _ = pdeath_targets.try_reserve(1);
+                    if pdeath_targets.len() < pdeath_targets.capacity() {
+                        pdeath_targets.push((child.pid, child.pdeath_sig));
+                    }
+                }
             }
-            // 自检：父进程退出清理僵尸孩子，孤儿退出清理自身。
+            for (child_pid, sig) in pdeath_targets {
+                let blocked = reg.thread(child_pid).map_or(0, |t| t.signal.blocked());
+                if let Some(child) = reg.records.iter_mut().find(|r| r.pid == child_pid) {
+                    child.signal.generate(
+                        sig,
+                        SigInfoSlot {
+                            pid: pid as u32,
+                            ..Default::default()
+                        },
+                        blocked,
+                    );
+                }
+                sched::request_signal_wake();
+            }
+            if adopted_zombie && reaper != init {
+                sched::request_children_wake();
+            }
+            // 自检：父进程退出清理或过继全部孩子，孤儿退出清理自身。
             debug_assert!(reg.records.iter().all(|r| r.parent != pid));
             debug_assert!(!orphan || reg.records.iter().all(|r| r.pid != pid));
             taken
         };
-        // 锁外 Drop：页表/页释放、fd 关闭，可能触发磁盘回收写
+        // 锁外释放该进程持有的全部 POSIX 记录锁，再 Drop 地址空间与 FD 表。
+        crate::fs::locks::release_process_locks(pid as u32);
         drop(taken);
     }
 

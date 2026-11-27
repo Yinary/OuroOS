@@ -1,12 +1,18 @@
 //! FAT 挂载卷与按路径访问；使用锁定的 rust-fatfs（MIT）。
 use crate::{drivers, syscall::Errno};
 use alloc::{string::String, vec::Vec};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use fatfs::{FileSystem, FsOptions, IoBase, IoError, Read, Seek, SeekFrom, Write};
 use spin::Mutex;
 static MOUNTS: Mutex<Vec<Mount>> = Mutex::new(Vec::new());
+static MOUNT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NEXT_DEVICE: AtomicU32 = AtomicU32::new(2);
 static NEXT: AtomicU32 = AtomicU32::new(0x8000_0000);
+
+/// 当前是否存在已挂载的 FAT 卷，用于无挂载时的无锁快路径。
+pub(super) fn has_mounts() -> bool {
+    MOUNT_COUNT.load(Ordering::Acquire) != 0
+}
 
 /// 判断路径本身或其子目录是否有挂载点。
 /// 挂载记录快照（/proc/mounts 用）：(设备名, 挂载点)
@@ -24,6 +30,9 @@ pub(super) fn mount_list() -> Vec<(String, String)> {
 }
 
 pub(super) fn contains_mount(path: &str) -> bool {
+    if !has_mounts() {
+        return false;
+    }
     MOUNTS.lock().iter().any(|m| {
         m.path == path
             || m.path
@@ -140,6 +149,7 @@ pub fn mount(source: &str, target: &str) -> Result<(), Errno> {
         fs,
         nodes: Vec::new(),
     });
+    MOUNT_COUNT.store(mounts.len(), Ordering::Release);
     Ok(())
 }
 /// 挂载源解析：严格按设备名（/dev/vd<字母>[分区]）对应总线枚举的块
@@ -176,6 +186,7 @@ pub fn unmount(target: &str) -> Result<(), Errno> {
         return Err(Errno::Busy);
     }
     let m = mounts.remove(i);
+    MOUNT_COUNT.store(mounts.len(), Ordering::Release);
     m.fs.unmount().map_err(error)
 }
 fn node(m: &mut Mount, path: &str) -> Result<u32, Errno> {
@@ -193,6 +204,9 @@ fn node(m: &mut Mount, path: &str) -> Result<u32, Errno> {
 }
 /// 若路径落入 FAT 挂载点，返回其虚拟 inode。
 pub fn lookup(path: &str) -> Result<Option<u32>, Errno> {
+    if !has_mounts() {
+        return Ok(None);
+    }
     let mut mounts = MOUNTS.lock();
     let Some(m) = mounts
         .iter_mut()

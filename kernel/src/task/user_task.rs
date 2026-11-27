@@ -1345,7 +1345,7 @@ fn process_call(
             } else {
                 let wanted = args[0] as i32;
                 if wanted == i32::MIN {
-                    Err(Errno::NoChild)
+                    Err(Errno::NoProcess)
                 } else {
                     let caller_pgid = REGISTRY.lock().group(parent).map_or(0, |r| r.pgid);
                     let wanted_pgid = (-(wanted as i64)) as usize;
@@ -1427,6 +1427,7 @@ fn process_call(
         }
         sysnr::WAITID => return waitid(parent, frame, args),
         sysnr::GETRUSAGE => get_rusage(parent, args),
+        sysnr::PRCTL => prctl(parent, args),
         sysnr::SCHED_SETSCHEDULER => sched_setscheduler(parent, args),
         sysnr::SCHED_SETPARAM => sched_setparam(parent, args),
         sysnr::SCHED_GETSCHEDULER => sched_getscheduler(parent, args[0]),
@@ -2643,12 +2644,14 @@ fn sched_rr_get_interval(parent: Pid, pid_arg: usize, tp: usize) -> Result<usize
     }
     let target = sched_target(parent, pid_arg)?;
     let reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter()
-        .find(|r| r.pid == target)
-        .ok_or(Errno::NoProcess)?;
-    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    if reg.thread(target).is_none() {
+        return Err(Errno::NoProcess);
+    }
+    let space = reg
+        .group(parent)
+        .and_then(|r| r.space.as_ref())
+        .ok_or(Errno::NoProcess)?
+        .as_space();
     let mut data = [0u8; 16];
     data[8..16].copy_from_slice(&(crate::config::TICK_MS * 1_000_000).to_ne_bytes());
     crate::mm::user_access::copy_to_user(space, tp, &data).map_err(|_| Errno::Fault)?;
@@ -2658,12 +2661,14 @@ fn sched_rr_get_interval(parent: Pid, pid_arg: usize, tp: usize) -> Result<usize
 fn sched_getaffinity(parent: Pid, pid_arg: usize, len: usize, mask: usize) -> Result<usize, Errno> {
     let target = sched_target(parent, pid_arg)?;
     let reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter()
-        .find(|r| r.pid == target)
-        .ok_or(Errno::NoProcess)?;
-    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    if reg.thread(target).is_none() {
+        return Err(Errno::NoProcess);
+    }
+    let space = reg
+        .group(parent)
+        .and_then(|r| r.space.as_ref())
+        .ok_or(Errno::NoProcess)?
+        .as_space();
     let n = len.min(8);
     let bits = 1u64.to_ne_bytes();
     if n > 0 {
@@ -2675,15 +2680,17 @@ fn sched_getaffinity(parent: Pid, pid_arg: usize, len: usize, mask: usize) -> Re
 fn sched_setaffinity(parent: Pid, pid_arg: usize, len: usize, mask: usize) -> Result<usize, Errno> {
     let target = sched_target(parent, pid_arg)?;
     let reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter()
-        .find(|r| r.pid == target)
-        .ok_or(Errno::NoProcess)?;
+    if reg.thread(target).is_none() {
+        return Err(Errno::NoProcess);
+    }
     if len == 0 {
         return Err(Errno::Invalid);
     }
-    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    let space = reg
+        .group(parent)
+        .and_then(|r| r.space.as_ref())
+        .ok_or(Errno::NoProcess)?
+        .as_space();
     let n = len.min(8);
     let mut data = [0u8; 8];
     crate::mm::user_access::copy_from_user(space, mask, &mut data[..n])
@@ -2790,14 +2797,30 @@ fn fork_user(
                 }
                 core::cmp::Ordering::Equal => {}
             }
-            let (pgid, sid) = (reg.records[pi].pgid, reg.records[pi].sid);
-            // 子进程继承备用栈，pending/info 清零。
+            let (pgid, sid, comm, dumpable, no_new_privs, keep_caps, timer_slack_ns) = {
+                let p = &reg.records[pi];
+                (
+                    p.pgid,
+                    p.sid,
+                    p.comm,
+                    p.dumpable,
+                    p.no_new_privs,
+                    p.keep_caps,
+                    p.timer_slack_ns,
+                )
+            };
+            // 子进程继承备用栈与进程属性；pdeath_sig 与 child_subreaper 按 Linux fork 规则清零。
             let child = &mut reg.records[ci];
             child.parent = parent;
             child.fs = Some(fs);
             child.pgid = pgid;
             child.sid = sid;
             child.creds = creds;
+            child.comm = comm;
+            child.dumpable = dumpable;
+            child.no_new_privs = no_new_privs;
+            child.keep_caps = keep_caps;
+            child.timer_slack_ns = timer_slack_ns;
         }
         let parent_thread = reg.threads.iter().position(|t| t.tid == parent);
         let child_thread = reg.threads.iter().position(|t| t.tid == pid);
@@ -2948,4 +2971,122 @@ fn fork_thread(
     }
     sched::enqueue(task);
     Ok(tid)
+}
+
+/// Linux prctl(2)：支持 PDEATHSIG、DUMPABLE、KEEPCAPS、NAME、CAPBSET_READ、TIMERSLACK、
+/// CHILD_SUBREAPER 与 NO_NEW_PRIVS；其余未实现选项返回 EINVAL。
+fn prctl(caller: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    const PR_SET_PDEATHSIG: i32 = 1;
+    const PR_GET_PDEATHSIG: i32 = 2;
+    const PR_GET_DUMPABLE: i32 = 3;
+    const PR_SET_DUMPABLE: i32 = 4;
+    const PR_GET_KEEPCAPS: i32 = 7;
+    const PR_SET_KEEPCAPS: i32 = 8;
+    const PR_SET_NAME: i32 = 15;
+    const PR_GET_NAME: i32 = 16;
+    const PR_CAPBSET_READ: i32 = 23;
+    const PR_SET_TIMERSLACK: i32 = 29;
+    const PR_GET_TIMERSLACK: i32 = 30;
+    const PR_SET_CHILD_SUBREAPER: i32 = 36;
+    const PR_GET_CHILD_SUBREAPER: i32 = 37;
+    const PR_SET_NO_NEW_PRIVS: i32 = 38;
+    const PR_GET_NO_NEW_PRIVS: i32 = 39;
+
+    let option = args[0] as u32 as i32;
+    let mut locked = REGISTRY.lock();
+    let rec = locked.group_mut(caller).ok_or(Errno::NoProcess)?;
+    match option {
+        PR_SET_PDEATHSIG => {
+            if args[1] > 64 {
+                return Err(Errno::Invalid);
+            }
+            rec.pdeath_sig = args[1] as u8;
+            Ok(0)
+        }
+        PR_GET_PDEATHSIG => {
+            let sig = i32::from(rec.pdeath_sig);
+            let space = rec.space.as_ref().ok_or(Errno::Fault)?.as_space();
+            crate::mm::user_access::copy_to_user(space, args[1], &sig.to_ne_bytes())
+                .map_err(|_| Errno::Fault)?;
+            Ok(0)
+        }
+        PR_GET_DUMPABLE => Ok(usize::from(rec.dumpable)),
+        PR_SET_DUMPABLE => {
+            if args[1] != 0 && args[1] != 1 {
+                return Err(Errno::Invalid);
+            }
+            rec.dumpable = args[1] as u8;
+            Ok(0)
+        }
+        PR_GET_KEEPCAPS => Ok(usize::from(rec.keep_caps)),
+        PR_SET_KEEPCAPS => {
+            if args[1] > 1 {
+                return Err(Errno::Invalid);
+            }
+            rec.keep_caps = args[1] != 0;
+            Ok(0)
+        }
+        PR_SET_NAME => {
+            let space = rec.space.as_ref().ok_or(Errno::Fault)?.as_space();
+            let mut buf = [0u8; 16];
+            for i in 0..15 {
+                let mut byte = [0u8; 1];
+                crate::mm::user_access::copy_from_user(
+                    space,
+                    args[1].checked_add(i).ok_or(Errno::Fault)?,
+                    &mut byte,
+                )
+                .map_err(|_| Errno::Fault)?;
+                if byte[0] == 0 {
+                    break;
+                }
+                buf[i] = byte[0];
+            }
+            rec.comm = buf;
+            Ok(0)
+        }
+        PR_GET_NAME => {
+            let comm = rec.comm;
+            let space = rec.space.as_ref().ok_or(Errno::Fault)?.as_space();
+            crate::mm::user_access::copy_to_user(space, args[1], &comm)
+                .map_err(|_| Errno::Fault)?;
+            Ok(0)
+        }
+        PR_CAPBSET_READ => {
+            if args[1] > 40 {
+                return Err(Errno::Invalid);
+            }
+            Ok(1)
+        }
+        PR_SET_TIMERSLACK => {
+            rec.timer_slack_ns = if args[1] == 0 { 50_000 } else { args[1] as u64 };
+            Ok(0)
+        }
+        PR_GET_TIMERSLACK => Ok(rec.timer_slack_ns as usize),
+        PR_SET_CHILD_SUBREAPER => {
+            rec.child_subreaper = args[1] != 0;
+            Ok(0)
+        }
+        PR_GET_CHILD_SUBREAPER => {
+            let val = i32::from(rec.child_subreaper);
+            let space = rec.space.as_ref().ok_or(Errno::Fault)?.as_space();
+            crate::mm::user_access::copy_to_user(space, args[1], &val.to_ne_bytes())
+                .map_err(|_| Errno::Fault)?;
+            Ok(0)
+        }
+        PR_SET_NO_NEW_PRIVS => {
+            if args[1] != 1 || args[2] != 0 || args[3] != 0 || args[4] != 0 {
+                return Err(Errno::Invalid);
+            }
+            rec.no_new_privs = true;
+            Ok(0)
+        }
+        PR_GET_NO_NEW_PRIVS => {
+            if args[1] != 0 || args[2] != 0 || args[3] != 0 || args[4] != 0 {
+                return Err(Errno::Invalid);
+            }
+            Ok(usize::from(rec.no_new_privs))
+        }
+        _ => Err(Errno::Invalid),
+    }
 }
