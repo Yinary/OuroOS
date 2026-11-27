@@ -281,6 +281,18 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
     if path == "/proc/sys/fs" {
         return Ok(procfs::SYS_FS_DIR);
     }
+    if path == "/proc/sys/fs/mqueue" {
+        return Ok(procfs::SYS_FS_MQUEUE_DIR);
+    }
+    if path == "/proc/sys/fs/mqueue/queues_max" {
+        return Ok(procfs::SYS_FS_MQUEUE_QUEUES_MAX);
+    }
+    if path == "/proc/sys/fs/mqueue/msg_max" {
+        return Ok(procfs::SYS_FS_MQUEUE_MSG_MAX);
+    }
+    if path == "/proc/sys/fs/mqueue/msgsize_max" {
+        return Ok(procfs::SYS_FS_MQUEUE_MSGSIZE_MAX);
+    }
     if path == "/proc/sys/fs/pipe-max-size" {
         return Ok(procfs::PIPE_MAX_SIZE_NODE);
     }
@@ -381,6 +393,30 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
     if ino == procfs::PIPE_MAX_SIZE_NODE {
         return Ok((0o100444, procfs::pipe_max_size().len() as u64, 1, 0));
     }
+    if ino == procfs::SYS_FS_MQUEUE_QUEUES_MAX {
+        let len = alloc::format!(
+            "{}\n",
+            crate::ipc::mqueue::read_sysctl(crate::ipc::mqueue::MqSysctl::QueuesMax)
+        )
+        .len() as u64;
+        return Ok((0o100644, len, 1, 0));
+    }
+    if ino == procfs::SYS_FS_MQUEUE_MSG_MAX {
+        let len = alloc::format!(
+            "{}\n",
+            crate::ipc::mqueue::read_sysctl(crate::ipc::mqueue::MqSysctl::MsgMax)
+        )
+        .len() as u64;
+        return Ok((0o100644, len, 1, 0));
+    }
+    if ino == procfs::SYS_FS_MQUEUE_MSGSIZE_MAX {
+        let len = alloc::format!(
+            "{}\n",
+            crate::ipc::mqueue::read_sysctl(crate::ipc::mqueue::MqSysctl::MsgSizeMax)
+        )
+        .len() as u64;
+        return Ok((0o100644, len, 1, 0));
+    }
     if ino == procfs::VERSION {
         return Ok((0o100444, procfs::version().len() as u64, 1, 0));
     }
@@ -393,6 +429,7 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
             | procfs::SYS_DIR
             | procfs::SYS_KERNEL_DIR
             | procfs::SYS_FS_DIR
+            | procfs::SYS_FS_MQUEUE_DIR
             | procfs::SYSVIPC_DIR
             | procfs::SELF_DIR
             | procfs::SELF_FD_DIR

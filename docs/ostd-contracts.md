@@ -284,7 +284,7 @@ try_lock 失败即报告“持锁跨调度”。
 | 信号 | kill、tkill、tgkill、rt_sigaction、rt_sigprocmask、rt_sigpending、rt_sigsuspend、rt_sigtimedwait、rt_sigqueueinfo、sigaltstack、rt_sigreturn | `syscall/signal.rs`、`task/signal.rs`、`sigframe/`（契约与偏差见 §4.5） |
 | 网络 | socket、socketpair、bind、listen、accept、accept4、connect、getsockname、getpeername、sendto、recvfrom、setsockopt、getsockopt、shutdown | `syscall/net.rs`、`net/mod.rs`（AF_INET 本地回环 UDP/TCP、AF_UNIX 匿名套接字对与未连接 AF_UNIX 套接字） |
 | 内存 | brk、mmap、munmap、mprotect、mremap、mincore、madvise、msync、锁页系列、shmget、shmctl、shmat、shmdt | `syscall/memory.rs`、`mm/shm.rs` |
-| System V IPC | msgget、msgctl、msgrcv、msgsnd、semget、semctl、semop、semtimedop | `ipc/msg.rs`、`ipc/sem.rs`、`task::process_call` |
+| System V / POSIX IPC | msgget、msgctl、msgrcv、msgsnd、semget、semctl、semop、semtimedop、mq_open、mq_unlink、mq_timedsend、mq_timedreceive、mq_notify、mq_getsetattr | `ipc/msg.rs`、`ipc/sem.rs`、`ipc/mqueue.rs`、`task::process_call` |
 | 其他 | uname、sethostname、setdomainname、getcpu、gettimeofday、set_tid_address(96) | `syscall/mod.rs` |
 | 其余 | 未列出的调用号 | ENOSYS |
 

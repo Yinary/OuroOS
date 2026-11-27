@@ -230,6 +230,18 @@ pub fn dispatch(
                     if path == "/proc/self/fd" {
                         return ctx.open_proc_fd_dir(a[2], a[2] & O_CLOEXEC != 0);
                     }
+                    if let Some(field) = match path.as_str() {
+                        "/proc/sys/fs/mqueue/queues_max" => {
+                            Some(crate::ipc::mqueue::MqSysctl::QueuesMax)
+                        }
+                        "/proc/sys/fs/mqueue/msg_max" => Some(crate::ipc::mqueue::MqSysctl::MsgMax),
+                        "/proc/sys/fs/mqueue/msgsize_max" => {
+                            Some(crate::ipc::mqueue::MqSysctl::MsgSizeMax)
+                        }
+                        _ => None,
+                    } {
+                        return ctx.open_proc_mq_sysctl(field, a[2], a[2] & O_CLOEXEC != 0);
+                    }
                     if fs::is_procfs_text(&path) {
                         let text = fs::procfs_text(&path)?;
                         return ctx.open_proc_text(text, a[2], a[2] & O_CLOEXEC != 0);

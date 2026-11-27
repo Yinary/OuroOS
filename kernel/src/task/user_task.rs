@@ -680,8 +680,12 @@ fn park_check_signals(
             // 其余：完成 syscall 返回 -EINTR；信号留给循环顶检查点。
             _ => {
                 *sleep_deadline = None;
-                if ipc_wait.take().is_some_and(|w| w.is_sem) {
-                    crate::ipc::sem::clear_waiter(pid);
+                if let Some(w) = ipc_wait.take() {
+                    if w.is_sem {
+                        crate::ipc::sem::clear_waiter(pid);
+                    } else {
+                        crate::ipc::mqueue::clear_waiter(pid);
+                    }
                 }
                 frame.syscall_ok();
                 frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
@@ -1733,6 +1737,165 @@ fn process_call(
                             cur_wait,
                         ),
                     },
+                    None => crate::ipc::IpcFlow::Done(Err(Errno::NoProcess)),
+                }
+            };
+            match flow {
+                crate::ipc::IpcFlow::Done(res) => {
+                    *ipc_wait = None;
+                    res
+                }
+                crate::ipc::IpcFlow::Wait {
+                    key,
+                    deadline,
+                    state,
+                } => {
+                    *ipc_wait = Some(state);
+                    return ProcessResult::Wait(WaitReason::Ipc { key, deadline });
+                }
+            }
+        }
+        sysnr::MQ_OPEN => {
+            let mut reg = REGISTRY.lock();
+            match reg.group_mut(parent) {
+                Some(rec) => {
+                    let rlim = rec.rlimits[12][0];
+                    match (rec.space.as_ref(), rec.fs.as_mut()) {
+                        (Some(space), Some(fs)) => crate::ipc::mqueue::open(
+                            space.as_space(),
+                            fs,
+                            args[0],
+                            args[1] as u32 as i32,
+                            args[2] as u32,
+                            args[3],
+                            &rec.creds,
+                            rlim,
+                        ),
+                        _ => Err(Errno::NoProcess),
+                    }
+                }
+                None => Err(Errno::NoProcess),
+            }
+        }
+        sysnr::MQ_UNLINK => {
+            let reg = REGISTRY.lock();
+            match reg
+                .group(parent)
+                .and_then(|r| Some((&r.creds, r.space.as_ref()?.as_space())))
+            {
+                Some((creds, space)) => crate::ipc::mqueue::unlink(space, args[0], creds),
+                None => Err(Errno::NoProcess),
+            }
+        }
+        sysnr::MQ_GETSETATTR => {
+            let reg = REGISTRY.lock();
+            match reg
+                .group(parent)
+                .and_then(|r| Some((r.fs.as_ref()?, r.space.as_ref()?.as_space())))
+            {
+                Some((fs, space)) => crate::ipc::mqueue::getsetattr(
+                    space,
+                    fs,
+                    args[0] as u32 as i32,
+                    args[1],
+                    args[2],
+                ),
+                None => Err(Errno::NoProcess),
+            }
+        }
+        sysnr::MQ_NOTIFY => {
+            let reg = REGISTRY.lock();
+            match reg
+                .group(parent)
+                .and_then(|r| Some((r.pid, r.fs.as_ref()?, r.space.as_ref()?.as_space())))
+            {
+                Some((tgid, fs, space)) => {
+                    crate::ipc::mqueue::notify(space, fs, args[0] as u32 as i32, args[1], tgid)
+                }
+                None => Err(Errno::NoProcess),
+            }
+        }
+        sysnr::MQ_TIMEDSEND => {
+            let cur_wait = *ipc_wait;
+            let outcome = {
+                let reg = REGISTRY.lock();
+                match reg
+                    .group(parent)
+                    .and_then(|r| Some((r.pid, r.fs.as_ref()?, r.space.as_ref()?.as_space())))
+                {
+                    Some((tgid, fs, space)) => crate::ipc::mqueue::timedsend(
+                        space,
+                        fs,
+                        args[0] as u32 as i32,
+                        args[1],
+                        args[2],
+                        args[3] as u32,
+                        args[4],
+                        tgid,
+                        cur_wait,
+                    ),
+                    None => crate::ipc::mqueue::SendOutcome::Flow(crate::ipc::IpcFlow::Done(Err(
+                        Errno::NoProcess,
+                    ))),
+                }
+            };
+            match outcome {
+                crate::ipc::mqueue::SendOutcome::Sent(pending) => {
+                    *ipc_wait = None;
+                    if let Some(p) = pending {
+                        match p.kind {
+                            crate::ipc::mqueue::MqNotifyKind::None => {}
+                            crate::ipc::mqueue::MqNotifyKind::Signal { sig, sigval } => {
+                                let _ = send_signal(
+                                    p.target_tgid,
+                                    sig,
+                                    crate::ipc::mqueue::make_notify_slot(p.sender_tgid, sigval),
+                                );
+                            }
+                            crate::ipc::mqueue::MqNotifyKind::Thread {
+                                sock_id,
+                                mut cookie,
+                            } => {
+                                cookie[31] = crate::ipc::mqueue::NOTIFY_WOKENUP;
+                                let _ = crate::net::enqueue_netlink(sock_id, &cookie);
+                            }
+                        }
+                    }
+                    Ok(0)
+                }
+                crate::ipc::mqueue::SendOutcome::Flow(crate::ipc::IpcFlow::Done(res)) => {
+                    *ipc_wait = None;
+                    res
+                }
+                crate::ipc::mqueue::SendOutcome::Flow(crate::ipc::IpcFlow::Wait {
+                    key,
+                    deadline,
+                    state,
+                }) => {
+                    *ipc_wait = Some(state);
+                    return ProcessResult::Wait(WaitReason::Ipc { key, deadline });
+                }
+            }
+        }
+        sysnr::MQ_TIMEDRECEIVE => {
+            let cur_wait = *ipc_wait;
+            let flow = {
+                let reg = REGISTRY.lock();
+                match reg
+                    .group(parent)
+                    .and_then(|r| Some((r.fs.as_ref()?, r.space.as_ref()?.as_space())))
+                {
+                    Some((fs, space)) => crate::ipc::mqueue::timedreceive(
+                        space,
+                        fs,
+                        args[0] as u32 as i32,
+                        args[1],
+                        args[2],
+                        args[3],
+                        args[4],
+                        parent,
+                        cur_wait,
+                    ),
                     None => crate::ipc::IpcFlow::Done(Err(Errno::NoProcess)),
                 }
             };

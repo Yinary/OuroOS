@@ -10,9 +10,9 @@ use crate::{
     fs::context::Context,
     mm::{address_space::UserAddressSpace, user_access},
     net::{
-        self, SockType, SocketAddr, SocketAddrV4, AF_INET, AF_UNIX, AF_UNSPEC, IPPROTO_IP,
-        IPPROTO_TCP, IPPROTO_UDP, MSG_NOSIGNAL, SOCKADDR_IN_LEN, SOCK_CLOEXEC, SOCK_DGRAM,
-        SOCK_NONBLOCK, SOCK_STREAM,
+        self, SockType, SocketAddr, SocketAddrV4, AF_INET, AF_NETLINK, AF_UNIX, AF_UNSPEC,
+        IPPROTO_IP, IPPROTO_TCP, IPPROTO_UDP, MSG_NOSIGNAL, SOCKADDR_IN_LEN, SOCK_CLOEXEC,
+        SOCK_DGRAM, SOCK_NONBLOCK, SOCK_RAW, SOCK_STREAM,
     },
     syscall::{sysnr, Errno},
     task::{
@@ -98,7 +98,7 @@ pub(crate) fn dispatch_sync(
             let domain = args[0] as u32 as i32;
             let raw_type = args[1] as u32 as usize;
             let protocol = args[2] as u32 as i32;
-            if domain != AF_INET as i32 && domain != AF_UNIX as i32 {
+            if domain != AF_INET as i32 && domain != AF_UNIX as i32 && domain != AF_NETLINK as i32 {
                 return Err(Errno::AfNoSupport);
             }
             let flags = raw_type & !0xf;
@@ -108,6 +108,16 @@ pub(crate) fn dispatch_sync(
             let base_type = (raw_type & 0xf) as i32;
             if !(1..=10).contains(&base_type) {
                 return Err(Errno::Invalid);
+            }
+            if domain == AF_NETLINK as i32 {
+                if base_type != SOCK_RAW && base_type != SOCK_DGRAM {
+                    return Err(Errno::ProtoNoSupport);
+                }
+                if protocol != 0 {
+                    return Err(Errno::ProtoNoSupport);
+                }
+                let id = net::create_netlink()?;
+                return fs.open_socket(id, flags & SOCK_NONBLOCK != 0, flags & SOCK_CLOEXEC != 0);
             }
             let sock_type = if domain == AF_UNIX as i32 {
                 if protocol != 0 {

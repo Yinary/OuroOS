@@ -157,6 +157,8 @@ pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
 /// siginfo si_code：SI_QUEUE，sigqueue 类发送。
 pub const SI_QUEUE: i32 = -1;
+/// siginfo si_code：SI_MESGQ，POSIX 消息队列异步通知发送。
+pub const SI_MESGQ: i32 = -3;
 /// siginfo si_code：SI_TKILL，tkill/tgkill 发送。
 pub const SI_TKILL: i32 = -6;
 

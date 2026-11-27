@@ -15,9 +15,11 @@ use crate::syscall::Errno;
 pub const AF_UNSPEC: u16 = 0;
 pub const AF_UNIX: u16 = 1;
 pub const AF_INET: u16 = 2;
+pub const AF_NETLINK: u16 = 16;
 
 pub const SOCK_STREAM: i32 = 1;
 pub const SOCK_DGRAM: i32 = 2;
+pub const SOCK_RAW: i32 = 3;
 pub const SOCK_NONBLOCK: usize = 0x800;
 pub const SOCK_CLOEXEC: usize = 0x80000;
 
@@ -200,6 +202,10 @@ enum SockKind {
         rx_bytes: usize,
         peer_closed: bool,
     },
+    /// AF_NETLINK 极简接收队列套接字（服务 POSIX mq_notify(SIGEV_THREAD) 内核通知）。
+    Netlink {
+        rx: VecDeque<Vec<u8>>,
+    },
 }
 
 struct SocketOptions {
@@ -266,7 +272,9 @@ struct SocketEntry {
 impl SocketEntry {
     fn sock_type(&self) -> SockType {
         match self.kind {
-            SockKind::Udp(_) | SockKind::UnixDgram { .. } => SockType::Dgram,
+            SockKind::Udp(_) | SockKind::UnixDgram { .. } | SockKind::Netlink { .. } => {
+                SockType::Dgram
+            }
             SockKind::Tcp(_) | SockKind::UnixStream { .. } => SockType::Stream,
         }
     }
@@ -282,7 +290,9 @@ impl SocketEntry {
             SockKind::Tcp(TcpState::Bound { local })
             | SockKind::Tcp(TcpState::Listening { local, .. })
             | SockKind::Tcp(TcpState::Connected { local, .. }) => Some(*local),
-            SockKind::UnixStream { .. } | SockKind::UnixDgram { .. } => None,
+            SockKind::UnixStream { .. } | SockKind::UnixDgram { .. } | SockKind::Netlink { .. } => {
+                None
+            }
         }
     }
 }
@@ -558,6 +568,52 @@ pub fn create_unix_pair(sock_type: SockType) -> Result<(SocketId, SocketId), Err
     Ok((id0, id1))
 }
 
+/// 创建极简 AF_NETLINK 套接字，用于接收内核异步通知报文（如 mq_notify(SIGEV_THREAD)）。
+pub fn create_netlink() -> Result<SocketId, Errno> {
+    let mut net = NET.lock();
+    let id = net.alloc_id();
+    net.sockets.insert(
+        id,
+        SocketEntry {
+            kind: SockKind::Netlink {
+                rx: VecDeque::new(),
+            },
+            opts: SocketOptions::default(),
+            shut_rd: false,
+            shut_wr: false,
+        },
+    );
+    Ok(id)
+}
+
+/// 判断给定套接字是否为 AF_NETLINK 套接字。
+pub fn is_netlink(id: SocketId) -> bool {
+    NET.lock()
+        .sockets
+        .get(&id)
+        .is_some_and(|e| matches!(e.kind, SockKind::Netlink { .. }))
+}
+
+/// 由内核直接向 AF_NETLINK 套接字投递一条报文并唤醒等待读取者。
+pub fn enqueue_netlink(id: SocketId, data: &[u8]) -> Result<(), Errno> {
+    let mut net = NET.lock();
+    let entry = net.sockets.get_mut(&id).ok_or(Errno::BadF)?;
+    let SockKind::Netlink { rx } = &mut entry.kind else {
+        return Err(Errno::BadF);
+    };
+    if entry.shut_rd || rx.len() >= MAX_UDP_QUEUE_PACKETS {
+        return Ok(());
+    }
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(data.len())
+        .map_err(|_| Errno::NoMem)?;
+    payload.extend_from_slice(data);
+    rx.push_back(payload);
+    crate::task::sched::request_pipe_id_wake(id.wake_id());
+    Ok(())
+}
+
 /// 返回套接字是否处于已连接状态（供 splice 校验流式/已连接套接字）。
 pub fn is_connected(id: SocketId) -> bool {
     let net = NET.lock();
@@ -586,7 +642,7 @@ pub fn close(id: SocketId) {
     };
     let reset = entry.opts.linger[0] != 0 && entry.opts.linger[1] == 0;
     match entry.kind {
-        SockKind::Udp(_) => {
+        SockKind::Udp(_) | SockKind::Netlink { .. } => {
             crate::task::sched::request_pipe_id_wake(id.wake_id());
         }
         SockKind::Tcp(TcpState::Connected { peer_id, .. })
@@ -645,9 +701,10 @@ pub fn bind(id: SocketId, addr: SocketAddrV4) -> Result<(), Errno> {
     match &mut entry.kind {
         SockKind::Udp(u) => u.local = Some(bound),
         SockKind::Tcp(state @ TcpState::Unbound) => *state = TcpState::Bound { local: bound },
-        SockKind::Tcp(_) | SockKind::UnixStream { .. } | SockKind::UnixDgram { .. } => {
-            return Err(Errno::Invalid)
-        }
+        SockKind::Tcp(_)
+        | SockKind::UnixStream { .. }
+        | SockKind::UnixDgram { .. }
+        | SockKind::Netlink { .. } => return Err(Errno::Invalid),
     }
     Ok(())
 }
@@ -657,7 +714,9 @@ pub fn listen(id: SocketId, backlog: i32) -> Result<(), Errno> {
     let mut net = NET.lock();
     let backlog = backlog.clamp(1, 128) as usize;
     let needs_bind = match net.sockets.get(&id).ok_or(Errno::BadF)?.kind {
-        SockKind::Udp(_) | SockKind::UnixDgram { .. } => return Err(Errno::NotSupported),
+        SockKind::Udp(_) | SockKind::UnixDgram { .. } | SockKind::Netlink { .. } => {
+            return Err(Errno::NotSupported)
+        }
         SockKind::Tcp(TcpState::Unbound) => true,
         SockKind::Tcp(TcpState::Bound { .. } | TcpState::Listening { .. }) => false,
         SockKind::Tcp(TcpState::Connected { .. }) | SockKind::UnixStream { .. } => {
@@ -698,7 +757,9 @@ pub fn listen(id: SocketId, backlog: i32) -> Result<(), Errno> {
             }
             TcpState::Connected { .. } => return Err(Errno::Invalid),
         },
-        SockKind::Udp(_) | SockKind::UnixDgram { .. } => return Err(Errno::NotSupported),
+        SockKind::Udp(_) | SockKind::UnixDgram { .. } | SockKind::Netlink { .. } => {
+            return Err(Errno::NotSupported)
+        }
         SockKind::UnixStream { .. } => return Err(Errno::Invalid),
     }
     Ok(())
@@ -711,7 +772,7 @@ pub fn connect(id: SocketId, dst: Option<SocketAddrV4>, nonblock: bool) -> Resul
     let entry = net.sockets.get(&id).ok_or(Errno::BadF)?;
     match &entry.kind {
         SockKind::UnixStream { .. } => return Err(Errno::IsConn),
-        SockKind::UnixDgram { .. } => return Err(Errno::NotSupported),
+        SockKind::UnixDgram { .. } | SockKind::Netlink { .. } => return Err(Errno::NotSupported),
         _ => {}
     }
     let sock_type = entry.sock_type();
@@ -771,9 +832,10 @@ pub fn connect(id: SocketId, dst: Option<SocketAddrV4>, nonblock: bool) -> Resul
         SockKind::Tcp(TcpState::Bound { local }) => Some(*local),
         SockKind::Tcp(TcpState::Connected { .. }) => return Err(Errno::IsConn),
         SockKind::Tcp(TcpState::Listening { .. }) => return Err(Errno::Invalid),
-        SockKind::Udp(_) | SockKind::UnixStream { .. } | SockKind::UnixDgram { .. } => {
-            return Err(Errno::Invalid)
-        }
+        SockKind::Udp(_)
+        | SockKind::UnixStream { .. }
+        | SockKind::UnixDgram { .. }
+        | SockKind::Netlink { .. } => return Err(Errno::Invalid),
     };
     let listener_id = net.find_tcp_listener(dst).ok_or(Errno::ConnRefused)?;
     let listener_local = match &net
@@ -847,7 +909,9 @@ pub fn connect(id: SocketId, dst: Option<SocketAddrV4>, nonblock: bool) -> Resul
 pub fn accept(id: SocketId, nonblock: bool) -> Result<(SocketId, SocketAddrV4), Errno> {
     let mut net = NET.lock();
     let server_id = match &mut net.sockets.get_mut(&id).ok_or(Errno::BadF)?.kind {
-        SockKind::Udp(_) | SockKind::UnixDgram { .. } => return Err(Errno::NotSupported),
+        SockKind::Udp(_) | SockKind::UnixDgram { .. } | SockKind::Netlink { .. } => {
+            return Err(Errno::NotSupported)
+        }
         SockKind::Tcp(TcpState::Listening { accept_queue, .. }) => match accept_queue.pop_front() {
             Some(sid) => sid,
             None => {
@@ -895,6 +959,7 @@ pub fn getpeername(id: SocketId) -> Result<SocketAddr, Errno> {
                 Err(Errno::NotConn)
             }
         }
+        SockKind::Netlink { .. } => Err(Errno::NotConn),
     }
 }
 
@@ -1062,6 +1127,7 @@ pub fn sendto(
             Ok(data.len())
         }
         SockKind::Tcp(_) => Err(Errno::NotConn),
+        SockKind::Netlink { .. } => Err(Errno::NotSupported),
     }
 }
 
@@ -1168,6 +1234,26 @@ pub fn recvfrom(
                 if let Some(pid) = *peer_id {
                     crate::task::sched::request_pipe_id_wake(pid.wake_id());
                 }
+            }
+            Ok(delivered)
+        }
+        SockKind::Netlink { rx } => {
+            let Some(front) = rx.front() else {
+                if shut_rd {
+                    return deliver(&[], None);
+                }
+                return Err(if dontwait {
+                    Errno::Again
+                } else {
+                    Errno::WouldBlock
+                });
+            };
+            let count = buf.len().min(front.len());
+            buf[..count].copy_from_slice(&front[..count]);
+            let delivered = deliver(&buf[..count], None)?;
+            if !peek {
+                rx.pop_front();
+                crate::task::sched::request_pipe_id_wake(id.wake_id());
             }
             Ok(delivered)
         }
@@ -1589,6 +1675,11 @@ pub fn poll_events(id: SocketId, requested: u16) -> u16 {
                 if entry.shut_wr {
                     revents |= 0x10;
                 }
+            }
+        }
+        SockKind::Netlink { rx } => {
+            if !rx.is_empty() || entry.shut_rd {
+                revents |= 0x41 & requested;
             }
         }
         SockKind::Tcp(TcpState::Unbound | TcpState::Bound { .. }) => {
