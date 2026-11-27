@@ -26,6 +26,7 @@ pub fn dispatch(
     space: &UserAddressSpace,
     ctx: &mut Context,
     credentials: &Credentials,
+    tgid: u32,
 ) -> Result<usize, Errno> {
     match nr {
         sysnr::UMASK => Ok(ctx.set_umask(a[0])),
@@ -47,13 +48,14 @@ pub fn dispatch(
             Ok(cwd.len() + 1)
         }
         sysnr::DUP => ctx.install(ctx.get(a[0])?, false),
-        sysnr::FCNTL => fcntl(ctx, a[0] as u32 as usize, a[1] as u32, a[2] as u32),
+        sysnr::FCNTL => fcntl(ctx, space, a[0] as u32 as usize, a[1] as u32, a[2], tgid),
+        sysnr::FLOCK => flock_call(ctx, a[0] as u32 as usize, a[1] as u32),
         sysnr::STATFS | sysnr::FSTATFS => statfs(nr, ctx, space, a),
         sysnr::DUP3 => {
             if a[2] & !0x80000 != 0 || a[0] == a[1] {
                 return Err(Errno::Invalid);
             }
-            ctx.dup_to(a[0], a[1], a[2] & 0x80000 != 0)
+            ctx.dup_to(a[0], a[1], a[2] & 0x80000 != 0, tgid)
         }
         sysnr::MKDIRAT => {
             let input = user_string(space, a[1])?;
@@ -175,8 +177,8 @@ pub fn dispatch(
             pair[..4].copy_from_slice(&(rfd as u32).to_ne_bytes());
             pair[4..].copy_from_slice(&(wfd as u32).to_ne_bytes());
             if user_access::copy_to_user(space, a[0], &pair).is_err() {
-                ctx.close(rfd)?;
-                ctx.close(wfd)?;
+                ctx.close(rfd, 0)?;
+                ctx.close(wfd, 0)?;
                 return Err(Errno::Fault);
             }
             Ok(0)
@@ -216,6 +218,7 @@ pub fn dispatch(
                     if path == "/proc/mounts"
                         || path == "/proc/sys/kernel/pid_max"
                         || path == "/proc/sys/kernel/tainted"
+                        || path == "/proc/sys/fs/pipe-max-size"
                         || path == "/proc/version"
                     {
                         let text = fs::procfs_text(&path)?;
@@ -379,7 +382,7 @@ pub fn dispatch(
             Ok(0)
         }
         sysnr::CLOSE => {
-            ctx.close(a[0])?;
+            ctx.close(a[0], tgid)?;
             Ok(0)
         }
         sysnr::LSEEK => {
@@ -737,17 +740,148 @@ fn readlinkat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<
     Ok(n)
 }
 
-/// Linux fcntl 基础 FD 控制；未知命令返回 EINVAL，未实现文件锁及异步 I/O。
-fn fcntl(ctx: &mut Context, fd: usize, command: u32, argument: u32) -> Result<usize, Errno> {
+/// Linux flock(2)：按打开文件描述（OFD）施加共享锁、独占锁或解锁。
+fn flock_call(ctx: &Context, fd: usize, operation: u32) -> Result<usize, Errno> {
+    let handle = ctx.get(fd)?;
+    let (key, ofd_id, flags) = {
+        let f = handle.lock();
+        (f.lock_key(), f.ofd_id(), f.status_flags())
+    };
+    if flags & 0x200000 != 0 {
+        return Err(Errno::BadF);
+    }
+    fs::locks::flock(key, ofd_id, operation)?;
+    Ok(0)
+}
+
+/// Linux fcntl：基础 FD 控制、管道容量与 POSIX/OFD 字节区间记录锁。
+fn fcntl(
+    ctx: &mut Context,
+    space: &UserAddressSpace,
+    fd: usize,
+    command: u32,
+    argument: usize,
+    tgid: u32,
+) -> Result<usize, Errno> {
+    const F_GETLK: u32 = 5;
+    const F_SETLK: u32 = 6;
+    const F_SETLKW: u32 = 7;
+    const F_OFD_GETLK: u32 = 36;
+    const F_OFD_SETLK: u32 = 37;
+    const F_OFD_SETLKW: u32 = 38;
+
     let handle = ctx.get(fd)?;
     match command {
-        0 | 1030 => ctx.install_from(handle, argument as usize, command == 1030),
+        0 | 1030 => ctx.install_from(handle, argument as u32 as usize, command == 1030),
         1 => ctx.descriptor_flags(fd),
-        2 => ctx.set_descriptor_flags(fd, argument as usize),
+        2 => ctx.set_descriptor_flags(fd, argument as u32 as usize),
         3 => Ok(handle.lock().status_flags()),
-        4 => handle.lock().set_status_flags(argument as usize),
-        1031 => handle.lock().set_pipe_size(argument as usize),
+        4 => handle.lock().set_status_flags(argument as u32 as usize),
+        1031 => handle.lock().set_pipe_size(argument as u32 as usize),
         1032 => handle.lock().pipe_size(),
+        F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
+            let ofd_cmd = matches!(command, F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW);
+            let mut raw = [0u8; 32];
+            user_access::copy_from_user(space, argument, &mut raw).map_err(|_| Errno::Fault)?;
+            let l_type = i16::from_ne_bytes([raw[0], raw[1]]);
+            let l_whence = i16::from_ne_bytes([raw[2], raw[3]]);
+            let l_start = i64::from_ne_bytes([
+                raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
+            ]);
+            let l_len = i64::from_ne_bytes([
+                raw[16], raw[17], raw[18], raw[19], raw[20], raw[21], raw[22], raw[23],
+            ]);
+            let l_pid = i32::from_ne_bytes([raw[24], raw[25], raw[26], raw[27]]);
+
+            if ofd_cmd && l_pid != 0 {
+                return Err(Errno::Invalid);
+            }
+            let (key, ofd_id, flags, base) = {
+                let f = handle.lock();
+                let flags = f.status_flags();
+                if flags & 0x200000 != 0 {
+                    return Err(Errno::BadF);
+                }
+                let base: i64 = match l_whence {
+                    0 => 0,
+                    1 => i64::try_from(f.offset()).map_err(|_| Errno::Invalid)?,
+                    2 => i64::try_from(f.lock_file_size()?).map_err(|_| Errno::Invalid)?,
+                    _ => return Err(Errno::Invalid),
+                };
+                (f.lock_key(), f.ofd_id(), flags, base)
+            };
+
+            let origin = base.checked_add(l_start).ok_or(Errno::Invalid)?;
+            let (start, end) = if l_len == 0 {
+                if origin < 0 {
+                    return Err(Errno::Invalid);
+                }
+                (origin as u64, u64::MAX)
+            } else if l_len > 0 {
+                if origin < 0 {
+                    return Err(Errno::Invalid);
+                }
+                let hi = origin.checked_add(l_len - 1).ok_or(Errno::Invalid)?;
+                (origin as u64, hi as u64)
+            } else {
+                let lo = origin.checked_add(l_len).ok_or(Errno::Invalid)?;
+                if lo < 0 || origin <= 0 {
+                    return Err(Errno::Invalid);
+                }
+                (lo as u64, (origin - 1) as u64)
+            };
+
+            let owner = if ofd_cmd {
+                fs::locks::LockOwner::Ofd(ofd_id)
+            } else {
+                fs::locks::LockOwner::Process(tgid)
+            };
+
+            if matches!(command, F_GETLK | F_OFD_GETLK) {
+                let exclusive = match l_type {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Errno::Invalid),
+                };
+                if let Some(c) = fs::locks::get_record_lock(key, owner, exclusive, start, end) {
+                    let c_type: i16 = if c.exclusive { 1 } else { 0 };
+                    let c_len: i64 = if c.end == u64::MAX {
+                        0
+                    } else {
+                        i64::try_from(c.end - c.start + 1).unwrap_or(0)
+                    };
+                    raw[0..2].copy_from_slice(&c_type.to_ne_bytes());
+                    raw[2..4].copy_from_slice(&0i16.to_ne_bytes());
+                    raw[8..16].copy_from_slice(&(c.start as i64).to_ne_bytes());
+                    raw[16..24].copy_from_slice(&c_len.to_ne_bytes());
+                    raw[24..28].copy_from_slice(&c.pid.to_ne_bytes());
+                } else {
+                    raw[0..2].copy_from_slice(&2i16.to_ne_bytes());
+                }
+                user_access::copy_to_user(space, argument, &raw).map_err(|_| Errno::Fault)?;
+                return Ok(0);
+            }
+
+            let exclusive = match l_type {
+                0 => {
+                    if flags & 3 == 1 {
+                        return Err(Errno::BadF);
+                    }
+                    Some(false)
+                }
+                1 => {
+                    if flags & 3 == 0 {
+                        return Err(Errno::BadF);
+                    }
+                    Some(true)
+                }
+                2 => None,
+                _ => return Err(Errno::Invalid),
+            };
+            let blocking = matches!(command, F_SETLKW | F_OFD_SETLKW);
+            fs::locks::set_record_lock(key, owner, exclusive, start, end, blocking)?;
+            Ok(0)
+        }
         _ => Err(Errno::Invalid),
     }
 }

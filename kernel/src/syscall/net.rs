@@ -193,7 +193,7 @@ pub(crate) fn dispatch_sync(
             let fd1 = match fs.open_socket(id1, nonblock, cloexec) {
                 Ok(fd) => fd,
                 Err(e) => {
-                    let _ = fs.close(fd0);
+                    let _ = fs.close(fd0, 0);
                     return Err(e);
                 }
             };
@@ -201,8 +201,8 @@ pub(crate) fn dispatch_sync(
             out[0..4].copy_from_slice(&(fd0 as i32).to_ne_bytes());
             out[4..8].copy_from_slice(&(fd1 as i32).to_ne_bytes());
             if user_access::copy_to_user(space, sv_ptr, &out).is_err() {
-                let _ = fs.close(fd0);
-                let _ = fs.close(fd1);
+                let _ = fs.close(fd0, 0);
+                let _ = fs.close(fd1, 0);
                 return Err(Errno::Fault);
             }
             Ok(0)
@@ -351,7 +351,7 @@ pub(crate) fn dispatch_blocking(
             )?;
             if args[1] != 0 {
                 if let Err(e) = write_sockaddr(space, args[1], args[2], SocketAddr::V4(peer)) {
-                    let _ = fs.close(new_fd);
+                    let _ = fs.close(new_fd, 0);
                     return Err(e);
                 }
             }
