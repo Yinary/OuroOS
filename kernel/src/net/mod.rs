@@ -434,7 +434,7 @@ impl NetState {
         wildcard
     }
 
-    fn detach_peer(&mut self, peer_id: Option<SocketId>) {
+    fn detach_peer(&mut self, peer_id: Option<SocketId>, reset: bool) {
         if let Some(pid) = peer_id {
             if let Some(peer) = self.sockets.get_mut(&pid) {
                 match &mut peer.kind {
@@ -457,6 +457,9 @@ impl NetState {
                         *peer_closed = true;
                     }
                     _ => {}
+                }
+                if reset {
+                    peer.opts.pending_error = 104; // ECONNRESET
                 }
             }
         }
@@ -581,6 +584,7 @@ pub fn close(id: SocketId) {
     let Some(entry) = net.sockets.remove(&id) else {
         return;
     };
+    let reset = entry.opts.linger[0] != 0 && entry.opts.linger[1] == 0;
     match entry.kind {
         SockKind::Udp(_) => {
             crate::task::sched::request_pipe_id_wake(id.wake_id());
@@ -588,7 +592,7 @@ pub fn close(id: SocketId) {
         SockKind::Tcp(TcpState::Connected { peer_id, .. })
         | SockKind::UnixStream { peer_id, .. }
         | SockKind::UnixDgram { peer_id, .. } => {
-            net.detach_peer(peer_id);
+            net.detach_peer(peer_id, reset);
             if let Some(pid) = peer_id {
                 crate::task::sched::request_pipe_id_wake(pid.wake_id());
             }
@@ -598,7 +602,7 @@ pub fn close(id: SocketId) {
             for queued in accept_queue {
                 if let Some(server) = net.sockets.remove(&queued) {
                     if let SockKind::Tcp(TcpState::Connected { peer_id, .. }) = server.kind {
-                        net.detach_peer(peer_id);
+                        net.detach_peer(peer_id, true);
                         if let Some(pid) = peer_id {
                             crate::task::sched::request_pipe_id_wake(pid.wake_id());
                         }
@@ -1541,6 +1545,12 @@ pub fn poll_events(id: SocketId, requested: u16) -> u16 {
                 if peer_space {
                     revents |= 0x104 & requested;
                 }
+            }
+            if entry.opts.pending_error != 0 {
+                revents |= 0x08 | 0x10; // POLLERR | POLLHUP
+            }
+            if entry.shut_rd && entry.shut_wr {
+                revents |= 0x10; // POLLHUP
             }
             if *peer_closed {
                 revents |= 0x2000 & requested; // POLLRDHUP

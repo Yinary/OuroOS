@@ -444,8 +444,105 @@ pub fn dispatch(
                 .map_err(|_| Errno::Fault)?;
             Ok(0)
         }
+        sysnr::EVENTFD2 => ctx.open_eventfd(a[0] as u32, a[1] as u32 as usize),
+        sysnr::EPOLL_CREATE1 => ctx.open_epoll(a[0] as u32 as usize),
+        sysnr::EPOLL_CTL => epoll_ctl(ctx, space, a),
+        sysnr::TIMERFD_CREATE => ctx.open_timerfd(a[0] as u32 as i32, a[1] as u32 as usize),
+        sysnr::TIMERFD_SETTIME => timerfd_settime(ctx, space, a),
+        sysnr::TIMERFD_GETTIME => timerfd_gettime(ctx, space, a),
         _ => Err(Errno::NoSys),
     }
+}
+
+/// epoll_ctl(2)：解析 16 字节非紧凑 struct epoll_event（rv64/la64 布局）并操作 epoll 兴趣表。
+fn epoll_ctl(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
+    let epfd = a[0] as u32 as i32;
+    let op = a[1] as u32 as i32;
+    let fd = a[2] as u32 as i32;
+    if epfd < 0 || fd < 0 {
+        return Err(Errno::BadF);
+    }
+    let event = if op == fs::event::EPOLL_CTL_DEL {
+        None
+    } else if a[3] == 0 {
+        return Err(Errno::Fault);
+    } else {
+        let mut raw = [0u8; 16];
+        user_access::copy_from_user(space, a[3], &mut raw).map_err(|_| Errno::Fault)?;
+        let events = u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        let data = u64::from_ne_bytes([
+            raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
+        ]);
+        Some((events, data))
+    };
+    ctx.epoll_ctl(epfd as usize, op, fd as usize, event)?;
+    Ok(0)
+}
+
+/// 解码 32 字节 struct itimerspec（interval + value）。
+fn read_itimerspec(
+    space: &UserAddressSpace,
+    ptr: usize,
+) -> Result<(core::time::Duration, core::time::Duration), Errno> {
+    if ptr == 0 {
+        return Err(Errno::Fault);
+    }
+    let mut raw = [0u8; 32];
+    user_access::copy_from_user(space, ptr, &mut raw).map_err(|_| Errno::Fault)?;
+    let parse_ts = |chunk: &[u8]| -> Result<core::time::Duration, Errno> {
+        let sec = i64::from_ne_bytes(chunk[0..8].try_into().unwrap_or([0; 8]));
+        let nsec = i64::from_ne_bytes(chunk[8..16].try_into().unwrap_or([0; 8]));
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+            return Err(Errno::Invalid);
+        }
+        Ok(core::time::Duration::new(sec as u64, nsec as u32))
+    };
+    Ok((parse_ts(&raw[0..16])?, parse_ts(&raw[16..32])?))
+}
+
+/// 编码并写回 32 字节 struct itimerspec。
+fn write_itimerspec(
+    space: &UserAddressSpace,
+    ptr: usize,
+    interval: core::time::Duration,
+    value: core::time::Duration,
+) -> Result<(), Errno> {
+    let mut raw = [0u8; 32];
+    raw[0..8].copy_from_slice(&(interval.as_secs() as i64).to_ne_bytes());
+    raw[8..16].copy_from_slice(&(interval.subsec_nanos() as i64).to_ne_bytes());
+    raw[16..24].copy_from_slice(&(value.as_secs() as i64).to_ne_bytes());
+    raw[24..32].copy_from_slice(&(value.subsec_nanos() as i64).to_ne_bytes());
+    user_access::copy_to_user(space, ptr, &raw).map_err(|_| Errno::Fault)
+}
+
+/// timerfd_settime(2)：先校验 fd 类型，再读取新值与写回旧值，最后更新定时器状态。
+fn timerfd_settime(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
+    let fd = a[0] as u32 as i32;
+    if fd < 0 {
+        return Err(Errno::BadF);
+    }
+    let flags = a[1] as u32 as usize;
+    let old = ctx.timerfd_gettime(fd as usize)?;
+    let (interval, value) = read_itimerspec(space, a[2])?;
+    if a[3] != 0 {
+        write_itimerspec(space, a[3], old.0, old.1)?;
+    }
+    let _ = ctx.timerfd_settime(fd as usize, flags, interval, value)?;
+    Ok(0)
+}
+
+/// timerfd_gettime(2)：先校验 fd 是否为 timerfd（EBADF/EINVAL），再写回 curr_value（EFAULT）。
+fn timerfd_gettime(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
+    let fd = a[0] as u32 as i32;
+    if fd < 0 {
+        return Err(Errno::BadF);
+    }
+    let (interval, value) = ctx.timerfd_gettime(fd as usize)?;
+    if a[1] == 0 {
+        return Err(Errno::Fault);
+    }
+    write_itimerspec(space, a[1], interval, value)?;
+    Ok(0)
 }
 
 /// Linux truncate/ftruncate：检查有符号长度，按路径或可写 FD 调整普通文件长度。
@@ -1071,7 +1168,7 @@ fn transfer(
         .fold(0usize, |sum, b| sum.saturating_add(b.len))
         .min(MAX_RW_COUNT);
     if total == 0 {
-        return Ok(0);
+        return file.check_zero_rw(reading);
     }
     if total <= STACK_IO_BUF {
         let mut stack_buf = [0u8; STACK_IO_BUF];

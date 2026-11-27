@@ -10,6 +10,7 @@ pub use ext4::mounted;
 pub mod block_cache;
 pub mod cache;
 pub mod context;
+pub mod event;
 pub mod fat;
 pub mod locks;
 pub mod mapping;

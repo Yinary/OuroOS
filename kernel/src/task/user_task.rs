@@ -667,11 +667,13 @@ fn park_check_signals(
                 }
             }
             // SA_RESTART：pipe 读写与 wait 的等待不完成不睡，信号留给循环顶检查点。
-            // ppoll 与 pselect6 被 handler 信号打断一律以 -EINTR 完成。
+            // ppoll、pselect6 与 epoll_pwait/epoll_pwait2 被 handler 信号打断一律以 -EINTR 完成。
             WaitReason::Pipe | WaitReason::PipeId(_) | WaitReason::Children
                 if d.flags & SA_RESTART != 0
                     && frame[TrapFrameArgs::SYSCALL] != sysnr::PPOLL
-                    && frame[TrapFrameArgs::SYSCALL] != sysnr::PSELECT6 =>
+                    && frame[TrapFrameArgs::SYSCALL] != sysnr::PSELECT6
+                    && frame[TrapFrameArgs::SYSCALL] != sysnr::EPOLL_PWAIT
+                    && frame[TrapFrameArgs::SYSCALL] != sysnr::EPOLL_PWAIT2 =>
             {
                 ParkOutcome::Incomplete
             }
@@ -956,15 +958,21 @@ fn process_call(
                         return Ok(SelectStep::Done(Ok(sets.ready)));
                     }
                     match *sleep_deadline {
-                        None => Ok(SelectStep::Wait(WaitReason::Pipe)),
-                        Some(d) if crate::time::monotonic() < d => {
-                            Ok(SelectStep::Wait(WaitReason::PollUntil(d)))
-                        }
-                        Some(_) => {
+                        Some(d) if crate::time::monotonic() >= d => {
                             crate::fs::context::select_write_back(
                                 space, args[1], args[2], args[3], &sets,
                             )?;
                             Ok(SelectStep::Done(Ok(0)))
+                        }
+                        dl => {
+                            let wake_at = match (dl, sets.earliest_timer) {
+                                (Some(a), Some(b)) => Some(a.min(b)),
+                                (a, b) => a.or(b),
+                            };
+                            Ok(SelectStep::Wait(match wake_at {
+                                Some(d) => WaitReason::PollUntil(d),
+                                None => WaitReason::Pipe,
+                            }))
                         }
                     }
                 })();
@@ -1135,17 +1143,157 @@ fn process_call(
                     args[1],
                 )
             })();
-            if checked == Ok(0) {
-                match *sleep_deadline {
-                    None => return ProcessResult::Wait(WaitReason::Pipe),
-                    Some(d) if crate::time::monotonic() < d => {
-                        return ProcessResult::Wait(WaitReason::PollUntil(d))
+            match checked {
+                Ok((0, tfd_dl)) => match *sleep_deadline {
+                    Some(d) if crate::time::monotonic() >= d => {
+                        *sleep_deadline = None;
+                        Ok(0)
                     }
-                    _ => {}
+                    dl => {
+                        let wake_at = match (dl, tfd_dl) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        };
+                        return ProcessResult::Wait(match wake_at {
+                            Some(d) => WaitReason::PollUntil(d),
+                            None => WaitReason::Pipe,
+                        });
+                    }
+                },
+                Ok((ready, _)) => {
+                    *sleep_deadline = None;
+                    Ok(ready)
+                }
+                Err(e) => {
+                    *sleep_deadline = None;
+                    Err(e)
                 }
             }
-            *sleep_deadline = None;
-            checked
+        }
+        sysnr::EPOLL_PWAIT | sysnr::EPOLL_PWAIT2 => {
+            enum EpollStep {
+                Done(Result<usize, Errno>),
+                Wait(WaitReason),
+            }
+            let step = {
+                let mut locked = REGISTRY.lock();
+                let reg = &mut *locked;
+                let res: Result<EpollStep, Errno> = (|| {
+                    let epfd = args[0] as u32 as i32;
+                    let events_ptr = args[1];
+                    let maxevents = args[2] as u32 as i32;
+                    if maxevents <= 0 || maxevents > 4096 {
+                        return Err(Errno::Invalid);
+                    }
+                    if epfd < 0 {
+                        return Err(Errno::BadF);
+                    }
+                    let maxevents = maxevents as usize;
+                    user_access::check_user_range(events_ptr, maxevents * 16)
+                        .map_err(|_| Errno::Fault)?;
+
+                    let index = reg.group_index(parent).ok_or(Errno::NoProcess)?;
+                    let space = reg.records[index]
+                        .space
+                        .as_ref()
+                        .ok_or(Errno::Invalid)?
+                        .as_space();
+
+                    // 安装临时信号屏蔽字（首次进入时生效，返回时恢复；被信号打断由检查点带入 uc_sigmask）。
+                    let sigmask_ptr = args[4];
+                    let sigsetsize = args[5];
+                    if sigmask_ptr != 0 && sigsuspend_saved.is_none() {
+                        if sigsetsize != SIGSETSIZE {
+                            return Err(Errno::Invalid);
+                        }
+                        let mut raw_mask = [0u8; SIGSETSIZE];
+                        user_access::copy_from_user(space, sigmask_ptr, &mut raw_mask)
+                            .map_err(|_| Errno::Fault)?;
+                        let mut new_mask = SignalSet::from_ne_bytes(raw_mask);
+                        new_mask.del(SIGKILL);
+                        new_mask.del(SIGSTOP);
+                        if let Some(thread) = reg.threads.iter_mut().find(|t| t.tid == parent) {
+                            *sigsuspend_saved = Some(thread.signal.blocked());
+                            thread.signal.setmask(new_mask);
+                        }
+                    }
+
+                    // 首次进入解析超时并固定为绝对单调截止时刻。
+                    if sleep_deadline.is_none() {
+                        if nr == sysnr::EPOLL_PWAIT {
+                            let timeout_ms = args[3] as u32 as i32;
+                            if timeout_ms >= 0 {
+                                *sleep_deadline = Some(
+                                    crate::time::monotonic()
+                                        .checked_add(core::time::Duration::from_millis(
+                                            timeout_ms as u64,
+                                        ))
+                                        .ok_or(Errno::Invalid)?,
+                                );
+                            }
+                        } else if args[3] != 0 {
+                            let mut ts = [0u8; 16];
+                            user_access::copy_from_user(space, args[3], &mut ts)
+                                .map_err(|_| Errno::Fault)?;
+                            let sec = i64::from_ne_bytes(ts[0..8].try_into().unwrap_or([0; 8]));
+                            let nsec = i64::from_ne_bytes(ts[8..16].try_into().unwrap_or([0; 8]));
+                            if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+                                return Err(Errno::Invalid);
+                            }
+                            *sleep_deadline = Some(
+                                crate::time::monotonic()
+                                    .checked_add(core::time::Duration::new(sec as u64, nsec as u32))
+                                    .ok_or(Errno::Invalid)?,
+                            );
+                        }
+                    }
+
+                    let rec = &reg.records[index];
+                    let space = rec.space.as_ref().ok_or(Errno::Invalid)?.as_space();
+                    let fs = rec.fs.as_ref().ok_or(Errno::Invalid)?;
+                    let (encoded, ready, tfd_dl) = fs.epoll_collect(epfd as usize, maxevents)?;
+                    if ready > 0 {
+                        user_access::copy_to_user(space, events_ptr, &encoded)
+                            .map_err(|_| Errno::Fault)?;
+                        return Ok(EpollStep::Done(Ok(ready)));
+                    }
+                    match *sleep_deadline {
+                        Some(d) if crate::time::monotonic() >= d => Ok(EpollStep::Done(Ok(0))),
+                        dl => {
+                            let wake_at = match (dl, tfd_dl) {
+                                (Some(a), Some(b)) => Some(a.min(b)),
+                                (a, b) => a.or(b),
+                            };
+                            Ok(EpollStep::Wait(match wake_at {
+                                Some(d) => WaitReason::PollUntil(d),
+                                None => WaitReason::Pipe,
+                            }))
+                        }
+                    }
+                })();
+                match res {
+                    Ok(EpollStep::Wait(reason)) => EpollStep::Wait(reason),
+                    other => {
+                        if let Some(saved) = sigsuspend_saved.take() {
+                            if let Some(thread) = reg.threads.iter_mut().find(|t| t.tid == parent) {
+                                thread.signal.setmask(saved);
+                            }
+                        }
+                        EpollStep::Done(match other {
+                            Ok(EpollStep::Done(r)) => r,
+                            Err(e) => Err(e),
+                            Ok(EpollStep::Wait(_)) => unreachable!(),
+                        })
+                    }
+                }
+            };
+            match step {
+                EpollStep::Wait(reason) => return ProcessResult::Wait(reason),
+                EpollStep::Done(res) => {
+                    *sleep_deadline = None;
+                    res
+                }
+            }
         }
         sysnr::NANOSLEEP => {
             // nanosleep(2)：到期返回 0；被打断时回写剩余时间并返回 -EINTR。
