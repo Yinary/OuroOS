@@ -1578,6 +1578,10 @@ fn process_call(
             }
         }
         sysnr::WAITID => return waitid(parent, frame, args),
+        sysnr::KCMP => kcmp_call(parent, args),
+        sysnr::PIDFD_OPEN => pidfd_open(parent, args),
+        sysnr::PIDFD_SEND_SIGNAL => pidfd_send_signal(parent, args),
+        sysnr::PIDFD_GETFD => pidfd_getfd(parent, args),
         sysnr::GETRUSAGE => get_rusage(parent, args),
         sysnr::SCHED_SETSCHEDULER => sched_setscheduler(parent, args),
         sysnr::SCHED_SETPARAM => sched_setparam(parent, args),
@@ -2099,7 +2103,7 @@ fn waitid(parent: Pid, frame: &mut TrapFrame, args: [usize; 6]) -> ProcessResult
     let allowed =
         WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | __WNOTHREAD | __WALL | __WCLONE;
     let idtype = args[0] as u32 as i32;
-    if !(0..=2).contains(&idtype) {
+    if !(0..=3).contains(&idtype) {
         frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Invalid));
         return ProcessResult::Done;
     }
@@ -2110,21 +2114,52 @@ fn waitid(parent: Pid, frame: &mut TrapFrame, args: [usize; 6]) -> ProcessResult
     }
     let infop = args[2];
     let id = args[1] as u32 as usize;
-    let (ready, any) = {
+    let (ready, any, pidfd_nonblock) = {
         let reg = REGISTRY.lock();
-        let caller_pgid = match reg.group(parent) {
-            Some(r) => r.pgid,
+        let caller = match reg.group(parent) {
+            Some(r) => r,
             None => {
                 frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::NoProcess));
                 return ProcessResult::Done;
             }
+        };
+        let caller_pgid = caller.pgid;
+        let pidfd_target = if idtype == 3 {
+            let fd = args[1] as u32 as i32;
+            if fd < 0 {
+                frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::BadF));
+                return ProcessResult::Done;
+            }
+            let Some(fs) = caller.fs.as_ref() else {
+                frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::BadF));
+                return ProcessResult::Done;
+            };
+            match fs.pidfd_info(fd as usize) {
+                Ok(Some((state, nb))) => Some((state, nb)),
+                Ok(None) => {
+                    frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Invalid));
+                    return ProcessResult::Done;
+                }
+                Err(e) => {
+                    frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(e));
+                    return ProcessResult::Done;
+                }
+            }
+        } else {
+            None
         };
         let matches = |r: &super::ProcessRecord| {
             r.parent == parent
                 && match idtype {
                     0 => true,
                     1 => r.pid == id,
-                    _ => r.pgid == if id == 0 { caller_pgid } else { id },
+                    2 => r.pgid == if id == 0 { caller_pgid } else { id },
+                    _ => pidfd_target.as_ref().is_some_and(|(state, _)| {
+                        r.pid == state.pid()
+                            && r.pidfd_state
+                                .as_ref()
+                                .is_some_and(|s| alloc::sync::Arc::ptr_eq(s, state))
+                    }),
                 }
         };
         let ready = reg
@@ -2141,7 +2176,8 @@ fn waitid(parent: Pid, frame: &mut TrapFrame, args: [usize; 6]) -> ProcessResult
                 rec.system_ns.saturating_add(rec.child_system_ns),
             ))
         });
-        (ready, any)
+        let nb = pidfd_target.is_some_and(|(_, nb)| nb);
+        (ready, any, nb)
     };
     if let Some((child_pid, exit, user_ns, system_ns)) = ready {
         let mut data = [0u8; 128];
@@ -2208,7 +2244,258 @@ fn waitid(parent: Pid, frame: &mut TrapFrame, args: [usize; 6]) -> ProcessResult
         frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Ok(0));
         return ProcessResult::Done;
     }
+    if pidfd_nonblock {
+        frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Again));
+        return ProcessResult::Done;
+    }
     ProcessResult::Wait(WaitReason::Children)
+}
+
+/// pidfd_open(2)：为指定线程组 leader 进程打开进程描述符（默认 FD_CLOEXEC，支持 PIDFD_NONBLOCK）。
+fn pidfd_open(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    const PIDFD_NONBLOCK: u32 = 0x800;
+    let raw_pid = args[0] as u32 as i32;
+    let flags = args[1] as u32;
+    if raw_pid <= 0 || flags & !PIDFD_NONBLOCK != 0 {
+        return Err(Errno::Invalid);
+    }
+    let target_pid = raw_pid as usize;
+    let mut reg = REGISTRY.lock();
+    let state = if let Some(target) = reg.records.iter_mut().find(|r| r.pid == target_pid) {
+        if let Some(ref existing) = target.pidfd_state {
+            existing.clone()
+        } else {
+            let created =
+                crate::fs::try_arc(super::PidFdState::new(target.pid, target.exit.is_some()))?;
+            target.pidfd_state = Some(created.clone());
+            created
+        }
+    } else if reg.threads.iter().any(|t| t.tid == target_pid) {
+        return Err(Errno::Invalid);
+    } else {
+        return Err(Errno::NoProcess);
+    };
+    let caller = reg.group_mut(parent).ok_or(Errno::NoProcess)?;
+    let fs = caller.fs.as_mut().ok_or(Errno::NoProcess)?;
+    fs.open_pidfd(state, flags & PIDFD_NONBLOCK != 0)
+}
+
+/// pidfd_send_signal(2)：通过进程描述符（含 /proc/<pid> 目录 FD）向目标进程投递信号。
+fn pidfd_send_signal(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    enum SignalTarget {
+        PidFd(alloc::sync::Arc<super::PidFdState>),
+        ProcDir(Pid),
+    }
+    let pidfd = args[0] as u32 as i32;
+    let sig = args[1] as u32;
+    let info_ptr = args[2];
+    let flags = args[3] as u32;
+    if flags != 0 || sig > 64 {
+        return Err(Errno::Invalid);
+    }
+    if pidfd < 0 {
+        return Err(Errno::BadF);
+    }
+    let mut locked = REGISTRY.lock();
+    let reg = &mut *locked;
+    let (caller_tgid, caller_ruid, caller_euid, target_ref, user_info) = {
+        let caller = reg.group(parent).ok_or(Errno::NoProcess)?;
+        let fs = caller.fs.as_ref().ok_or(Errno::NoProcess)?;
+        // Linux pidfd_send_signal 接受 pidfd_open 与 /proc/<pid>（含 /proc/self）目录 FD；
+        // 未打开或非进程描述符均返回 EBADF。
+        let target_ref = match fs.pidfd_info(pidfd as usize)? {
+            Some((state, _)) => SignalTarget::PidFd(state),
+            None => match fs.proc_pid_dir(pidfd as usize, caller.pid)? {
+                Some(proc_pid) => SignalTarget::ProcDir(proc_pid),
+                None => return Err(Errno::BadF),
+            },
+        };
+        let user_info = if info_ptr != 0 {
+            let space = caller.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+            let mut raw = [0u8; 128];
+            user_access::copy_from_user(space, info_ptr, &mut raw).map_err(|_| Errno::Fault)?;
+            Some(raw)
+        } else {
+            None
+        };
+        (
+            caller.pid,
+            caller.creds.ruid,
+            caller.creds.euid,
+            target_ref,
+            user_info,
+        )
+    };
+    let target_idx = match target_ref {
+        SignalTarget::PidFd(state) => reg.records.iter().position(|r| {
+            r.pid == state.pid()
+                && r.pidfd_state
+                    .as_ref()
+                    .is_some_and(|s| alloc::sync::Arc::ptr_eq(s, &state))
+        }),
+        SignalTarget::ProcDir(proc_pid) => reg.records.iter().position(|r| r.pid == proc_pid),
+    }
+    .ok_or(Errno::NoProcess)?;
+    let target_pid = reg.records[target_idx].pid;
+    let target_creds = &reg.records[target_idx].creds;
+    let allowed = caller_tgid == target_pid
+        || caller_euid == 0
+        || caller_euid == target_creds.ruid
+        || caller_euid == target_creds.suid
+        || caller_ruid == target_creds.ruid
+        || caller_ruid == target_creds.suid;
+    if !allowed {
+        return Err(Errno::Perm);
+    }
+    let slot = if let Some(raw) = user_info {
+        let si_signo = i32::from_ne_bytes(raw[0..4].try_into().unwrap_or([0; 4]));
+        if si_signo != sig as i32 {
+            return Err(Errno::Invalid);
+        }
+        let code = i32::from_ne_bytes(raw[8..12].try_into().unwrap_or([0; 4]));
+        if (code >= 0 || code == SI_TKILL) && target_pid != caller_tgid {
+            return Err(Errno::Perm);
+        }
+        SigInfoSlot {
+            code,
+            errno: i32::from_ne_bytes(raw[4..8].try_into().unwrap_or([0; 4])),
+            pid: u32::from_ne_bytes(raw[16..20].try_into().unwrap_or([0; 4])),
+            addr: usize::from_ne_bytes(raw[24..32].try_into().unwrap_or([0; 8])),
+            ..Default::default()
+        }
+    } else {
+        SigInfoSlot {
+            code: 0,
+            pid: caller_tgid as u32,
+            ..Default::default()
+        }
+    };
+    if sig == 0 || reg.records[target_idx].exit.is_some() {
+        return Ok(0);
+    }
+    let blocked = reg
+        .threads
+        .iter()
+        .find(|t| t.tgid == target_pid)
+        .map_or(0, |t| t.signal.blocked());
+    reg.records[target_idx]
+        .signal
+        .generate(sig as u8, slot, blocked);
+    sched::request_signal_wake();
+    Ok(0)
+}
+
+/// kcmp(2)：比较两个进程是否共享指定内核资源（KCMP_FILE/VM/FILES/FS/SIGHAND/IO/SYSVSEM）。
+fn kcmp_call(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    const KCMP_FILE: i32 = 0;
+    const KCMP_SYSVSEM: i32 = 6;
+    let pid1 = args[0] as u32 as i32;
+    let pid2 = args[1] as u32 as i32;
+    let kind = args[2] as u32 as i32;
+    if pid1 <= 0 || pid2 <= 0 {
+        return Err(Errno::NoProcess);
+    }
+    if !(KCMP_FILE..=KCMP_SYSVSEM).contains(&kind) {
+        return Err(Errno::Invalid);
+    }
+    let reg = REGISTRY.lock();
+    let caller = reg.group(parent).ok_or(Errno::NoProcess)?;
+    let t1 = reg.group(pid1 as usize).ok_or(Errno::NoProcess)?;
+    let t2 = reg.group(pid2 as usize).ok_or(Errno::NoProcess)?;
+    if t1.exit.is_some() || t2.exit.is_some() {
+        return Err(Errno::NoProcess);
+    }
+    let can_inspect = |target: &super::ProcessRecord| {
+        caller.pid == target.pid
+            || caller.creds.euid == 0
+            || (caller.creds.euid == target.creds.ruid
+                && caller.creds.euid == target.creds.euid
+                && caller.creds.euid == target.creds.suid
+                && caller.creds.egid == target.creds.rgid
+                && caller.creds.egid == target.creds.egid
+                && caller.creds.egid == target.creds.sgid)
+    };
+    if !can_inspect(t1) || !can_inspect(t2) {
+        return Err(Errno::Perm);
+    }
+    let cmp_order = |a: usize, b: usize| -> usize {
+        if a == b {
+            0
+        } else if a < b {
+            1
+        } else {
+            2
+        }
+    };
+    if kind == KCMP_FILE {
+        let fd1 = args[3] as u32 as i32;
+        let fd2 = args[4] as u32 as i32;
+        if fd1 < 0 || fd2 < 0 {
+            return Err(Errno::BadF);
+        }
+        let h1 = t1.fs.as_ref().ok_or(Errno::BadF)?.get(fd1 as usize)?;
+        let h2 = t2.fs.as_ref().ok_or(Errno::BadF)?.get(fd2 as usize)?;
+        return Ok(cmp_order(
+            alloc::sync::Arc::as_ptr(&h1) as usize,
+            alloc::sync::Arc::as_ptr(&h2) as usize,
+        ));
+    }
+    Ok(cmp_order(t1.pid, t2.pid))
+}
+
+/// pidfd_getfd(2)：复制目标进程指定 FD 的打开文件描述到调用进程（强制置位 FD_CLOEXEC）。
+fn pidfd_getfd(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let pidfd = args[0] as u32 as i32;
+    let targetfd = args[1] as u32 as i32;
+    let flags = args[2] as u32;
+    if flags != 0 {
+        return Err(Errno::Invalid);
+    }
+    if pidfd < 0 || targetfd < 0 {
+        return Err(Errno::BadF);
+    }
+    let mut locked = REGISTRY.lock();
+    let reg = &mut *locked;
+    let caller_idx = reg.group_index(parent).ok_or(Errno::NoProcess)?;
+    let (state, caller_euid, caller_egid) = {
+        let caller = &reg.records[caller_idx];
+        let fs = caller.fs.as_ref().ok_or(Errno::NoProcess)?;
+        let (state, _) = fs.pidfd_info(pidfd as usize)?.ok_or(Errno::BadF)?;
+        (state, caller.creds.euid, caller.creds.egid)
+    };
+    let target_idx = reg
+        .records
+        .iter()
+        .position(|r| {
+            r.pid == state.pid()
+                && r.exit.is_none()
+                && r.pidfd_state
+                    .as_ref()
+                    .is_some_and(|s| alloc::sync::Arc::ptr_eq(s, &state))
+        })
+        .ok_or(Errno::NoProcess)?;
+    if caller_idx != target_idx && caller_euid != 0 {
+        let tc = &reg.records[target_idx].creds;
+        let same = caller_euid == tc.ruid
+            && caller_euid == tc.euid
+            && caller_euid == tc.suid
+            && caller_egid == tc.rgid
+            && caller_egid == tc.egid
+            && caller_egid == tc.sgid;
+        if !same {
+            return Err(Errno::Perm);
+        }
+    }
+    let handle = reg.records[target_idx]
+        .fs
+        .as_ref()
+        .ok_or(Errno::NoProcess)?
+        .get(targetfd as usize)?;
+    let caller_fs = reg.records[caller_idx]
+        .fs
+        .as_mut()
+        .ok_or(Errno::NoProcess)?;
+    caller_fs.install(handle, true)
 }
 
 /// clock_nanosleep(2) 一次处理的结果。

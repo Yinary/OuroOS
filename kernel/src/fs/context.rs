@@ -166,6 +166,8 @@ enum Kind {
     },
     /// epoll_create1(2) 事件多路复用实例
     Epoll(Arc<Mutex<super::event::EpollInstance>>),
+    /// pidfd_open(2) 进程文件描述符
+    PidFd(Arc<crate::task::PidFdState>),
 }
 /// 共享偏移、打开标志和文件资源的持有者。
 pub(crate) struct OpenFile {
@@ -1400,6 +1402,52 @@ impl Context {
         self.install(file, flags & EPOLL_CLOEXEC != 0)
     }
 
+    /// 安装 pidfd_open(2) 进程描述符（按 Linux 强制设置 FD_CLOEXEC）。
+    pub(crate) fn open_pidfd(
+        &mut self,
+        state: Arc<crate::task::PidFdState>,
+        nonblock: bool,
+    ) -> Result<usize, Errno> {
+        let file = fs::try_arc(Mutex::new(OpenFile {
+            ofd_id: next_ofd_id(),
+            kind: Kind::PidFd(state),
+            offset: 0,
+            flags: 2 | if nonblock { 0x800 } else { 0 },
+        }))?;
+        self.install(file, true)
+    }
+
+    /// 查询 FD 对应的 pidfd 状态与 O_NONBLOCK 标志；FD 未打开返回 EBADF，非 pidfd 返回 Ok(None)。
+    pub(crate) fn pidfd_info(
+        &self,
+        fd: usize,
+    ) -> Result<Option<(Arc<crate::task::PidFdState>, bool)>, Errno> {
+        let handle = self.get(fd)?;
+        let f = handle.lock();
+        match &f.kind {
+            Kind::PidFd(state) => Ok(Some((state.clone(), f.flags & 0x800 != 0))),
+            _ => Ok(None),
+        }
+    }
+
+    /// 若 FD 指向 `/proc/<pid>` 或 `/proc/self` 目录，返回对应 pid（供 pidfd_send_signal 兼容 Linux 5.1 语义）。
+    pub(crate) fn proc_pid_dir(
+        &self,
+        fd: usize,
+        caller_tgid: usize,
+    ) -> Result<Option<usize>, Errno> {
+        let handle = self.get(fd)?;
+        let f = handle.lock();
+        match f.kind {
+            Kind::Inode { ino, .. } if ino == super::procfs::SELF_DIR => Ok(Some(caller_tgid)),
+            Kind::Inode { ino, .. } => match super::procfs::pid_ino_parts(ino) {
+                Some((pid, 0)) => Ok(Some(pid as usize)),
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
     /// epoll_ctl(2)：向 epoll 实例增、改、删目标描述符。
     pub(crate) fn epoll_ctl(
         &self,
@@ -1669,12 +1717,14 @@ impl OpenFile {
                 block_size: 4096,
                 ..Default::default()
             }),
-            Kind::EventFd { .. } | Kind::TimerFd { .. } | Kind::Epoll(_) => Ok(fs::Metadata {
-                mode: 0o000600,
-                links: 1,
-                block_size: 4096,
-                ..Default::default()
-            }),
+            Kind::EventFd { .. } | Kind::TimerFd { .. } | Kind::Epoll(_) | Kind::PidFd(_) => {
+                Ok(fs::Metadata {
+                    mode: 0o000600,
+                    links: 1,
+                    block_size: 4096,
+                    ..Default::default()
+                })
+            }
             _ => Ok(fs::Metadata {
                 mode: (if matches!(&self.kind, Kind::Pipe { .. }) {
                     0x1000
@@ -1780,7 +1830,9 @@ impl OpenFile {
     /// 零字节读写前置检查：eventfd/timerfd/epoll 拒绝小于 8 字节的读写并报 EINVAL。
     pub(crate) fn check_zero_rw(&self, _reading: bool) -> Result<usize, Errno> {
         match self.kind {
-            Kind::EventFd { .. } | Kind::TimerFd { .. } | Kind::Epoll(_) => Err(Errno::Invalid),
+            Kind::EventFd { .. } | Kind::TimerFd { .. } | Kind::Epoll(_) | Kind::PidFd(_) => {
+                Err(Errno::Invalid)
+            }
             _ => Ok(0),
         }
     }
@@ -1800,6 +1852,7 @@ impl OpenFile {
                 | Kind::EventFd { .. }
                 | Kind::TimerFd { .. }
                 | Kind::Epoll(_)
+                | Kind::PidFd(_)
                 | Kind::Input
                 | Kind::Output
         )
@@ -1810,6 +1863,7 @@ impl OpenFile {
             Kind::Pipe { pipe, .. } => pipe.lock().event_gen,
             Kind::EventFd { efd, .. } => efd.lock().event_gen(),
             Kind::TimerFd { tfd, .. } => tfd.lock().event_gen(),
+            Kind::PidFd(state) => state.event_gen(),
             _ => 0,
         }
     }
@@ -2045,7 +2099,7 @@ impl OpenFile {
                 }
                 tfd.lock().read(self.flags & 0x800 != 0, deliver)
             }
-            Kind::Epoll(_) => Err(Errno::Invalid),
+            Kind::Epoll(_) | Kind::PidFd(_) => Err(Errno::Invalid),
             Kind::DevNull | Kind::Rtc => Ok(0),
             Kind::DevZero | Kind::DevRandom { .. } => self.read_at(0, data, false, deliver),
             Kind::DevBlk { .. } => Ok(0), // 设备块读走专用路径（见 read_devblk）
@@ -2109,7 +2163,7 @@ impl OpenFile {
                 Ok(count)
             }
             Kind::EventFd { efd, .. } => efd.lock().write(data, self.flags & 0x800 != 0),
-            Kind::TimerFd { .. } | Kind::Epoll(_) => Err(Errno::Invalid),
+            Kind::TimerFd { .. } | Kind::Epoll(_) | Kind::PidFd(_) => Err(Errno::Invalid),
             Kind::Socket(id) => {
                 let nonblock = self.flags & 0x800 != 0;
                 crate::net::sendto(*id, data, 0, None, nonblock)
@@ -2294,6 +2348,13 @@ pub(super) fn fd_poll_events(file: &mut OpenFile, requested: u16, depth: usize) 
         Kind::Socket(id) => crate::net::poll_events(*id, requested),
         Kind::EventFd { efd, .. } => efd.lock().poll_events(requested),
         Kind::TimerFd { tfd, .. } => tfd.lock().poll_events(requested),
+        Kind::PidFd(state) => {
+            if state.is_exited() {
+                0x41 & requested
+            } else {
+                0
+            }
+        }
         Kind::Epoll(ep) => {
             if ep.lock().has_ready(depth) {
                 0x41 & requested
