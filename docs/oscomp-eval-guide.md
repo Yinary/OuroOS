@@ -240,3 +240,17 @@ python3 tests/run_official.py la --groups ltp-musl --ltp-filter chown,statx --lt
   - `la` `lmbench-musl` 抽测对比：`Simple stat` 由 **37.69 µs → 4.32 µs**（提速 **8.7×**），`Simple syscall` **1.03 µs**；
   - `fs_stat.py`（默认及 `--metadata`，双架构 128/256 字节 inode + `e2fsck`）**8/8 全部通过**；
   - 双架构 7 组回归零回退：`rv` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9、`iozone-musl` 35.87/20、`iperf-musl` 7.61/6、`netperf-musl` 8.66/5、`libctest-musl` 217/220；`la` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9、`iozone-musl` 37.30/20、`iperf-musl` 8.21/6、`netperf-musl` 9.13/5、`libctest-musl` 217/220。
+
+### 5.9 LTP 第 1 批基础框架与核心系统调用语义补齐（`syscall/ltp-core-infra`）
+
+- **补齐范围（均为通用 Linux 语义，无测例特判）**：
+  1. **全量 16 项 `RLIMIT_*` 资源限额（`kernel/src/fs/context.rs`、`kernel/src/syscall/memory.rs`）**：在既有内存类与 `RLIMIT_NOFILE` 之外补齐全部 16 项资源（含 `RLIMIT_CORE`、`RLIMIT_NPROC` 等 Linux 默认初值），支持查询、修改、`rlim_cur <= rlim_max` 校验及 `fork` 继承/`exec` 保留，消除大批 LTP 测例准备阶段的 `setrlimit(RLIMIT_CORE)` 报错。
+  2. **`procfs` 节点扩展（`kernel/src/fs/procfs.rs`、`kernel/src/fs/mod.rs`、`kernel/src/fs/metadata.rs`、`kernel/src/syscall/fs.rs`）**：新增 `/proc/sys/kernel/pid_max`、`/proc/sys/kernel/tainted`（支撑 `tst_taint`）、`/proc/version`、`/proc/self/maps`（按 Linux `%08lx-%08lx` 导出 VMA 快照）及 `/proc/self/fd` 目录快照（`getdents64` 枚举存活 FD）。
+  3. **管道控制与文件创建/映射细节对齐（`kernel/src/fs/context.rs`、`kernel/src/syscall/fs.rs`、`kernel/src/syscall/memory.rs`）**：实现 `fcntl` 的 `F_GETPIPE_SZ(1032)` / `F_SETPIPE_SZ(1031)`（4 KiB..1 MiB 按页对齐，低于已缓冲字节数返回 `EBUSY`）；`ioctl` 为管道与普通文件补齐 `FIONREAD(0x541B)`；`creation_mode` 保留 `0o7000` 特殊权限位；`mmap` 非匿名映射按 Linux `ksys_mmap_pgoff` 先校验 FD（含拒绝 `O_PATH` FD 返回 `EBADF`）再校验长度。
+  4. **套接字与进程回收错误码对齐（`kernel/src/net/mod.rs`、`kernel/src/syscall/net.rs`、`kernel/src/task/user_task.rs`）**：支持 `socket(AF_UNIX, SOCK_STREAM|SOCK_DGRAM, 0)` 未连接创建，对齐 `socket`/`socketpair` 的类型与协议校验错误码顺序（非法 `type` 返回 `EINVAL`，协议不匹配优先返回 `EPROTONOSUPPORT`）；`wait4(INT_MIN, ...)` 返回 `ESRCH`。
+- **双架构实测对比（QEMU 10.0.2 + QCOW2 覆盖层，`sdcard-rv.img`/`sdcard-la.img` `pre-20250615`）**：
+  - 9 前缀 LTP 探测（`open,read,write,pipe,fork,wait,kill,mmap,socket`）：
+    - 基线（`perf/lmbench-hotpath` `7296567`）：`rv` **`244/318`**；
+    - 本批修复后：`rv` **`420/525`**（净增 **+176** 条通过断言，+72.1%）、`la` **`421/527`**（净增 **+177** 条通过断言），零 panic；其中 `socket01`/`socket02`/`socketpair01`/`socketpair02`/`waitpid04`/`wait403`/`mmap08`/`open01`/`pipe12` 均 100% 通过，`waitpid01` 通过 126/146，`readahead01` 提升至 9/25，`mmap04` 权限行匹配生效。
+  - 资源限额专项 LTP（`getrlimit,setrlimit,prlimit`）：`rv` **`40/40`**、`la` **`40/40`**（双架构 100% 通过）。
+  - 双架构回归与专项：`rv` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9、`cyclictest-musl` 5.14/4；`la` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9；`tests/fs_fcntl.py` 双架构 + `e2fsck` 全部通过。
