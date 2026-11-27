@@ -228,3 +228,15 @@ python3 tests/run_official.py la --groups ltp-musl --ltp-filter chown,statx --lt
   - `la` `cyclictest-glibc`：`STRESS_P1` 最大延迟由 **40,010 µs → 4,427 µs**（降 **9.0×**），`STRESS_P8` 8 线程平均最大延迟由 **43,619 µs → 1,839 µs**（降 **23.7×**），总分由 `5.46/4` 升至 **5.84/4**；
   - `rv` `cyclictest-musl` `STRESS_P1` 最大延迟由 **4,996 µs → 1,226 µs**（降 **4.1×**，总分 5.61/4），`cyclictest-glibc` `STRESS_P1` 由 **5,424 µs → 944 µs**（降 **5.7×**，总分 5.19/4）；
   - 双架构回归与专项：`rv` 与 `la` 上 `basic-glibc` 102/102、`busybox-glibc` 54/55、`libctest-musl` 217/220 全部零回退；主机 `tests/file_mapping.rs` 6/6 通过。
+
+### 5.8 `lmbench` 通用系统调用与文件 I/O 热路径优化验证结果（`perf/lmbench-hotpath`）
+
+- **优化范围（均属通用操作系统机制，无测例特判）**：
+  1. **按页扫描的用户字符串读取（`kernel/src/mm/user_access.rs`、`kernel/src/syscall/fs.rs`）**：新增 `user_access::read_cstr`，按页翻译并直接扫描页内 NUL 字节，≤256 字节路径走栈暂存并按精确长度分配 `String`，取代原逐字节 `copy_from_user` + 4 KiB 固定堆分配。
+  2. **Ext4 路径目录项缓存与 `stat`/`query` 单锁快路径（`kernel/src/fs/ext4_rsext4.rs`、`kernel/src/fs/metadata.rs`、`kernel/src/fs/fat.rs`）**：在 Ext4 根卷内维护 256 槽直接映射路径目录项缓存（`rmdir`/`unlink`/`rename` 整表失效，绝不缓存元数据本身），对经 `resolve` 确认整条路径无符号链接的规范绝对路径置 `direct_stat` 标记，使后续 `stat`/`query` 在单次 `ROOT` 锁内直取实时 inode 元数据，消除原 $O(D^2)$ 逐层重复查找；同时为 `fat` 增加 `MOUNT_COUNT` 原子快路径，无 FAT 挂载时免锁跳过。
+  3. **私有文件缺页单次 4 KiB 直填帧（`kernel/src/mm/frame.rs`、`kernel/src/mm/file.rs`）**：新增 `OwnedFrame::fill_range_with`，`FilePage::fault` 私有页缺页直接单次读满 4 KiB 至物理页帧，替代原 `4 × 1 KiB` 分段读与二次拷贝。
+  4. **小读写栈缓冲、64 KiB 复用暂存池与管道切片拷贝（`kernel/src/syscall/fs.rs`、`kernel/src/fs/context.rs`）**：≤256 字节读写走栈缓冲免自旋锁；大读写复用单槽 64 KiB 堆暂存池（将 64 KiB 读写从 16 轮缩减为 1 轮）；管道读改用 `VecDeque::as_slices` 批量切片拷贝，管道写遵循 POSIX `PIPE_BUF(4096)` 原子写并对 >4 KiB 请求允许部分写入。
+- **双架构实测与一致性验证（QEMU 10.0.2 + QCOW2 覆盖层）**：
+  - `la` `lmbench-musl` 抽测对比：`Simple stat` 由 **37.69 µs → 4.32 µs**（提速 **8.7×**），`Simple syscall` **1.03 µs**；
+  - `fs_stat.py`（默认及 `--metadata`，双架构 128/256 字节 inode + `e2fsck`）**8/8 全部通过**；
+  - 双架构 7 组回归零回退：`rv` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9、`iozone-musl` 35.87/20、`iperf-musl` 7.61/6、`netperf-musl` 8.66/5、`libctest-musl` 217/220；`la` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9、`iozone-musl` 37.30/20、`iperf-musl` 8.21/6、`netperf-musl` 9.13/5、`libctest-musl` 217/220。
