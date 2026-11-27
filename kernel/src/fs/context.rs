@@ -542,6 +542,23 @@ impl Context {
         Ok((parent, name))
     }
 
+    /// 创建命名管道节点并保存权限和属主信息。
+    pub(crate) fn create_fifo(
+        &self,
+        dir: usize,
+        path: &str,
+        mode: usize,
+        credentials: &crate::task::Credentials,
+    ) -> Result<(), Errno> {
+        let (parent, name) = self.new_entry_path(dir, path)?;
+        fs::create_fifo(
+            parent,
+            &name,
+            self.creation_mode(mode),
+            (credentials.fsuid, credentials.fsgid),
+        )
+    }
+
     /// 删除末项名称，符号链接按自身的 inode 处理。
     pub(crate) fn unlink(&self, dir: usize, input: &str) -> Result<(), Errno> {
         let path = input.trim_end_matches('/');

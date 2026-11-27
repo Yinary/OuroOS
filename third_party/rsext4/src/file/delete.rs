@@ -65,7 +65,7 @@ pub fn free_inode<B: BlockDevice>(
 }
 
 // OuroOS patch: leave inode reclamation to the caller that owns open references.
-/// 移除普通文件或符号链接 的目录项，返回剩余链接数。
+/// 移除普通文件、符号链接或 FIFO 的目录项，返回剩余链接数。
 pub fn unlink_file_entry<B: BlockDevice>(
     fs: &mut Ext4FileSystem,
     device: &mut Jbd2Dev<B>,
@@ -88,7 +88,10 @@ pub fn unlink_file_entry<B: BlockDevice>(
     if inode.is_dir() {
         return Err(Ext4Error::is_dir());
     }
-    if !inode.is_file() && !inode.is_symlink() {
+    if !inode.is_file()
+        && !inode.is_symlink()
+        && inode.i_mode & Ext4Inode::S_IFMT != Ext4Inode::S_IFIFO
+    {
         return Err(Ext4Error::unsupported());
     }
     let links = inode

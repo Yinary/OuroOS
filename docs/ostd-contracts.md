@@ -291,7 +291,7 @@ try_lock 失败即报告“持锁跨调度”。
 
 | 调用/类别 | 当前实现 | Linux 对照 / 说明 | 性质 |
 |---|---|---|---|
-| mknodat | 仅 S_IFBLK：节点登记 (盘,分区) 身份（minor 编码），必须位于 /dev 下，分区须真实存在（总线位置校验），同名 EEXIST；major 须为 254（本内核块设备空间）。S_IFCHR/S_IFIFO/S_IFSOCK 返回 EOPNOTSUPP | 设备节点无独立文件系统支持，为内核注册表条目（内存态，重启即失） | 未实现；取舍，理由待补 |
+| mknodat | S_IFIFO 在 Ext4 上创建持久节点，应用 umask，支持状态查询、硬链接和删名。S_IFBLK 由特权调用方在 /dev 下登记已存在的盘或分区，major 为 254，同名 EEXIST。 | 块设备节点由内核注册表管理。FIFO 的数据端点和阻塞打开仍未实现，O_PATH 可持有节点，数据打开返回 EOPNOTSUPP。S_IFCHR/S_IFSOCK 返回 EOPNOTSUPP。 | 未实现：FIFO 数据传输及其他设备类型 |
 | faccessat/faccessat2 | 按路径检查存在性；X_OK 要求文件有任一执行位（无执行位 EACCES），R_OK/W_OK 放行，不按凭证检查；flags 仅接受 AT_EACCESS/AT_SYMLINK_NOFOLLOW，NOFOLLOW 暂与跟随一致 | 不按 uid/gid 做权限检查 | 缺陷 1；未实现：NOFOLLOW 暂与跟随一致 |
 | fchown/fchownat | Ext4 按 FD 或路径修改属主和属组，两个 ID 独立接受 -1 保留。支持 AT_SYMLINK_NOFOLLOW、空字符串配合 AT_EMPTY_PATH，以及已删名但仍打开的 inode。普通属主可保留原属主并改到原属组、文件系统组或补充组。 | 特权沿用进程有效 UID 为 0 的规则，普通属主按文件系统 UID 判断。暂未接入 CAP_CHOWN、目录搜索授权、FAT、虚拟对象或空指针形式的 AT_EMPTY_PATH。沿用后端 ctime、set-ID 位及日志更新规则。 | 缺陷 2；未实现 |
 | fchmod/fchmodat | 保留 07777 权限位（含 setuid/setgid/sticky），类型位由 inode 持有；仅普通文件与目录可改。fchmod 按已打开对象的 inode 身份生效（rename/unlink 后仍有效，管道/procfs FD 返回 ENOENT）；fchmodat 按路径且总是跟随符号链接，不读取第四个参数，fchmodat2 未实现；FAT 卷返回 ENOTSUP | 通用调用表没有 chmod，libc 的 chmod 走 fchmodat；无属主校验与 ACL | 缺陷 2；未实现：ACL |

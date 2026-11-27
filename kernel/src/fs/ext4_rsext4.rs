@@ -562,6 +562,35 @@ pub(super) fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
     })
 }
 
+/// 创建命名管道节点并保存权限和属主信息。
+pub(super) fn create_fifo(
+    parent: u32,
+    name: &str,
+    mode: u16,
+    owner: (u32, u32),
+) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        v.invalidate_dcache();
+        rsext4::file::create_fifo_inode(
+            &mut v.device,
+            &mut v.fs,
+            InodeNumber::new(parent)?,
+            name,
+            mode,
+            owner,
+        )
+        .map(|_| ())
+        .inspect_err(|e| {
+            if matches!(e.code, rsext4::Errno::EIO | rsext4::Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })
+    })
+}
+
 /// 在指定父目录创建符号链接，允许相对或悬空目标。
 pub(super) fn symlink(
     parent: u32,

@@ -388,6 +388,19 @@ pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
     }
 }
 
+/// 创建命名管道节点并保存权限和属主信息。
+pub(crate) fn create_fifo(
+    parent: u32,
+    name: &str,
+    mode: u16,
+    owner: (u32, u32),
+) -> Result<(), Errno> {
+    if parent & FAT_INODE != 0 || procfs::pid_ino_parts(parent).is_some() {
+        return Err(Errno::NotSupported);
+    }
+    ext4::create_fifo(parent, name, mode, owner)
+}
+
 /// 在指定父目录下创建符号链接；FAT 与虚拟目录不支持。
 pub(crate) fn symlink(
     parent: u32,
@@ -410,7 +423,7 @@ pub(crate) fn link(source: &Metadata, parent: u32, name: &str) -> Result<(), Err
     let ino = source.inode_handle();
     if ino & FAT_INODE != 0
         || procfs::pid_ino_parts(ino).is_some()
-        || !matches!(source.mode & 0xf000, 0x8000 | 0xa000)
+        || !matches!(source.mode & 0xf000, 0x8000 | 0xa000 | 0x1000)
     {
         return Err(Errno::Perm);
     }

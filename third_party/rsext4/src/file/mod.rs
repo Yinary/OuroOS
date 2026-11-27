@@ -34,6 +34,8 @@ pub use blocks::build_file_block_mapping_with_inode_num;
 pub use create::{create_symbol_link, create_symbol_link_with_owner, mkfile, mkfile_with_owner};
 // OuroOS patch: create a regular file by parent inode.
 pub use create::create_regular_inode;
+// OuroOS patch: 按父 inode 创建命名管道节点。
+pub use create::create_fifo_inode;
 // OuroOS patch: create a symbolic link by parent inode.
 pub use create::create_symlink_inode;
 pub use delete::{
