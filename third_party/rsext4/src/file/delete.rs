@@ -95,6 +95,10 @@ pub fn unlink_file_entry<B: BlockDevice>(
     undo.block(fs, device, entry.phys)?;
     undo.inode(fs, device, ino)?;
     undo.inode(fs, device, parent)?;
+    let index = fs
+        .directory_index
+        .take()
+        .filter(|index| index.parent == parent);
     let result = (|| {
         remove_named_entry_at(fs, device, parent, &dir, entry.phys, name.as_bytes())?;
         fs.set_inode_links_count(device, ino, links)?;
@@ -103,6 +107,9 @@ pub fn unlink_file_entry<B: BlockDevice>(
     })();
     if result.is_err() {
         undo.restore(fs, device).map_err(|_| Ext4Error::io())?;
+    } else {
+        // 删除后的指纹只会增加候选查询，命中仍由目录块中的名称确认。
+        fs.directory_index = index;
     }
     result
 }
@@ -269,6 +276,7 @@ fn try_remove_dentry_in_block<B: BlockDevice>(
     phys: AbsoluteBN,
     name_bytes: &[u8],
 ) -> Ext4Result<bool> {
+    fs.directory_index = None;
     let superblock = &fs.superblock;
     let mut removed = false;
     // OuroOS patch: 目录块经日志事务（与插入同路径），不直写 home
@@ -328,6 +336,11 @@ pub(crate) fn find_named_entry_in_parent<B: BlockDevice>(
 
     if !parent_inode.is_dir() {
         return Err(Ext4Error::not_dir());
+    }
+    if let Some(result) =
+        crate::dir::index::cached_lookup(fs, block_dev, _parent_ino, parent_inode, name_bytes)
+    {
+        return result;
     }
 
     if parent_inode.is_htree_indexed()

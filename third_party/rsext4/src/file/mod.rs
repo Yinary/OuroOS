@@ -44,6 +44,7 @@ pub use delete::{
 // OuroOS patch: separate directory-entry removal from inode reclamation.
 pub use delete::unlink_file_entry;
 // OuroOS patch: reuse directory-entry lookup for mkdir.
+pub(crate) use delete::ParentDirEntry;
 pub(crate) use delete::find_named_entry_in_parent;
 pub use io::{
     read_file, read_inode_data_into, truncate, truncate_inode, write_file, write_inode_data,

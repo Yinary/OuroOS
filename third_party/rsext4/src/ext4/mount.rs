@@ -202,6 +202,7 @@ impl Ext4FileSystem {
             mounted: true,
             readonly: options.readonly,
             journal_sb_block_start: None,
+            directory_index: None,
         };
         // Dump the core topology once so later failures have useful context in
         // the logs.
@@ -303,8 +304,7 @@ impl Ext4FileSystem {
                         || j_sb.s_errno != 0
                         || j_sb.s_feature_compat != 0
                         || j_sb.s_feature_ro_compat != 0
-                        || incompat
-                            & !(JBD2_FEATURE_INCOMPAT_64BIT | JBD2_FEATURE_INCOMPAT_CSUM_V3)
+                        || incompat & !(JBD2_FEATURE_INCOMPAT_64BIT | JBD2_FEATURE_INCOMPAT_CSUM_V3)
                             != 0
                         || (has_64bit && !v3_csum)
                         || (v3_csum && j_sb.s_checksum_type != JBD2_CRC32C_CHKSUM)
