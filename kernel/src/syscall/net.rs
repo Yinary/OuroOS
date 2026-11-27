@@ -94,33 +94,52 @@ pub(crate) fn dispatch_sync(
 ) -> Result<usize, Errno> {
     match nr {
         sysnr::SOCKET => {
-            // socket(2)：创建 AF_INET SOCK_STREAM/SOCK_DGRAM 套接字。
+            // socket(2)：创建 AF_INET 或 AF_UNIX 的 SOCK_STREAM/SOCK_DGRAM 套接字。
             let domain = args[0] as u32 as i32;
             let raw_type = args[1] as u32 as usize;
             let protocol = args[2] as u32 as i32;
-            if domain != AF_INET as i32 {
+            if domain != AF_INET as i32 && domain != AF_UNIX as i32 {
                 return Err(Errno::AfNoSupport);
             }
             let flags = raw_type & !0xf;
             if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
                 return Err(Errno::Invalid);
             }
-            let sock_type = match (raw_type & 0xf) as i32 {
-                SOCK_STREAM => {
-                    if protocol != IPPROTO_IP && protocol != IPPROTO_TCP {
-                        return Err(Errno::ProtoNoSupport);
-                    }
-                    SockType::Stream
+            let base_type = (raw_type & 0xf) as i32;
+            if !(1..=10).contains(&base_type) {
+                return Err(Errno::Invalid);
+            }
+            let sock_type = if domain == AF_UNIX as i32 {
+                if protocol != 0 {
+                    return Err(Errno::ProtoNoSupport);
                 }
-                SOCK_DGRAM => {
-                    if protocol != IPPROTO_IP && protocol != IPPROTO_UDP {
-                        return Err(Errno::ProtoNoSupport);
-                    }
-                    SockType::Dgram
+                match base_type {
+                    SOCK_STREAM => SockType::Stream,
+                    SOCK_DGRAM => SockType::Dgram,
+                    _ => return Err(Errno::ProtoNoSupport),
                 }
-                _ => return Err(Errno::ProtoType),
+            } else {
+                match base_type {
+                    SOCK_STREAM => {
+                        if protocol != IPPROTO_IP && protocol != IPPROTO_TCP {
+                            return Err(Errno::ProtoNoSupport);
+                        }
+                        SockType::Stream
+                    }
+                    SOCK_DGRAM => {
+                        if protocol != IPPROTO_IP && protocol != IPPROTO_UDP {
+                            return Err(Errno::ProtoNoSupport);
+                        }
+                        SockType::Dgram
+                    }
+                    _ => return Err(Errno::ProtoNoSupport),
+                }
             };
-            let id = net::create(sock_type)?;
+            let id = if domain == AF_UNIX as i32 {
+                net::create_unix(sock_type)?
+            } else {
+                net::create(sock_type)?
+            };
             fs.open_socket(id, flags & SOCK_NONBLOCK != 0, flags & SOCK_CLOEXEC != 0)
         }
         sysnr::SOCKETPAIR => {
@@ -129,24 +148,35 @@ pub(crate) fn dispatch_sync(
             let raw_type = args[1] as u32 as usize;
             let protocol = args[2] as u32 as i32;
             let sv_ptr = args[3];
-            if domain == AF_INET as i32 {
-                return Err(Errno::NotSupported);
-            }
-            if domain != AF_UNIX as i32 {
+            if domain != AF_UNIX as i32 && domain != AF_INET as i32 {
                 return Err(Errno::AfNoSupport);
-            }
-            if protocol != 0 {
-                return Err(Errno::ProtoNoSupport);
             }
             let flags = raw_type & !0xf;
             if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
                 return Err(Errno::Invalid);
             }
-            let sock_type = match (raw_type & 0xf) as i32 {
+            let base_type = (raw_type & 0xf) as i32;
+            if !(1..=10).contains(&base_type) {
+                return Err(Errno::Invalid);
+            }
+            let sock_type = match base_type {
                 SOCK_STREAM => SockType::Stream,
                 SOCK_DGRAM => SockType::Dgram,
-                _ => return Err(Errno::ProtoType),
+                _ => return Err(Errno::ProtoNoSupport),
             };
+            if domain == AF_INET as i32 {
+                let proto_ok = match sock_type {
+                    SockType::Stream => protocol == IPPROTO_IP || protocol == IPPROTO_TCP,
+                    SockType::Dgram => protocol == IPPROTO_IP || protocol == IPPROTO_UDP,
+                };
+                if !proto_ok {
+                    return Err(Errno::ProtoNoSupport);
+                }
+                return Err(Errno::NotSupported);
+            }
+            if protocol != 0 {
+                return Err(Errno::ProtoNoSupport);
+            }
             if sv_ptr == 0 {
                 return Err(Errno::Fault);
             }
