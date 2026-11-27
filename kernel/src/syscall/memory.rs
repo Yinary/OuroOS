@@ -79,11 +79,15 @@ fn mmap_region(
     ctx: &crate::fs::context::Context,
 ) -> Result<usize, Errno> {
     let [addr, len, prot, map_flags, _fd, offset] = a;
-    let n = pages(len)?;
-    let f = flags(prot)?;
     if offset % PAGE_SIZE != 0 {
         return Err(Errno::Invalid);
     }
+    // 对齐 Linux ksys_mmap_pgoff：非匿名映射先校验 FD 有效性（EBADF），再校验长度
+    if map_flags & 0x20 == 0 {
+        ctx.get(_fd)?;
+    }
+    let n = pages(len)?;
+    let f = flags(prot)?;
     if map_flags & 3 == 0 || (map_flags & 3 == 3 && map_flags & 0x20 != 0) {
         return Err(Errno::Invalid);
     }

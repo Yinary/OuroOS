@@ -47,3 +47,10 @@ LoongArch 关机使用 PolyHAL 0.4.0（MIT）中 QEMU virt GED 的寄存器地�
   - `file/io.rs` 单块读免 `Vec<ExtentRun>` 堆分配与 `write_regular_inode_data` 合并加载；
   - `metadata/apply.rs` 按 Linux `mount(8)` 默认 `relatime` 语义更新 `atime`；
   - `cache/inode_table.rs` 与 `checksum/inode.rs` 命中单次查找及落盘编码前延迟更新 inode CRC32C（思路参考 Linux Ext4 `ext4_do_update_inode`，未复制 GPL 源码）。
+
+## 本轮符号链接与硬链接涉及的第三方补丁（2026-11-27）
+
+- `third_party/rsext4`（Apache-2.0，rsext4 0.8.1）新增补丁（均标注 `// OuroOS patch:`，明细见 `third_party/rsext4/README.md`）：
+  - `file/create.rs` 新增 `create_symlink_inode`（支持相对与悬空目标，区分 <60 字节快速内联与块存储长链接）；
+  - `file/link.rs` 新增 `link_inode`（按 inode 创建非目录硬链接，支持 `EMLINK` 检查与失败回滚）；
+  - `file/delete.rs` 扩展 `unlink_regular_entry` 支持删除符号链接，并在 `free_inode` 中为快速内联符号链接跳过块指针遍历。

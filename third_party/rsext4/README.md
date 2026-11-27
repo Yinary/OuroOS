@@ -38,3 +38,7 @@ Cargo 清单移除了随上游测试程序提供的目标。内核默认启用�
   2. `file/io.rs` 单块读直接走 `resolve_inode_block` 免除 `Vec<ExtentRun>` 堆分配，新增 `write_regular_inode_data` 合并类型校验与旧长度返回；
   3. `metadata/apply.rs` 采用 Linux `mount(8)` 默认 `relatime` 语义（仅当 `atime <= mtime/ctime` 或超过 24 小时才更新 `atime`）并复用已加载 inode；
   4. `cache/inode_table.rs` 与 `checksum/inode.rs` 优化命中单次 `BTreeMap` 查找，并将元数据校验和计算延迟至 `InodeCache` 落盘编码前统一执行（复用挂载时预计算的超级块校验种子与 256 字节栈缓冲），落盘结果与原逐次重算位级一致。
+- 符号链接与硬链接补丁（`fs/link-symlink-sendfile`）：
+  1. `file/create.rs` 新增 `create_symlink_inode`，按父 inode 在线性目录创建符号链接，允许相对与悬空目标（不校验目标存在性），同时支持 <60 字节内联快速链接与块存储长链接；
+  2. `file/link.rs` 新增 `link_inode`，按目标 inode 与父目录 inode 创建硬链接（拒绝目录返回 `EPERM`，超 `65000` 链接数返回 `EMLINK`，更新链接计数失败时回滚目录项）；
+  3. `file/delete.rs` 扩展 `unlink_regular_entry` 放行符号链接，并在 `free_inode` 中跳过内联快速符号链接的 `extent_block_map` 遍历，避免把内联目标文本误作块号释放。

@@ -1,6 +1,6 @@
-//! 套接字类系统调用实现（socket/bind/listen/accept/connect/getsockname/
+//! 套接字类系统调用实现（socket/socketpair/bind/listen/accept/connect/getsockname/
 //! getpeername/sendto/recvfrom/setsockopt/getsockopt/shutdown）。
-//! 当前覆盖 AF_INET 本地回环 UDP 与 TCP，语义范围见 docs/ostd-contracts.md。
+//! 当前覆盖 AF_INET 本地回环 UDP/TCP 与 AF_UNIX 匿名套接字对，语义范围见 docs/ostd-contracts.md。
 #![deny(unsafe_code)]
 
 use alloc::vec::Vec;
@@ -10,8 +10,9 @@ use crate::{
     fs::context::Context,
     mm::{address_space::UserAddressSpace, user_access},
     net::{
-        self, SockType, SocketAddrV4, AF_INET, AF_UNSPEC, IPPROTO_IP, IPPROTO_TCP, IPPROTO_UDP,
-        MSG_NOSIGNAL, SOCKADDR_IN_LEN, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM,
+        self, SockType, SocketAddr, SocketAddrV4, AF_INET, AF_UNIX, AF_UNSPEC, IPPROTO_IP,
+        IPPROTO_TCP, IPPROTO_UDP, MSG_NOSIGNAL, SOCKADDR_IN_LEN, SOCK_CLOEXEC, SOCK_DGRAM,
+        SOCK_NONBLOCK, SOCK_STREAM,
     },
     syscall::{sysnr, Errno},
     task::{
@@ -53,7 +54,7 @@ fn write_sockaddr(
     space: &UserAddressSpace,
     addr: usize,
     addrlen_ptr: usize,
-    sockaddr: SocketAddrV4,
+    sockaddr: SocketAddr,
 ) -> Result<(), Errno> {
     if addr == 0 || addrlen_ptr == 0 {
         return Err(Errno::Fault);
@@ -64,12 +65,22 @@ fn write_sockaddr(
     if user_len < 0 {
         return Err(Errno::Invalid);
     }
-    let encoded = sockaddr.to_bytes();
-    let copy_len = (user_len as usize).min(SOCKADDR_IN_LEN);
+    let mut buf = [0u8; SOCKADDR_IN_LEN];
+    let total_len = match sockaddr {
+        SocketAddr::V4(v4) => {
+            buf.copy_from_slice(&v4.to_bytes());
+            SOCKADDR_IN_LEN
+        }
+        SocketAddr::Unix => {
+            buf[0..2].copy_from_slice(&AF_UNIX.to_ne_bytes());
+            2
+        }
+    };
+    let copy_len = (user_len as usize).min(total_len);
     if copy_len > 0 {
-        user_access::copy_to_user(space, addr, &encoded[..copy_len]).map_err(|_| Errno::Fault)?;
+        user_access::copy_to_user(space, addr, &buf[..copy_len]).map_err(|_| Errno::Fault)?;
     }
-    let actual_len = (SOCKADDR_IN_LEN as u32).to_ne_bytes();
+    let actual_len = (total_len as u32).to_ne_bytes();
     user_access::copy_to_user(space, addrlen_ptr, &actual_len).map_err(|_| Errno::Fault)?;
     Ok(())
 }
@@ -83,34 +94,118 @@ pub(crate) fn dispatch_sync(
 ) -> Result<usize, Errno> {
     match nr {
         sysnr::SOCKET => {
-            // socket(2)：创建 AF_INET SOCK_STREAM/SOCK_DGRAM 套接字。
+            // socket(2)：创建 AF_INET 或 AF_UNIX 的 SOCK_STREAM/SOCK_DGRAM 套接字。
             let domain = args[0] as u32 as i32;
             let raw_type = args[1] as u32 as usize;
             let protocol = args[2] as u32 as i32;
-            if domain != AF_INET as i32 {
+            if domain != AF_INET as i32 && domain != AF_UNIX as i32 {
                 return Err(Errno::AfNoSupport);
             }
             let flags = raw_type & !0xf;
             if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
                 return Err(Errno::Invalid);
             }
-            let sock_type = match (raw_type & 0xf) as i32 {
-                SOCK_STREAM => {
-                    if protocol != IPPROTO_IP && protocol != IPPROTO_TCP {
-                        return Err(Errno::ProtoNoSupport);
-                    }
-                    SockType::Stream
+            let base_type = (raw_type & 0xf) as i32;
+            if !(1..=10).contains(&base_type) {
+                return Err(Errno::Invalid);
+            }
+            let sock_type = if domain == AF_UNIX as i32 {
+                if protocol != 0 {
+                    return Err(Errno::ProtoNoSupport);
                 }
-                SOCK_DGRAM => {
-                    if protocol != IPPROTO_IP && protocol != IPPROTO_UDP {
-                        return Err(Errno::ProtoNoSupport);
-                    }
-                    SockType::Dgram
+                match base_type {
+                    SOCK_STREAM => SockType::Stream,
+                    SOCK_DGRAM => SockType::Dgram,
+                    _ => return Err(Errno::ProtoNoSupport),
                 }
-                _ => return Err(Errno::ProtoType),
+            } else {
+                match base_type {
+                    SOCK_STREAM => {
+                        if protocol != IPPROTO_IP && protocol != IPPROTO_TCP {
+                            return Err(Errno::ProtoNoSupport);
+                        }
+                        SockType::Stream
+                    }
+                    SOCK_DGRAM => {
+                        if protocol != IPPROTO_IP && protocol != IPPROTO_UDP {
+                            return Err(Errno::ProtoNoSupport);
+                        }
+                        SockType::Dgram
+                    }
+                    _ => return Err(Errno::ProtoNoSupport),
+                }
             };
-            let id = net::create(sock_type)?;
+            let id = if domain == AF_UNIX as i32 {
+                net::create_unix(sock_type)?
+            } else {
+                net::create(sock_type)?
+            };
             fs.open_socket(id, flags & SOCK_NONBLOCK != 0, flags & SOCK_CLOEXEC != 0)
+        }
+        sysnr::SOCKETPAIR => {
+            // socketpair(2)：创建一对已互连的 AF_UNIX SOCK_STREAM/SOCK_DGRAM 套接字。
+            let domain = args[0] as u32 as i32;
+            let raw_type = args[1] as u32 as usize;
+            let protocol = args[2] as u32 as i32;
+            let sv_ptr = args[3];
+            if domain != AF_UNIX as i32 && domain != AF_INET as i32 {
+                return Err(Errno::AfNoSupport);
+            }
+            let flags = raw_type & !0xf;
+            if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+                return Err(Errno::Invalid);
+            }
+            let base_type = (raw_type & 0xf) as i32;
+            if !(1..=10).contains(&base_type) {
+                return Err(Errno::Invalid);
+            }
+            let sock_type = match base_type {
+                SOCK_STREAM => SockType::Stream,
+                SOCK_DGRAM => SockType::Dgram,
+                _ => return Err(Errno::ProtoNoSupport),
+            };
+            if domain == AF_INET as i32 {
+                let proto_ok = match sock_type {
+                    SockType::Stream => protocol == IPPROTO_IP || protocol == IPPROTO_TCP,
+                    SockType::Dgram => protocol == IPPROTO_IP || protocol == IPPROTO_UDP,
+                };
+                if !proto_ok {
+                    return Err(Errno::ProtoNoSupport);
+                }
+                return Err(Errno::NotSupported);
+            }
+            if protocol != 0 {
+                return Err(Errno::ProtoNoSupport);
+            }
+            if sv_ptr == 0 {
+                return Err(Errno::Fault);
+            }
+            let nonblock = flags & SOCK_NONBLOCK != 0;
+            let cloexec = flags & SOCK_CLOEXEC != 0;
+            let (id0, id1) = net::create_unix_pair(sock_type)?;
+            let fd0 = match fs.open_socket(id0, nonblock, cloexec) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    net::close(id1);
+                    return Err(e);
+                }
+            };
+            let fd1 = match fs.open_socket(id1, nonblock, cloexec) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    let _ = fs.close(fd0, 0);
+                    return Err(e);
+                }
+            };
+            let mut out = [0u8; 8];
+            out[0..4].copy_from_slice(&(fd0 as i32).to_ne_bytes());
+            out[4..8].copy_from_slice(&(fd1 as i32).to_ne_bytes());
+            if user_access::copy_to_user(space, sv_ptr, &out).is_err() {
+                let _ = fs.close(fd0, 0);
+                let _ = fs.close(fd1, 0);
+                return Err(Errno::Fault);
+            }
+            Ok(0)
         }
         sysnr::BIND => {
             // bind(2)：绑定本地 IPv4 地址（0.0.0.0 或 127.x.x.x）。
@@ -196,9 +291,16 @@ pub(crate) fn dispatch_sync(
     }
 }
 
-fn wait_with_timeout(timeout: Option<Duration>, sleep_deadline: &mut Option<Duration>) -> NetFlow {
+fn wait_with_timeout(
+    wake_id: Option<u64>,
+    timeout: Option<Duration>,
+    sleep_deadline: &mut Option<Duration>,
+) -> NetFlow {
     let Some(dur) = timeout else {
-        return NetFlow::Wait(WaitReason::Pipe);
+        return NetFlow::Wait(match wake_id {
+            Some(id) => WaitReason::PipeId(id),
+            None => WaitReason::Pipe,
+        });
     };
     let now = crate::time::monotonic();
     let deadline = match *sleep_deadline {
@@ -248,8 +350,8 @@ pub(crate) fn dispatch_blocking(
                 flags & SOCK_CLOEXEC != 0,
             )?;
             if args[1] != 0 {
-                if let Err(e) = write_sockaddr(space, args[1], args[2], peer) {
-                    let _ = fs.close(new_fd);
+                if let Err(e) = write_sockaddr(space, args[1], args[2], SocketAddr::V4(peer)) {
+                    let _ = fs.close(new_fd, 0);
                     return Err(e);
                 }
             }
@@ -322,7 +424,7 @@ pub(crate) fn dispatch_blocking(
                 }
                 if src_addr_ptr != 0 {
                     if let Some(peer) = src {
-                        write_sockaddr(space, src_addr_ptr, src_len_ptr, peer)?;
+                        write_sockaddr(space, src_addr_ptr, src_len_ptr, SocketAddr::V4(peer))?;
                     }
                 }
                 Ok(data.len())
@@ -332,11 +434,17 @@ pub(crate) fn dispatch_blocking(
     };
 
     if result == Err(Errno::WouldBlock) {
-        let timeout = fs.socket_id(args[0]).ok().and_then(|(id, _)| match nr {
-            sysnr::SENDTO | sysnr::CONNECT => net::snd_timeout(id),
-            _ => net::rcv_timeout(id),
-        });
-        return wait_with_timeout(timeout, sleep_deadline);
+        let (wake_id, timeout) = match fs.socket_id(args[0]).ok() {
+            Some((id, _)) => (
+                Some(id.wake_id()),
+                match nr {
+                    sysnr::SENDTO | sysnr::CONNECT => net::snd_timeout(id),
+                    _ => net::rcv_timeout(id),
+                },
+            ),
+            None => (None, None),
+        };
+        return wait_with_timeout(wake_id, timeout, sleep_deadline);
     }
     *sleep_deadline = None;
     NetFlow::Done(result)

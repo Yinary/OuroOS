@@ -754,7 +754,7 @@ mod registry {
             };
             // 向上寻找最近的存活 child_subreaper 祖先；找不到则过继 init。
             let mut reparent_to = init;
-            let mut cursor = parent_pid;
+            let mut cursor = reg.thread(parent_pid).map_or(parent_pid, |t| t.tgid);
             for _ in 0..reg.records.len() {
                 if cursor == 0 || cursor == init || cursor == pid {
                     break;
@@ -773,6 +773,7 @@ mod registry {
                 cursor = ancestor.parent;
             }
             // PR_SET_PDEATHSIG：向每个设置了父亡信号的存活子进程投递信号。
+            let mut sent_pdeath = false;
             let reg_ref = &mut *reg;
             for child in reg_ref
                 .records
@@ -794,7 +795,11 @@ mod registry {
                         },
                         thread.signal.blocked(),
                     );
+                    sent_pdeath = true;
                 }
+            }
+            if sent_pdeath {
+                sched::request_signal_wake();
             }
             // 孤儿即收：无 subreaper 时清理已退出孩子及过继 init 的任务；
             // 有 subreaper 时将所有孩子（含僵尸）过继给 subreaper 并补发 SIGCHLD。
@@ -856,14 +861,16 @@ mod registry {
                             );
                         }
                     }
+                    sched::request_children_wake();
                 }
             }
-            // 自检：父进程退出后不再留有以自身为父的记录，孤儿退出清理自身。
+            // 自检：父进程退出清理或过继全部孩子，孤儿退出清理自身。
             debug_assert!(reg.records.iter().all(|r| r.parent != pid));
             debug_assert!(!orphan || reg.records.iter().all(|r| r.pid != pid));
             taken
         };
-        // 锁外 Drop：页表/页释放、fd 关闭，可能触发磁盘回收写
+        // 锁外释放该进程持有的全部 POSIX 记录锁，再 Drop 地址空间与 FD 表。
+        crate::fs::locks::release_process_locks(pid as u32);
         drop(taken);
     }
 
