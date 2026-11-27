@@ -14,15 +14,28 @@ pub fn free_inode<B: BlockDevice>(
     inode_num: InodeNumber,
     inode: &mut Ext4Inode,
 ) -> Ext4Result<()> {
-    let mut used_blocks: Vec<AbsoluteBN> = extent_block_map(block_dev, inode, true)?
-        .into_values()
-        .collect();
-    if inode.have_extend_header_and_use_extend() {
-        used_blocks.extend(
-            ExtentTree::with_checksum(inode, &fs.superblock, inode_num)
-                .external_node_blocks(block_dev)?,
-        );
-    }
+    // OuroOS patch: fast symlinks store target bytes inline in i_block, never parse as block pointers.
+    let xattr_sectors = if inode.file_acl() == 0 {
+        0
+    } else {
+        (BLOCK_SIZE / 512) as u64
+    };
+    let fast_symlink =
+        inode.is_symlink() && inode.size() < 60 && inode.blocks_count() == xattr_sectors;
+    let mut used_blocks: Vec<AbsoluteBN> = if fast_symlink {
+        Vec::new()
+    } else {
+        let mut blocks: Vec<AbsoluteBN> = extent_block_map(block_dev, inode, true)?
+            .into_values()
+            .collect();
+        if inode.have_extend_header_and_use_extend() {
+            blocks.extend(
+                ExtentTree::with_checksum(inode, &fs.superblock, inode_num)
+                    .external_node_blocks(block_dev)?,
+            );
+        }
+        blocks
+    };
     used_blocks.sort_unstable();
     used_blocks.dedup();
 
@@ -75,7 +88,8 @@ pub fn unlink_regular_entry<B: BlockDevice>(
     if inode.is_dir() {
         return Err(Ext4Error::is_dir());
     }
-    if !inode.is_file() {
+    // OuroOS patch: allow unlinking symlinks in addition to regular files.
+    if !inode.is_file() && !inode.is_symlink() {
         return Err(Ext4Error::unsupported());
     }
     let links = inode.i_links_count.checked_sub(1).ok_or_else(Ext4Error::corrupted)?;

@@ -1,4 +1,5 @@
-//! 本地回环 IPv4（AF_INET）套接字子系统：支持 UDP 数据报与 TCP 字节流。
+//! 本地回环 IPv4（AF_INET）与匿名 UNIX 域（AF_UNIX）套接字子系统：
+//! 支持 UDP 数据报、TCP 字节流与 socketpair 匿名连接对。
 //! 契约与支持范围见 docs/ostd-contracts.md。
 #![deny(unsafe_code)]
 
@@ -12,6 +13,7 @@ use spin::Mutex;
 use crate::syscall::Errno;
 
 pub const AF_UNSPEC: u16 = 0;
+pub const AF_UNIX: u16 = 1;
 pub const AF_INET: u16 = 2;
 
 pub const SOCK_STREAM: i32 = 1;
@@ -68,6 +70,7 @@ pub const SOCKADDR_IN_LEN: usize = 16;
 const EPHEMERAL_START: u16 = 49152;
 const EPHEMERAL_END: u16 = 65535;
 const STREAM_BUF_DEFAULT: usize = 131_072;
+const UNIX_BUF_DEFAULT: usize = 16_384;
 const TCP_DEFAULT_MSS: i32 = 1460;
 const MAX_UDP_PAYLOAD: usize = 65507;
 const MAX_UDP_QUEUE_BYTES: usize = 2 * 1024 * 1024;
@@ -76,6 +79,20 @@ const MAX_UDP_QUEUE_PACKETS: usize = 512;
 /// 套接字句柄标识，由全局表分配，关闭时回收。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SocketId(u64);
+
+impl SocketId {
+    /// 供调度器定向唤醒的唯一键（最高位置 1，避免与管道实例号碰撞）。
+    pub fn wake_id(self) -> u64 {
+        (1u64 << 63) | self.0
+    }
+}
+
+/// 套接字地址：IPv4 或匿名 UNIX 域。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketAddr {
+    V4(SocketAddrV4),
+    Unix,
+}
 
 /// 支持的传输层套接字类型。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,6 +189,17 @@ enum TcpState {
 enum SockKind {
     Udp(UdpSocket),
     Tcp(TcpState),
+    UnixStream {
+        peer_id: Option<SocketId>,
+        rx: VecDeque<u8>,
+        peer_closed: bool,
+    },
+    UnixDgram {
+        peer_id: Option<SocketId>,
+        rx: VecDeque<Vec<u8>>,
+        rx_bytes: usize,
+        peer_closed: bool,
+    },
 }
 
 struct SocketOptions {
@@ -238,9 +266,13 @@ struct SocketEntry {
 impl SocketEntry {
     fn sock_type(&self) -> SockType {
         match self.kind {
-            SockKind::Udp(_) => SockType::Dgram,
-            SockKind::Tcp(_) => SockType::Stream,
+            SockKind::Udp(_) | SockKind::UnixDgram { .. } => SockType::Dgram,
+            SockKind::Tcp(_) | SockKind::UnixStream { .. } => SockType::Stream,
         }
+    }
+
+    fn is_inet(&self) -> bool {
+        matches!(self.kind, SockKind::Udp(_) | SockKind::Tcp(_))
     }
 
     fn local_addr(&self) -> Option<SocketAddrV4> {
@@ -250,6 +282,7 @@ impl SocketEntry {
             SockKind::Tcp(TcpState::Bound { local })
             | SockKind::Tcp(TcpState::Listening { local, .. })
             | SockKind::Tcp(TcpState::Connected { local, .. }) => Some(*local),
+            SockKind::UnixStream { .. } | SockKind::UnixDgram { .. } => None,
         }
     }
 }
@@ -404,14 +437,26 @@ impl NetState {
     fn detach_peer(&mut self, peer_id: Option<SocketId>, reset: bool) {
         if let Some(pid) = peer_id {
             if let Some(peer) = self.sockets.get_mut(&pid) {
-                if let SockKind::Tcp(TcpState::Connected {
-                    peer_id,
-                    peer_closed,
-                    ..
-                }) = &mut peer.kind
-                {
-                    *peer_id = None;
-                    *peer_closed = true;
+                match &mut peer.kind {
+                    SockKind::Tcp(TcpState::Connected {
+                        peer_id,
+                        peer_closed,
+                        ..
+                    })
+                    | SockKind::UnixStream {
+                        peer_id,
+                        peer_closed,
+                        ..
+                    }
+                    | SockKind::UnixDgram {
+                        peer_id,
+                        peer_closed,
+                        ..
+                    } => {
+                        *peer_id = None;
+                        *peer_closed = true;
+                    }
+                    _ => {}
                 }
                 if reset {
                     peer.opts.pending_error = 104; // ECONNRESET
@@ -448,6 +493,71 @@ pub fn create(sock_type: SockType) -> Result<SocketId, Errno> {
     Ok(id)
 }
 
+/// 创建未连接的 AF_UNIX 套接字（支持 SOCK_STREAM 与 SOCK_DGRAM）。
+pub fn create_unix(sock_type: SockType) -> Result<SocketId, Errno> {
+    let mut net = NET.lock();
+    let id = net.alloc_id();
+    let kind = match sock_type {
+        SockType::Stream => SockKind::UnixStream {
+            peer_id: None,
+            rx: VecDeque::new(),
+            peer_closed: false,
+        },
+        SockType::Dgram => SockKind::UnixDgram {
+            peer_id: None,
+            rx: VecDeque::new(),
+            rx_bytes: 0,
+            peer_closed: false,
+        },
+    };
+    net.sockets.insert(
+        id,
+        SocketEntry {
+            kind,
+            opts: SocketOptions {
+                snd_buf: UNIX_BUF_DEFAULT,
+                rcv_buf: UNIX_BUF_DEFAULT,
+                ..SocketOptions::default()
+            },
+            shut_rd: false,
+            shut_wr: false,
+        },
+    );
+    Ok(id)
+}
+
+/// 创建一对已互连的匿名 AF_UNIX 套接字（支持 SOCK_STREAM 与 SOCK_DGRAM）。
+pub fn create_unix_pair(sock_type: SockType) -> Result<(SocketId, SocketId), Errno> {
+    let mut net = NET.lock();
+    let id0 = net.alloc_id();
+    let id1 = net.alloc_id();
+    let make_entry = |peer: SocketId| SocketEntry {
+        kind: match sock_type {
+            SockType::Stream => SockKind::UnixStream {
+                peer_id: Some(peer),
+                rx: VecDeque::new(),
+                peer_closed: false,
+            },
+            SockType::Dgram => SockKind::UnixDgram {
+                peer_id: Some(peer),
+                rx: VecDeque::new(),
+                rx_bytes: 0,
+                peer_closed: false,
+            },
+        },
+        opts: SocketOptions {
+            snd_buf: UNIX_BUF_DEFAULT,
+            rcv_buf: UNIX_BUF_DEFAULT,
+            ..SocketOptions::default()
+        },
+        shut_rd: false,
+        shut_wr: false,
+    };
+    net.sockets.insert(id0, make_entry(id1));
+    net.sockets.insert(id1, make_entry(id0));
+    Ok((id0, id1))
+}
+
 /// 关闭套接字并通知对端或清理待接收队列。
 pub fn close(id: SocketId) {
     let mut net = NET.lock();
@@ -456,20 +566,30 @@ pub fn close(id: SocketId) {
     };
     let reset = entry.opts.linger[0] != 0 && entry.opts.linger[1] == 0;
     match entry.kind {
-        SockKind::Udp(_) => {}
-        SockKind::Tcp(TcpState::Connected { peer_id, .. }) => {
+        SockKind::Udp(_) => {
+            crate::task::sched::request_pipe_id_wake(id.wake_id());
+        }
+        SockKind::Tcp(TcpState::Connected { peer_id, .. })
+        | SockKind::UnixStream { peer_id, .. }
+        | SockKind::UnixDgram { peer_id, .. } => {
             net.detach_peer(peer_id, reset);
-            crate::task::sched::request_pipe_wake();
+            if let Some(pid) = peer_id {
+                crate::task::sched::request_pipe_id_wake(pid.wake_id());
+            }
+            crate::task::sched::request_pipe_id_wake(id.wake_id());
         }
         SockKind::Tcp(TcpState::Listening { accept_queue, .. }) => {
             for queued in accept_queue {
                 if let Some(server) = net.sockets.remove(&queued) {
                     if let SockKind::Tcp(TcpState::Connected { peer_id, .. }) = server.kind {
                         net.detach_peer(peer_id, true);
+                        if let Some(pid) = peer_id {
+                            crate::task::sched::request_pipe_id_wake(pid.wake_id());
+                        }
                     }
                 }
             }
-            crate::task::sched::request_pipe_wake();
+            crate::task::sched::request_pipe_id_wake(id.wake_id());
         }
         SockKind::Tcp(TcpState::Unbound | TcpState::Bound { .. }) => {}
     }
@@ -483,7 +603,7 @@ pub fn bind(id: SocketId, addr: SocketAddrV4) -> Result<(), Errno> {
     let mut net = NET.lock();
     let (sock_type, reuse_addr, reuse_port) = {
         let entry = net.sockets.get(&id).ok_or(Errno::BadF)?;
-        if entry.local_addr().is_some() {
+        if !entry.is_inet() || entry.local_addr().is_some() {
             return Err(Errno::Invalid);
         }
         (
@@ -505,7 +625,9 @@ pub fn bind(id: SocketId, addr: SocketAddrV4) -> Result<(), Errno> {
     match &mut entry.kind {
         SockKind::Udp(u) => u.local = Some(bound),
         SockKind::Tcp(state @ TcpState::Unbound) => *state = TcpState::Bound { local: bound },
-        SockKind::Tcp(_) => return Err(Errno::Invalid),
+        SockKind::Tcp(_) | SockKind::UnixStream { .. } | SockKind::UnixDgram { .. } => {
+            return Err(Errno::Invalid)
+        }
     }
     Ok(())
 }
@@ -515,10 +637,12 @@ pub fn listen(id: SocketId, backlog: i32) -> Result<(), Errno> {
     let mut net = NET.lock();
     let backlog = backlog.clamp(1, 128) as usize;
     let needs_bind = match net.sockets.get(&id).ok_or(Errno::BadF)?.kind {
-        SockKind::Udp(_) => return Err(Errno::NotSupported),
+        SockKind::Udp(_) | SockKind::UnixDgram { .. } => return Err(Errno::NotSupported),
         SockKind::Tcp(TcpState::Unbound) => true,
         SockKind::Tcp(TcpState::Bound { .. } | TcpState::Listening { .. }) => false,
-        SockKind::Tcp(TcpState::Connected { .. }) => return Err(Errno::Invalid),
+        SockKind::Tcp(TcpState::Connected { .. }) | SockKind::UnixStream { .. } => {
+            return Err(Errno::Invalid)
+        }
     };
     let auto_port = if needs_bind {
         Some(net.alloc_ephemeral_port(SockType::Stream, id)?)
@@ -554,7 +678,8 @@ pub fn listen(id: SocketId, backlog: i32) -> Result<(), Errno> {
             }
             TcpState::Connected { .. } => return Err(Errno::Invalid),
         },
-        SockKind::Udp(_) => return Err(Errno::NotSupported),
+        SockKind::Udp(_) | SockKind::UnixDgram { .. } => return Err(Errno::NotSupported),
+        SockKind::UnixStream { .. } => return Err(Errno::Invalid),
     }
     Ok(())
 }
@@ -563,7 +688,13 @@ pub fn listen(id: SocketId, backlog: i32) -> Result<(), Errno> {
 /// 非阻塞 TCP 发起连接按 Linux 语义返回 EINPROGRESS，对端随即立即可被 accept。
 pub fn connect(id: SocketId, dst: Option<SocketAddrV4>, nonblock: bool) -> Result<(), Errno> {
     let mut net = NET.lock();
-    let sock_type = net.sockets.get(&id).ok_or(Errno::BadF)?.sock_type();
+    let entry = net.sockets.get(&id).ok_or(Errno::BadF)?;
+    match &entry.kind {
+        SockKind::UnixStream { .. } => return Err(Errno::IsConn),
+        SockKind::UnixDgram { .. } => return Err(Errno::NotSupported),
+        _ => {}
+    }
+    let sock_type = entry.sock_type();
     if sock_type == SockType::Dgram {
         let Some(dst) = dst else {
             // AF_UNSPEC 解除 UDP 默认对端绑定
@@ -620,7 +751,9 @@ pub fn connect(id: SocketId, dst: Option<SocketAddrV4>, nonblock: bool) -> Resul
         SockKind::Tcp(TcpState::Bound { local }) => Some(*local),
         SockKind::Tcp(TcpState::Connected { .. }) => return Err(Errno::IsConn),
         SockKind::Tcp(TcpState::Listening { .. }) => return Err(Errno::Invalid),
-        SockKind::Udp(_) => return Err(Errno::Invalid),
+        SockKind::Udp(_) | SockKind::UnixStream { .. } | SockKind::UnixDgram { .. } => {
+            return Err(Errno::Invalid)
+        }
     };
     let listener_id = net.find_tcp_listener(dst).ok_or(Errno::ConnRefused)?;
     let listener_local = match &net
@@ -682,7 +815,7 @@ pub fn connect(id: SocketId, dst: Option<SocketAddrV4>, nonblock: bool) -> Resul
     {
         accept_queue.push_back(server_id);
     }
-    crate::task::sched::request_pipe_wake();
+    crate::task::sched::request_pipe_id_wake(listener_id.wake_id());
     if nonblock {
         Err(Errno::InProgress)
     } else {
@@ -694,7 +827,7 @@ pub fn connect(id: SocketId, dst: Option<SocketAddrV4>, nonblock: bool) -> Resul
 pub fn accept(id: SocketId, nonblock: bool) -> Result<(SocketId, SocketAddrV4), Errno> {
     let mut net = NET.lock();
     let server_id = match &mut net.sockets.get_mut(&id).ok_or(Errno::BadF)?.kind {
-        SockKind::Udp(_) => return Err(Errno::NotSupported),
+        SockKind::Udp(_) | SockKind::UnixDgram { .. } => return Err(Errno::NotSupported),
         SockKind::Tcp(TcpState::Listening { accept_queue, .. }) => match accept_queue.pop_front() {
             Some(sid) => sid,
             None => {
@@ -705,7 +838,7 @@ pub fn accept(id: SocketId, nonblock: bool) -> Result<(SocketId, SocketAddrV4), 
                 });
             }
         },
-        SockKind::Tcp(_) => return Err(Errno::Invalid),
+        SockKind::Tcp(_) | SockKind::UnixStream { .. } => return Err(Errno::Invalid),
     };
     let peer = match &net.sockets.get(&server_id).ok_or(Errno::ConnReset)?.kind {
         SockKind::Tcp(TcpState::Connected { peer, .. }) => *peer,
@@ -715,21 +848,33 @@ pub fn accept(id: SocketId, nonblock: bool) -> Result<(SocketId, SocketAddrV4), 
     Ok((server_id, peer))
 }
 
-/// 查询本地绑定地址；未绑定时返回 0.0.0.0:0。
-pub fn getsockname(id: SocketId) -> Result<SocketAddrV4, Errno> {
-    let net = NET.lock();
-    let entry = net.sockets.get(&id).ok_or(Errno::BadF)?;
-    Ok(entry.local_addr().unwrap_or(SocketAddrV4::UNSPECIFIED))
-}
-
-/// 查询已连接套接字的对端地址；未连接返回 ENOTCONN。
-pub fn getpeername(id: SocketId) -> Result<SocketAddrV4, Errno> {
+/// 查询本地绑定地址；AF_INET 未绑定时返回 0.0.0.0:0，AF_UNIX 匿名对返回 Unix 地址。
+pub fn getsockname(id: SocketId) -> Result<SocketAddr, Errno> {
     let net = NET.lock();
     let entry = net.sockets.get(&id).ok_or(Errno::BadF)?;
     match &entry.kind {
-        SockKind::Udp(u) => u.peer.ok_or(Errno::NotConn),
-        SockKind::Tcp(TcpState::Connected { peer, .. }) => Ok(*peer),
+        SockKind::UnixStream { .. } | SockKind::UnixDgram { .. } => Ok(SocketAddr::Unix),
+        _ => Ok(SocketAddr::V4(
+            entry.local_addr().unwrap_or(SocketAddrV4::UNSPECIFIED),
+        )),
+    }
+}
+
+/// 查询已连接套接字的对端地址；未连接返回 ENOTCONN。
+pub fn getpeername(id: SocketId) -> Result<SocketAddr, Errno> {
+    let net = NET.lock();
+    let entry = net.sockets.get(&id).ok_or(Errno::BadF)?;
+    match &entry.kind {
+        SockKind::Udp(u) => u.peer.map(SocketAddr::V4).ok_or(Errno::NotConn),
+        SockKind::Tcp(TcpState::Connected { peer, .. }) => Ok(SocketAddr::V4(*peer)),
         SockKind::Tcp(_) => Err(Errno::NotConn),
+        SockKind::UnixStream { peer_id, .. } | SockKind::UnixDgram { peer_id, .. } => {
+            if peer_id.is_some() {
+                Ok(SocketAddr::Unix)
+            } else {
+                Err(Errno::NotConn)
+            }
+        }
     }
 }
 
@@ -793,7 +938,7 @@ pub fn sendto(
                             {
                                 recv_u.rx_bytes += payload.len();
                                 recv_u.rx.push_back(UdpDatagram { src, data: payload });
-                                crate::task::sched::request_pipe_wake();
+                                crate::task::sched::request_pipe_id_wake(recv_id.wake_id());
                             }
                         }
                     }
@@ -805,7 +950,15 @@ pub fn sendto(
             peer_id,
             peer_closed,
             ..
-        }) => {
+        })
+        | SockKind::UnixStream {
+            peer_id,
+            peer_closed,
+            ..
+        } => {
+            if matches!(entry.kind, SockKind::UnixStream { .. }) && dst.is_some() {
+                return Err(Errno::IsConn);
+            }
             if *peer_closed {
                 return Err(Errno::Pipe);
             }
@@ -820,8 +973,11 @@ pub fn sendto(
             if peer.shut_rd {
                 return Err(Errno::Pipe);
             }
-            let SockKind::Tcp(TcpState::Connected { rx, .. }) = &mut peer.kind else {
-                return Err(Errno::Pipe);
+            let rx = match &mut peer.kind {
+                SockKind::Tcp(TcpState::Connected { rx, .. }) | SockKind::UnixStream { rx, .. } => {
+                    rx
+                }
+                _ => return Err(Errno::Pipe),
             };
             let avail = cap.saturating_sub(rx.len());
             // 阻塞写且请求不超过接收缓冲半容时，等待足够空间整块写入，避免小包被拆成短写。
@@ -840,8 +996,50 @@ pub fn sendto(
             let count = data.len().min(avail);
             rx.try_reserve(count).map_err(|_| Errno::NoMem)?;
             rx.extend(&data[..count]);
-            crate::task::sched::request_pipe_wake();
+            crate::task::sched::request_pipe_id_wake(pid.wake_id());
             Ok(count)
+        }
+        SockKind::UnixDgram {
+            peer_id,
+            peer_closed,
+            ..
+        } => {
+            if dst.is_some() {
+                return Err(Errno::IsConn);
+            }
+            if *peer_closed {
+                return Err(Errno::Pipe);
+            }
+            let Some(pid) = *peer_id else {
+                return Err(Errno::Pipe);
+            };
+            let peer = net.sockets.get_mut(&pid).ok_or(Errno::Pipe)?;
+            let cap = peer.opts.rcv_buf.max(4096);
+            if data.len() > cap {
+                return Err(Errno::MsgSize);
+            }
+            if peer.shut_rd {
+                return Err(Errno::Pipe);
+            }
+            let SockKind::UnixDgram { rx, rx_bytes, .. } = &mut peer.kind else {
+                return Err(Errno::Pipe);
+            };
+            if rx.len() >= MAX_UDP_QUEUE_PACKETS || rx_bytes.saturating_add(data.len()) > cap {
+                return Err(if dontwait {
+                    Errno::Again
+                } else {
+                    Errno::WouldBlock
+                });
+            }
+            let mut payload = Vec::new();
+            payload
+                .try_reserve_exact(data.len())
+                .map_err(|_| Errno::NoMem)?;
+            payload.extend_from_slice(data);
+            *rx_bytes += payload.len();
+            rx.push_back(payload);
+            crate::task::sched::request_pipe_id_wake(pid.wake_id());
+            Ok(data.len())
         }
         SockKind::Tcp(_) => Err(Errno::NotConn),
     }
@@ -880,13 +1078,21 @@ pub fn recvfrom(
                 if let Some(dgram) = u.rx.pop_front() {
                     u.rx_bytes = u.rx_bytes.saturating_sub(dgram.data.len());
                 }
-                crate::task::sched::request_pipe_wake();
+                crate::task::sched::request_pipe_id_wake(id.wake_id());
             }
             Ok(delivered)
         }
         SockKind::Tcp(TcpState::Connected {
-            rx, peer_closed, ..
-        }) => {
+            peer_id,
+            rx,
+            peer_closed,
+            ..
+        })
+        | SockKind::UnixStream {
+            peer_id,
+            rx,
+            peer_closed,
+        } => {
             if rx.is_empty() {
                 if *peer_closed || shut_rd {
                     return Ok(0);
@@ -898,8 +1104,11 @@ pub fn recvfrom(
                 });
             }
             let count = buf.len().min(rx.len());
-            for (slot, byte) in buf[..count].iter_mut().zip(rx.iter().take(count)) {
-                *slot = *byte;
+            let (first, second) = rx.as_slices();
+            let take_first = count.min(first.len());
+            buf[..take_first].copy_from_slice(&first[..take_first]);
+            if take_first < count {
+                buf[take_first..count].copy_from_slice(&second[..count - take_first]);
             }
             let delivered = deliver(&buf[..count], None)?;
             if delivered > count {
@@ -907,7 +1116,38 @@ pub fn recvfrom(
             }
             if !peek {
                 rx.drain(..delivered);
-                crate::task::sched::request_pipe_wake();
+                if let Some(pid) = *peer_id {
+                    crate::task::sched::request_pipe_id_wake(pid.wake_id());
+                }
+            }
+            Ok(delivered)
+        }
+        SockKind::UnixDgram {
+            peer_id,
+            rx,
+            rx_bytes,
+            ..
+        } => {
+            let Some(front) = rx.front() else {
+                if shut_rd {
+                    return deliver(&[], None);
+                }
+                return Err(if dontwait {
+                    Errno::Again
+                } else {
+                    Errno::WouldBlock
+                });
+            };
+            let count = buf.len().min(front.len());
+            buf[..count].copy_from_slice(&front[..count]);
+            let delivered = deliver(&buf[..count], None)?;
+            if !peek {
+                if let Some(dgram) = rx.pop_front() {
+                    *rx_bytes = rx_bytes.saturating_sub(dgram.len());
+                }
+                if let Some(pid) = *peer_id {
+                    crate::task::sched::request_pipe_id_wake(pid.wake_id());
+                }
             }
             Ok(delivered)
         }
@@ -921,7 +1161,7 @@ pub fn shutdown(id: SocketId, how: i32) -> Result<(), Errno> {
         return Err(Errno::Invalid);
     }
     let mut net = NET.lock();
-    let peer_to_close = {
+    let (peer_to_wake, close_peer_wr) = {
         let entry = net.sockets.get_mut(&id).ok_or(Errno::BadF)?;
         if matches!(
             entry.kind,
@@ -932,25 +1172,34 @@ pub fn shutdown(id: SocketId, how: i32) -> Result<(), Errno> {
         if how == SHUT_RD || how == SHUT_RDWR {
             entry.shut_rd = true;
         }
-        if how == SHUT_WR || how == SHUT_RDWR {
+        let close_wr = how == SHUT_WR || how == SHUT_RDWR;
+        if close_wr {
             entry.shut_wr = true;
-            if let SockKind::Tcp(TcpState::Connected { peer_id, .. }) = entry.kind {
-                peer_id
-            } else {
-                None
-            }
-        } else {
-            None
         }
+        let peer_id = match entry.kind {
+            SockKind::Tcp(TcpState::Connected { peer_id, .. })
+            | SockKind::UnixStream { peer_id, .. }
+            | SockKind::UnixDgram { peer_id, .. } => peer_id,
+            _ => None,
+        };
+        (peer_id, close_wr)
     };
-    if let Some(pid) = peer_to_close {
-        if let Some(peer) = net.sockets.get_mut(&pid) {
-            if let SockKind::Tcp(TcpState::Connected { peer_closed, .. }) = &mut peer.kind {
-                *peer_closed = true;
+    if let Some(pid) = peer_to_wake {
+        if close_peer_wr {
+            if let Some(peer) = net.sockets.get_mut(&pid) {
+                match &mut peer.kind {
+                    SockKind::Tcp(TcpState::Connected { peer_closed, .. })
+                    | SockKind::UnixStream { peer_closed, .. }
+                    | SockKind::UnixDgram { peer_closed, .. } => {
+                        *peer_closed = true;
+                    }
+                    _ => {}
+                }
             }
         }
+        crate::task::sched::request_pipe_id_wake(pid.wake_id());
     }
-    crate::task::sched::request_pipe_wake();
+    crate::task::sched::request_pipe_id_wake(id.wake_id());
     Ok(())
 }
 
@@ -995,6 +1244,9 @@ fn parse_i32(raw: &[u8]) -> Result<i32, Errno> {
 pub fn setsockopt(id: SocketId, level: i32, optname: i32, optval: &[u8]) -> Result<(), Errno> {
     let mut net = NET.lock();
     let entry = net.sockets.get_mut(&id).ok_or(Errno::BadF)?;
+    if (level == IPPROTO_IP || level == IPPROTO_TCP) && !entry.is_inet() {
+        return Err(Errno::NoProtoOpt);
+    }
     match (level, optname) {
         (SOL_SOCKET, SO_REUSEADDR) => entry.opts.reuse_addr = parse_i32(optval)? != 0,
         (SOL_SOCKET, SO_REUSEPORT) => entry.opts.reuse_port = parse_i32(optval)? != 0,
@@ -1099,6 +1351,9 @@ pub fn getsockopt(id: SocketId, level: i32, optname: i32, buf: &mut [u8]) -> Res
         buf[..n].copy_from_slice(&bytes[..n]);
         Ok(n)
     };
+    if (level == IPPROTO_IP || level == IPPROTO_TCP) && !entry.is_inet() {
+        return Err(Errno::NoProtoOpt);
+    }
     match (level, optname) {
         (SOL_SOCKET, SO_REUSEADDR) => write_i32(buf, i32::from(entry.opts.reuse_addr)),
         (SOL_SOCKET, SO_REUSEPORT) => write_i32(buf, i32::from(entry.opts.reuse_port)),
@@ -1248,7 +1503,12 @@ pub fn poll_events(id: SocketId, requested: u16) -> u16 {
             rx,
             peer_closed,
             ..
-        }) => {
+        })
+        | SockKind::UnixStream {
+            peer_id,
+            rx,
+            peer_closed,
+        } => {
             if !rx.is_empty() || *peer_closed || entry.shut_rd {
                 revents |= 0x41 & requested;
             }
@@ -1256,7 +1516,8 @@ pub fn poll_events(id: SocketId, requested: u16) -> u16 {
                 let peer_space = peer_id
                     .and_then(|pid| net.sockets.get(&pid))
                     .is_some_and(|p| match &p.kind {
-                        SockKind::Tcp(TcpState::Connected { rx, .. }) => {
+                        SockKind::Tcp(TcpState::Connected { rx, .. })
+                        | SockKind::UnixStream { rx, .. } => {
                             !p.shut_rd && rx.len() < p.opts.rcv_buf.max(4096)
                         }
                         _ => false,
@@ -1276,6 +1537,37 @@ pub fn poll_events(id: SocketId, requested: u16) -> u16 {
                 revents |= 0x104 & requested; // 对端关闭后写操作立即返回 EPIPE，不阻塞
                 if entry.shut_wr {
                     revents |= 0x10; // POLLHUP
+                }
+            }
+        }
+        SockKind::UnixDgram {
+            peer_id,
+            rx,
+            peer_closed,
+            ..
+        } => {
+            if !rx.is_empty() || entry.shut_rd {
+                revents |= 0x41 & requested;
+            }
+            if !entry.shut_wr && !*peer_closed {
+                let peer_space = peer_id
+                    .and_then(|pid| net.sockets.get(&pid))
+                    .is_some_and(|p| match &p.kind {
+                        SockKind::UnixDgram { rx, rx_bytes, .. } => {
+                            !p.shut_rd
+                                && rx.len() < MAX_UDP_QUEUE_PACKETS
+                                && *rx_bytes < p.opts.rcv_buf.max(4096)
+                        }
+                        _ => false,
+                    });
+                if peer_space {
+                    revents |= 0x104 & requested;
+                }
+            }
+            if *peer_closed {
+                revents |= 0x104 & requested;
+                if entry.shut_wr {
+                    revents |= 0x10;
                 }
             }
         }

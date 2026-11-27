@@ -33,8 +33,11 @@ pub mod sysnr {
     pub const DUP3: usize = 24;
     pub const IOCTL: usize = 29;
     pub const FCNTL: usize = 25;
+    pub const FLOCK: usize = 32;
     pub const MKDIRAT: usize = 34;
     pub const UNLINKAT: usize = 35;
+    pub const SYMLINKAT: usize = 36;
+    pub const LINKAT: usize = 37;
     pub const RENAMEAT: usize = 38;
     pub const UMOUNT2: usize = 39;
     pub const MOUNT: usize = 40;
@@ -56,6 +59,7 @@ pub mod sysnr {
     pub const PWRITE64: usize = 68;
     pub const PREADV: usize = 69;
     pub const PWRITEV: usize = 70;
+    pub const SENDFILE: usize = 71;
     pub const READLINKAT: usize = 78;
     pub const FSTATAT: usize = 79;
     pub const FSTAT: usize = 80;
@@ -101,6 +105,7 @@ pub mod sysnr {
     pub const SET_TID_ADDRESS: usize = 96;
     pub const WAITID: usize = 95;
     pub const GETRUSAGE: usize = 165;
+    pub const PRCTL: usize = 167;
     pub const SCHED_SETPARAM: usize = 118;
     pub const SCHED_SETSCHEDULER: usize = 119;
     pub const SCHED_GETSCHEDULER: usize = 120;
@@ -155,8 +160,9 @@ pub mod sysnr {
     pub const SHMCTL: usize = 195;
     pub const SHMAT: usize = 196;
     pub const SHMDT: usize = 197;
-    // 网络（AF_INET 本地回环套接字）
+    // 网络（AF_INET 本地回环与 AF_UNIX 匿名套接字）
     pub const SOCKET: usize = 198;
+    pub const SOCKETPAIR: usize = 199;
     pub const BIND: usize = 200;
     pub const LISTEN: usize = 201;
     pub const ACCEPT: usize = 202;
@@ -373,8 +379,11 @@ pub fn dispatch(
         | sysnr::DUP
         | sysnr::DUP3
         | sysnr::FCNTL
+        | sysnr::FLOCK
         | sysnr::MKDIRAT
         | sysnr::UNLINKAT
+        | sysnr::SYMLINKAT
+        | sysnr::LINKAT
         | sysnr::RENAMEAT
         | sysnr::RENAMEAT2
         | sysnr::UMOUNT2
@@ -397,6 +406,7 @@ pub fn dispatch(
         | sysnr::PWRITE64
         | sysnr::PREADV
         | sysnr::PWRITEV
+        | sysnr::SENDFILE
         | sysnr::READLINKAT
         | sysnr::FSTAT
         | sysnr::FSTATAT
@@ -419,13 +429,19 @@ pub fn dispatch(
                 space,
                 fs,
                 credentials,
+                thread.tgid as u32,
             );
-            // pipe/eventfd/timerfd/套接字无数据或无空间且非 O_NONBLOCK：转为阻塞等待。
+            // pipe/eventfd/timerfd/套接字/文件锁无数据或锁冲突且阻塞：等待唤醒。
             if ret == Err(Errno::WouldBlock) {
+                if matches!(nr, sysnr::FCNTL | sysnr::FLOCK) {
+                    return Flow::Wait(WaitReason::Pipe);
+                }
                 return Flow::Wait(fs.wait_reason_for_fd(args[0]));
             }
             // 向无读者的管道写入：SIGPIPE 入队并与 -EPIPE 返回并行。
-            if ret == Err(Errno::Pipe) && (nr == sysnr::WRITE || nr == sysnr::WRITEV) {
+            if ret == Err(Errno::Pipe)
+                && (nr == sysnr::WRITE || nr == sysnr::WRITEV || nr == sysnr::SENDFILE)
+            {
                 signal.generate(
                     SIGPIPE,
                     // code=0 即 SI_USER，发送者为调用进程自身（线程组号）。
@@ -440,6 +456,7 @@ pub fn dispatch(
             Flow::Continue
         }
         sysnr::SOCKET
+        | sysnr::SOCKETPAIR
         | sysnr::BIND
         | sysnr::LISTEN
         | sysnr::GETSOCKNAME
@@ -653,6 +670,7 @@ pub fn dispatch(
         | sysnr::WAIT4
         | sysnr::WAITID
         | sysnr::GETRUSAGE
+        | sysnr::PRCTL
         | sysnr::SCHED_SETPARAM
         | sysnr::SCHED_SETSCHEDULER
         | sysnr::SCHED_GETSCHEDULER

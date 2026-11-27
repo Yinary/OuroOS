@@ -123,9 +123,14 @@ impl Page {
     fn backing(&self) -> core::cell::Ref<'_, Backing> {
         self.frame.borrow()
     }
-    /// 请求权限到实际叶权限的唯一入口；共享私有帧在 COW 阶段扣除 W。
+    /// 请求权限到实际叶权限的唯一入口；共享私有帧与私有文件页在 COW 阶段扣除 W。
     fn leaf_flags(&self, requested: MappingFlags) -> MappingFlags {
-        if matches!(&*self.backing(), Backing::Private(frame) if frame.strong_count() > 1) {
+        let cow_shared = match &*self.backing() {
+            Backing::Private(frame) => frame.strong_count() > 1,
+            Backing::File(file) => file.is_cow_shared(),
+            Backing::AnonymousShared(_) => false,
+        };
+        if cow_shared {
             requested - MappingFlags::W
         } else {
             requested
@@ -589,19 +594,36 @@ impl UserAddressSpace {
                     return Err(e.into());
                 }
                 super::fence_icache();
-            } else if self.pt.borrow().translate(page_va).is_none() {
-                let pa = file.addr().ok_or(MapError::NotMapped)?;
-                self.pt.borrow_mut().map(page_va, pa, area.flags)?;
-                super::fence_icache();
+            } else {
+                let shared = file.is_cow_shared();
+                let split = shared && required.contains(MappingFlags::W);
+                let pa = if split {
+                    file.split_private()?
+                } else {
+                    file.addr().ok_or(MapError::NotMapped)?
+                };
+                let flags = if shared && !split {
+                    area.flags - MappingFlags::W
+                } else {
+                    area.flags
+                };
+                if leaf.is_some() {
+                    self.pt.borrow_mut().protect(page_va, pa, flags);
+                } else {
+                    self.pt.borrow_mut().map(page_va, pa, flags)?;
+                }
+                if split || leaf.is_none() {
+                    super::fence_icache();
+                }
             }
             return Ok(());
         }
         if matches!(
             area.kind,
-            AreaKind::Anonymous | AreaKind::Heap | AreaKind::Stack
+            AreaKind::Elf | AreaKind::Anonymous | AreaKind::Heap | AreaKind::Stack
         ) {
             let installed = self.page_at(page_va);
-            if leaf.is_none() && installed.is_none() {
+            if leaf.is_none() && installed.is_none() && area.kind != AreaKind::Elf {
                 // pending 只收录已安装的匿名页；撤销叶项前先由 collect_pending 接管。
                 let mut pending = self.pending.borrow_mut();
                 reserve(&mut pending, 1)?;
@@ -948,8 +970,8 @@ impl UserAddressSpace {
     fn populate_locked(&self, area: &VmArea, start: usize, end: usize) -> Result<(), MapError> {
         let cow = matches!(
             area.kind,
-            AreaKind::Anonymous | AreaKind::Heap | AreaKind::Stack
-        );
+            AreaKind::Elf | AreaKind::Anonymous | AreaKind::Heap | AreaKind::Stack
+        ) || (area.kind == AreaKind::File && !area.shared_file);
         let access = if cow && area.flags.contains(MappingFlags::W) {
             MappingFlags::U | MappingFlags::W
         } else {
@@ -1434,29 +1456,30 @@ impl UserAddressSpace {
             }
             let mut child_flags = area.flags;
             let frame = match &*source.backing() {
-                Backing::Private(shared)
-                    if matches!(
-                        area.kind,
-                        AreaKind::Anonymous | AreaKind::Heap | AreaKind::Stack
-                    ) =>
-                {
-                    // 共享私有帧：子页沿用共享帧；父页在全部子页安装成功后再降权。
+                Backing::Private(shared) => {
+                    // 全部私有帧（含 ELF、匿名、堆、栈）跨 fork 共享；父页在全部子页安装成功后再降权。
                     child_flags = area.flags - MappingFlags::W;
                     Backing::Private(shared.clone())
                 }
-                Backing::Private(shared) => Backing::Private(shared.duplicate()?),
-                Backing::File(f) => Backing::File(f.fork()?),
+                Backing::File(f) => {
+                    let forked = f.fork()?;
+                    if forked.is_cow_shared() {
+                        child_flags = area.flags - MappingFlags::W;
+                    }
+                    Backing::File(forked)
+                }
                 Backing::AnonymousShared(page) => Backing::AnonymousShared(page.clone()),
             };
             frame.install(child.pt.get_mut(), source.va, child_flags)?;
             child.pages.push(Page::new(source.va, frame));
         }
-        // 只有写时复制的私有帧会由父子共同持有；子空间安装完成后再统一降权。
+        // 只有写时复制的私有帧与私有文件驻留页会由父子共同持有；子空间安装完成后再统一降权。
         let shared = child
             .pages
             .iter()
             .filter_map(|page| match &*page.backing() {
                 Backing::Private(frame) if frame.strong_count() > 1 => Some(page.va),
+                Backing::File(file) if file.is_cow_shared() => Some(page.va),
                 _ => None,
             });
         self.pt.get_mut().write_protect_pages(shared);

@@ -1,7 +1,7 @@
 //! 用户内存访问：内核与用户地址空间之间的数据复制——地址范围校验、
 //! 逐页翻译与权限校验、经内核直映窗口复制；用户指针不构造为 Rust 引用。
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use polyhal::{
     pagetable::{MappingFlags, PAGE_SIZE},
     PhysAddr,
@@ -239,6 +239,76 @@ fn copy_from_user_slow(
         pos += n;
     }
     Ok(())
+}
+
+/// 从用户内存按页读取 NUL 结尾 UTF-8 字符串的错误类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CStrError {
+    Fault,
+    TooLong,
+    NoMem,
+    InvalidUtf8,
+}
+
+/// 按页扫描用户内存中的 NUL 结尾 UTF-8 字符串，避免逐字节页表翻译与过量堆分配。
+pub fn read_cstr(
+    space: &UserAddressSpace,
+    vaddr: usize,
+    max_len: usize,
+) -> Result<String, CStrError> {
+    if vaddr == 0 || vaddr >= USER_TOP {
+        return Err(CStrError::Fault);
+    }
+    let mut stack = [0u8; 256];
+    let mut heap: Option<Vec<u8>> = None;
+    let mut done = 0usize;
+    let mut va = vaddr;
+    while done < max_len {
+        if va >= USER_TOP {
+            return Err(CStrError::Fault);
+        }
+        let paddr = space
+            .ensure_and_translate(va, MappingFlags::U | MappingFlags::R)
+            .map_err(|_| CStrError::Fault)?;
+        let avail = (PAGE_SIZE - (va % PAGE_SIZE))
+            .min(max_len - done)
+            .min(USER_TOP - va);
+        // SAFETY: ensure_and_translate 已确认本页在用户地址空间内可读且不跨页边界，
+        // phys_to_kernel_vaddr 为有效直映别名，单核内核态无并发修改。
+        let slice =
+            unsafe { core::slice::from_raw_parts(phys_to_kernel_vaddr(paddr) as *const u8, avail) };
+        let (take, finished) = match slice.iter().position(|&b| b == 0) {
+            Some(pos) => (pos, true),
+            None => (avail, false),
+        };
+        if let Some(buf) = heap.as_mut() {
+            buf.try_reserve(take).map_err(|_| CStrError::NoMem)?;
+            buf.extend_from_slice(&slice[..take]);
+        } else if done + take <= stack.len() {
+            stack[done..done + take].copy_from_slice(&slice[..take]);
+        } else {
+            let mut buf = Vec::new();
+            buf.try_reserve(done + take).map_err(|_| CStrError::NoMem)?;
+            buf.extend_from_slice(&stack[..done]);
+            buf.extend_from_slice(&slice[..take]);
+            heap = Some(buf);
+        }
+        done += take;
+        if finished {
+            return if let Some(buf) = heap {
+                String::from_utf8(buf).map_err(|_| CStrError::InvalidUtf8)
+            } else {
+                let s = core::str::from_utf8(&stack[..done]).map_err(|_| CStrError::InvalidUtf8)?;
+                let mut out = String::new();
+                out.try_reserve_exact(s.len())
+                    .map_err(|_| CStrError::NoMem)?;
+                out.push_str(s);
+                Ok(out)
+            };
+        }
+        va = va.checked_add(avail).ok_or(CStrError::Fault)?;
+    }
+    Err(CStrError::TooLong)
 }
 
 /// 检查 `[vaddr, vaddr+len)` 的溢出与用户地址范围，返回结束地址。

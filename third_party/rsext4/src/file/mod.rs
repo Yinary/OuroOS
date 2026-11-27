@@ -32,8 +32,8 @@ mod rename;
 
 pub use blocks::build_file_block_mapping_with_inode_num;
 pub use create::{create_symbol_link, create_symbol_link_with_owner, mkfile, mkfile_with_owner};
-// OuroOS patch: create a regular file by parent inode.
-pub use create::create_regular_inode;
+// OuroOS patch: create a regular file or symlink by parent inode.
+pub use create::{create_regular_inode, create_symlink_inode};
 pub use delete::{
     delete_dir, delete_file, free_inode, is_dir_empty, remove_inodeentry_from_parentdir, unlink,
 };
@@ -46,6 +46,8 @@ pub use io::{
     write_regular_inode_data,
 };
 pub use link::link;
+// OuroOS patch: create a hard link by target and parent inode.
+pub use link::link_inode;
 pub use rename::{mv, rename};
 // OuroOS patch: 按 inode 更新目录项并延迟回收。
 pub use rename::reclaim_unlinked_inode as reclaim_rename_target;
