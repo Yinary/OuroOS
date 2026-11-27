@@ -59,6 +59,7 @@ impl Undo {
         fs: &mut Ext4FileSystem,
         dev: &mut Jbd2Dev<B>,
     ) -> Ext4Result<()> {
+        fs.directory_index = None;
         for (block, data) in &self.blocks {
             fs.datablock_cache
                 .modify_via_journal(dev, *block, |out| out.copy_from_slice(data))?;
@@ -96,6 +97,7 @@ fn replace_entry<B: BlockDevice>(
     ino: InodeNumber,
     kind: u8,
 ) -> Ext4Result<()> {
+    fs.directory_index = None;
     let inode = fs.get_inode_by_num(dev, parent)?;
     let data = fs.datablock_cache.get_or_load(dev, block)?;
     let offset = entry_offset(&data.data, name.as_bytes())?;
@@ -118,6 +120,7 @@ pub fn rename_entry<B: BlockDevice>(
     target: &str,
     no_replace: bool,
 ) -> Ext4Result<Option<InodeNumber>> {
+    fs.directory_index = None;
     if fs.readonly {
         return Err(Ext4Error::read_only());
     }

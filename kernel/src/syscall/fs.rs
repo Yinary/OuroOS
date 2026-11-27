@@ -80,12 +80,12 @@ pub fn dispatch(
             fs::mount(&source, &target, &kind, a[3])?;
             Ok(0)
         }
-        sysnr::FACCESSAT => faccessat(ctx, space, a),
+        sysnr::FACCESSAT => access_check_common(ctx, space, a, 0, credentials),
         sysnr::FCHOWNAT | sysnr::FCHOWN => chown(nr, ctx, space, a, credentials),
         sysnr::FCHMOD => fchmod(ctx, space, a),
         sysnr::FCHMODAT => fchmodat(ctx, space, a),
         sysnr::MKNODAT => mknodat(ctx, space, a, credentials),
-        sysnr::FACCESSAT2 => faccessat2(ctx, space, a),
+        sysnr::FACCESSAT2 => access_check_common(ctx, space, a, a[3] as u32, credentials),
         sysnr::IOCTL => ioctl(ctx, space, a),
 
         sysnr::UMOUNT2 => {
@@ -369,6 +369,7 @@ fn getdents64(
 ) -> Result<usize, Errno> {
     let handle = ctx.get(fd)?;
     let mut f = handle.lock();
+    f.check_access(true)?;
     if let Some(entries) = f.proc_fd_entries() {
         let mut out = [0u8; 4096];
         let cap = count.min(out.len());
@@ -1145,33 +1146,20 @@ fn encode_statx(m: &fs::Metadata) -> [u8; 256] {
     out
 }
 /// Linux faccessat/faccessat2：按身份检查路径权限；原始 faccessat 不读取第 4 参数。
-fn faccessat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
-    access_check_common(ctx, space, a, true)
-}
-
-fn faccessat2(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
-    access_check_common(ctx, space, a, false)
-}
-
 fn access_check_common(
     ctx: &Context,
     space: &UserAddressSpace,
     a: [usize; 6],
-    raw: bool,
+    flags: u32,
+    credentials: &Credentials,
 ) -> Result<usize, Errno> {
-    if !raw && a[3] & !0x300 != 0 {
+    let mode = a[2] as u32;
+    if mode & !0x7 != 0 || flags & !0x1300 != 0 {
         return Err(Errno::Invalid);
     }
-    let path = ctx.path(a[0], &user_string(space, a[1])?)?;
-    let ino = fs::lookup(&path)?;
-    let (st_mode, ..) = fs::stat(ino)?;
-    let mode = a[2];
-    if mode & !0x7 != 0 {
-        return Err(Errno::Invalid);
-    }
-    if mode & 1 != 0 && st_mode & 0o111 == 0 {
-        return Err(Errno::Access);
-    }
+    let path = user_string(space, a[1])?;
+    let dir = a[0] as u32 as i32 as isize as usize;
+    ctx.access(dir, &path, mode as u16, flags, credentials)?;
     Ok(0)
 }
 

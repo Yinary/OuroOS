@@ -31,10 +31,79 @@ pub(crate) struct Metadata {
     pub btime: Option<Timestamp>,
 }
 
+/// 一次权限查询使用的身份，补充组借用调用进程的凭证。
+#[derive(Clone, Copy)]
+pub(super) struct AccessIdentity<'a> {
+    pub uid: u32,
+    pub gid: u32,
+    pub groups: &'a [u32],
+}
+
+impl<'a> AccessIdentity<'a> {
+    /// 取得实际文件操作使用的文件系统身份。
+    pub fn filesystem(credentials: &'a crate::task::Credentials) -> Self {
+        Self {
+            uid: credentials.fsuid,
+            gid: credentials.fsgid,
+            groups: &credentials.groups,
+        }
+    }
+
+    /// 取得 access 查询身份；默认使用真实号，effective 沿用文件系统身份。
+    pub fn for_access(credentials: &'a crate::task::Credentials, effective: bool) -> Self {
+        if effective {
+            Self::filesystem(credentials)
+        } else {
+            Self {
+                uid: credentials.ruid,
+                gid: credentials.rgid,
+                groups: &credentials.groups,
+            }
+        }
+    }
+}
+
 impl Metadata {
     /// 返回文件系统内部使用的 inode 句柄。
     pub(crate) fn inode_handle(&self) -> u32 {
         self.handle.unwrap_or(self.ino as u32)
+    }
+
+    /// 按文件系统凭证检查目录权限位，权限不足返回 EACCES。
+    pub(super) fn check_directory_access(
+        &self,
+        credentials: &crate::task::Credentials,
+        required: u16,
+    ) -> Result<(), Errno> {
+        if self.mode & 0xf000 != 0x4000 {
+            return Err(Errno::NotDir);
+        }
+        self.check_access(AccessIdentity::filesystem(credentials), required)
+    }
+
+    /// 检查读、写、执行权限位；任一请求位未获授权时返回 EACCES。
+    pub(super) fn check_access(
+        &self,
+        identity: AccessIdentity<'_>,
+        required: u16,
+    ) -> Result<(), Errno> {
+        if identity.uid == 0 {
+            if required & 1 != 0 && self.mode & 0xf000 == 0x8000 && self.mode & 0o111 == 0 {
+                return Err(Errno::Access);
+            }
+            return Ok(());
+        }
+        let shift = if identity.uid == self.uid {
+            6
+        } else if identity.gid == self.gid || identity.groups.contains(&self.gid) {
+            3
+        } else {
+            0
+        };
+        if (self.mode >> shift) & required != required {
+            return Err(Errno::Access);
+        }
+        Ok(())
     }
 }
 
@@ -141,7 +210,30 @@ pub(super) fn resolve_entry(
     follow: bool,
     allow_create: bool,
 ) -> Result<(String, ResolvedEntry), Errno> {
-    resolve_entry_from("/", path, follow, allow_create)
+    resolve_entry_from("/", path, follow, allow_create, None)
+}
+
+/// 从给定目录解析路径，并按调用者凭证检查沿途目录的搜索权限。
+pub(super) fn resolve_with_credentials(
+    base: &str,
+    path: &str,
+    follow: bool,
+    credentials: &crate::task::Credentials,
+) -> Result<(String, Metadata), Errno> {
+    resolve_with_identity(base, path, follow, AccessIdentity::filesystem(credentials))
+}
+
+/// 按指定身份解析路径；沿途目录必须授予搜索权限。
+pub(super) fn resolve_with_identity(
+    base: &str,
+    path: &str,
+    follow: bool,
+    identity: AccessIdentity<'_>,
+) -> Result<(String, Metadata), Errno> {
+    match resolve_entry_from(base, path, follow, false, Some(identity))? {
+        (path, ResolvedEntry::Existing(info)) => Ok((path, info)),
+        (_, ResolvedEntry::Missing { .. }) => Err(Errno::NoEntry),
+    }
 }
 
 fn resolve_entry_from(
@@ -149,6 +241,7 @@ fn resolve_entry_from(
     path: &str,
     follow: bool,
     allow_create: bool,
+    identity: Option<AccessIdentity<'_>>,
 ) -> Result<(String, ResolvedEntry), Errno> {
     let mut pending = string(path)?;
     let mut current = string(if path.starts_with('/') { "/" } else { base })?;
@@ -163,6 +256,9 @@ fn resolve_entry_from(
         let rest = pending[cursor..].trim_start_matches('/');
         if rest.is_empty() {
             break;
+        }
+        if let Some(identity) = identity {
+            info.check_access(identity, 1)?;
         }
         let end = rest.find('/').unwrap_or(rest.len());
         let name = &rest[..end];
@@ -236,7 +332,8 @@ fn resolve_entry_from(
         }
         cursor = next;
     }
-    if !saw_symlink
+    if identity.is_none()
+        && !saw_symlink
         && info.mode & 0xf000 != 0xa000
         && is_clean_ext4_path(&current)
         && !fat::has_mounts()

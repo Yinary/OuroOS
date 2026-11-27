@@ -47,9 +47,14 @@ pub fn link_entry<B: BlockDevice>(
     }
 
     let mut dir = original_dir;
-    let inserted = insert_dir_entry(fs, dev, parent, &mut dir, source, name, kind);
+    let mut index = fs
+        .directory_index
+        .take()
+        .filter(|index| index.parent == parent);
+    let hint = index.as_ref().map_or(0, |index| index.insertion);
+    let inserted = insert_dir_entry_with_hint(fs, dev, parent, &mut dir, source, name, kind, hint);
     let result = match inserted {
-        Ok(()) => fs
+        Ok(_) => fs
             .set_inode_links_count(dev, source, inode.i_links_count + 1)
             .map(|_| ()),
         Err(error) if no_space_before_insert(error) => return Err(error),
@@ -61,6 +66,11 @@ pub fn link_entry<B: BlockDevice>(
         if inserted.is_ok() {
             fs.modify_inode(dev, source, |out| *out = inode)
                 .map_err(|_| Ext4Error::io())?;
+        }
+    } else if let (Some(mut cache), Ok((logical, block))) = (index.take(), inserted) {
+        if cache.remember(name.as_bytes(), block).is_ok() {
+            cache.inserted(&dir, logical);
+            fs.directory_index = Some(cache);
         }
     }
     result
