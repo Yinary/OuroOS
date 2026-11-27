@@ -90,7 +90,7 @@ pub fn dispatch(
         sysnr::FCHOWNAT | sysnr::FCHOWN => chown(nr, ctx, space, a, credentials),
         sysnr::FCHMOD => fchmod(ctx, space, a),
         sysnr::FCHMODAT => fchmodat(ctx, space, a),
-        sysnr::MKNODAT => mknodat(ctx, space, a),
+        sysnr::MKNODAT => mknodat(ctx, space, a, credentials),
         sysnr::FACCESSAT2 => faccessat2(ctx, space, a),
         sysnr::IOCTL => ioctl(ctx, space, a),
 
@@ -131,6 +131,10 @@ pub fn dispatch(
             Ok(0)
         }
         sysnr::SENDFILE => sendfile(ctx, space, a),
+        sysnr::SPLICE => splice(ctx, space, a),
+        sysnr::TEE => tee(ctx, a),
+        sysnr::FADVISE64 => fadvise64(ctx, a),
+        sysnr::COPY_FILE_RANGE => copy_file_range(ctx, space, a),
         sysnr::UNLINKAT => {
             if a[2] & !0x200 != 0 {
                 return Err(Errno::Invalid);
@@ -191,6 +195,10 @@ pub fn dispatch(
                 return Err(Errno::NotDir);
             }
             ctx.set_cwd(resolved, info.ino as u32)?;
+            Ok(0)
+        }
+        sysnr::FCHDIR => {
+            ctx.fchdir(a[0], credentials)?;
             Ok(0)
         }
         sysnr::OPENAT => {
@@ -342,8 +350,28 @@ pub fn dispatch(
             if a[2] & O_DIRECTORY != 0 && mode & 0xf000 != 0x4000 {
                 return Err(Errno::NotDir);
             }
-            if mode & 0xf000 == 0x4000 && a[2] & 3 != 0 && !o_path {
+            if mode & 0xf000 == 0x4000 && (a[2] & 3 != 0 || creat) && !o_path {
                 return Err(Errno::IsDir);
+            }
+            if mode & 0xf000 == 0x1000 && !o_path {
+                return ctx.open_fifo(ino, a[2], a[2] & O_CLOEXEC != 0, tgid);
+            }
+            if mode & 0xf000 == 0xc000 && !o_path {
+                return Err(Errno::NxIo);
+            }
+            if mode & 0xf000 == 0x2000 && !o_path {
+                let rdev = fs::metadata(ino)?.rdev;
+                let cloexec = a[2] & O_CLOEXEC != 0;
+                return match rdev {
+                    0x0103 => ctx.open_devnull(a[2], cloexec),
+                    0x0105 => ctx.open_devzero(a[2], cloexec),
+                    0x0108 => ctx.open_devrandom(false, a[2], cloexec),
+                    0x0109 => ctx.open_devrandom(true, a[2], cloexec),
+                    _ => Err(Errno::NxIo),
+                };
+            }
+            if mode & 0xf000 == 0x6000 && !o_path {
+                return Err(Errno::NxIo);
             }
             if a[2] & O_TRUNC != 0 && a[2] & 3 != 0 && !o_path {
                 fs::truncate(ino, 0)?;
@@ -1237,30 +1265,60 @@ fn fchmodat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<us
 }
 
 /// chmod 公共实现：mode 保留 07777（含 setuid/setgid/sticky），类型位由
-/// inode 持有；仅普通文件与目录可改。
+/// inode 持有；普通文件、目录与命名管道可改。
 fn apply_chmod(path: &str, ino: u32, mode: usize) -> Result<usize, Errno> {
     let (cur_mode, ..) = fs::stat(ino)?;
-    if cur_mode & 0xf000 != 0x8000 && cur_mode & 0xf000 != 0x4000 {
-        return Err(Errno::Invalid); // 仅普通文件与目录可 chmod
+    if !matches!(cur_mode & 0xf000, 0x8000 | 0x4000 | 0x1000) {
+        return Err(Errno::Invalid);
     }
     fs::chmod_by_ino(ino, path, mode as u16 & 0o7777)?;
     Ok(0)
 }
 
-/// mknodat(2)：仅支持 S_IFBLK 节点注册（授权清单在用户态启动器维护），
-/// 登记 (盘, 分区) 身份供 mount 与通用块访问解析；其余类型 EOPNOTSUPP。
-fn mknodat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
-    // mknodat(dirfd, pathname, mode, dev)：mode 在 a[2]
+/// mknodat(2)：支持普通文件（S_IFREG/0）、命名管道（S_IFIFO）、套接字节点（S_IFSOCK）、
+/// 字符/块设备节点（S_IFCHR/S_IFBLK，非特权进程返回 EPERM；/dev/ 下块设备走块设备登记）。
+fn mknodat(
+    ctx: &Context,
+    space: &UserAddressSpace,
+    a: [usize; 6],
+    credentials: &Credentials,
+) -> Result<usize, Errno> {
+    let dirfd = a[0] as u32 as i32 as isize as usize;
+    let input = user_string(space, a[1])?;
     let mode = a[2];
-    if mode & 0xf000 != 0o060000 {
-        return Err(Errno::NotSupported); // 非 S_IFBLK
+    let dev = a[3] as u64;
+    let ftype = mode & 0xf000;
+    let create_type: u16 = match ftype {
+        0 | 0o100000 => 0x8000,
+        0o010000 => 0x1000,
+        0o020000 => 0x2000,
+        0o060000 => {
+            if let Ok(path) = ctx.path(dirfd, &input) {
+                if path.starts_with("/dev/") {
+                    fs::mknod_blk(&path, mode, dev)?;
+                    return Ok(0);
+                }
+            }
+            0x6000
+        }
+        0o140000 => 0xc000,
+        _ => return Err(Errno::Invalid),
+    };
+    if matches!(create_type, 0x2000 | 0x6000) && credentials.euid != 0 {
+        return Err(Errno::Perm);
     }
-    let path = ctx.path(a[0], &user_string(space, a[1])?)?;
-    if !path.starts_with("/dev/") {
-        return Err(Errno::Invalid); // 设备节点必须在 /dev 下
+    let (canonical, p, name) = ctx.resolve_parent_entry(dirfd, &input, Errno::Exists)?;
+    match fs::query(&canonical, false) {
+        Ok(_) => Err(Errno::Exists),
+        Err(Errno::NoEntry) => {
+            if input.ends_with('/') {
+                return Err(Errno::NoEntry);
+            }
+            fs::create_node(p, &name, create_type | ctx.creation_mode(mode), dev)?;
+            Ok(0)
+        }
+        Err(e) => Err(e),
     }
-    fs::mknod_blk(&path, mode, a[3] as u64)?;
-    Ok(0)
 }
 /// ioctl(2)：转发到 FD 层按设备类型分派（见 Context::ioctl）。
 fn ioctl(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
@@ -1380,6 +1438,479 @@ fn sendfile(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<us
     if let Some(off) = cur_offset {
         user_access::copy_to_user(space, offset_ptr, &(off as i64).to_ne_bytes())
             .map_err(|_| Errno::Fault)?;
+    }
+    Ok(done)
+}
+
+/// Linux fadvise64(2)（fd, offset, len, advice）：校验描述符、类型与提示值，有效请求为空操作。
+fn fadvise64(ctx: &Context, a: [usize; 6]) -> Result<usize, Errno> {
+    let handle = ctx.get(a[0])?;
+    {
+        let f = handle.lock();
+        if f.status_flags() & 0x200000 != 0 {
+            return Err(Errno::BadF);
+        }
+        if f.pipe_id().is_some() || f.is_socket() {
+            return Err(Errno::SeekPipe);
+        }
+    }
+    if (a[2] as i64) < 0 {
+        return Err(Errno::Invalid);
+    }
+    let advice = a[3] as u32 as i32;
+    if !(0..=5).contains(&advice) {
+        return Err(Errno::Invalid);
+    }
+    Ok(0)
+}
+
+/// Linux copy_file_range(2)：在两个普通文件描述符间直接搬运字节，支持显式偏移与同文件重叠检查。
+fn copy_file_range(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
+    const MAX_RW_COUNT: usize = 0x7fff_f000;
+    const O_APPEND: usize = 0x400;
+    if a[5] != 0 {
+        return Err(Errno::Invalid);
+    }
+    let in_fd = a[0];
+    let off_in_ptr = a[1];
+    let out_fd = a[2];
+    let off_out_ptr = a[3];
+    let raw_len = a[4];
+
+    let in_handle = ctx.get(in_fd)?;
+    let out_handle = ctx.get(out_fd)?;
+    let same_file = alloc::sync::Arc::ptr_eq(&in_handle, &out_handle);
+
+    let (in_ino, in_cur_off, out_ino, out_cur_off) = {
+        let in_f = in_handle.lock();
+        in_f.check_access(true)?;
+        let in_dir = in_f.is_directory();
+        let in_reg = in_f.is_regular_file()?;
+        let in_off = in_f.offset();
+        if same_file {
+            in_f.check_access(false)?;
+            if in_f.status_flags() & O_APPEND != 0 {
+                return Err(Errno::BadF);
+            }
+            if in_dir {
+                return Err(Errno::IsDir);
+            }
+            if !in_reg {
+                return Err(Errno::Invalid);
+            }
+            let ino = in_f.inode()?;
+            (ino, in_off, ino, in_off)
+        } else {
+            let in_ino = if in_reg { in_f.inode()? } else { 0 };
+            drop(in_f);
+            let out_f = out_handle.lock();
+            out_f.check_access(false)?;
+            if out_f.status_flags() & O_APPEND != 0 {
+                return Err(Errno::BadF);
+            }
+            if in_dir || out_f.is_directory() {
+                return Err(Errno::IsDir);
+            }
+            if !in_reg || !out_f.is_regular_file()? {
+                return Err(Errno::Invalid);
+            }
+            (in_ino, in_off, out_f.inode()?, out_f.offset())
+        }
+    };
+
+    let pos_in = if off_in_ptr != 0 {
+        let mut raw = [0u8; 8];
+        user_access::copy_from_user(space, off_in_ptr, &mut raw).map_err(|_| Errno::Fault)?;
+        let off = i64::from_ne_bytes(raw);
+        if off < 0 {
+            return Err(Errno::Invalid);
+        }
+        off as usize
+    } else {
+        in_cur_off
+    };
+    let pos_out = if off_out_ptr != 0 {
+        let mut raw = [0u8; 8];
+        user_access::copy_from_user(space, off_out_ptr, &mut raw).map_err(|_| Errno::Fault)?;
+        let off = i64::from_ne_bytes(raw);
+        if off < 0 {
+            return Err(Errno::Invalid);
+        }
+        off as usize
+    } else {
+        out_cur_off
+    };
+
+    let size_in = fs::stat(in_ino)?.1 as usize;
+    if raw_len == 0 {
+        return Ok(0);
+    }
+    if (pos_in as u64)
+        .checked_add(raw_len as u64)
+        .is_none_or(|e| e > i64::MAX as u64)
+        || (pos_out as u64)
+            .checked_add(raw_len as u64)
+            .is_none_or(|e| e > i64::MAX as u64)
+    {
+        return Err(Errno::FileTooBig);
+    }
+    let count = raw_len.min(MAX_RW_COUNT);
+    if in_ino == out_ino {
+        let eff = count.min(size_in.saturating_sub(pos_in));
+        if eff > 0 && pos_in < pos_out.saturating_add(eff) && pos_out < pos_in.saturating_add(eff) {
+            return Err(Errno::Invalid);
+        }
+    }
+    if pos_in >= size_in {
+        return Ok(0);
+    }
+
+    let mut scratch = ScratchBuf::acquire(count.min(POOL_IO_BUF))?;
+    let mut done = 0usize;
+    while done < count {
+        let chunk = (count - done).min(scratch.0.len());
+        let read_n = {
+            let mut in_f = in_handle.lock();
+            in_f.read_into_buf(Some(pos_in + done), &mut scratch.0[..chunk], done == 0)
+        };
+        let n = match read_n {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) if done > 0 => break,
+            Err(e) => return Err(e),
+        };
+        let written = {
+            let out_f = out_handle.lock();
+            out_f.write_at(pos_out + done, &scratch.0[..n], done == 0)
+        };
+        match written {
+            Ok(0) => break,
+            Ok(w) => {
+                done += w;
+                if w < n {
+                    break;
+                }
+            }
+            Err(_) if done > 0 => break,
+            Err(e) => return Err(e),
+        }
+    }
+
+    let new_in = pos_in + done;
+    let new_out = pos_out + done;
+    if off_in_ptr != 0 {
+        user_access::copy_to_user(space, off_in_ptr, &(new_in as i64).to_ne_bytes())
+            .map_err(|_| Errno::Fault)?;
+    } else {
+        in_handle.lock().set_offset(new_in);
+    }
+    if off_out_ptr != 0 {
+        user_access::copy_to_user(space, off_out_ptr, &(new_out as i64).to_ne_bytes())
+            .map_err(|_| Errno::Fault)?;
+    } else {
+        out_handle.lock().set_offset(new_out);
+    }
+    Ok(done)
+}
+
+/// Linux splice(2)：在至少一端为管道的两个描述符间搬运数据，支持显式文件偏移与 SPLICE_F_NONBLOCK。
+fn splice(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
+    const MAX_RW_COUNT: usize = 0x7fff_f000;
+    const O_APPEND: usize = 0x400;
+    const SPLICE_F_NONBLOCK: usize = 2;
+    let in_fd = a[0];
+    let off_in_ptr = a[1];
+    let out_fd = a[2];
+    let off_out_ptr = a[3];
+    let count = a[4].min(MAX_RW_COUNT);
+    let nonblock = a[5] & SPLICE_F_NONBLOCK != 0;
+
+    let in_handle = ctx.get(in_fd)?;
+    let out_handle = ctx.get(out_fd)?;
+    let same_file = alloc::sync::Arc::ptr_eq(&in_handle, &out_handle);
+
+    let (in_pipe, out_pipe, in_sock, out_sock) = {
+        let in_f = in_handle.lock();
+        in_f.check_access(true)?;
+        let in_p = in_f.pipe_id();
+        let in_s = in_f.is_connected_socket();
+        if in_p.is_none() && !in_s {
+            if in_f.is_directory() {
+                return Err(Errno::Invalid);
+            }
+            in_f.check_positioned().map_err(|e| match e {
+                Errno::SeekPipe => Errno::Invalid,
+                other => other,
+            })?;
+        }
+        if same_file {
+            in_f.check_access(false)?;
+            (in_p, in_p, in_s, in_s)
+        } else {
+            drop(in_f);
+            let out_f = out_handle.lock();
+            out_f.check_access(false)?;
+            let out_p = out_f.pipe_id();
+            let out_s = out_f.is_connected_socket();
+            if out_p.is_none() && !out_s {
+                if out_f.is_directory() || out_f.status_flags() & O_APPEND != 0 {
+                    return Err(Errno::Invalid);
+                }
+                out_f.check_positioned().map_err(|e| match e {
+                    Errno::SeekPipe => Errno::Invalid,
+                    other => other,
+                })?;
+            }
+            (in_p, out_p, in_s, out_s)
+        }
+    };
+
+    if in_pipe.is_none() && out_pipe.is_none() {
+        return Err(Errno::Invalid);
+    }
+    if in_pipe.is_some() && in_pipe == out_pipe {
+        return Err(Errno::Invalid);
+    }
+    if (in_pipe.is_some() || in_sock) && off_in_ptr != 0 {
+        return Err(Errno::SeekPipe);
+    }
+    if (out_pipe.is_some() || out_sock) && off_out_ptr != 0 {
+        return Err(Errno::SeekPipe);
+    }
+
+    let mut cur_in_off = if off_in_ptr != 0 {
+        let mut raw = [0u8; 8];
+        user_access::copy_from_user(space, off_in_ptr, &mut raw).map_err(|_| Errno::Fault)?;
+        let off = i64::from_ne_bytes(raw);
+        if off < 0 {
+            return Err(Errno::Invalid);
+        }
+        Some(off as usize)
+    } else {
+        None
+    };
+    let mut cur_out_off = if off_out_ptr != 0 {
+        let mut raw = [0u8; 8];
+        user_access::copy_from_user(space, off_out_ptr, &mut raw).map_err(|_| Errno::Fault)?;
+        let off = i64::from_ne_bytes(raw);
+        if off < 0 {
+            return Err(Errno::Invalid);
+        }
+        Some(off as usize)
+    } else {
+        None
+    };
+
+    if count == 0 {
+        return Ok(0);
+    }
+
+    let mut scratch = ScratchBuf::acquire(count.min(POOL_IO_BUF))?;
+    let mut done = 0usize;
+    match (in_pipe.is_some(), out_pipe.is_some()) {
+        (true, true) => {
+            while done < count {
+                let chunk = (count - done).min(scratch.0.len());
+                let nb = nonblock || done > 0;
+                let n = match in_handle
+                    .lock()
+                    .peek_pipe_into(0, &mut scratch.0[..chunk], nb)
+                {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(Errno::Again) if done > 0 => break,
+                    Err(e) => return Err(e),
+                };
+                match out_handle.lock().write_pipe_from(&scratch.0[..n], nb) {
+                    Ok(w) => {
+                        in_handle.lock().consume_pipe(w);
+                        done += w;
+                        if w < n {
+                            break;
+                        }
+                    }
+                    Err(Errno::Again) if done > 0 => break,
+                    Err(_) if done > 0 => break,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        (true, false) => {
+            while done < count {
+                let chunk = (count - done).min(scratch.0.len());
+                let nb = nonblock || done > 0;
+                let n = match in_handle
+                    .lock()
+                    .peek_pipe_into(0, &mut scratch.0[..chunk], nb)
+                {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(Errno::Again) if done > 0 => break,
+                    Err(e) => return Err(e),
+                };
+                let written = if out_sock {
+                    out_handle.lock().write_socket_from(&scratch.0[..n], nb)
+                } else {
+                    let mut out_f = out_handle.lock();
+                    if let Some(off) = cur_out_off {
+                        out_f.write_at(off, &scratch.0[..n], done == 0)
+                    } else {
+                        out_f.write_chunk(&scratch.0[..n], done == 0)
+                    }
+                };
+                match written {
+                    Ok(0) => break,
+                    Ok(w) => {
+                        in_handle.lock().consume_pipe(w);
+                        done += w;
+                        if let Some(off) = cur_out_off.as_mut() {
+                            *off = off.saturating_add(w);
+                        }
+                        if w < n {
+                            break;
+                        }
+                    }
+                    Err(Errno::Again) if done > 0 => break,
+                    Err(_) if done > 0 => break,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        (false, true) => {
+            while done < count {
+                let nb = nonblock || done > 0;
+                let chunk = if in_sock {
+                    let avail = match out_handle.lock().pipe_writable_space(nb) {
+                        Ok(avail) => avail,
+                        Err(Errno::Again) if done > 0 => break,
+                        Err(e) if done > 0 => {
+                            let _ = e;
+                            break;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    (count - done).min(scratch.0.len()).min(avail)
+                } else {
+                    (count - done).min(scratch.0.len())
+                };
+                let read_n = if in_sock {
+                    in_handle
+                        .lock()
+                        .read_socket_into(&mut scratch.0[..chunk], nb)
+                } else {
+                    let mut in_f = in_handle.lock();
+                    in_f.read_into_buf(cur_in_off, &mut scratch.0[..chunk], done == 0)
+                };
+                let n = match read_n {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(Errno::Again) if done > 0 => break,
+                    Err(_) if done > 0 => break,
+                    Err(e) => return Err(e),
+                };
+                match out_handle.lock().write_pipe_from(&scratch.0[..n], nb) {
+                    Ok(w) => {
+                        done += w;
+                        if let Some(off) = cur_in_off.as_mut() {
+                            *off = off.saturating_add(w);
+                        }
+                        if w < n {
+                            if !in_sock && cur_in_off.is_none() {
+                                let mut in_f = in_handle.lock();
+                                let pos = in_f.offset().saturating_sub(n - w);
+                                in_f.set_offset(pos);
+                            }
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if !in_sock && cur_in_off.is_none() {
+                            let mut in_f = in_handle.lock();
+                            let pos = in_f.offset().saturating_sub(n);
+                            in_f.set_offset(pos);
+                        }
+                        if done > 0 {
+                            break;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        (false, false) => unreachable!(),
+    }
+
+    if let Some(off) = cur_in_off {
+        user_access::copy_to_user(space, off_in_ptr, &(off as i64).to_ne_bytes())
+            .map_err(|_| Errno::Fault)?;
+    }
+    if let Some(off) = cur_out_off {
+        user_access::copy_to_user(space, off_out_ptr, &(off as i64).to_ne_bytes())
+            .map_err(|_| Errno::Fault)?;
+    }
+    Ok(done)
+}
+
+/// Linux tee(2)：在两个不同管道间复制数据而不消费输入管道。
+fn tee(ctx: &Context, a: [usize; 6]) -> Result<usize, Errno> {
+    const MAX_RW_COUNT: usize = 0x7fff_f000;
+    const SPLICE_F_NONBLOCK: usize = 2;
+    let in_fd = a[0];
+    let out_fd = a[1];
+    let count = a[2].min(MAX_RW_COUNT);
+    let nonblock = a[3] & SPLICE_F_NONBLOCK != 0;
+
+    let in_handle = ctx.get(in_fd)?;
+    let out_handle = ctx.get(out_fd)?;
+    let same_file = alloc::sync::Arc::ptr_eq(&in_handle, &out_handle);
+
+    let (in_pipe, out_pipe) = {
+        let in_f = in_handle.lock();
+        in_f.check_access(true)?;
+        let in_p = in_f.pipe_id();
+        if same_file {
+            in_f.check_access(false)?;
+            (in_p, in_p)
+        } else {
+            drop(in_f);
+            let out_f = out_handle.lock();
+            out_f.check_access(false)?;
+            (in_p, out_f.pipe_id())
+        }
+    };
+
+    if in_pipe.is_none() || out_pipe.is_none() || in_pipe == out_pipe {
+        return Err(Errno::Invalid);
+    }
+    if count == 0 {
+        return Ok(0);
+    }
+
+    let mut scratch = ScratchBuf::acquire(count.min(POOL_IO_BUF))?;
+    let mut done = 0usize;
+    while done < count {
+        let chunk = (count - done).min(scratch.0.len());
+        let nb = nonblock || done > 0;
+        let n = match in_handle
+            .lock()
+            .peek_pipe_into(done, &mut scratch.0[..chunk], nb)
+        {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(Errno::Again) if done > 0 => break,
+            Err(e) => return Err(e),
+        };
+        match out_handle.lock().write_pipe_from(&scratch.0[..n], nb) {
+            Ok(w) => {
+                done += w;
+                if w < n {
+                    break;
+                }
+            }
+            Err(Errno::Again) if done > 0 => break,
+            Err(_) if done > 0 => break,
+            Err(e) => return Err(e),
+        }
     }
     Ok(done)
 }

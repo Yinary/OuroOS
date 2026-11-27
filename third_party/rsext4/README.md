@@ -42,3 +42,7 @@ Cargo 清单移除了随上游测试程序提供的目标。内核默认启用�
   1. `file/create.rs` 新增 `create_symlink_inode`，按父 inode 在线性目录创建符号链接，允许相对与悬空目标（不校验目标存在性），同时支持 <60 字节内联快速链接与块存储长链接；
   2. `file/link.rs` 新增 `link_inode`，按目标 inode 与父目录 inode 创建硬链接（拒绝目录返回 `EPERM`，超 `65000` 链接数返回 `EMLINK`，更新链接计数失败时回滚目录项）；
   3. `file/delete.rs` 扩展 `unlink_regular_entry` 放行符号链接，并在 `free_inode` 中跳过内联快速符号链接的 `extent_block_map` 遍历，避免把内联目标文本误作块号释放。
+- 命名管道与特殊节点补丁（`fs/fifo-fchdir-splice`）：
+  1. `file/create.rs` 新增 `create_special_inode`（`create_regular_inode` 复用该实现），按父 inode 在线性目录创建普通文件（`S_IFREG`）、命名管道（`S_IFIFO`）、字符设备（`S_IFCHR`）、块设备（`S_IFBLK`）与套接字节点（`S_IFSOCK`），非普通节点不置 `EXT4_EXTENTS_FL`，字符/块设备按 Ext4 `old_encode_dev`/`new_encode_dev` 约定将设备号写入 `i_block[0]`/`i_block[1]` 并写入对应 `EXT4_FT_*` 目录项类型；
+  2. `file/delete.rs` 扩展 `unlink_regular_entry` 放行命名管道、字符/块设备与套接字节点，并在 `free_inode` 中为无数据块的特殊节点跳过 `extent_block_map` 遍历；
+  3. `file/link.rs` 扩展 `link_inode` 按目标 inode 类型写入对应 `EXT4_FT_*` 目录项类型。

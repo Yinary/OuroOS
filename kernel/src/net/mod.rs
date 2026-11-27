@@ -70,7 +70,7 @@ pub const SOCKADDR_IN_LEN: usize = 16;
 const EPHEMERAL_START: u16 = 49152;
 const EPHEMERAL_END: u16 = 65535;
 const STREAM_BUF_DEFAULT: usize = 131_072;
-const UNIX_BUF_DEFAULT: usize = 16_384;
+const UNIX_BUF_DEFAULT: usize = 131_072;
 const TCP_DEFAULT_MSS: i32 = 1460;
 const MAX_UDP_PAYLOAD: usize = 65507;
 const MAX_UDP_QUEUE_BYTES: usize = 2 * 1024 * 1024;
@@ -553,6 +553,26 @@ pub fn create_unix_pair(sock_type: SockType) -> Result<(SocketId, SocketId), Err
     net.sockets.insert(id0, make_entry(id1));
     net.sockets.insert(id1, make_entry(id0));
     Ok((id0, id1))
+}
+
+/// 返回套接字是否处于已连接状态（供 splice 校验流式/已连接套接字）。
+pub fn is_connected(id: SocketId) -> bool {
+    let net = NET.lock();
+    let Some(entry) = net.sockets.get(&id) else {
+        return false;
+    };
+    matches!(
+        entry.kind,
+        SockKind::Tcp(TcpState::Connected { .. })
+            | SockKind::UnixStream {
+                peer_id: Some(_),
+                ..
+            }
+            | SockKind::UnixDgram {
+                peer_id: Some(_),
+                ..
+            }
+    )
 }
 
 /// 关闭套接字并通知对端或清理待接收队列。

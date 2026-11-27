@@ -275,3 +275,17 @@ python3 tests/run_official.py la --groups ltp-musl --ltp-filter chown,statx --lt
     - 改动前基线（`fs/link-symlink-sendfile`）：`la` **`41/97`**（`fcntl` 40/68、`flock` 1/15、`prctl` 0/14）；
     - 本批修复后：`rv` **`118/139`**、`la` **`118/139`**（双架构净增 **+77** 条通过断言，+187.8%，零 panic）；其中 `flock` 全部 **19/19（100%）**、`fcntl` 达 **80/94**（含 `fcntl11`/`fcntl21`/`fcntl30` 及其 `_64` 变体）、`prctl` 达 **19/26**。
   - 双架构核心回归与专项：`rv` 与 `la` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9 零回退；`tests/fs_fcntl.py` 双架构 + `e2fsck` 全部通过。
+
+### 5.12 LTP 第 4 批命名管道、`fchdir` 与内核零拷贝搬运验证结果（`fs/fifo-fchdir-splice`）
+
+- **前 3 批合并基线（`dev` `3be3429`）四配置全覆盖验证（20 前缀：`open,read,write,pipe,fork,wait,kill,mmap,socket,getrlimit,setrlimit,prlimit,symlink,link,readlink,sendfile,unlink,fcntl,flock,prctl`）**：
+  - `rv` `ltp-musl` **`675/810`**、`rv` `ltp-glibc` **`677/815`**、`la` `ltp-musl` **`673/810`**、`la` `ltp-glibc` **`678/818`**，四配置均零 panic，成绩一致且 `glibc` 略高于 `musl`。
+- **第 4 批补齐范围（均为通用 Linux 语义，无测例特判，避开队友已推送的 `epoll`/`eventfd`/`timerfd` 与 System V `msg`/`sem` 分支）**：
+  1. **Ext4 特殊节点与 `mknodat(33)` / `openat(56)` 语义（`third_party/rsext4/src/file/{create,delete,link,mod}.rs`、`kernel/src/fs/{ext4_rsext4,mod,context}.rs`、`kernel/src/syscall/fs.rs`）**：`rsext4` 新增 `create_special_inode` 支持 `S_IFREG`/`S_IFIFO`/`S_IFCHR`/`S_IFBLK`/`S_IFSOCK` 及 Ext4 `i_block[0..2]` 设备号编码，同步扩展 `free_inode`/`unlink_regular_entry`/`link_inode`；`mknodat` 保留 `/dev/` 下 `S_IFBLK` 内核块设备登记并对非特权进程创建字符/块设备返回 `EPERM`；命名管道（FIFO）按 `fifo(7)` 实现 `O_RDONLY`/`O_WRONLY`/`O_RDWR`/`O_NONBLOCK` 会合、`ENXIO` 与 `fchmod`/`utimensat`/`linkat(AT_EMPTY_PATH)`；`openat` 对已有目录配 `O_CREAT` 返回 `EISDIR`，对 `S_IFCHR` 识别标准内存设备号 `1:3`/`1:5`/`1:8`/`1:9`，其余设备节点与 `S_IFSOCK` 返回 `ENXIO`。
+  2. **`fchdir(50)`（`kernel/src/fs/context.rs`、`kernel/src/syscall/{fs,mod}.rs`）**：支持按已打开目录描述符（含 `O_PATH` 目录 FD）切换工作目录，非目录返回 `ENOTDIR`，非特权进程校验目录搜索执行位（缺失返回 `EACCES`）。
+  3. **`splice(76)`、`tee(77)`、`copy_file_range(285)` 与 `fadvise64(223)`（`kernel/src/syscall/{fs,mod}.rs`、`kernel/src/fs/context.rs`、`kernel/src/net/mod.rs`）**：`splice` 支持管道↔管道、管道↔可定位文件与管道↔已连接流式套接字（同步将 `AF_UNIX` 默认缓冲提升至 128 KiB），未连接套接字返回 `EINVAL`，管道/套接字非空偏移返回 `ESPIPE`，采用 peek-then-consume 避免出错丢字节并走定向唤醒与 `SIGPIPE`；`tee` 实现两不同管道只看不消费复制；`copy_file_range` 支持显式与共享偏移、目录 `EISDIR`、`O_APPEND` `EBADF`、同 inode 重叠区间 `EINVAL`、偏移溢出 `EFBIG` 与目标 `mtime` 更新；`fadvise64` 校验描述符、`O_PATH`、`ESPIPE`、负长度与 advice 范围。
+- **四配置实测与回归验证（QEMU 10.0.2 + QCOW2 覆盖层，`sdcard-rv.img`/`sdcard-la.img` `pre-20250615`）**：
+  - 15 项 Batch 4 专项 LTP（`mkfifo,mknod,fchdir,splice,tee,copy_file_range,posix_fadvise,open06,open11,read03,write04,dup05,linkat01,unlink05,fcntl07`，默认单测例 2 秒超时）：
+    - `rv` `ltp-musl` **`159/324`**、`rv` `ltp-glibc` **`159/324`**、`la` `ltp-musl` **`159/324`**、`la` `ltp-glibc` **`159/324`**，四配置完全一致，**零 `TFAIL`、零 panic**；其中 `dup05`（1/1）、`fchdir01`–`03`（3/3）、`mknod01`（7/7）、`mknod02`（2/2）、`mknod09`（1/1）、`open06`（1/1）、`open11`（28/28）、`posix_fadvise02/04` 含 `_64`（24/24）、`read03`（1/1）、`write04`（1/1）、`unlink05`（2/2）、`splice01`–`05`（11/11）、`splice07`（73/73 有效断言，160 项因未实现 fd 类型 `TCONF`）、`tee01`（1/1）、`tee02`（3/3）全部 100% 通过。
+  - `copy_file_range03`（两变体各自调用 1 秒 `usleep`，需 `--ltp-timeout 6`）：四配置（`rv`/`la` × `ltp-musl`/`ltp-glibc`）均 **`2/2`（100% 通过）**。
+  - 双架构核心回归与文件系统一致性：`rv` 与 `la` 上 `basic-musl` **102/102**、`busybox-musl` **54/55**、`lua-musl` **9/9** 零回退；`tests/fs_stat.py`（双架构 128/256 字节 inode + `e2fsck`）与 `tests/fs_fcntl.py`（双架构 + `e2fsck`）全部通过。
