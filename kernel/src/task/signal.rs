@@ -294,6 +294,7 @@ impl SignalGroup {
         }
         self.queue(sig, slot);
         super::sched::request_signal_wake();
+        super::sched::request_pipe_wake();
     }
 
     /// 设置信号 sig 的处置；sig 不在 1..=64 时不修改任何状态。
@@ -540,6 +541,7 @@ pub fn generate_thread(group: &SignalGroup, thread: &mut ThreadSig, sig: u8, slo
     }
     thread.queue(sig, slot);
     super::sched::request_signal_wake();
+    super::sched::request_pipe_wake();
 }
 
 /// 锁外信号产生入口（kill/tgkill）：取 REGISTRY 锁并调用 generate。

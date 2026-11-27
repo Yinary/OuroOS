@@ -946,10 +946,18 @@ fn process_call(
                         );
                     }
                     let rec = &reg.records[index];
+                    let pending_signals =
+                        rec.signal.pending() | reg.thread(parent).map_or(0, |t| t.signal.pending());
                     let space = rec.space.as_ref().ok_or(Errno::Invalid)?.as_space();
                     let fs = rec.fs.as_ref().ok_or(Errno::Invalid)?;
                     let sets = crate::fs::context::select_check(
-                        fs, space, args[0], args[1], args[2], args[3],
+                        fs,
+                        space,
+                        args[0],
+                        args[1],
+                        args[2],
+                        args[3],
+                        pending_signals,
                     )?;
                     if sets.ready > 0 {
                         crate::fs::context::select_write_back(
@@ -1136,11 +1144,14 @@ fn process_call(
                             .ok_or(Errno::Invalid)?,
                     );
                 }
+                let pending_signals =
+                    rec.signal.pending() | reg.thread(parent).map_or(0, |t| t.signal.pending());
                 crate::fs::context::poll(
                     rec.fs.as_ref().ok_or(Errno::Invalid)?,
                     space,
                     args[0],
                     args[1],
+                    pending_signals,
                 )
             })();
             match checked {
@@ -1249,9 +1260,12 @@ fn process_call(
                     }
 
                     let rec = &reg.records[index];
+                    let pending_signals =
+                        rec.signal.pending() | reg.thread(parent).map_or(0, |t| t.signal.pending());
                     let space = rec.space.as_ref().ok_or(Errno::Invalid)?.as_space();
                     let fs = rec.fs.as_ref().ok_or(Errno::Invalid)?;
-                    let (encoded, ready, tfd_dl) = fs.epoll_collect(epfd as usize, maxevents)?;
+                    let (encoded, ready, tfd_dl) =
+                        fs.epoll_collect(epfd as usize, maxevents, pending_signals)?;
                     if ready > 0 {
                         user_access::copy_to_user(space, events_ptr, &encoded)
                             .map_err(|_| Errno::Fault)?;

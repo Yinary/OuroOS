@@ -131,6 +131,7 @@ pub fn dispatch(
             Ok(0)
         }
         sysnr::SENDFILE => sendfile(ctx, space, a),
+        sysnr::VMSPLICE => vmsplice(ctx, space, a),
         sysnr::SPLICE => splice(ctx, space, a),
         sysnr::TEE => tee(ctx, a),
         sysnr::FADVISE64 => fadvise64(ctx, a),
@@ -2009,5 +2010,100 @@ fn tee(ctx: &Context, a: [usize; 6]) -> Result<usize, Errno> {
             Err(e) => return Err(e),
         }
     }
+    Ok(done)
+}
+
+/// Linux vmsplice(2)：在用户 iovec 数组与管道描述符之间直接搬运数据。
+fn vmsplice(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
+    const SPLICE_F_NONBLOCK: u32 = 2;
+    let fd = a[0];
+    let iov_ptr = a[1];
+    let nr_segs = a[2];
+    let nonblock = (a[3] as u32) & SPLICE_F_NONBLOCK != 0;
+
+    if nr_segs > MAX_IOV {
+        return Err(Errno::Invalid);
+    }
+    let handle = ctx.get(fd)?;
+    let (reading, writing) = handle.lock().pipe_rw_mode().ok_or(Errno::BadF)?;
+    let buffers = import_iov(space, iov_ptr, nr_segs)?;
+    let total = buffers
+        .iter()
+        .fold(0usize, |sum, b| sum.saturating_add(b.len))
+        .min(MAX_RW_COUNT);
+    if total == 0 {
+        return Ok(0);
+    }
+
+    let mut scratch = ScratchBuf::acquire(total.min(POOL_IO_BUF))?;
+    let mut user = UserIo {
+        buffers: &buffers,
+        index: 0,
+        offset: 0,
+    };
+    let mut done = 0usize;
+
+    if writing {
+        while done < total {
+            let nb = nonblock || done > 0;
+            let avail = match handle.lock().pipe_writable_space(nb) {
+                Ok(n) => n,
+                Err(Errno::Again) if done > 0 => break,
+                Err(_) if done > 0 => break,
+                Err(e) => return Err(e),
+            };
+            let want = (total - done).min(scratch.0.len()).min(avail);
+            if want == 0 {
+                break;
+            }
+            let copied = match user.copy(want, |address, start, len| {
+                user_access::copy_from_user(space, address, &mut scratch.0[start..start + len])
+                    .map_err(|_| Errno::Fault)
+            }) {
+                Ok(n) => n,
+                Err(e) => return if done > 0 { Ok(done) } else { Err(e) },
+            };
+            if copied == 0 {
+                break;
+            }
+            match handle.lock().write_pipe_from(&scratch.0[..copied], nb) {
+                Ok(w) => {
+                    done += w;
+                    if w < copied {
+                        break;
+                    }
+                }
+                Err(Errno::Again) if done > 0 => break,
+                Err(_) if done > 0 => break,
+                Err(e) => return Err(e),
+            }
+        }
+    } else if reading {
+        while done < total {
+            let nb = nonblock || done > 0;
+            let want = (total - done).min(scratch.0.len());
+            let n = match handle.lock().peek_pipe_into(0, &mut scratch.0[..want], nb) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(Errno::Again) if done > 0 => break,
+                Err(e) => return Err(e),
+            };
+            let delivered = match user.copy(n, |address, start, len| {
+                user_access::copy_to_user(space, address, &scratch.0[start..start + len])
+                    .map_err(|_| Errno::Fault)
+            }) {
+                Ok(m) => m,
+                Err(e) => return if done > 0 { Ok(done) } else { Err(e) },
+            };
+            handle.lock().consume_pipe(delivered);
+            done += delivered;
+            if delivered < n || n < want {
+                break;
+            }
+        }
+    } else {
+        return Err(Errno::BadF);
+    }
+
     Ok(done)
 }

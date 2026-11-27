@@ -166,6 +166,11 @@ enum Kind {
     },
     /// epoll_create1(2) 事件多路复用实例
     Epoll(Arc<Mutex<super::event::EpollInstance>>),
+    /// signalfd4(2) 信号事件描述符（存储监听信号集掩码）
+    SignalFd {
+        mask: u64,
+        event_gen: u64,
+    },
 }
 /// 共享偏移、打开标志和文件资源的持有者。
 pub(crate) struct OpenFile {
@@ -1448,11 +1453,78 @@ impl Context {
         }
     }
 
+    /// signalfd4(2)：创建新 signalfd（fd == -1）或更新已有 signalfd 的掩码与标志。
+    pub(crate) fn open_or_update_signalfd(
+        &mut self,
+        fd: i32,
+        mask: u64,
+        nonblock: bool,
+        cloexec: bool,
+    ) -> Result<usize, Errno> {
+        if fd == -1 {
+            let file_flags = 2 | if nonblock { 0x800 } else { 0 };
+            let file = fs::try_arc(Mutex::new(OpenFile {
+                ofd_id: next_ofd_id(),
+                kind: Kind::SignalFd { mask, event_gen: 1 },
+                offset: 0,
+                flags: file_flags,
+            }))?;
+            return self.install(file, cloexec);
+        }
+        if fd < 0 {
+            return Err(Errno::BadF);
+        }
+        let idx = fd as usize;
+        let handle = self.get(idx)?;
+        {
+            let mut f = handle.lock();
+            let Kind::SignalFd {
+                mask: cur_mask,
+                event_gen,
+            } = &mut f.kind
+            else {
+                return Err(Errno::Invalid);
+            };
+            *cur_mask = mask;
+            *event_gen = event_gen.wrapping_add(1);
+            if nonblock {
+                f.flags |= 0x800;
+            } else {
+                f.flags &= !0x800;
+            }
+        }
+        if cloexec {
+            let _ = self.set_descriptor_flags(idx, 1);
+        }
+        Ok(idx)
+    }
+
+    /// 若 `fd` 为 signalfd，返回 `(监听掩码, 是否非阻塞)` 并可选递增版本号。
+    pub(crate) fn signalfd_info(&self, fd: usize) -> Option<(u64, bool)> {
+        let handle = self.get(fd).ok()?;
+        let f = handle.lock();
+        match f.kind {
+            Kind::SignalFd { mask, .. } => Some((mask, f.flags & 0x800 != 0)),
+            _ => None,
+        }
+    }
+
+    /// 消费 signalfd 信号后递增其边沿版本号。
+    pub(crate) fn bump_signalfd_gen(&self, fd: usize) {
+        if let Ok(handle) = self.get(fd) {
+            let mut f = handle.lock();
+            if let Kind::SignalFd { event_gen, .. } = &mut f.kind {
+                *event_gen = event_gen.wrapping_add(1);
+            }
+        }
+    }
+
     /// 采集 epoll 实例当前就绪事件及最早武装 timerfd 到期时刻。
     pub(crate) fn epoll_collect(
         &self,
         epfd: usize,
         maxevents: usize,
+        pending_signals: u64,
     ) -> Result<(Vec<u8>, usize, Option<core::time::Duration>), Errno> {
         let ep_handle = self.get(epfd)?;
         let ep = {
@@ -1460,7 +1532,7 @@ impl Context {
             f.epoll_instance().ok_or(Errno::Invalid)?
         };
         let mut guard = ep.lock();
-        guard.collect_ready(maxevents, 0)
+        guard.collect_ready(maxevents, 0, pending_signals)
     }
 }
 
@@ -1669,7 +1741,10 @@ impl OpenFile {
                 block_size: 4096,
                 ..Default::default()
             }),
-            Kind::EventFd { .. } | Kind::TimerFd { .. } | Kind::Epoll(_) => Ok(fs::Metadata {
+            Kind::EventFd { .. }
+            | Kind::TimerFd { .. }
+            | Kind::Epoll(_)
+            | Kind::SignalFd { .. } => Ok(fs::Metadata {
                 mode: 0o000600,
                 links: 1,
                 block_size: 4096,
@@ -1780,7 +1855,10 @@ impl OpenFile {
     /// 零字节读写前置检查：eventfd/timerfd/epoll 拒绝小于 8 字节的读写并报 EINVAL。
     pub(crate) fn check_zero_rw(&self, _reading: bool) -> Result<usize, Errno> {
         match self.kind {
-            Kind::EventFd { .. } | Kind::TimerFd { .. } | Kind::Epoll(_) => Err(Errno::Invalid),
+            Kind::EventFd { .. }
+            | Kind::TimerFd { .. }
+            | Kind::Epoll(_)
+            | Kind::SignalFd { .. } => Err(Errno::Invalid),
             _ => Ok(0),
         }
     }
@@ -1800,6 +1878,7 @@ impl OpenFile {
                 | Kind::EventFd { .. }
                 | Kind::TimerFd { .. }
                 | Kind::Epoll(_)
+                | Kind::SignalFd { .. }
                 | Kind::Input
                 | Kind::Output
         )
@@ -1810,6 +1889,7 @@ impl OpenFile {
             Kind::Pipe { pipe, .. } => pipe.lock().event_gen,
             Kind::EventFd { efd, .. } => efd.lock().event_gen(),
             Kind::TimerFd { tfd, .. } => tfd.lock().event_gen(),
+            Kind::SignalFd { event_gen, .. } => *event_gen,
             _ => 0,
         }
     }
@@ -1826,6 +1906,19 @@ impl OpenFile {
     pub(crate) fn pipe_id(&self) -> Option<u64> {
         match &self.kind {
             Kind::Pipe { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// 若为管道或命名管道且非 O_PATH，返回 `(可读, 可写)`（供 vmsplice 判定传输方向）。
+    pub(crate) fn pipe_rw_mode(&self) -> Option<(bool, bool)> {
+        if self.flags & 0x200000 != 0 {
+            return None;
+        }
+        match self.kind {
+            Kind::Pipe {
+                reading, writing, ..
+            } => Some((reading, writing)),
             _ => None,
         }
     }
@@ -2045,7 +2138,7 @@ impl OpenFile {
                 }
                 tfd.lock().read(self.flags & 0x800 != 0, deliver)
             }
-            Kind::Epoll(_) => Err(Errno::Invalid),
+            Kind::Epoll(_) | Kind::SignalFd { .. } => Err(Errno::Invalid),
             Kind::DevNull | Kind::Rtc => Ok(0),
             Kind::DevZero | Kind::DevRandom { .. } => self.read_at(0, data, false, deliver),
             Kind::DevBlk { .. } => Ok(0), // 设备块读走专用路径（见 read_devblk）
@@ -2109,7 +2202,7 @@ impl OpenFile {
                 Ok(count)
             }
             Kind::EventFd { efd, .. } => efd.lock().write(data, self.flags & 0x800 != 0),
-            Kind::TimerFd { .. } | Kind::Epoll(_) => Err(Errno::Invalid),
+            Kind::TimerFd { .. } | Kind::Epoll(_) | Kind::SignalFd { .. } => Err(Errno::Invalid),
             Kind::Socket(id) => {
                 let nonblock = self.flags & 0x800 != 0;
                 crate::net::sendto(*id, data, 0, None, nonblock)
@@ -2280,7 +2373,12 @@ pub fn executable(ctx: &Context, path: &str) -> Result<Vec<u8>, Errno> {
 }
 /// 获取 mmap 用的普通文件，权限来自打开方式。
 /// 单文件描述符在 poll/select/epoll 下的就绪事件计算。
-pub(super) fn fd_poll_events(file: &mut OpenFile, requested: u16, depth: usize) -> u16 {
+pub(super) fn fd_poll_events(
+    file: &mut OpenFile,
+    requested: u16,
+    depth: usize,
+    pending_signals: u64,
+) -> u16 {
     match &file.kind {
         Kind::Input => 0x41 & requested,
         Kind::Output => 0x104 & requested,
@@ -2294,8 +2392,15 @@ pub(super) fn fd_poll_events(file: &mut OpenFile, requested: u16, depth: usize) 
         Kind::Socket(id) => crate::net::poll_events(*id, requested),
         Kind::EventFd { efd, .. } => efd.lock().poll_events(requested),
         Kind::TimerFd { tfd, .. } => tfd.lock().poll_events(requested),
+        Kind::SignalFd { mask, .. } => {
+            if pending_signals & *mask != 0 {
+                0x41 & requested
+            } else {
+                0
+            }
+        }
         Kind::Epoll(ep) => {
-            if ep.lock().has_ready(depth) {
+            if ep.lock().has_ready(depth, pending_signals) {
                 0x41 & requested
             } else {
                 0
@@ -2336,6 +2441,7 @@ pub(crate) fn poll(
     space: &UserAddressSpace,
     addr: usize,
     count: usize,
+    pending_signals: u64,
 ) -> Result<(usize, Option<core::time::Duration>), Errno> {
     if count > 1024 {
         return Err(Errno::Invalid);
@@ -2358,7 +2464,7 @@ pub(crate) fn poll(
                     None => d,
                 });
             }
-            fd_poll_events(&mut guard, requested, 0)
+            fd_poll_events(&mut guard, requested, 0, pending_signals)
         } else {
             32
         };
@@ -2390,6 +2496,7 @@ pub(crate) fn select_check(
     rfds_ptr: usize,
     wfds_ptr: usize,
     efds_ptr: usize,
+    pending_signals: u64,
 ) -> Result<SelectSets, Errno> {
     let nfds = nfds as u32 as i32;
     if !(0..=1024).contains(&nfds) {
@@ -2440,7 +2547,7 @@ pub(crate) fn select_check(
                 None => d,
             });
         }
-        let ev = fd_poll_events(&mut guard, ALL_SELECT_MASK, 0);
+        let ev = fd_poll_events(&mut guard, ALL_SELECT_MASK, 0, pending_signals);
         if want_r && (ev & (0x1 | 0x40 | 0x10 | 0x8 | 0x2000) != 0) {
             out.read[idx] |= bit;
             out.ready += 1;
