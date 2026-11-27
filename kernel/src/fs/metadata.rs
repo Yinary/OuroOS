@@ -71,8 +71,30 @@ fn string(s: &str) -> Result<String, Errno> {
     Ok(out)
 }
 
+fn is_clean_ext4_path(path: &str) -> bool {
+    if path == "/" {
+        return true;
+    }
+    if !path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains("//")
+        || path == "/proc"
+        || path.starts_with("/proc/")
+        || path == "/dev"
+        || path.starts_with("/dev/")
+    {
+        return false;
+    }
+    !path.split('/').any(|s| s == "." || s == "..")
+}
+
 /// 查询绝对路径；follow 只控制末项链接，最多跟随 40 个链接。
 pub(crate) fn query(path: &str, follow: bool) -> Result<Metadata, Errno> {
+    if is_clean_ext4_path(path) && !fat::has_mounts() {
+        if let Ok(Some(info)) = ext4::fast_metadata(path) {
+            return Ok(info);
+        }
+    }
     resolve(path, follow).map(|(_, info)| info)
 }
 
@@ -83,6 +105,7 @@ pub(super) fn resolve(path: &str, follow: bool) -> Result<(String, Metadata), Er
     let mut info = metadata(lookup("/")?)?;
     let mut cursor = 0;
     let mut links = 0;
+    let mut saw_symlink = false;
     while cursor < pending.len() {
         if info.mode & 0xf000 != 0x4000 {
             return Err(Errno::NotDir);
@@ -119,6 +142,7 @@ pub(super) fn resolve(path: &str, follow: bool) -> Result<(String, Metadata), Er
                 let ino = lookup(&candidate)?;
                 let child = metadata(ino)?;
                 if child.mode & 0xf000 == 0xa000 && (follow || !suffix.is_empty()) {
+                    saw_symlink = true;
                     links += 1;
                     if links > 40 {
                         return Err(Errno::Loop);
@@ -150,6 +174,14 @@ pub(super) fn resolve(path: &str, follow: bool) -> Result<(String, Metadata), Er
             }
         }
         cursor = next;
+    }
+    if !saw_symlink
+        && info.mode & 0xf000 != 0xa000
+        && is_clean_ext4_path(&current)
+        && (info.ino as u32) & FAT_INODE == 0
+        && !fat::has_mounts()
+    {
+        ext4::mark_direct_stat(&current, info.ino as u32);
     }
     Ok((current, info))
 }

@@ -232,17 +232,15 @@ impl FilePage {
         let data = match self.mode {
             Mode::Private => {
                 let frame = OwnedFrame::new()?;
-                let mut buf = [0u8; 1024];
                 let count = (length - self.offset as u64).min(PAGE_SIZE as u64) as usize;
                 let mut i = 0;
                 while i < count {
-                    let n = (count - i).min(buf.len());
-                    let n =
-                        fs::read(self.file.ino, self.offset + i, &mut buf[..n]).map_err(map_io)?;
+                    let n = frame.fill_range_with(i, count - i, |dst| {
+                        fs::read(self.file.ino, self.offset + i, dst).map_err(map_io)
+                    })?;
                     if n == 0 {
                         return Err(MapError::FileIo);
                     }
-                    frame.write(i, &buf[..n])?;
                     i += n;
                 }
                 Data::Private(frame)

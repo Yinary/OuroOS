@@ -15,18 +15,12 @@ use alloc::{string::String, vec::Vec};
 
 /// 从用户内存读取 NUL 结尾 UTF-8 字符串；不可访问或过长时返回错误。
 pub(crate) fn user_string(space: &UserAddressSpace, ptr: usize) -> Result<String, Errno> {
-    let mut bytes = Vec::new();
-    bytes.try_reserve(4096).map_err(|_| Errno::NoMem)?;
-    for n in 0..4096 {
-        let mut b = [0];
-        user_access::copy_from_user(space, ptr.checked_add(n).ok_or(Errno::Fault)?, &mut b)
-            .map_err(|_| Errno::Fault)?;
-        if b[0] == 0 {
-            return String::from_utf8(bytes).map_err(|_| Errno::Invalid);
-        }
-        bytes.push(b[0]);
-    }
-    Err(Errno::NameTooLong)
+    user_access::read_cstr(space, ptr, 4096).map_err(|e| match e {
+        user_access::CStrError::Fault => Errno::Fault,
+        user_access::CStrError::TooLong => Errno::NameTooLong,
+        user_access::CStrError::NoMem => Errno::NoMem,
+        user_access::CStrError::InvalidUtf8 => Errno::Invalid,
+    })
 }
 /// Linux 文件调用，所有用户缓冲区经 user_access 复制。
 pub fn dispatch(
@@ -687,24 +681,28 @@ fn rw(nr: usize, a: [usize; 6], space: &UserAddressSpace, ctx: &Context) -> Resu
     }
 }
 
-/// `transfer` 复用的单槽 4 KiB 堆暂存池，避免高频小读写每次堆分配与清零，
-/// 同时维持 16 KiB 内核栈预算（docs/ostd-contracts.md §8）。
+/// 小读写直接走栈上 256 字节缓冲，避免自旋锁与堆池开销。
+const STACK_IO_BUF: usize = 256;
+/// `transfer` 复用的单槽 64 KiB 堆暂存池，大幅降低大块文件/管道读写的加锁与分块次数。
+const POOL_IO_BUF: usize = 65536;
 static IO_SCRATCH: spin::Mutex<Option<Vec<u8>>> = spin::Mutex::new(None);
 
 struct ScratchBuf(Vec<u8>);
 
 impl ScratchBuf {
     fn acquire(cap: usize) -> Result<Self, Errno> {
+        let need = cap.max(4096);
         if let Some(mut buf) = IO_SCRATCH.lock().take() {
-            if buf.len() >= cap {
+            if buf.len() >= need {
                 return Ok(Self(buf));
             }
+            let target = POOL_IO_BUF.max(need);
             buf.clear();
-            buf.try_reserve_exact(4096).map_err(|_| Errno::NoMem)?;
-            buf.resize(4096, 0);
+            buf.try_reserve_exact(target).map_err(|_| Errno::NoMem)?;
+            buf.resize(target, 0);
             return Ok(Self(buf));
         }
-        let alloc_len = 4096.max(cap);
+        let alloc_len = POOL_IO_BUF.max(need);
         let mut buf = Vec::new();
         buf.try_reserve_exact(alloc_len).map_err(|_| Errno::NoMem)?;
         buf.resize(alloc_len, 0);
@@ -714,7 +712,7 @@ impl ScratchBuf {
 
 impl Drop for ScratchBuf {
     fn drop(&mut self) {
-        if self.0.len() == 4096 {
+        if self.0.len() == POOL_IO_BUF {
             let mut pool = IO_SCRATCH.lock();
             if pool.is_none() {
                 *pool = Some(core::mem::take(&mut self.0));
@@ -723,30 +721,61 @@ impl Drop for ScratchBuf {
     }
 }
 
-/// 复用可失败分配的 4 KiB 缓冲区；发生部分传输后返回已完成长度。
+/// 小读写走 256 字节栈缓冲，大读写复用 64 KiB 堆池；发生部分传输后返回已完成长度。
 #[inline(never)]
 fn transfer(
     space: &UserAddressSpace,
     file: &mut fs::context::OpenFile,
     buffers: &[UserBuffer],
     reading: bool,
-    mut position: Option<usize>,
+    position: Option<usize>,
 ) -> Result<usize, Errno> {
     let total = buffers
         .iter()
         .fold(0usize, |sum, b| sum.saturating_add(b.len))
         .min(MAX_RW_COUNT);
+    if total == 0 {
+        return Ok(0);
+    }
+    if total <= STACK_IO_BUF {
+        let mut stack_buf = [0u8; STACK_IO_BUF];
+        return transfer_with_buf(
+            space,
+            file,
+            buffers,
+            total,
+            reading,
+            position,
+            &mut stack_buf[..total],
+        );
+    }
+    let cap = total.min(POOL_IO_BUF);
+    let mut scratch = ScratchBuf::acquire(cap)?;
+    transfer_with_buf(
+        space,
+        file,
+        buffers,
+        total,
+        reading,
+        position,
+        &mut scratch.0[..cap],
+    )
+}
+
+fn transfer_with_buf(
+    space: &UserAddressSpace,
+    file: &mut fs::context::OpenFile,
+    buffers: &[UserBuffer],
+    total: usize,
+    reading: bool,
+    mut position: Option<usize>,
+    chunk: &mut [u8],
+) -> Result<usize, Errno> {
     let mut user = UserIo {
         buffers,
         index: 0,
         offset: 0,
     };
-    if total == 0 {
-        return Ok(0);
-    }
-    let cap = total.min(4096);
-    let mut scratch = ScratchBuf::acquire(cap)?;
-    let chunk = &mut scratch.0[..cap];
     let mut done = 0;
     while done < total {
         let want = (total - done).min(chunk.len());

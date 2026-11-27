@@ -1071,8 +1071,11 @@ impl OpenFile {
                     };
                 }
                 let count = data.len().min(p.data.len());
-                for (i, b) in p.data.iter().take(count).enumerate() {
-                    data[i] = *b;
+                let (first, second) = p.data.as_slices();
+                let take_first = count.min(first.len());
+                data[..take_first].copy_from_slice(&first[..take_first]);
+                if take_first < count {
+                    data[take_first..count].copy_from_slice(&second[..count - take_first]);
                 }
                 let delivered = deliver(&data[..count])?;
                 if delivered > count {
@@ -1126,12 +1129,16 @@ impl OpenFile {
                 if p.readers == 0 {
                     return Err(Errno::Pipe);
                 }
-                if PIPE_CAPACITY - p.data.len() < data.len() {
+                let avail = PIPE_CAPACITY - p.data.len();
+                // 遵循 POSIX PIPE_BUF(4096) 原子写语义；更大请求允许部分写入以提升大块管道吞吐。
+                let need = if data.len() <= 4096 { data.len() } else { 1 };
+                if avail < need {
                     return Err(nonblock_or_wait(self.flags));
                 }
-                p.data.extend(data);
+                let count = data.len().min(avail);
+                p.data.extend(&data[..count]);
                 crate::task::sched::request_pipe_id_wake(*id);
-                Ok(data.len())
+                Ok(count)
             }
             Kind::Socket(id) => {
                 let nonblock = self.flags & 0x800 != 0;
