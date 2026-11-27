@@ -23,11 +23,10 @@ const SA_RESTORER: u32 = 0x0400_0000;
 /// SA_ONSTACK：帧落备用栈顶。
 pub(crate) const SA_ONSTACK: u32 = 0x0800_0000;
 pub(crate) const SA_RESTART: u32 = 0x1000_0000;
-/// SA_NODEFER：未支持，建帧投递恒加本信号屏蔽位（sigframe）。
-#[allow(dead_code)]
-const SA_NODEFER: u32 = 0x4000_0000;
-#[allow(dead_code)]
-const SA_RESETHAND: u32 = 0x8000_0000;
+/// SA_NODEFER：进入处理函数期间不自动屏蔽本信号。
+pub(crate) const SA_NODEFER: u32 = 0x4000_0000;
+/// SA_RESETHAND：进入处理函数后把本信号处置复位为默认动作。
+pub(crate) const SA_RESETHAND: u32 = 0x8000_0000;
 const SIG_BLOCK: usize = 0;
 const SIG_UNBLOCK: usize = 1;
 const SIG_SETMASK: usize = 2;

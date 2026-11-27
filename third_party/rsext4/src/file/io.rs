@@ -338,7 +338,17 @@ pub fn read_inode_data_into<B: BlockDevice>(
     let end_lbn = (end - 1) / block_bytes;
 
     let mut copied = 0usize;
-    if inode.have_extend_header_and_use_extend() {
+    if start_lbn == end_lbn {
+        // OuroOS patch: 单块读直接解析逻辑块号并走 read_block_slice，免除 Vec<ExtentRun> 堆分配。
+        if let Some(phys) = resolve_inode_block(device, &mut inode, start_lbn as u32)? {
+            let src_off = (offset - start_lbn * block_bytes) as usize;
+            fs.datablock_cache
+                .read_block_slice(device, phys, src_off, &mut dst[..to_read])?;
+        } else {
+            dst[..to_read].fill(0);
+        }
+        copied = to_read;
+    } else if inode.have_extend_header_and_use_extend() {
         let mut tree = ExtentTree::new(&mut inode);
         let runs = tree.initialized_runs_in_range(device, start_lbn as u32, end_lbn as u32)?;
         let mut lbn = start_lbn;
@@ -356,6 +366,23 @@ pub fn read_inode_data_into<B: BlockDevice>(
             while run_block_offset < run.len {
                 let part_blocks = (run.len - run_block_offset).min(max_run_blocks);
                 let phys = run.physical_start.checked_add(run_block_offset)?;
+                // OuroOS patch: 单块读直接走 read_block_slice，免除每轮 4 KiB 堆分配与清零。
+                if part_blocks == 1 {
+                    let current_lbn = run_lbn + u64::from(run_block_offset);
+                    let src_len = copy_len_for_lbn(offset, end, current_lbn)?;
+                    let lbn_start = current_lbn * block_bytes;
+                    let src_off = (core::cmp::max(offset, lbn_start) - lbn_start) as usize;
+                    fs.datablock_cache.read_block_slice(
+                        device,
+                        phys,
+                        src_off,
+                        &mut dst[copied..copied + src_len],
+                    )?;
+                    copied += src_len;
+                    lbn = current_lbn + 1;
+                    run_block_offset += 1;
+                    continue;
+                }
                 let run_bytes = BLOCK_SIZE
                     .checked_mul(part_blocks as usize)
                     .ok_or_else(|| Ext4Error::from(Errno::EOVERFLOW))?;
@@ -401,7 +428,7 @@ pub fn read_inode_data_into<B: BlockDevice>(
         }
     }
 
-    fs.touch_inode_atime_if_needed(device, inode_num)?;
+    fs.touch_inode_atime_if_needed_loaded(device, inode_num, &inode)?;
     Ok(copied)
 }
 
@@ -475,23 +502,19 @@ fn write_inode_block_data<B: BlockDevice>(
     let src_end = src_off
         .checked_add(len)
         .ok_or_else(|| Ext4Error::from(Errno::EOVERFLOW))?;
-    let dst_end = dst_off
+    dst_off
         .checked_add(len)
         .ok_or_else(|| Ext4Error::from(Errno::EOVERFLOW))?;
 
     let full_block = dst_off == 0 && len == BLOCK_SIZE;
-    if newly_allocated || full_block {
-        fs.datablock_cache.modify_new(device, phys, |blk| {
-            if !full_block {
-                blk.fill(0);
-            }
-            blk[dst_off..dst_end].copy_from_slice(&write.data[src_off..src_end]);
-        })?;
-    } else {
-        fs.datablock_cache.modify(device, phys, |blk| {
-            blk[dst_off..dst_end].copy_from_slice(&write.data[src_off..src_end]);
-        })?;
-    }
+    // OuroOS patch: 数据块写经 write_block_slice 直通底层块缓存，免除小块缓存淘汰与堆分配。
+    fs.datablock_cache.write_block_slice(
+        device,
+        phys,
+        dst_off,
+        &write.data[src_off..src_end],
+        newly_allocated || full_block,
+    )?;
 
     Ok(())
 }
@@ -573,13 +596,42 @@ pub fn write_inode_data<B: BlockDevice>(
     offset: u64,
     data: &[u8],
 ) -> Ext4Result<()> {
-    if data.is_empty() {
-        return Ok(());
+    write_inode_data_inner(device, fs, inode_num, offset, data, false).map(|_| ())
+}
+
+// OuroOS patch: 校验普通文件并返回写入前旧长度，免除调用方二次加载 inode。
+pub fn write_regular_inode_data<B: BlockDevice>(
+    device: &mut Jbd2Dev<B>,
+    fs: &mut Ext4FileSystem,
+    inode_num: InodeNumber,
+    offset: u64,
+    data: &[u8],
+) -> Ext4Result<u64> {
+    write_inode_data_inner(device, fs, inode_num, offset, data, true)
+}
+
+fn write_inode_data_inner<B: BlockDevice>(
+    device: &mut Jbd2Dev<B>,
+    fs: &mut Ext4FileSystem,
+    inode_num: InodeNumber,
+    offset: u64,
+    data: &[u8],
+    require_regular: bool,
+) -> Ext4Result<u64> {
+    let mut inode = fs.get_inode_by_num(device, inode_num)?;
+    if require_regular {
+        if inode.is_dir() {
+            return Err(Ext4Error::is_dir());
+        }
+        if !inode.is_file() {
+            return Err(Ext4Error::unsupported());
+        }
     }
 
-    let mut inode = fs.get_inode_by_num(device, inode_num)?;
-
     let old_size = inode.size();
+    if data.is_empty() {
+        return Ok(old_size);
+    }
     let block_bytes = BLOCK_SIZE as u64;
 
     // Some older or partially initialized inodes may carry the extents flag
@@ -708,5 +760,5 @@ pub fn write_inode_data<B: BlockDevice>(
         Ext4InodeMetadataUpdate::write_access(),
     )?;
 
-    Ok(())
+    Ok(old_size)
 }

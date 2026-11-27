@@ -24,7 +24,7 @@ use super::{
         SignalDisposition, SignalSet, SignalSetExt, SIGKILL, SIGSEGV, SIGSTOP, SIG_DFL, SIG_IGN,
         SI_TKILL,
     },
-    task::{FutexKey, Pid, Task, TaskBody, WaitReason},
+    task::{FutexEnd, Pid, Task, TaskBody, WaitReason},
     ExitInfo, FutexStep, REGISTRY,
 };
 
@@ -131,7 +131,6 @@ pub fn user_task_entry() -> ! {
         TaskBody::Kernel(_) => panic!("kernel task entered user entry"),
     };
     let mut sleep_deadline = None;
-    let mut futex_wait = None;
     let mut vfork_child: Option<Pid> = None;
     // 循环局部等待状态：sigsuspend 的旧屏蔽集合、sigtimedwait 的等待集与截止。
     let mut sigsuspend_saved: Option<SignalSet> = None;
@@ -145,7 +144,7 @@ pub fn user_task_entry() -> ! {
         let kernel_start;
         let action = {
             // 每轮激活本任务页表；REGISTRY 锁不跨 run_user_task。
-            // 致命信号在此记下，锁释放后跳过用户态直接退出。
+            // 致命信号在此记下，锁释放后结束整个线程组。
             let signal_exit = {
                 let mut locked = REGISTRY.lock();
                 let reg = &mut *locked;
@@ -199,6 +198,10 @@ pub fn user_task_entry() -> ! {
                             ) {
                                 Ok(new_blocked) => {
                                     thread.signal.setmask(new_blocked);
+                                    if d.flags & crate::syscall::signal::SA_RESETHAND != 0 {
+                                        rec.signal
+                                            .set_disposition(sig, SignalDisposition::default());
+                                    }
                                     None
                                 }
                                 Err(_) => Some(ExitInfo::Signaled {
@@ -211,7 +214,7 @@ pub fn user_task_entry() -> ! {
                 }
             };
             if let Some(info) = signal_exit {
-                sched::exit_current(info);
+                sched::exit_group_current(info);
             }
             let user_start = crate::time::monotonic();
             let trap_type = run_user_task(&mut frame);
@@ -250,6 +253,7 @@ pub fn user_task_entry() -> ! {
                                     &mut space.0,
                                     rec.fs.as_mut().expect("user fs context"),
                                     &mut rec.signal,
+                                    &rec.creds,
                                     thread,
                                 ),
                                 None => Flow::Continue,
@@ -264,7 +268,6 @@ pub fn user_task_entry() -> ! {
                                     &mut sleep_deadline,
                                     &mut sigsuspend_saved,
                                     &mut timedwait,
-                                    &mut futex_wait,
                                     &mut vfork_child,
                                     &mut wait_uncompleted,
                                 ),
@@ -446,28 +449,34 @@ pub fn user_task_entry() -> ! {
             Action::Yield => sched::yield_now(),
             // Wait：先做可落睡的 park 检查，睡醒后补一次不落睡的重查。
             Action::Wait(reason) => {
-                let outcome = park_check_signals(
-                    pid,
-                    reason,
-                    &mut frame,
-                    &mut sleep_deadline,
-                    &mut timedwait,
-                    &mut futex_wait,
-                    true,
-                );
-                wait_uncompleted = outcome != ParkOutcome::Completed;
-                if outcome == ParkOutcome::Parked {
-                    // 睡醒后的不落睡重查。
+                let mut allow_park = true;
+                loop {
                     let outcome = park_check_signals(
                         pid,
                         reason,
                         &mut frame,
                         &mut sleep_deadline,
                         &mut timedwait,
-                        &mut futex_wait,
-                        false,
+                        allow_park,
                     );
-                    wait_uncompleted = outcome != ParkOutcome::Completed;
+                    match outcome {
+                        ParkOutcome::Parked => allow_park = false,
+                        ParkOutcome::Incomplete if matches!(reason, WaitReason::Futex { .. }) => {
+                            if allow_park {
+                                // 入队前丢弃了默认忽略的信号，沿用原截止时间。
+                                continue;
+                            }
+                            // 信号导致的虚假唤醒也须返回用户，由调用方重查条件。
+                            frame.syscall_ok();
+                            frame[TrapFrameArgs::RET] = 0;
+                            wait_uncompleted = false;
+                            break;
+                        }
+                        _ => {
+                            wait_uncompleted = outcome != ParkOutcome::Completed;
+                            break;
+                        }
+                    }
                 }
             }
             Action::Continue => sched::resume_check(),
@@ -539,7 +548,6 @@ fn park_check_signals(
     frame: &mut TrapFrame,
     sleep_deadline: &mut Option<core::time::Duration>,
     timedwait: &mut Option<(SignalSet, core::time::Duration)>,
-    futex_wait: &mut Option<(FutexKey, u32, Option<core::time::Duration>, u32)>,
     allow_park: bool,
 ) -> ParkOutcome {
     // sigtimedwait 的等待集；Some 即本次挂起属于 rt_sigtimedwait。
@@ -555,12 +563,9 @@ fn park_check_signals(
             .find(|t| t.tid == pid)
             .expect("user task unregistered");
         let blocked = thread.signal.blocked();
-        // 先查等待集内信号：命中即消费，不经处置。
-        let tw_hit = tw_set.and_then(|set| {
-            let mut hidden = blocked;
-            hidden |= !set;
-            super::signal::take_any(&mut rec.signal, &mut thread.signal, hidden)
-        });
+        // 先查等待集内信号（含已屏蔽信号，同 sigtimedwait(2)）：命中即消费，不经处置。
+        let tw_hit = tw_set
+            .and_then(|set| super::signal::take_any(&mut rec.signal, &mut thread.signal, !set));
         match tw_hit {
             Some((sig, slot)) => ParkPeek::TwHit { sig, slot },
             None => match super::signal::peek_any(&rec.signal, &thread.signal, blocked) {
@@ -585,8 +590,17 @@ fn park_check_signals(
         ParkPeek::Empty => {
             if allow_park {
                 // 无可投递信号：挂起，醒来后由调用方补一次不落睡的重查。
-                sched::park(reason);
-                ParkOutcome::Parked
+                match sched::park(reason) {
+                    Some(end) => {
+                        frame.syscall_ok();
+                        frame[TrapFrameArgs::RET] = crate::syscall::to_abi(match end {
+                            FutexEnd::Notified => Ok(0),
+                            FutexEnd::TimedOut => Err(Errno::TimedOut),
+                        });
+                        ParkOutcome::Completed
+                    }
+                    None => ParkOutcome::Parked,
+                }
             } else {
                 ParkOutcome::Incomplete
             }
@@ -604,15 +618,16 @@ fn park_check_signals(
             ParkOutcome::Completed
         }
         ParkPeek::Handler(d) => match reason {
-            WaitReason::Deadline(until) => {
+            WaitReason::SigTimedWait { .. } => {
                 // sigtimedwait 被集合外 handler 信号打断：以 -EINTR 完成。
-                if tw_set.is_some() {
-                    *timedwait = None;
-                    // Wait 路径原欠一次 syscall_ok，EINTR 完成恰好补上。
-                    frame.syscall_ok();
-                    frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
-                    ParkOutcome::Completed
-                } else if is_absolute_nanosleep(frame) {
+                *timedwait = None;
+                // Wait 路径原欠一次 syscall_ok，EINTR 完成恰好补上。
+                frame.syscall_ok();
+                frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
+                ParkOutcome::Completed
+            }
+            WaitReason::Deadline(until) => {
+                if is_absolute_nanosleep(frame) {
                     // clock_nanosleep 的绝对期限：清截止时间，不回写剩余时间，以 -EINTR 完成。
                     *sleep_deadline = None;
                     // Wait 路径原欠一次 syscall_ok，EINTR 完成恰好补上。
@@ -648,15 +663,17 @@ fn park_check_signals(
                 }
             }
             // SA_RESTART：pipe 读写与 wait 的等待不完成不睡，信号留给循环顶检查点。
-            // ppoll 被 handler 信号打断一律以 -EINTR 完成。
-            WaitReason::Pipe | WaitReason::Children
-                if d.flags & SA_RESTART != 0 && frame[TrapFrameArgs::SYSCALL] != sysnr::PPOLL =>
+            // ppoll 与 pselect6 被 handler 信号打断一律以 -EINTR 完成。
+            WaitReason::Pipe | WaitReason::PipeId(_) | WaitReason::Children
+                if d.flags & SA_RESTART != 0
+                    && frame[TrapFrameArgs::SYSCALL] != sysnr::PPOLL
+                    && frame[TrapFrameArgs::SYSCALL] != sysnr::PSELECT6 =>
             {
                 ParkOutcome::Incomplete
             }
             // 其余：完成 syscall 返回 -EINTR；信号留给循环顶检查点。
             _ => {
-                *futex_wait = None;
+                *sleep_deadline = None;
                 frame.syscall_ok();
                 frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
                 ParkOutcome::Completed
@@ -664,8 +681,8 @@ fn park_check_signals(
         },
         ParkPeek::Default { sig, slot, d } => {
             if let Some(info) = delivery_verdict(sig, slot, d) {
-                // Term/Core：已消费，按默认动作终止。
-                sched::exit_current(info);
+                // Term/Core：已消费，按默认动作结束整个线程组。
+                sched::exit_group_current(info);
             }
             // 丢弃即可，由 syscall 重执行重查决定是否继续等。
             ParkOutcome::Incomplete
@@ -687,7 +704,6 @@ fn process_call(
     sleep_deadline: &mut Option<core::time::Duration>,
     sigsuspend_saved: &mut Option<SignalSet>,
     timedwait: &mut Option<(SignalSet, core::time::Duration)>,
-    futex_wait: &mut Option<(FutexKey, u32, Option<core::time::Duration>, u32)>,
     vfork_child: &mut Option<Pid>,
     wait_uncompleted: &mut bool,
 ) -> ProcessResult {
@@ -759,9 +775,8 @@ fn process_call(
             }
         }
         sysnr::RT_SIGTIMEDWAIT => {
-            // rt_sigtimedwait(2)：等待集合内未屏蔽信号，命中即取出返回
+            // rt_sigtimedwait(2)：等待集合内信号（含已屏蔽信号），命中即取出返回
             // 信号号（不经处置）；超时 EAGAIN，集合外 handler 信号打断 -EINTR。
-            // 偏差登记 docs/ostd-contracts.md §4.5。
             if let Some((set, deadline)) = *timedwait {
                 // 重入：先查命中（Mesa），再查截止。
                 let taken = {
@@ -773,9 +788,7 @@ fn process_call(
                     ) {
                         (Some(index), Some(thread)) => {
                             let rec = &mut reg.records[index];
-                            let mut hidden = thread.signal.blocked();
-                            hidden |= !set;
-                            super::signal::take_any(&mut rec.signal, &mut thread.signal, hidden)
+                            super::signal::take_any(&mut rec.signal, &mut thread.signal, !set)
                         }
                         _ => None,
                     }
@@ -788,10 +801,10 @@ fn process_call(
                     Err(Errno::Again)
                 } else {
                     // 未到截止被假唤醒：带剩余时间重新挂起。
-                    return ProcessResult::Wait(WaitReason::Deadline(deadline));
+                    return ProcessResult::Wait(WaitReason::SigTimedWait { set, deadline });
                 }
             } else {
-                // 首次：读集合与超时；已命中立即返回，否则挂起。
+                // 首次：先校验集合与超时，再尝试消费等待集内挂起信号；未命中且未到期才挂起。
                 if args[3] != SIGSETSIZE {
                     Err(Errno::Invalid)
                 } else {
@@ -800,34 +813,38 @@ fn process_call(
                         Ok(mut set) => {
                             set.del(SIGKILL);
                             set.del(SIGSTOP);
-                            let taken = {
-                                let mut locked = REGISTRY.lock();
-                                let reg = &mut *locked;
-                                match (
-                                    reg.group_index(parent),
-                                    reg.threads.iter_mut().find(|t| t.tid == parent),
-                                ) {
-                                    (Some(index), Some(thread)) => {
-                                        let rec = &mut reg.records[index];
-                                        let mut hidden = thread.signal.blocked();
-                                        hidden |= !set;
-                                        super::signal::take_any(
-                                            &mut rec.signal,
-                                            &mut thread.signal,
-                                            hidden,
-                                        )
-                                    }
-                                    _ => None,
-                                }
-                            };
-                            if let Some((sig, slot)) = taken {
-                                write_uinfo(parent, args[1], sig, &slot).map(|_| sig as usize)
-                            } else {
-                                match timedwait_deadline(parent, args[2]) {
-                                    Err(e) => Err(e),
-                                    Ok(deadline) => {
+                            match timedwait_deadline(parent, args[2]) {
+                                Err(e) => Err(e),
+                                Ok(deadline) => {
+                                    let taken = {
+                                        let mut locked = REGISTRY.lock();
+                                        let reg = &mut *locked;
+                                        match (
+                                            reg.group_index(parent),
+                                            reg.threads.iter_mut().find(|t| t.tid == parent),
+                                        ) {
+                                            (Some(index), Some(thread)) => {
+                                                let rec = &mut reg.records[index];
+                                                super::signal::take_any(
+                                                    &mut rec.signal,
+                                                    &mut thread.signal,
+                                                    !set,
+                                                )
+                                            }
+                                            _ => None,
+                                        }
+                                    };
+                                    if let Some((sig, slot)) = taken {
+                                        write_uinfo(parent, args[1], sig, &slot)
+                                            .map(|_| sig as usize)
+                                    } else if crate::time::monotonic() >= deadline {
+                                        Err(Errno::Again)
+                                    } else {
                                         *timedwait = Some((set, deadline));
-                                        return ProcessResult::Wait(WaitReason::Deadline(deadline));
+                                        return ProcessResult::Wait(WaitReason::SigTimedWait {
+                                            set,
+                                            deadline,
+                                        });
                                     }
                                 }
                             }
@@ -863,6 +880,219 @@ fn process_call(
                         .map_err(|_| Errno::Fault)
                 })
                 .map(|()| 0)
+        }
+        sysnr::PSELECT6 => {
+            // pselect6(2)：检查 read/write/except 位图集合，可选相对超时与临时信号掩码。
+            enum SelectStep {
+                Done(Result<usize, Errno>),
+                Wait(WaitReason),
+            }
+            let step = {
+                let mut locked = REGISTRY.lock();
+                let reg = &mut *locked;
+                let res: Result<SelectStep, Errno> = (|| {
+                    let index = reg.group_index(parent).ok_or(Errno::NoProcess)?;
+                    let space = reg.records[index]
+                        .space
+                        .as_ref()
+                        .ok_or(Errno::Invalid)?
+                        .as_space();
+                    if args[5] != 0 && sigsuspend_saved.is_none() {
+                        let mut sigarg = [0u8; 16];
+                        crate::mm::user_access::copy_from_user(space, args[5], &mut sigarg)
+                            .map_err(|_| Errno::Fault)?;
+                        let ss = usize::from_ne_bytes(sigarg[0..8].try_into().unwrap_or([0; 8]));
+                        let ss_len =
+                            usize::from_ne_bytes(sigarg[8..16].try_into().unwrap_or([0; 8]));
+                        if ss != 0 {
+                            if ss_len != SIGSETSIZE {
+                                return Err(Errno::Invalid);
+                            }
+                            let mut raw_mask = [0u8; SIGSETSIZE];
+                            crate::mm::user_access::copy_from_user(space, ss, &mut raw_mask)
+                                .map_err(|_| Errno::Fault)?;
+                            let mut new_mask = SignalSet::from_ne_bytes(raw_mask);
+                            new_mask.del(SIGKILL);
+                            new_mask.del(SIGSTOP);
+                            if let Some(thread) = reg.threads.iter_mut().find(|t| t.tid == parent) {
+                                *sigsuspend_saved = Some(thread.signal.blocked());
+                                thread.signal.setmask(new_mask);
+                            }
+                        }
+                    }
+                    if args[4] != 0 && sleep_deadline.is_none() {
+                        let mut ts = [0u8; 16];
+                        crate::mm::user_access::copy_from_user(space, args[4], &mut ts)
+                            .map_err(|_| Errno::Fault)?;
+                        let sec = i64::from_ne_bytes(ts[0..8].try_into().unwrap_or([0; 8]));
+                        let ns = i64::from_ne_bytes(ts[8..16].try_into().unwrap_or([0; 8]));
+                        if sec < 0 || !(0..1_000_000_000).contains(&ns) {
+                            return Err(Errno::Invalid);
+                        }
+                        *sleep_deadline = Some(
+                            crate::time::monotonic()
+                                .checked_add(core::time::Duration::new(sec as u64, ns as u32))
+                                .ok_or(Errno::Invalid)?,
+                        );
+                    }
+                    let rec = &reg.records[index];
+                    let space = rec.space.as_ref().ok_or(Errno::Invalid)?.as_space();
+                    let fs = rec.fs.as_ref().ok_or(Errno::Invalid)?;
+                    let sets = crate::fs::context::select_check(
+                        fs, space, args[0], args[1], args[2], args[3],
+                    )?;
+                    if sets.ready > 0 {
+                        crate::fs::context::select_write_back(
+                            space, args[1], args[2], args[3], &sets,
+                        )?;
+                        return Ok(SelectStep::Done(Ok(sets.ready)));
+                    }
+                    match *sleep_deadline {
+                        None => Ok(SelectStep::Wait(WaitReason::Pipe)),
+                        Some(d) if crate::time::monotonic() < d => {
+                            Ok(SelectStep::Wait(WaitReason::PollUntil(d)))
+                        }
+                        Some(_) => {
+                            crate::fs::context::select_write_back(
+                                space, args[1], args[2], args[3], &sets,
+                            )?;
+                            Ok(SelectStep::Done(Ok(0)))
+                        }
+                    }
+                })();
+                match res {
+                    Ok(SelectStep::Wait(reason)) => SelectStep::Wait(reason),
+                    other => {
+                        if let Some(saved) = sigsuspend_saved.take() {
+                            if let Some(thread) = reg.threads.iter_mut().find(|t| t.tid == parent) {
+                                thread.signal.setmask(saved);
+                            }
+                        }
+                        SelectStep::Done(match other {
+                            Ok(SelectStep::Done(r)) => r,
+                            Err(e) => Err(e),
+                            Ok(SelectStep::Wait(_)) => unreachable!(),
+                        })
+                    }
+                }
+            };
+            match step {
+                SelectStep::Wait(reason) => return ProcessResult::Wait(reason),
+                SelectStep::Done(res) => {
+                    *sleep_deadline = None;
+                    res
+                }
+            }
+        }
+        sysnr::GETITIMER => {
+            // getitimer(2)：查询 ITIMER_REAL 当前剩余时间与周期。
+            let which = args[0] as u32 as i32;
+            if which < 0 || which > 2 {
+                Err(Errno::Invalid)
+            } else if which != 0 {
+                Err(Errno::NotSupported)
+            } else if args[1] == 0 {
+                Err(Errno::Fault)
+            } else {
+                let reg = REGISTRY.lock();
+                let rec = reg.group(parent).ok_or(Errno::NoProcess);
+                rec.and_then(|r| {
+                    let space = r.space.as_ref().ok_or(Errno::Invalid)?.as_space();
+                    let now = crate::time::monotonic();
+                    let mut raw = [0u8; 32];
+                    if let Some((deadline, interval)) = r.itimer_real {
+                        let rem = deadline.saturating_sub(now);
+                        raw[0..8].copy_from_slice(&(interval.as_secs() as i64).to_ne_bytes());
+                        raw[8..16]
+                            .copy_from_slice(&(interval.subsec_micros() as i64).to_ne_bytes());
+                        raw[16..24].copy_from_slice(&(rem.as_secs() as i64).to_ne_bytes());
+                        raw[24..32].copy_from_slice(&(rem.subsec_micros() as i64).to_ne_bytes());
+                    }
+                    crate::mm::user_access::copy_to_user(space, args[1], &raw)
+                        .map(|()| 0)
+                        .map_err(|_| Errno::Fault)
+                })
+            }
+        }
+        sysnr::SETITIMER => {
+            // setitimer(2)：设置或关闭 ITIMER_REAL，到期产生 SIGALRM。
+            let which = args[0] as u32 as i32;
+            let res = if which < 0 || which > 2 {
+                Err(Errno::Invalid)
+            } else if which != 0 {
+                Err(Errno::NotSupported)
+            } else if args[1] == 0 {
+                Err(Errno::Fault)
+            } else {
+                let mut reg = REGISTRY.lock();
+                let index = reg.group_index(parent);
+                match index {
+                    None => Err(Errno::NoProcess),
+                    Some(idx) => {
+                        let res = (|| {
+                            let space = reg.records[idx]
+                                .space
+                                .as_ref()
+                                .ok_or(Errno::Invalid)?
+                                .as_space();
+                            let mut new_raw = [0u8; 32];
+                            crate::mm::user_access::copy_from_user(space, args[1], &mut new_raw)
+                                .map_err(|_| Errno::Fault)?;
+                            let int_sec =
+                                i64::from_ne_bytes(new_raw[0..8].try_into().unwrap_or([0; 8]));
+                            let int_usec =
+                                i64::from_ne_bytes(new_raw[8..16].try_into().unwrap_or([0; 8]));
+                            let val_sec =
+                                i64::from_ne_bytes(new_raw[16..24].try_into().unwrap_or([0; 8]));
+                            let val_usec =
+                                i64::from_ne_bytes(new_raw[24..32].try_into().unwrap_or([0; 8]));
+                            if int_sec < 0
+                                || val_sec < 0
+                                || !(0..1_000_000).contains(&int_usec)
+                                || !(0..1_000_000).contains(&val_usec)
+                            {
+                                return Err(Errno::Invalid);
+                            }
+                            let now = crate::time::monotonic();
+                            if args[2] != 0 {
+                                let mut old_raw = [0u8; 32];
+                                if let Some((deadline, interval)) = reg.records[idx].itimer_real {
+                                    let rem = deadline.saturating_sub(now);
+                                    old_raw[0..8].copy_from_slice(
+                                        &(interval.as_secs() as i64).to_ne_bytes(),
+                                    );
+                                    old_raw[8..16].copy_from_slice(
+                                        &(interval.subsec_micros() as i64).to_ne_bytes(),
+                                    );
+                                    old_raw[16..24]
+                                        .copy_from_slice(&(rem.as_secs() as i64).to_ne_bytes());
+                                    old_raw[24..32].copy_from_slice(
+                                        &(rem.subsec_micros() as i64).to_ne_bytes(),
+                                    );
+                                }
+                                crate::mm::user_access::copy_to_user(space, args[2], &old_raw)
+                                    .map_err(|_| Errno::Fault)?;
+                            }
+                            let val =
+                                core::time::Duration::new(val_sec as u64, (val_usec as u32) * 1000);
+                            let interval =
+                                core::time::Duration::new(int_sec as u64, (int_usec as u32) * 1000);
+                            reg.records[idx].itimer_real = if val.is_zero() {
+                                None
+                            } else {
+                                Some((now.saturating_add(val), interval))
+                            };
+                            super::recompute_next_itimer(&reg);
+                            Ok(0)
+                        })();
+                        res
+                    }
+                }
+            };
+            if res.is_ok() {
+                sched::refresh_timer_deadline();
+            }
+            res
         }
         sysnr::PPOLL => {
             let reg = REGISTRY.lock();
@@ -947,12 +1177,16 @@ fn process_call(
                 }
             }
         }
+        sysnr::CLOCK_SETTIME => clock_settime(parent, args),
         sysnr::CLOCK_GETTIME => clock_gettime(parent, args),
         sysnr::CLOCK_GETRES => clock_getres(parent, args),
         sysnr::CLOCK_NANOSLEEP => match clock_nanosleep(parent, sleep_deadline, args) {
             SleepStep::Done(result) => result,
             SleepStep::Wait(until) => return ProcessResult::Wait(WaitReason::Deadline(until)),
         },
+        sysnr::SETTIMEOFDAY => set_time_of_day(parent, args),
+        sysnr::GETRLIMIT | sysnr::SETRLIMIT | sysnr::PRLIMIT64 => prlimit_call(parent, nr, args),
+        sysnr::PRCTL => prctl_call(parent, args),
         sysnr::TIMES => {
             let reg = REGISTRY.lock();
             if let Some(rec) = reg.group(parent) {
@@ -1009,7 +1243,6 @@ fn process_call(
         // ctid, tls)（对照两架构 clone.s 与 Linux fork.c 的拷贝语义）。
         // 归一化为具名参数后再按 CLONE_THREAD 分流。
         sysnr::CLONE => {
-            log::debug!("DBG clone flags {:#x} stack {:#x}", args[0], args[1]);
             #[cfg(target_arch = "riscv64")]
             let (tls, child_tid) = (args[3], args[4]);
             #[cfg(target_arch = "loongarch64")]
@@ -1033,21 +1266,70 @@ fn process_call(
         sysnr::FUTEX => {
             let step = {
                 let reg = REGISTRY.lock();
-                match reg.group(parent).and_then(|r| r.space.as_ref()) {
-                    Some(record) => futex_call(record.as_space(), args, futex_wait),
-                    None => FutexStep::Done(Err(Errno::NoProcess)),
+                match reg
+                    .group(parent)
+                    .and_then(|r| Some((r.pid, r.space.as_ref()?)))
+                {
+                    Some((tgid, space)) => futex_call(space.as_space(), tgid, args),
+                    None => Err(Errno::NoProcess),
                 }
             };
             match step {
-                FutexStep::Done(result) => result,
-                FutexStep::Wait(reason) => return ProcessResult::Wait(reason),
-                FutexStep::Wake { key, n, bitset } => Ok(super::sched::wake_futex(key, n, bitset)),
-                FutexStep::Requeue {
+                Err(error) => Err(error),
+                Ok(FutexStep::Wait(reason)) => return ProcessResult::Wait(reason),
+                Ok(FutexStep::Wake { key, n, bitset }) => {
+                    Ok(sched::wake_futex(key, n, bitset, None))
+                }
+                Ok(FutexStep::Requeue {
                     from,
                     to,
                     nr_wake,
                     nr_requeue,
-                } => Ok(super::sched::requeue_futex(from, to, nr_wake, nr_requeue)),
+                }) => Ok(sched::wake_futex(
+                    from,
+                    nr_wake,
+                    u32::MAX,
+                    Some((to, nr_requeue)),
+                )),
+            }
+        }
+        sysnr::GET_ROBUST_LIST => {
+            let raw_pid = args[0] as u32 as i32;
+            if raw_pid < 0 {
+                Err(Errno::Invalid)
+            } else {
+                let target = if raw_pid == 0 {
+                    parent
+                } else {
+                    raw_pid as usize
+                };
+                let reg = REGISTRY.lock();
+                match (reg.group(parent), reg.thread(target)) {
+                    (Some(caller_group), Some(target_thread)) => {
+                        if target_thread.tgid != caller_group.pid && caller_group.creds.euid != 0 {
+                            Err(Errno::Perm)
+                        } else if let Some(space) = caller_group.space.as_ref() {
+                            let space = space.as_space();
+                            user_access::copy_to_user(
+                                space,
+                                args[1],
+                                &target_thread.robust_list.to_ne_bytes(),
+                            )
+                            .and_then(|()| {
+                                user_access::copy_to_user(
+                                    space,
+                                    args[2],
+                                    &super::futex::ROBUST_LIST_HEAD_SIZE.to_ne_bytes(),
+                                )
+                            })
+                            .map(|()| 0)
+                            .map_err(|_| Errno::Fault)
+                        } else {
+                            Err(Errno::NoProcess)
+                        }
+                    }
+                    _ => Err(Errno::NoProcess),
+                }
             }
         }
         sysnr::WAIT4 => {
@@ -1059,7 +1341,7 @@ fn process_call(
             } else {
                 let wanted = args[0] as i32;
                 if wanted == i32::MIN {
-                    Err(Errno::NoChild)
+                    Err(Errno::NoProcess)
                 } else {
                     let caller_pgid = REGISTRY.lock().group(parent).map_or(0, |r| r.pgid);
                     let wanted_pgid = (-(wanted as i64)) as usize;
@@ -1141,8 +1423,12 @@ fn process_call(
         }
         sysnr::WAITID => return waitid(parent, frame, args),
         sysnr::GETRUSAGE => get_rusage(parent, args),
+        sysnr::SCHED_SETSCHEDULER => sched_setscheduler(parent, args),
+        sysnr::SCHED_SETPARAM => sched_setparam(parent, args),
         sysnr::SCHED_GETSCHEDULER => sched_getscheduler(parent, args[0]),
         sysnr::SCHED_GETPARAM => sched_getparam(parent, args[0], args[1]),
+        sysnr::SETPRIORITY => setpriority(parent, args),
+        sysnr::GETPRIORITY => getpriority(parent, args),
         sysnr::SCHED_GET_PRIORITY_MAX => sched_priority_limit(args[0], true),
         sysnr::SCHED_GET_PRIORITY_MIN => sched_priority_limit(args[0], false),
         sysnr::SCHED_RR_GET_INTERVAL => sched_rr_get_interval(parent, args[0], args[1]),
@@ -1150,9 +1436,45 @@ fn process_call(
         sysnr::SCHED_SETAFFINITY => sched_setaffinity(parent, args[0], args[1], args[2]),
         sysnr::SETPGID => set_pg_id(parent, args),
         sysnr::GETPGID => get_pg_or_sid(parent, args[0], false),
+        sysnr::CAPGET => capget(parent, args),
+        sysnr::CAPSET => capset(parent, args),
         sysnr::GETSID => get_pg_or_sid(parent, args[0], true),
         sysnr::SETSID => set_sid(parent),
         sysnr::KILL | sysnr::TKILL | sysnr::TGKILL => kill_or_tgkill(parent, nr, args),
+        sysnr::ACCEPT | sysnr::ACCEPT4 | sysnr::CONNECT | sysnr::SENDTO | sysnr::RECVFROM => {
+            let flow = {
+                let mut locked = REGISTRY.lock();
+                let reg = &mut *locked;
+                match (
+                    reg.group_index(parent),
+                    reg.threads.iter().find(|t| t.tid == parent),
+                ) {
+                    (Some(index), Some(thread)) => {
+                        let blocked = thread.signal.blocked();
+                        let tgid = thread.tgid;
+                        let rec = &mut reg.records[index];
+                        match (rec.space.as_ref(), rec.fs.as_mut()) {
+                            (Some(space), Some(fs)) => crate::syscall::net::dispatch_blocking(
+                                nr,
+                                args,
+                                space.as_space(),
+                                fs,
+                                &mut rec.signal,
+                                blocked,
+                                tgid,
+                                sleep_deadline,
+                            ),
+                            _ => crate::syscall::net::NetFlow::Done(Err(Errno::Invalid)),
+                        }
+                    }
+                    _ => crate::syscall::net::NetFlow::Done(Err(Errno::NoProcess)),
+                }
+            };
+            match flow {
+                crate::syscall::net::NetFlow::Done(res) => res,
+                crate::syscall::net::NetFlow::Wait(reason) => return ProcessResult::Wait(reason),
+            }
+        }
         _ => Err(Errno::NoSys),
     };
     frame[TrapFrameArgs::RET] = crate::syscall::to_abi(result);
@@ -1250,17 +1572,21 @@ fn queue_info(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
     let pid = args[0] as u32 as i32;
     let sig = args[1] as u32;
     let mut raw = [0u8; 128];
-    let ok = REGISTRY
-        .lock()
-        .group(parent)
-        .and_then(|r| r.space.as_ref())
-        .is_some_and(|s| user_access::copy_from_user(s.as_space(), args[2], &mut raw).is_ok());
+    let (sender_tgid, ok) = {
+        let reg = REGISTRY.lock();
+        let tgid = reg.group(parent).map_or(parent, |r| r.pid);
+        let ok = reg
+            .group(parent)
+            .and_then(|r| r.space.as_ref())
+            .is_some_and(|s| user_access::copy_from_user(s.as_space(), args[2], &mut raw).is_ok());
+        (tgid, ok)
+    };
     if !ok {
         return Err(Errno::Fault);
     }
     let code = i32::from_ne_bytes(raw[8..12].try_into().unwrap_or([0; 4]));
-    // 内核保留 si_code 只能对自身使用。
-    if (code >= 0 || code == SI_TKILL) && pid != parent as i32 {
+    // 内核保留 si_code 只能对自身线程组使用。
+    if (code >= 0 || code == SI_TKILL) && pid != sender_tgid as i32 {
         return Err(Errno::Perm);
     }
     if sig > 64 {
@@ -1303,14 +1629,15 @@ fn kill_or_tgkill(parent: Pid, nr: usize, args: [usize; 6]) -> Result<usize, Err
     if sig > 64 {
         return Err(Errno::Invalid);
     }
-    let slot = SigInfoSlot {
-        // kill(2) 恒 SI_USER(=0)；tgkill 发内核保留码 SI_TKILL。
-        code: if nr == sysnr::KILL { 0 } else { SI_TKILL },
-        pid: parent as u32,
-        ..Default::default()
-    };
     let mut locked = REGISTRY.lock();
     let reg = &mut *locked;
+    let sender_tgid = reg.group(parent).map_or(parent, |r| r.pid);
+    let slot = SigInfoSlot {
+        // kill(2) 恒 SI_USER(=0)；tkill/tgkill 发内核保留码 SI_TKILL，si_pid 为发送者线程组号。
+        code: if nr == sysnr::KILL { 0 } else { SI_TKILL },
+        pid: sender_tgid as u32,
+        ..Default::default()
+    };
     if nr == sysnr::TKILL {
         let tid = args[0] as u32 as i32;
         if tid <= 0 {
@@ -1370,18 +1697,13 @@ fn kill_or_tgkill(parent: Pid, nr: usize, args: [usize; 6]) -> Result<usize, Err
         if sig == 0 {
             return Ok(0);
         }
-        if let Some(tid_index) = reg.threads.iter().position(|t| t.tid == target) {
-            let group = &reg.records[index];
-            let thread = &mut reg.threads[tid_index];
-            super::signal::generate_thread(&group.signal, &mut thread.signal, sig as u8, slot);
-        } else {
-            let blocked = reg
-                .threads
-                .iter()
-                .find(|t| t.tgid == target)
-                .map_or(0, |t| t.signal.blocked());
-            reg.records[index].signal.generate(sig as u8, slot, blocked);
-        }
+        // 进程定向：排入线程组的待处理集合，任一未屏蔽它的线程都可取走。
+        let blocked = reg
+            .threads
+            .iter()
+            .find(|t| t.tgid == target)
+            .map_or(0, |t| t.signal.blocked());
+        reg.records[index].signal.generate(sig as u8, slot, blocked);
         return Ok(0);
     }
     let caller_pgid = reg.group(parent).map(|r| r.pgid).ok_or(Errno::NoProcess)?;
@@ -1659,6 +1981,473 @@ fn write_timespec(parent: Pid, ptr: usize, value: core::time::Duration) -> Resul
         .map(|()| 0)
 }
 
+/// clock_settime(2)：仅支持特权进程设置 CLOCK_REALTIME(0)；其余时钟或非法时间返回 EINVAL。
+fn clock_settime(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let clockid = args[0] as u32 as i32;
+    if clockid != 0 {
+        return Err(Errno::Invalid);
+    }
+    let [sec, nsec] = read_timespec(parent, args[1])?;
+    if !(0..=crate::time::MAX_SETTOD_SEC).contains(&sec) || !(0..1_000_000_000).contains(&nsec) {
+        return Err(Errno::Invalid);
+    }
+    let privileged = REGISTRY
+        .lock()
+        .group(parent)
+        .ok_or(Errno::NoProcess)?
+        .creds
+        .has_cap(super::CAP_SYS_TIME);
+    if !privileged {
+        return Err(Errno::Perm);
+    }
+    crate::time::set_realtime(core::time::Duration::new(sec as u64, nsec as u32));
+    Ok(0)
+}
+
+/// settimeofday(2)：设置墙钟（tv 非空时）并校验可选 tz；需要 CAP_SYS_TIME。
+/// 不修改单调时钟，也不回溯重排正在睡眠的 CLOCK_REALTIME 定时任务。
+fn set_time_of_day(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let (tv_ptr, tz_ptr) = (args[0], args[1]);
+    let (tv, privileged) = {
+        let reg = REGISTRY.lock();
+        let rec = reg.group(parent).ok_or(Errno::NoProcess)?;
+        let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+        let tv = if tv_ptr != 0 {
+            let mut raw = [0u8; 16];
+            user_access::copy_from_user(space, tv_ptr, &mut raw).map_err(|_| Errno::Fault)?;
+            let sec = i64::from_ne_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
+            let usec = i64::from_ne_bytes(raw[8..16].try_into().unwrap_or([0; 8]));
+            Some([sec, usec])
+        } else {
+            None
+        };
+        if tz_ptr != 0 {
+            let mut tz = [0u8; 8];
+            user_access::copy_from_user(space, tz_ptr, &mut tz).map_err(|_| Errno::Fault)?;
+        }
+        (tv, rec.creds.has_cap(super::CAP_SYS_TIME))
+    };
+    if tv.is_none() && tz_ptr == 0 {
+        return Ok(0);
+    }
+    if let Some([_, usec]) = tv {
+        if !(0..1_000_000).contains(&usec) {
+            return Err(Errno::Invalid);
+        }
+    }
+    if !privileged {
+        return Err(Errno::Perm);
+    }
+    if let Some([sec, usec]) = tv {
+        if !(0..=crate::time::MAX_SETTOD_SEC).contains(&sec) {
+            return Err(Errno::Invalid);
+        }
+        crate::time::set_realtime(core::time::Duration::new(sec as u64, (usec as u32) * 1000));
+    }
+    Ok(0)
+}
+
+/// 读取进程某项资源限额：DATA/STACK/MEMLOCK/AS 委派地址空间，NOFILE 委派文件上下文，其余取进程记录。
+fn read_process_rlimit(rec: &super::ProcessRecord, resource: usize) -> Result<[u64; 2], Errno> {
+    match resource {
+        7 => {
+            let lim = rec.fs.as_ref().ok_or(Errno::NoProcess)?.nofile_limit();
+            Ok([lim[0] as u64, lim[1] as u64])
+        }
+        2 | 3 | 8 | 9 => {
+            let lim = rec
+                .space
+                .as_ref()
+                .ok_or(Errno::NoProcess)?
+                .as_space()
+                .memory_limit(resource)
+                .ok_or(Errno::Invalid)?;
+            Ok([lim[0] as u64, lim[1] as u64])
+        }
+        r if r < super::RLIM_NLIMITS => Ok(rec.rlimits[r]),
+        _ => Err(Errno::Invalid),
+    }
+}
+
+/// 写入进程某项资源限额；同时同步内存与文件子系统中的限额副本。
+fn write_process_rlimit(
+    rec: &mut super::ProcessRecord,
+    resource: usize,
+    limit: [u64; 2],
+    privileged: bool,
+) -> Result<(), Errno> {
+    match resource {
+        7 => {
+            rec.fs
+                .as_mut()
+                .ok_or(Errno::NoProcess)?
+                .set_nofile_limit([limit[0] as usize, limit[1] as usize], privileged)?;
+            rec.rlimits[7] = limit;
+            Ok(())
+        }
+        2 | 3 | 8 | 9 => {
+            rec.space
+                .as_mut()
+                .ok_or(Errno::NoProcess)?
+                .0
+                .set_memory_limit(resource, [limit[0] as usize, limit[1] as usize])
+                .map_err(|_| Errno::Invalid)?;
+            rec.rlimits[resource] = limit;
+            Ok(())
+        }
+        r if r < super::RLIM_NLIMITS => {
+            rec.rlimits[r] = limit;
+            Ok(())
+        }
+        _ => Err(Errno::Invalid),
+    }
+}
+
+/// getrlimit(2) / setrlimit(2) / prlimit64(2)：支持全部 16 项 Linux 资源限额与跨进程查询修改。
+/// DATA/STACK/MEMLOCK/AS 与 NOFILE 实时生效；其余资源限额保存、回读并跨 fork/exec 继承。
+fn prlimit_call(parent: Pid, nr: usize, args: [usize; 6]) -> Result<usize, Errno> {
+    let (pid_arg, resource, new_ptr, old_ptr) = match nr {
+        sysnr::GETRLIMIT => {
+            let res = args[0] as u32 as usize;
+            if res >= super::RLIM_NLIMITS {
+                return Err(Errno::Invalid);
+            }
+            if args[1] == 0 {
+                return Err(Errno::Fault);
+            }
+            (0i32, res, 0usize, args[1])
+        }
+        sysnr::SETRLIMIT => {
+            let res = args[0] as u32 as usize;
+            if res >= super::RLIM_NLIMITS {
+                return Err(Errno::Invalid);
+            }
+            if args[1] == 0 {
+                return Err(Errno::Fault);
+            }
+            (0i32, res, args[1], 0usize)
+        }
+        _ => {
+            let pid = args[0] as u32 as i32;
+            if pid < 0 {
+                return Err(Errno::NoProcess);
+            }
+            let res = args[1] as u32 as usize;
+            if res >= super::RLIM_NLIMITS {
+                return Err(Errno::Invalid);
+            }
+            (pid, res, args[2], args[3])
+        }
+    };
+    let mut reg = REGISTRY.lock();
+    let caller_idx = reg.group_index(parent).ok_or(Errno::NoProcess)?;
+    let new_limit = if new_ptr != 0 {
+        let space = reg.records[caller_idx]
+            .space
+            .as_ref()
+            .ok_or(Errno::NoProcess)?
+            .as_space();
+        let mut raw = [0u8; 16];
+        user_access::copy_from_user(space, new_ptr, &mut raw).map_err(|_| Errno::Fault)?;
+        let soft = u64::from_ne_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
+        let hard = u64::from_ne_bytes(raw[8..16].try_into().unwrap_or([0; 8]));
+        if soft > hard {
+            return Err(Errno::Invalid);
+        }
+        Some([soft, hard])
+    } else {
+        None
+    };
+    let target_idx = if pid_arg == 0 {
+        caller_idx
+    } else {
+        reg.group_index(pid_arg as usize)
+            .filter(|&i| reg.records[i].exit.is_none())
+            .ok_or(Errno::NoProcess)?
+    };
+    let privileged = reg.records[caller_idx]
+        .creds
+        .has_cap(super::CAP_SYS_RESOURCE);
+    if target_idx != caller_idx && !privileged {
+        let c = &reg.records[caller_idx].creds;
+        let t = &reg.records[target_idx].creds;
+        let same_owner = c.ruid == t.ruid
+            && c.ruid == t.euid
+            && c.ruid == t.suid
+            && c.rgid == t.rgid
+            && c.rgid == t.egid
+            && c.rgid == t.sgid;
+        if !same_owner {
+            return Err(Errno::Perm);
+        }
+    }
+    let old = read_process_rlimit(&reg.records[target_idx], resource)?;
+    if let Some(next) = new_limit {
+        if !privileged && next[1] > old[1] {
+            return Err(Errno::Perm);
+        }
+        write_process_rlimit(&mut reg.records[target_idx], resource, next, privileged)?;
+    }
+    if old_ptr != 0 {
+        let mut raw = [0u8; 16];
+        raw[0..8].copy_from_slice(&old[0].to_ne_bytes());
+        raw[8..16].copy_from_slice(&old[1].to_ne_bytes());
+        let space = reg.records[caller_idx]
+            .space
+            .as_ref()
+            .ok_or(Errno::NoProcess)?
+            .as_space();
+        if user_access::copy_to_user(space, old_ptr, &raw).is_err() {
+            if new_limit.is_some() {
+                let _ = write_process_rlimit(&mut reg.records[target_idx], resource, old, true);
+            }
+            return Err(Errno::Fault);
+        }
+    }
+    Ok(0)
+}
+
+/// 逐字节读取用户态线程名（最多 15 字节并在末尾补 NUL），避免页末短串越界触发误报 EFAULT。
+fn read_user_comm(space: &UserAddressSpace, mut ptr: usize) -> Result<[u8; 16], Errno> {
+    let mut comm = [0u8; 16];
+    for slot in comm.iter_mut().take(15) {
+        let mut byte = [0u8; 1];
+        user_access::copy_from_user(space, ptr, &mut byte).map_err(|_| Errno::Fault)?;
+        if byte[0] == 0 {
+            break;
+        }
+        *slot = byte[0];
+        ptr = ptr.checked_add(1).ok_or(Errno::Fault)?;
+    }
+    Ok(comm)
+}
+
+/// prctl(2)：支持 PDEATHSIG、DUMPABLE、KEEPCAPS、TIMING、NAME、ENDIAN、SECCOMP(只读)、
+/// CAPBSET、SECUREBITS、TIMERSLACK、CHILD_SUBREAPER、NO_NEW_PRIVS、TID_ADDRESS 与 THP_DISABLE。
+/// 未实现选项返回 EINVAL。
+fn prctl_call(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    const PR_SET_PDEATHSIG: i32 = 1;
+    const PR_GET_PDEATHSIG: i32 = 2;
+    const PR_GET_DUMPABLE: i32 = 3;
+    const PR_SET_DUMPABLE: i32 = 4;
+    const PR_GET_KEEPCAPS: i32 = 7;
+    const PR_SET_KEEPCAPS: i32 = 8;
+    const PR_GET_TIMING: i32 = 13;
+    const PR_SET_TIMING: i32 = 14;
+    const PR_SET_NAME: i32 = 15;
+    const PR_GET_NAME: i32 = 16;
+    const PR_GET_ENDIAN: i32 = 19;
+    const PR_GET_SECCOMP: i32 = 21;
+    const PR_CAPBSET_READ: i32 = 23;
+    const PR_CAPBSET_DROP: i32 = 24;
+    const PR_GET_SECUREBITS: i32 = 27;
+    const PR_SET_SECUREBITS: i32 = 28;
+    const PR_SET_TIMERSLACK: i32 = 29;
+    const PR_GET_TIMERSLACK: i32 = 30;
+    const PR_SET_CHILD_SUBREAPER: i32 = 36;
+    const PR_GET_CHILD_SUBREAPER: i32 = 37;
+    const PR_SET_NO_NEW_PRIVS: i32 = 38;
+    const PR_GET_NO_NEW_PRIVS: i32 = 39;
+    const PR_GET_TID_ADDRESS: i32 = 40;
+    const PR_SET_THP_DISABLE: i32 = 41;
+    const PR_GET_THP_DISABLE: i32 = 42;
+    const PR_ENDIAN_LITTLE: i32 = 1;
+    const SECUREBITS_MASK: usize = 0xff;
+
+    let option = args[0] as u32 as i32;
+    let (arg2, arg3, arg4, arg5) = (args[1], args[2], args[3], args[4]);
+    let mut locked = REGISTRY.lock();
+    let reg = &mut *locked;
+    let idx = reg.group_index(parent).ok_or(Errno::NoProcess)?;
+    let t_idx = reg
+        .threads
+        .iter()
+        .position(|t| t.tid == parent)
+        .ok_or(Errno::NoProcess)?;
+    match option {
+        PR_SET_PDEATHSIG => {
+            if arg2 > 64 {
+                return Err(Errno::Invalid);
+            }
+            reg.threads[t_idx].pdeath_signal = arg2 as u8;
+            Ok(0)
+        }
+        PR_GET_PDEATHSIG => {
+            let sig = reg.threads[t_idx].pdeath_signal as i32;
+            let space = reg.records[idx]
+                .space
+                .as_ref()
+                .ok_or(Errno::NoProcess)?
+                .as_space();
+            user_access::copy_to_user(space, arg2, &sig.to_ne_bytes()).map_err(|_| Errno::Fault)?;
+            Ok(0)
+        }
+        PR_GET_DUMPABLE => Ok(reg.records[idx].dumpable as usize),
+        PR_SET_DUMPABLE => {
+            if arg2 != 0 && arg2 != 1 {
+                return Err(Errno::Invalid);
+            }
+            reg.records[idx].dumpable = arg2 as u8;
+            Ok(0)
+        }
+        PR_GET_KEEPCAPS => Ok(usize::from(reg.records[idx].keepcaps)),
+        PR_SET_KEEPCAPS => {
+            if arg2 != 0 && arg2 != 1 {
+                return Err(Errno::Invalid);
+            }
+            reg.records[idx].keepcaps = arg2 != 0;
+            Ok(0)
+        }
+        PR_GET_TIMING => Ok(0),
+        PR_SET_TIMING => {
+            if arg2 != 0 {
+                return Err(Errno::Invalid);
+            }
+            Ok(0)
+        }
+        PR_SET_NAME => {
+            let space = reg.records[idx]
+                .space
+                .as_ref()
+                .ok_or(Errno::NoProcess)?
+                .as_space();
+            let comm = read_user_comm(space, arg2)?;
+            reg.threads[t_idx].comm = comm;
+            let tgid = reg.records[idx].pid;
+            if parent == tgid {
+                super::proc_table_set_comm(tgid, comm);
+            }
+            Ok(0)
+        }
+        PR_GET_NAME => {
+            let comm = reg.threads[t_idx].comm;
+            let space = reg.records[idx]
+                .space
+                .as_ref()
+                .ok_or(Errno::NoProcess)?
+                .as_space();
+            user_access::copy_to_user(space, arg2, &comm).map_err(|_| Errno::Fault)?;
+            Ok(0)
+        }
+        PR_GET_ENDIAN => {
+            let space = reg.records[idx]
+                .space
+                .as_ref()
+                .ok_or(Errno::NoProcess)?
+                .as_space();
+            user_access::copy_to_user(space, arg2, &PR_ENDIAN_LITTLE.to_ne_bytes())
+                .map_err(|_| Errno::Fault)?;
+            Ok(0)
+        }
+        PR_GET_SECCOMP => Ok(0),
+        PR_CAPBSET_READ => {
+            if arg2 > super::CAP_LAST_CAP as usize {
+                return Err(Errno::Invalid);
+            }
+            Ok(usize::from((reg.records[idx].cap_bset >> arg2) & 1 != 0))
+        }
+        PR_CAPBSET_DROP => {
+            if arg2 > super::CAP_LAST_CAP as usize {
+                return Err(Errno::Invalid);
+            }
+            if !reg.records[idx].creds.has_cap(super::CAP_SETPCAP) {
+                return Err(Errno::Perm);
+            }
+            reg.records[idx].cap_bset &= !(1u64 << arg2);
+            Ok(0)
+        }
+        PR_GET_SECUREBITS => Ok(reg.records[idx].securebits as usize),
+        PR_SET_SECUREBITS => {
+            if !reg.records[idx].creds.has_cap(super::CAP_SETPCAP) {
+                return Err(Errno::Perm);
+            }
+            if arg2 & !SECUREBITS_MASK != 0 {
+                return Err(Errno::Invalid);
+            }
+            let old = reg.records[idx].securebits;
+            let new = arg2 as u32;
+            // 每对 (bit, lock_bit)：已锁定的位不可翻转，锁位本身亦不可撤销。
+            for pair in 0..4u32 {
+                let bit = 1u32 << (pair * 2);
+                let lock = 1u32 << (pair * 2 + 1);
+                if old & lock != 0 && ((new & lock == 0) || (new & bit != old & bit)) {
+                    return Err(Errno::Perm);
+                }
+            }
+            reg.records[idx].securebits = new;
+            Ok(0)
+        }
+        PR_SET_TIMERSLACK => {
+            let slack = if arg2 == 0 {
+                reg.threads[t_idx].default_timer_slack_ns
+            } else {
+                arg2 as u64
+            };
+            reg.threads[t_idx].timer_slack_ns = slack;
+            let tgid = reg.records[idx].pid;
+            if parent == tgid {
+                super::proc_table_set_timer_slack(tgid, slack);
+            }
+            Ok(0)
+        }
+        PR_GET_TIMERSLACK => Ok(reg.threads[t_idx].timer_slack_ns as usize),
+        PR_SET_CHILD_SUBREAPER => {
+            reg.records[idx].child_subreaper = arg2 != 0;
+            Ok(0)
+        }
+        PR_GET_CHILD_SUBREAPER => {
+            let val = i32::from(reg.records[idx].child_subreaper);
+            let space = reg.records[idx]
+                .space
+                .as_ref()
+                .ok_or(Errno::NoProcess)?
+                .as_space();
+            user_access::copy_to_user(space, arg2, &val.to_ne_bytes()).map_err(|_| Errno::Fault)?;
+            Ok(0)
+        }
+        PR_SET_NO_NEW_PRIVS => {
+            if arg2 != 1 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(Errno::Invalid);
+            }
+            reg.threads[t_idx].no_new_privs = true;
+            let tgid = reg.records[idx].pid;
+            super::proc_table_set_no_new_privs(tgid, true);
+            Ok(0)
+        }
+        PR_GET_NO_NEW_PRIVS => {
+            if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(Errno::Invalid);
+            }
+            Ok(usize::from(reg.threads[t_idx].no_new_privs))
+        }
+        PR_GET_TID_ADDRESS => {
+            let addr = reg.threads[t_idx].clear_child_tid;
+            let space = reg.records[idx]
+                .space
+                .as_ref()
+                .ok_or(Errno::NoProcess)?
+                .as_space();
+            user_access::copy_to_user(space, arg2, &addr.to_ne_bytes())
+                .map_err(|_| Errno::Fault)?;
+            Ok(0)
+        }
+        PR_SET_THP_DISABLE => {
+            if arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(Errno::Invalid);
+            }
+            reg.records[idx].thp_disable = arg2 != 0;
+            Ok(0)
+        }
+        PR_GET_THP_DISABLE => {
+            if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(Errno::Invalid);
+            }
+            Ok(usize::from(reg.records[idx].thp_disable))
+        }
+        _ => Err(Errno::Invalid),
+    }
+}
+
 /// clock_gettime(2)：按 clockid 取时间并写入 timespec。支持 REALTIME、MONOTONIC、
 /// BOOTTIME 三类时钟与进程、线程的 CPU 时间，未知 clockid 返回 EINVAL。
 fn clock_gettime(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
@@ -1783,6 +2572,131 @@ fn get_res_id(parent: Pid, args: [usize; 6], want_gid: bool) -> Result<usize, Er
     Ok(0)
 }
 
+/// capget(2)（header, data）：按头部版本号回填目标进程的真实能力集，返回 0。
+/// 版本不认识时把 0x20080522 写回头部并返回 EINVAL。数据指针为空返回 0，pid 为负或地址不可访问报错。
+fn capget(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let reg = REGISTRY.lock();
+    let caller = reg.group(parent).ok_or(Errno::NoProcess)?;
+    let space = caller.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    let mut header = [0u8; 8];
+    user_access::copy_from_user(space, args[0], &mut header).map_err(|_| Errno::Fault)?;
+    let version = u32::from_ne_bytes([header[0], header[1], header[2], header[3]]);
+    let pid = i32::from_ne_bytes([header[4], header[5], header[6], header[7]]);
+    let words = match version {
+        0x1998_0330 => 1usize,
+        0x2007_1026 | 0x2008_0522 => 2usize,
+        _ => {
+            user_access::copy_to_user(space, args[0], &0x2008_0522u32.to_ne_bytes())
+                .map_err(|_| Errno::Fault)?;
+            return if args[1] == 0 {
+                Ok(0)
+            } else {
+                Err(Errno::Invalid)
+            };
+        }
+    };
+    if args[1] == 0 {
+        return Ok(0);
+    }
+    if pid < 0 {
+        return Err(Errno::Invalid);
+    }
+    let target = if pid == 0 || pid as usize == parent {
+        caller
+    } else {
+        reg.group(pid as usize)
+            .or_else(|| reg.thread(pid as usize).and_then(|t| reg.group(t.tgid)))
+            .ok_or(Errno::NoProcess)?
+    };
+    let effective = [
+        target.creds.cap_effective as u32,
+        (target.creds.cap_effective >> 32) as u32,
+    ];
+    let permitted = [
+        target.creds.cap_permitted as u32,
+        (target.creds.cap_permitted >> 32) as u32,
+    ];
+    let inheritable = [
+        target.creds.cap_inheritable as u32,
+        (target.creds.cap_inheritable >> 32) as u32,
+    ];
+    let mut bytes = [0u8; 24];
+    let flat = effective
+        .iter()
+        .zip(permitted.iter())
+        .zip(inheritable.iter())
+        .flat_map(|((e, p), i)| [*e, *p, *i]);
+    for (dst, value) in bytes.chunks_exact_mut(4).zip(flat) {
+        dst.copy_from_slice(&value.to_ne_bytes());
+    }
+    user_access::copy_to_user(space, args[1], &bytes[..words * 12]).map_err(|_| Errno::Fault)?;
+    Ok(0)
+}
+
+/// capset(2)（header, data）：按 Linux `kernel/capability.c` 校验并更新当前进程能力集。
+/// 仅允许操作调用进程自身（pid 为 0 或等于调用者 tid），禁止超出允许集或非法抬高能力。
+fn capset(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let mut reg = REGISTRY.lock();
+    let idx = reg.group_index(parent).ok_or(Errno::NoProcess)?;
+    let space = reg.records[idx]
+        .space
+        .as_ref()
+        .ok_or(Errno::NoProcess)?
+        .as_space();
+    let mut header = [0u8; 8];
+    user_access::copy_from_user(space, args[0], &mut header).map_err(|_| Errno::Fault)?;
+    let version = u32::from_ne_bytes([header[0], header[1], header[2], header[3]]);
+    let pid = i32::from_ne_bytes([header[4], header[5], header[6], header[7]]);
+    let words = match version {
+        0x1998_0330 => 1usize,
+        0x2007_1026 | 0x2008_0522 => 2usize,
+        _ => {
+            user_access::copy_to_user(space, args[0], &0x2008_0522u32.to_ne_bytes())
+                .map_err(|_| Errno::Fault)?;
+            return Err(Errno::Invalid);
+        }
+    };
+    if pid != 0 && pid as usize != parent {
+        return Err(Errno::Perm);
+    }
+    let mut bytes = [0u8; 24];
+    user_access::copy_from_user(space, args[1], &mut bytes[..words * 12])
+        .map_err(|_| Errno::Fault)?;
+    let word = |off: usize| {
+        u32::from_ne_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]) as u64
+    };
+    let (eff, perm, inh) = if words == 1 {
+        (word(0), word(4), word(8))
+    } else {
+        (
+            word(0) | (word(12) << 32),
+            word(4) | (word(16) << 32),
+            word(8) | (word(20) << 32),
+        )
+    };
+    let eff = eff & super::CAP_FULL_SET;
+    let perm = perm & super::CAP_FULL_SET;
+    let inh = inh & super::CAP_FULL_SET;
+    let rec = &mut reg.records[idx];
+    let old_eff = rec.creds.cap_effective;
+    let old_perm = rec.creds.cap_permitted;
+    let old_inh = rec.creds.cap_inheritable;
+    // Linux cap_capset 规则：有效集须为新允许集子集，新允许集须为旧允许集子集；
+    // 继承集新增位无 CAP_SETPCAP 时只能来自旧允许集，有 CAP_SETPCAP 时可来自能力边界集。
+    let allowed_inh = if (old_eff >> super::CAP_SETPCAP) & 1 != 0 {
+        old_inh | old_perm | rec.cap_bset
+    } else {
+        old_inh | old_perm
+    };
+    if (eff & !perm) != 0 || (perm & !old_perm) != 0 || (inh & !allowed_inh) != 0 {
+        return Err(Errno::Perm);
+    }
+    rec.creds.cap_effective = eff;
+    rec.creds.cap_permitted = perm;
+    rec.creds.cap_inheritable = inh;
+    Ok(0)
+}
+
 /// getgroups(2)：size 为 0 时只返回补充组的个数，否则写入并返回个数；
 /// size 为负或装不下返回 EINVAL。
 fn get_groups(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
@@ -1856,7 +2770,9 @@ fn set_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
     let value = args[0] as u32;
     let mut reg = REGISTRY.lock();
     let rec = reg.group_mut(parent).ok_or(Errno::NoProcess)?;
-    let mut ids = IdSet::load(&rec.creds, gid);
+    let old = IdSet::load(&rec.creds, gid);
+    let mut ids = old;
+    let keepcaps = rec.keepcaps;
     let privileged = rec.creds.euid == 0;
     if privileged {
         ids.real = value;
@@ -1867,6 +2783,10 @@ fn set_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
     ids.effective = value;
     ids.fs = value;
     ids.store(&mut rec.creds, gid);
+    if !gid {
+        rec.creds
+            .sync_uid_transition(old.real, old.effective, old.saved, keepcaps);
+    }
     proc_sync_holding(&reg.records, parent);
     Ok(0)
 }
@@ -1879,6 +2799,7 @@ fn set_re_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
     let mut reg = REGISTRY.lock();
     let rec = reg.group_mut(parent).ok_or(Errno::NoProcess)?;
     let old = IdSet::load(&rec.creds, gid);
+    let keepcaps = rec.keepcaps;
     let privileged = rec.creds.euid == 0;
     if real_arg != u32::MAX && real_arg != old.real && real_arg != old.effective && !privileged {
         return Err(Errno::Perm);
@@ -1914,6 +2835,10 @@ fn set_re_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> {
         fs: effective,
     }
     .store(&mut rec.creds, gid);
+    if !gid {
+        rec.creds
+            .sync_uid_transition(old.real, old.effective, old.saved, keepcaps);
+    }
     proc_sync_holding(&reg.records, parent);
     Ok(0)
 }
@@ -1924,6 +2849,7 @@ fn set_res_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> 
     let mut reg = REGISTRY.lock();
     let rec = reg.group_mut(parent).ok_or(Errno::NoProcess)?;
     let old = IdSet::load(&rec.creds, gid);
+    let keepcaps = rec.keepcaps;
     if rec.creds.euid != 0 {
         for value in requested {
             if value != u32::MAX
@@ -1957,6 +2883,10 @@ fn set_res_id(parent: Pid, args: [usize; 6], gid: bool) -> Result<usize, Errno> 
         fs: effective,
     }
     .store(&mut rec.creds, gid);
+    if !gid {
+        rec.creds
+            .sync_uid_transition(old.real, old.effective, old.saved, keepcaps);
+    }
     proc_sync_holding(&reg.records, parent);
     Ok(0)
 }
@@ -2016,12 +2946,8 @@ fn sched_target(parent: Pid, pid_arg: usize) -> Result<usize, Errno> {
 
 fn sched_getscheduler(parent: Pid, pid_arg: usize) -> Result<usize, Errno> {
     let target = sched_target(parent, pid_arg)?;
-    let reg = REGISTRY.lock();
-    reg.records
-        .iter()
-        .find(|r| r.pid == target)
-        .ok_or(Errno::NoProcess)?;
-    Ok(0)
+    let (policy, _) = super::sched::sched_of(target).ok_or(Errno::NoProcess)?;
+    Ok(policy as usize)
 }
 
 fn sched_getparam(parent: Pid, pid_arg: usize, param: usize) -> Result<usize, Errno> {
@@ -2032,15 +2958,98 @@ fn sched_getparam(parent: Pid, pid_arg: usize, param: usize) -> Result<usize, Er
         return Err(Errno::Invalid);
     }
     let target = sched_target(parent, pid_arg)?;
+    let (_, priority) = super::sched::sched_of(target).ok_or(Errno::NoProcess)?;
     let reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter()
-        .find(|r| r.pid == target)
-        .ok_or(Errno::NoProcess)?;
-    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
-    crate::mm::user_access::copy_to_user(space, param, &[0u8; 4]).map_err(|_| Errno::Fault)?;
+    let space = reg
+        .group(parent)
+        .and_then(|r| r.space.as_ref())
+        .ok_or(Errno::NoProcess)?
+        .as_space();
+    crate::mm::user_access::copy_to_user(space, param, &priority.to_ne_bytes())
+        .map_err(|_| Errno::Fault)?;
     Ok(0)
+}
+
+/// 读调度参数结构里的优先级字段。
+fn read_sched_priority(parent: Pid, ptr: usize) -> Result<i32, Errno> {
+    if ptr == 0 {
+        return Err(Errno::Invalid);
+    }
+    let mut raw = [0u8; 4];
+    let reg = REGISTRY.lock();
+    let space = reg
+        .group(parent)
+        .and_then(|r| r.space.as_ref())
+        .ok_or(Errno::NoProcess)?
+        .as_space();
+    crate::mm::user_access::copy_from_user(space, ptr, &mut raw).map_err(|_| Errno::Fault)?;
+    Ok(i32::from_ne_bytes(raw))
+}
+
+/// 策略与优先级组合是否合法：实时策略要求 1 到 99，其余策略要求 0。
+fn sched_policy_valid(policy: i32, priority: i32) -> bool {
+    match policy {
+        1 | 2 => (1..=99).contains(&priority),
+        0 | 3 | 5 => priority == 0,
+        _ => false,
+    }
+}
+
+/// sched_setscheduler(2)：设置目标任务的策略与优先级。
+fn sched_setscheduler(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let target = sched_target(parent, args[0])?;
+    let policy = args[1] as u32 as i32;
+    let priority = read_sched_priority(parent, args[2])?;
+    if !sched_policy_valid(policy, priority) {
+        return Err(Errno::Invalid);
+    }
+    if super::sched::set_sched(target, policy as u8, priority) {
+        Ok(0)
+    } else {
+        Err(Errno::NoProcess)
+    }
+}
+
+/// sched_setparam(2)：只改优先级，策略沿用目标当前的策略。
+fn sched_setparam(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let target = sched_target(parent, args[0])?;
+    let (policy, _) = super::sched::sched_of(target).ok_or(Errno::NoProcess)?;
+    let priority = read_sched_priority(parent, args[1])?;
+    if !sched_policy_valid(policy as i32, priority) {
+        return Err(Errno::Invalid);
+    }
+    if super::sched::set_sched(target, policy, priority) {
+        Ok(0)
+    } else {
+        Err(Errno::NoProcess)
+    }
+}
+
+/// setpriority(2)：只支持 PRIO_PROCESS，谦让值范围 -20 到 19。
+fn setpriority(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    if (args[0] as u32 as i32) != 0 {
+        return Err(Errno::Invalid);
+    }
+    let target = sched_target(parent, args[1])?;
+    let nice = args[2] as u32 as i32;
+    if !(-20..=19).contains(&nice) {
+        return Err(Errno::Invalid);
+    }
+    if super::sched::set_nice(target, nice) {
+        Ok(0)
+    } else {
+        Err(Errno::NoProcess)
+    }
+}
+
+/// getpriority(2)：只支持 PRIO_PROCESS，返回 20 减谦让值。
+fn getpriority(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    if (args[0] as u32 as i32) != 0 {
+        return Err(Errno::Invalid);
+    }
+    let target = sched_target(parent, args[1])?;
+    let nice = super::sched::nice_of(target).ok_or(Errno::NoProcess)?;
+    Ok((20 - nice) as usize)
 }
 
 fn sched_priority_limit(policy_arg: usize, is_max: bool) -> Result<usize, Errno> {
@@ -2058,12 +3067,14 @@ fn sched_rr_get_interval(parent: Pid, pid_arg: usize, tp: usize) -> Result<usize
     }
     let target = sched_target(parent, pid_arg)?;
     let reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter()
-        .find(|r| r.pid == target)
-        .ok_or(Errno::NoProcess)?;
-    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    if reg.thread(target).is_none() {
+        return Err(Errno::NoProcess);
+    }
+    let space = reg
+        .group(parent)
+        .and_then(|r| r.space.as_ref())
+        .ok_or(Errno::NoProcess)?
+        .as_space();
     let mut data = [0u8; 16];
     data[8..16].copy_from_slice(&(crate::config::TICK_MS * 1_000_000).to_ne_bytes());
     crate::mm::user_access::copy_to_user(space, tp, &data).map_err(|_| Errno::Fault)?;
@@ -2073,12 +3084,14 @@ fn sched_rr_get_interval(parent: Pid, pid_arg: usize, tp: usize) -> Result<usize
 fn sched_getaffinity(parent: Pid, pid_arg: usize, len: usize, mask: usize) -> Result<usize, Errno> {
     let target = sched_target(parent, pid_arg)?;
     let reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter()
-        .find(|r| r.pid == target)
-        .ok_or(Errno::NoProcess)?;
-    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    if reg.thread(target).is_none() {
+        return Err(Errno::NoProcess);
+    }
+    let space = reg
+        .group(parent)
+        .and_then(|r| r.space.as_ref())
+        .ok_or(Errno::NoProcess)?
+        .as_space();
     let n = len.min(8);
     let bits = 1u64.to_ne_bytes();
     if n > 0 {
@@ -2090,15 +3103,17 @@ fn sched_getaffinity(parent: Pid, pid_arg: usize, len: usize, mask: usize) -> Re
 fn sched_setaffinity(parent: Pid, pid_arg: usize, len: usize, mask: usize) -> Result<usize, Errno> {
     let target = sched_target(parent, pid_arg)?;
     let reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter()
-        .find(|r| r.pid == target)
-        .ok_or(Errno::NoProcess)?;
+    if reg.thread(target).is_none() {
+        return Err(Errno::NoProcess);
+    }
     if len == 0 {
         return Err(Errno::Invalid);
     }
-    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    let space = reg
+        .group(parent)
+        .and_then(|r| r.space.as_ref())
+        .ok_or(Errno::NoProcess)?
+        .as_space();
     let n = len.min(8);
     let mut data = [0u8; 8];
     crate::mm::user_access::copy_from_user(space, mask, &mut data[..n])
@@ -2137,16 +3152,17 @@ fn fork_user(
         return Err(Errno::Invalid);
     }
     let (space, creds) = {
-        let reg = REGISTRY.lock();
-        let source = reg.group(parent).ok_or(Errno::NoProcess)?;
+        let mut reg = REGISTRY.lock();
+        let source = reg.group_mut(parent).ok_or(Errno::NoProcess)?;
+        let creds = source.creds.try_clone().map_err(|_| Errno::NoMem)?;
         let space = source
             .space
-            .as_ref()
+            .as_mut()
             .ok_or(Errno::NoProcess)?
-            .as_space()
+            .0
             .deep_copy()
             .map_err(|_| Errno::NoMem)?;
-        (space, source.creds.try_clone().map_err(|_| Errno::NoMem)?)
+        (space, creds)
     };
     let fs = {
         let reg = REGISTRY.lock();
@@ -2164,6 +3180,7 @@ fn fork_user(
         child_frame[TrapFrameArgs::SP] = stack;
     }
     let pid = super::registry::alloc_pid();
+    let (policy, priority, nice) = super::sched::attrs_of(parent).ok_or(Errno::NoProcess)?;
     // CLONE_CHILD_SETTID：在子进程地址空间写入其 tid。
     if flags & CLONE_CHILD_SETTID != 0 && child_tid != 0 {
         // 写入经 user_access 完成，目标是子进程自身的用户内存；地址来自
@@ -2171,7 +3188,10 @@ fn fork_user(
         let _ =
             crate::mm::user_access::copy_to_user(&space, child_tid, &(pid as u32).to_ne_bytes());
     }
-    let task = Task::new_user(pid, pid, "child", child_frame).map_err(|_| Errno::NoMem)?;
+    let mut task = Task::new_user(pid, pid, "child", child_frame).map_err(|_| Errno::NoMem)?;
+    task.policy = policy;
+    task.priority = priority;
+    task.nice = nice;
     let task = Box::try_new(task).map_err(|_| Errno::NoMem)?;
     super::registry::reserve().map_err(|_| Errno::NoMem)?;
     sched::reserve_task().map_err(|_| Errno::NoMem)?;
@@ -2200,17 +3220,39 @@ fn fork_user(
                 }
                 core::cmp::Ordering::Equal => {}
             }
-            let (pgid, sid) = (reg.records[pi].pgid, reg.records[pi].sid);
-            // 子进程继承备用栈，pending/info 清零。
+            let (pgid, sid, rlimits, dumpable, keepcaps, thp_disable, cap_bset, securebits) = {
+                let p = &reg.records[pi];
+                (
+                    p.pgid,
+                    p.sid,
+                    p.rlimits,
+                    p.dumpable,
+                    p.keepcaps,
+                    p.thp_disable,
+                    p.cap_bset,
+                    p.securebits,
+                )
+            };
+            // 子进程继承备用栈，pending/info 清零；child_subreaper 按 prctl(2) 在 fork 时清零。
             let child = &mut reg.records[ci];
             child.parent = parent;
             child.fs = Some(fs);
             child.pgid = pgid;
             child.sid = sid;
             child.creds = creds;
+            child.rlimits = rlimits;
+            child.dumpable = dumpable;
+            child.keepcaps = keepcaps;
+            child.child_subreaper = false;
+            child.thp_disable = thp_disable;
+            child.cap_bset = cap_bset;
+            child.securebits = securebits;
         }
         let parent_thread = reg.threads.iter().position(|t| t.tid == parent);
         let child_thread = reg.threads.iter().position(|t| t.tid == pid);
+        let mut child_comm = super::comm_from_bytes(b"child");
+        let mut child_nnp = false;
+        let mut child_slack = super::DEFAULT_TIMER_SLACK_NS;
         if let (Some(pi), Some(ci)) = (parent_thread, child_thread) {
             match pi.cmp(&ci) {
                 core::cmp::Ordering::Less => {
@@ -2223,9 +3265,27 @@ fn fork_user(
                 }
                 core::cmp::Ordering::Equal => {}
             }
+            let (comm, timer_slack_ns, no_new_privs) = {
+                let pt = &reg.threads[pi];
+                (pt.comm, pt.timer_slack_ns, pt.no_new_privs)
+            };
+            // pdeath_signal 按 prctl(2) 在 fork 时清零；comm/no_new_privs 继承；
+            // timer_slack_ns 与 default_timer_slack_ns 按 Linux fork 规则均取父当前值。
+            let ct = &mut reg.threads[ci];
+            ct.comm = comm;
+            ct.pdeath_signal = 0;
+            ct.timer_slack_ns = timer_slack_ns;
+            ct.default_timer_slack_ns = timer_slack_ns;
+            ct.no_new_privs = no_new_privs;
+            child_comm = comm;
+            child_nnp = no_new_privs;
+            child_slack = timer_slack_ns;
         }
+        super::proc_table_push(pid, "child", parent, true);
+        super::proc_table_set_comm(pid, child_comm);
+        super::proc_table_set_no_new_privs(pid, child_nnp);
+        super::proc_table_set_timer_slack(pid, child_slack);
     }
-    super::proc_table_push(pid, "child", parent, true);
     {
         let mut locked = REGISTRY.lock();
         let reg = &mut *locked;
@@ -2308,7 +3368,11 @@ fn fork_thread(
         child_frame[TrapFrameArgs::TLS] = tls;
     }
     let tid = super::registry::alloc_pid();
-    let task = Task::new_user(tid, tgid, "thread", child_frame).map_err(|_| Errno::NoMem)?;
+    let (policy, priority, nice) = super::sched::attrs_of(parent).ok_or(Errno::NoProcess)?;
+    let mut task = Task::new_user(tid, tgid, "thread", child_frame).map_err(|_| Errno::NoMem)?;
+    task.policy = policy;
+    task.priority = priority;
+    task.nice = nice;
     let task = Box::try_new(task).map_err(|_| Errno::NoMem)?;
     super::registry::reserve().map_err(|_| Errno::NoMem)?;
     sched::reserve_task().map_err(|_| Errno::NoMem)?;

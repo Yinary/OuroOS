@@ -50,8 +50,9 @@ OuroOS v0.1.0 · riscv64 · boot hart 0 · 1 cpus · boot ok
 ```
 
 随后内核进入用户态链路。挂载官方测例盘时由内嵌启动器 `official_init`
-布置动态解释器与 busybox 入口后运行盘上组脚本；无盘或调试场景则依次
-运行内嵌的用户程序 `smoke` 与 `check`（源码在 `user/`，构建时嵌入内核
+布置动态解释器与 busybox 入口后运行盘上组脚本；LTP 组例外，由启动器按
+目录顺序逐例执行并套用逐例时限。无盘或调试场景则依次运行内嵌的用户
+程序 `smoke` 与 `check`（源码在 `user/`，构建时嵌入内核
 镜像，不经磁盘），用户程序运行在用户权限级，经 ecall / syscall 执行
 write、exit 及内存系统调用：
 
@@ -90,12 +91,10 @@ check: all syscall paths ok, faulting now
 |---|---|---|
 | basic-musl / basic-glibc | 102/102 | 102/102 |
 | busybox-musl / busybox-glibc | 54/55 | 54/55 |
-| libcbench-musl，有耗时的子项 | 27/27 | 27/27 |
-| libcbench-glibc，有耗时的子项 | 27/27 | 27/27 |
+| lua-musl / lua-glibc | 9/9 | 9/9 |
+| libcbench-musl / libcbench-glibc | 27/27 | 27/27 |
 
-libcbench 每组包含 27 个性能子项。上表记录一次本地运行的有效计时数，当轮性能分与各项耗时见 `result.json`。
-
-busybox 各差 1 分来自判分器内嵌的 `kill 10` 命令与盘上命令表不对齐（外部差异，非功能缺陷）。自建盘 FS 语义回归（`make test-regress`）双架构四配置全通过。
+busybox 各差 1 分来自判分器内嵌的 `kill 10` 命令与盘上命令表不对齐（外部差异，非功能缺陷）。libcbench 按有效计时数计：27 个子项各得 1 到 2 分的性能分，慢于基线得 1 分，快于基线按比例增加。basic 的 `test_pipe` 偶发因父子进程输出交错少 3 分，见契约 §3.8。自建盘 FS 语义回归（`make test-regress`）双架构四配置全通过。
 
 ## 文档
 

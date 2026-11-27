@@ -2,7 +2,7 @@
 //!（收割即删，见 §3 生命周期）、协作 + 时间片调度与等待/唤醒。
 //! 完整契约见 docs/ostd-contracts.md §3。
 
-mod futex;
+pub(crate) mod futex;
 pub mod sched;
 pub mod signal;
 // Issue 指定的 `task/mod.rs` + `task/task.rs` 布局会自然形成同名子模块。
@@ -42,8 +42,14 @@ impl ExitInfo {
     }
 }
 
-/// 进程凭证：真实、有效、保存的用户号与组号，文件系统访问用的号，以及补充组。
-/// init 从全 0 开始，fork 继承，exec 保留。
+/// Linux 能力位编号（include/uapi/linux/capability.h）。
+pub const CAP_SETPCAP: u32 = 8;
+pub const CAP_SYS_ADMIN: u32 = 21;
+pub const CAP_SYS_RESOURCE: u32 = 24;
+pub const CAP_SYS_TIME: u32 = 25;
+
+/// 进程凭证：真实、有效、保存的用户号与组号，文件系统访问用的号，补充组与能力集。
+/// init 从全 0 与全能力集开始，fork 继承，exec 保留。
 pub struct Credentials {
     pub ruid: u32,
     pub euid: u32,
@@ -54,10 +60,13 @@ pub struct Credentials {
     pub fsuid: u32,
     pub fsgid: u32,
     pub groups: Vec<u32>,
+    pub cap_effective: u64,
+    pub cap_permitted: u64,
+    pub cap_inheritable: u64,
 }
 
 impl Credentials {
-    /// 全 0 的凭证，即 root。
+    /// 全 0 的凭证，即 root（携带完整能力集）。
     pub fn root() -> Self {
         Self {
             ruid: 0,
@@ -69,6 +78,38 @@ impl Credentials {
             fsuid: 0,
             fsgid: 0,
             groups: Vec::new(),
+            cap_effective: CAP_FULL_SET,
+            cap_permitted: CAP_FULL_SET,
+            cap_inheritable: 0,
+        }
+    }
+
+    /// 检查当前有效能力集中是否具备指定能力位。
+    pub fn has_cap(&self, cap: u32) -> bool {
+        cap <= CAP_LAST_CAP && ((self.cap_effective >> cap) & 1 != 0)
+    }
+
+    /// UID 切换时按 Linux `cap_emulate_setxuid` 同步有效/允许能力集。
+    pub fn sync_uid_transition(
+        &mut self,
+        old_ruid: u32,
+        old_euid: u32,
+        old_suid: u32,
+        keepcaps: bool,
+    ) {
+        if (old_ruid == 0 || old_euid == 0 || old_suid == 0)
+            && self.ruid != 0
+            && self.euid != 0
+            && self.suid != 0
+            && !keepcaps
+        {
+            self.cap_permitted = 0;
+            self.cap_effective = 0;
+        }
+        if old_euid == 0 && self.euid != 0 {
+            self.cap_effective = 0;
+        } else if old_euid != 0 && self.euid == 0 {
+            self.cap_effective = self.cap_permitted;
         }
     }
 
@@ -89,8 +130,61 @@ impl Credentials {
             fsuid: self.fsuid,
             fsgid: self.fsgid,
             groups,
+            cap_effective: self.cap_effective,
+            cap_permitted: self.cap_permitted,
+            cap_inheritable: self.cap_inheritable,
         })
     }
+}
+
+/// Linux 6.12 资源限额种类总数（RLIMIT_CPU=0 .. RLIMIT_RTTIME=15）。
+pub const RLIM_NLIMITS: usize = 16;
+
+/// Linux 默认线程定时器松弛值（50 微秒，见 kernel/fork.c TIMER_SLACK_NS_DEFAULT）。
+pub const DEFAULT_TIMER_SLACK_NS: u64 = 50_000;
+
+/// Linux 6.12 最大能力位编号（CAP_CHECKPOINT_RESTORE = 40）。
+pub const CAP_LAST_CAP: u32 = 40;
+
+/// 全能力边界集掩码（位 0..=40）。
+pub const CAP_FULL_SET: u64 = (1u64 << (CAP_LAST_CAP + 1)) - 1;
+
+/// 构造默认 16 项资源限额表（其中 DATA/STACK/MEMLOCK/AS 实际以地址空间为准，
+/// NOFILE 以文件系统上下文为准）。
+pub fn default_rlimits() -> [[u64; 2]; RLIM_NLIMITS] {
+    let mut lim = [[u64::MAX; 2]; RLIM_NLIMITS];
+    // RLIMIT_CORE(4)：Linux 默认软限额 0、硬限额无限
+    lim[4] = [0, u64::MAX];
+    // RLIMIT_NPROC(6)
+    lim[6] = [4096, 4096];
+    // RLIMIT_NOFILE(7)：与 fs/context 默认一致
+    lim[7] = [1024, 4096];
+    // RLIMIT_SIGPENDING(11)
+    lim[11] = [4096, 4096];
+    // RLIMIT_MSGQUEUE(12)：Linux MQ_BYTES_MAX = 819200
+    lim[12] = [819_200, 819_200];
+    // RLIMIT_NICE(13) / RLIMIT_RTPRIO(14)
+    lim[13] = [0, 0];
+    lim[14] = [0, 0];
+    lim
+}
+
+/// 把字节串截断并补 NUL 编码为 16 字节线程名（PR_SET_NAME / TASK_COMM_LEN=16）。
+pub fn comm_from_bytes(src: &[u8]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let n = src
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(src.len())
+        .min(15);
+    out[..n].copy_from_slice(&src[..n]);
+    out
+}
+
+/// 取路径末段文件名并编码为 16 字节线程名（execve 更新 comm 语义）。
+pub fn comm_from_path(path: &str) -> [u8; 16] {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    comm_from_bytes(base.as_bytes())
 }
 
 /// 进程注册表条目：Task 之外的全部资源与终态。
@@ -119,16 +213,44 @@ pub struct ProcessRecord {
     pub did_exec: bool,
     /// 凭证；fork 继承，exec 保留。
     pub creds: Credentials,
+    /// ITIMER_REAL 定时器：(下次单调触发时刻, 重复周期)；fork 清零，exec 保留。
+    pub itimer_real: Option<(core::time::Duration, core::time::Duration)>,
+    /// 16 项 POSIX 资源限额（DATA/STACK/MEMLOCK/AS 与 space 同步，NOFILE 与 fs 同步）。
+    pub rlimits: [[u64; 2]; RLIM_NLIMITS],
+    /// PR_SET_DUMPABLE / PR_GET_DUMPABLE（0=不可转储，1=可转储；fork 继承，exec 重置为 1）。
+    pub dumpable: u8,
+    /// PR_SET_KEEPCAPS / PR_GET_KEEPCAPS（fork 继承，exec 清零）。
+    pub keepcaps: bool,
+    /// PR_SET_CHILD_SUBREAPER / PR_GET_CHILD_SUBREAPER（fork 清零，exec 保留）。
+    pub child_subreaper: bool,
+    /// PR_SET_THP_DISABLE / PR_GET_THP_DISABLE（fork 继承，exec 保留）。
+    pub thp_disable: bool,
+    /// PR_CAPBSET_READ / PR_CAPBSET_DROP 能力边界集（fork 继承，exec 保留）。
+    pub cap_bset: u64,
+    /// PR_SET_SECUREBITS / PR_GET_SECUREBITS（fork 继承，exec 保留）。
+    pub securebits: u32,
 }
 
-/// 线程记录：线程私有的信号状态。地址空间等组级资源在 ProcessRecord。
+/// 线程记录：线程私有的信号状态与 prctl 属性。地址空间等组级资源在 ProcessRecord。
 pub struct ThreadRecord {
     pub tid: Pid,
-    /// 所属线程组；当前每个进程只有一个线程，与 tid 相同。
+    /// 所属线程组；单线程进程里与 tid 相同。
     pub tgid: Pid,
     /// 屏蔽字与备用栈；处置表与进程定向挂起在组记录里。
     pub signal: ThreadSig,
     pub clear_child_tid: usize,
+    /// set_robust_list(2) 登记的用户态健壮互斥锁链表头地址，0 表示未登记。
+    pub robust_list: usize,
+    /// PR_SET_NAME / PR_GET_NAME 线程名（最长 15 字节加末尾 NUL）。
+    pub comm: [u8; 16],
+    /// PR_SET_PDEATHSIG：父进程退出时发送的信号号（0 表示未设置；fork/clone 清零）。
+    pub pdeath_signal: u8,
+    /// PR_SET_TIMERSLACK / PR_GET_TIMERSLACK（纳秒；fork/exec 继承）。
+    pub timer_slack_ns: u64,
+    /// 默认定时器松弛值（PR_SET_TIMERSLACK(0) 的恢复目标；fork/clone 继承父当前值）。
+    pub default_timer_slack_ns: u64,
+    /// PR_SET_NO_NEW_PRIVS：置位后不可撤销，跨 fork/clone/exec 继承。
+    pub no_new_privs: bool,
 }
 
 /// 注册表本体。pid 0 保留（"无任务"标识）。
@@ -200,6 +322,8 @@ static EXIT_REPORTS: DebugMutex<Vec<(Pid, &'static str, ExitInfo)>> =
 pub(crate) struct ProcEntry {
     pub pid: u32,
     pub name: &'static str,
+    /// PR_SET_NAME / execve 维护的 16 字节进程名（NUL 结尾）。
+    pub comm: [u8; 16],
     /// execve 提交后的真实 argv（NUL 分隔、末尾 NUL）；未 exec 过为 None
     pub cmdline: Option<alloc::vec::Vec<u8>>,
     /// b'R' 用户任务运行中 / b'S' 内核任务 / b'Z' 已退出未收割
@@ -210,6 +334,10 @@ pub(crate) struct ProcEntry {
     pub sid: u32,
     /// 真实、有效、保存、文件系统用的用户号在前，组号在后。
     pub ids: [u32; 8],
+    /// PR_SET_NO_NEW_PRIVS 状态（/proc/<pid>/status 的 NoNewPrivs 字段）。
+    pub no_new_privs: bool,
+    /// PR_SET_TIMERSLACK 当前值（/proc/<pid>/timerslack_ns）。
+    pub timer_slack_ns: u64,
 }
 static PROC_TABLE: DebugMutex<alloc::vec::Vec<ProcEntry>> =
     DebugMutex::new("PROC_TABLE", alloc::vec::Vec::new());
@@ -228,13 +356,74 @@ pub(crate) fn proc_table_push(pid: Pid, name: &'static str, ppid: Pid, user: boo
     PROC_TABLE.lock().push(ProcEntry {
         pid: pid as u32,
         name,
+        comm: comm_from_bytes(name.as_bytes()),
         cmdline: None,
         state,
         ppid: ppid as u32,
         pgid: pid as u32,
         sid: pid as u32,
         ids: [0; 8],
+        no_new_privs: false,
+        timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
     });
+}
+
+/// 更新快照中的进程名（PR_SET_NAME / execve / fork 继承时同步）。
+pub(crate) fn proc_table_set_comm(pid: Pid, comm: [u8; 16]) {
+    if let Some(e) = PROC_TABLE.lock().iter_mut().find(|e| e.pid as Pid == pid) {
+        e.comm = comm;
+    }
+}
+
+/// 更新快照中的 NoNewPrivs 标志。
+pub(crate) fn proc_table_set_no_new_privs(pid: Pid, value: bool) {
+    if let Some(e) = PROC_TABLE.lock().iter_mut().find(|e| e.pid as Pid == pid) {
+        e.no_new_privs = value;
+    }
+}
+
+/// 更新快照中的 timer_slack_ns。
+pub(crate) fn proc_table_set_timer_slack(pid: Pid, value: u64) {
+    if let Some(e) = PROC_TABLE.lock().iter_mut().find(|e| e.pid as Pid == pid) {
+        e.timer_slack_ns = value;
+    }
+}
+
+/// 孤儿或 subreaper 过继时同步子进程快照的父 pid。
+pub(crate) fn proc_table_reparent(old_parent: Pid, new_parent: Pid) {
+    let mut table = PROC_TABLE.lock();
+    for e in table.iter_mut() {
+        if e.ppid as Pid == old_parent {
+            e.ppid = new_parent as u32;
+        }
+    }
+}
+
+/// FS 读接口：按 pid 取 16 字节 comm。
+pub fn proc_table_comm(pid: u32) -> Option<[u8; 16]> {
+    PROC_TABLE
+        .lock()
+        .iter()
+        .find(|e| e.pid == pid)
+        .map(|e| e.comm)
+}
+
+/// FS 读接口：按 pid 取 NoNewPrivs 状态。
+pub fn proc_table_no_new_privs(pid: u32) -> bool {
+    PROC_TABLE
+        .lock()
+        .iter()
+        .find(|e| e.pid == pid)
+        .is_some_and(|e| e.no_new_privs)
+}
+
+/// FS 读接口：按 pid 取 timer_slack_ns。
+pub fn proc_table_timer_slack(pid: u32) -> Option<u64> {
+    PROC_TABLE
+        .lock()
+        .iter()
+        .find(|e| e.pid == pid)
+        .map(|e| e.timer_slack_ns)
 }
 
 /// 把进程组、会话与凭证写入 procfs 快照；调用方须已持 REGISTRY 锁。
@@ -299,6 +488,82 @@ pub fn proc_table_lookup(pid: u32) -> Option<(&'static str, u8, u32, Option<allo
         .map(|e| (e.name, e.state, e.ppid, e.cmdline.clone()))
 }
 
+/// 最早到期的 ITIMER_REAL 单调时刻（纳秒；u64::MAX 表示当前无活动定时器）。
+static NEXT_ITIMER_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// 在持 REGISTRY 锁下重算全局最早 ITIMER_REAL 触发时刻。
+fn recompute_next_itimer(reg: &Registry) {
+    let min_ns = reg
+        .records
+        .iter()
+        .filter(|r| r.exit.is_none())
+        .filter_map(|r| {
+            r.itimer_real
+                .map(|(d, _)| d.as_nanos().min(u64::MAX as u128) as u64)
+        })
+        .min()
+        .unwrap_or(u64::MAX);
+    NEXT_ITIMER_NS.store(min_ns, core::sync::atomic::Ordering::Release);
+}
+
+/// 返回全局最早的 ITIMER_REAL 触发时刻（无活动定时器时返回 None）。
+pub(super) fn next_itimer_deadline() -> Option<core::time::Duration> {
+    let ns = NEXT_ITIMER_NS.load(core::sync::atomic::Ordering::Acquire);
+    (ns != u64::MAX).then(|| core::time::Duration::from_nanos(ns))
+}
+
+/// 检查并触发所有已到期的 ITIMER_REAL 定时器，投递 SIGALRM。
+/// 仅在已到最早触发时刻时才加 REGISTRY 锁（调用方持有 SCHED 锁，满足 SCHED→REGISTRY 锁序）。
+pub(super) fn fire_expired_itimers(now: core::time::Duration) -> bool {
+    let now_ns = now.as_nanos().min(u64::MAX as u128) as u64;
+    if now_ns < NEXT_ITIMER_NS.load(core::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    let mut reg = REGISTRY.lock();
+    let mut fired = false;
+    let sig_bit: signal::SignalSet = 1u64 << (signal::SIGALRM - 1);
+    for idx in 0..reg.records.len() {
+        let Some((deadline, interval)) = reg.records[idx].itimer_real else {
+            continue;
+        };
+        if reg.records[idx].exit.is_some() {
+            reg.records[idx].itimer_real = None;
+            continue;
+        }
+        if now < deadline {
+            continue;
+        }
+        let tgid = reg.records[idx].pid;
+        let all_blocked = reg
+            .threads
+            .iter()
+            .filter(|t| t.tgid == tgid)
+            .all(|t| t.signal.blocked() & sig_bit != 0);
+        let blocked = if all_blocked { sig_bit } else { 0 };
+        let next = if !interval.is_zero() {
+            let mut d = deadline.saturating_add(interval);
+            if d <= now {
+                d = now.saturating_add(interval);
+            }
+            Some((d, interval))
+        } else {
+            None
+        };
+        reg.records[idx].itimer_real = next;
+        reg.records[idx].signal.generate(
+            signal::SIGALRM,
+            SigInfoSlot {
+                code: 0x80, // SI_KERNEL
+                ..Default::default()
+            },
+            blocked,
+        );
+        fired = true;
+    }
+    recompute_next_itimer(&reg);
+    fired
+}
+
 /// 注册表访问（调度器登记退出、用户循环取空间共用）。
 mod registry {
     use super::*;
@@ -324,6 +589,7 @@ mod registry {
     /// 登记一个进程记录（孵化提交段）。
     pub fn register(pid: Pid, name: &'static str, space: Option<LocalSpace>) {
         let mut reg = REGISTRY.lock();
+        let comm = comm_from_bytes(name.as_bytes());
         reg.records.push(ProcessRecord {
             pid,
             name,
@@ -334,6 +600,14 @@ mod registry {
             sid: pid,
             did_exec: false,
             creds: Credentials::root(),
+            itimer_real: None,
+            rlimits: default_rlimits(),
+            dumpable: 1,
+            keepcaps: false,
+            child_subreaper: false,
+            thp_disable: false,
+            cap_bset: CAP_FULL_SET,
+            securebits: 0,
             user_ns: 0,
             system_ns: 0,
             child_user_ns: 0,
@@ -346,20 +620,39 @@ mod registry {
             tgid: pid,
             signal: ThreadSig::new(),
             clear_child_tid: 0,
+            robust_list: 0,
+            comm,
+            pdeath_signal: 0,
+            timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
+            default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
+            no_new_privs: false,
         });
     }
 
-    /// 登记一个新线程：信号状态从父线程 fork_from 继承。调用方须持 REGISTRY 锁。
+    /// 登记一个新线程：信号状态与线程级 prctl 属性从父线程继承，pdeath_signal 清零。
+    /// 调用方须持 REGISTRY 锁。
     pub fn register_thread(reg: &mut Registry, tid: Pid, tgid: Pid, parent_tid: Pid) {
         let mut signal = ThreadSig::new();
+        let mut comm = comm_from_bytes(b"thread");
+        let mut timer_slack_ns = DEFAULT_TIMER_SLACK_NS;
+        let mut no_new_privs = false;
         if let Some(parent) = reg.thread(parent_tid) {
             signal.fork_from(&parent.signal);
+            comm = parent.comm;
+            timer_slack_ns = parent.timer_slack_ns;
+            no_new_privs = parent.no_new_privs;
         }
         reg.threads.push(ThreadRecord {
             tid,
             tgid,
             signal,
             clear_child_tid: 0,
+            robust_list: 0,
+            comm,
+            pdeath_signal: 0,
+            timer_slack_ns,
+            default_timer_slack_ns: timer_slack_ns,
+            no_new_privs,
         });
     }
 
@@ -384,6 +677,7 @@ mod registry {
             let mut reg = REGISTRY.lock();
             let rec = reg.group_mut(pid).expect("exiting task is not registered");
             rec.exit = Some(exit);
+            let had_itimer = rec.itimer_real.take().is_some();
             // 快照置僵尸（procfs 可见的存活规则与注册表一致）
             proc_table_mark_zombie(pid);
             // 积攒终态行；容量不足时丢弃（打印非关键路径）
@@ -420,6 +714,9 @@ mod registry {
                 ..Default::default()
             };
             let taken = (rec.space.take(), rec.fs.take());
+            if had_itimer {
+                recompute_next_itimer(&reg);
+            }
             // 自动收割（IGN/SA_NOCLDWAIT）与 SIGCHLD 通知解耦：前者决定
             // 是否留僵尸并入父时间，通知统一经 generate 按处置过滤。
             // 全程持 REGISTRY 锁内联完成。
@@ -455,31 +752,125 @@ mod registry {
                     None => false,
                 }
             };
-            // 孤儿即收：清理已退出孩子及过继 init 的任务，自动收割的记录一并移除。
+            // 向上寻找最近的存活 child_subreaper 祖先；找不到则过继 init。
+            let mut reparent_to = init;
+            let mut cursor = reg.thread(parent_pid).map_or(parent_pid, |t| t.tgid);
+            for _ in 0..reg.records.len() {
+                if cursor == 0 || cursor == init || cursor == pid {
+                    break;
+                }
+                let Some(ancestor) = reg
+                    .records
+                    .iter()
+                    .find(|r| r.pid == cursor && r.exit.is_none())
+                else {
+                    break;
+                };
+                if ancestor.child_subreaper {
+                    reparent_to = ancestor.pid;
+                    break;
+                }
+                cursor = ancestor.parent;
+            }
+            // PR_SET_PDEATHSIG：向每个设置了父亡信号的存活子进程投递信号。
+            let mut sent_pdeath = false;
+            let reg_ref = &mut *reg;
+            for child in reg_ref
+                .records
+                .iter_mut()
+                .filter(|r| r.parent == pid && r.exit.is_none())
+            {
+                let child_tgid = child.pid;
+                for thread in reg_ref
+                    .threads
+                    .iter()
+                    .filter(|t| t.tgid == child_tgid && t.pdeath_signal != 0)
+                {
+                    child.signal.generate(
+                        thread.pdeath_signal,
+                        SigInfoSlot {
+                            code: 0x80, // SI_KERNEL
+                            pid: pid as u32,
+                            ..Default::default()
+                        },
+                        thread.signal.blocked(),
+                    );
+                    sent_pdeath = true;
+                }
+            }
+            if sent_pdeath {
+                sched::request_signal_wake();
+            }
+            // 孤儿即收：无 subreaper 时清理已退出孩子及过继 init 的任务；
+            // 有 subreaper 时将所有孩子（含僵尸）过继给 subreaper 并补发 SIGCHLD。
+            let reap_zombies = reparent_to == init;
             let removed: alloc::vec::Vec<u32> = reg
                 .records
                 .iter()
                 .filter(|r| {
-                    r.parent == pid && r.exit.is_some() || (r.pid == pid && (orphan || auto_reap))
+                    (reap_zombies && r.parent == pid && r.exit.is_some())
+                        || (r.pid == pid && (orphan || auto_reap))
                 })
                 .map(|r| r.pid as u32)
                 .collect();
             reg.records.retain(|r| {
-                !(r.parent == pid && r.exit.is_some() || (r.pid == pid && (orphan || auto_reap)))
+                !((reap_zombies && r.parent == pid && r.exit.is_some())
+                    || (r.pid == pid && (orphan || auto_reap)))
             });
             for pid in &removed {
                 reg.remove_thread(*pid as Pid);
             }
             proc_table_remove_all(|p| removed.contains(&p));
+            let mut adopted_zombie: Option<(Pid, ExitInfo)> = None;
             for child in reg.records.iter_mut().filter(|r| r.parent == pid) {
-                child.parent = init;
+                child.parent = reparent_to;
+                if let Some(info) = child.exit {
+                    adopted_zombie = Some((child.pid, info));
+                }
             }
-            // 自检：父进程退出清理僵尸孩子，孤儿退出清理自身。
+            proc_table_reparent(pid, reparent_to);
+            if reparent_to != init {
+                if let Some((zpid, zexit)) = adopted_zombie {
+                    let sub_blocked = reg
+                        .threads
+                        .iter()
+                        .find(|t| t.tgid == reparent_to)
+                        .map_or(0, |t| t.signal.blocked());
+                    if let Some(sub) = reg
+                        .records
+                        .iter_mut()
+                        .find(|r| r.pid == reparent_to && r.exit.is_none())
+                    {
+                        let d = sub.signal.disposition(SIGCHLD);
+                        if d.handler != SIG_IGN {
+                            sub.signal.generate(
+                                SIGCHLD,
+                                SigInfoSlot {
+                                    code: match zexit {
+                                        ExitInfo::Exited(_) => CLD_EXITED,
+                                        ExitInfo::Signaled { .. } => CLD_KILLED,
+                                    },
+                                    pid: zpid as u32,
+                                    status: match zexit {
+                                        ExitInfo::Exited(n) => n & 255,
+                                        ExitInfo::Signaled { sig, .. } => sig as i32,
+                                    },
+                                    ..Default::default()
+                                },
+                                sub_blocked,
+                            );
+                        }
+                    }
+                    sched::request_children_wake();
+                }
+            }
+            // 自检：父进程退出清理或过继全部孩子，孤儿退出清理自身。
             debug_assert!(reg.records.iter().all(|r| r.parent != pid));
             debug_assert!(!orphan || reg.records.iter().all(|r| r.pid != pid));
             taken
         };
-        // 锁外 Drop：页表/页释放、fd 关闭，可能触发磁盘回收写
+        // 锁外释放该进程持有的全部 POSIX 记录锁，再 Drop 地址空间与 FD 表。
+        crate::fs::locks::release_process_locks(pid as u32);
         drop(taken);
     }
 
@@ -643,7 +1034,7 @@ pub fn run(baseline: (usize, usize)) {
     }
     let (total, free) = mm::frame::stats();
     assert_eq!(
-        (total, free + crate::fs::cache::retained_frames()),
+        (total, free + crate::fs::retained_frames()),
         baseline,
         "frame conservation violated after all tasks exited"
     );

@@ -1,4 +1,64 @@
-use super::{delete::remove_inodeentry_from_parentdir, *};
+use super::{
+    delete::{find_named_entry_in_parent, remove_named_entry_at, remove_inodeentry_from_parentdir},
+    *,
+};
+
+// OuroOS patch: create a hard link by target inode and destination parent inode.
+/// Creates a hard link to an existing non-directory inode in a linear directory.
+pub fn link_inode<B: BlockDevice>(
+    device: &mut Jbd2Dev<B>,
+    fs: &mut Ext4FileSystem,
+    target_ino: InodeNumber,
+    parent: InodeNumber,
+    name: &str,
+) -> Ext4Result<()> {
+    const EXT4_LINK_MAX: u16 = 65_000;
+    if fs.readonly {
+        return Err(Ext4Error::read_only());
+    }
+    if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\0']) {
+        return Err(Ext4Error::invalid_input());
+    }
+    if name.len() > Ext4DirEntry2::MAX_NAME_LEN as usize {
+        return Err(Ext4Error::new(Errno::ENAMETOOLONG));
+    }
+    let target_inode = fs.get_inode_by_num(device, target_ino)?;
+    if target_inode.is_dir() {
+        return Err(Ext4Error::new(Errno::EPERM));
+    }
+    if target_inode.i_links_count >= EXT4_LINK_MAX {
+        return Err(Ext4Error::new(Errno::EMLINK));
+    }
+    let mut dir = fs.get_inode_by_num(device, parent)?;
+    if !dir.is_dir() {
+        return Err(Ext4Error::not_dir());
+    }
+    if dir.i_flags & Ext4Inode::EXT4_INDEX_FL != 0 {
+        return Err(Ext4Error::unsupported());
+    }
+    for block in resolve_inode_blocks(fs, device, &mut dir)?.into_values() {
+        let cached = fs.datablock_cache.get_or_load(device, block)?;
+        if crate::entries::classic_dir::find_entry(&cached.data, name.as_bytes()).is_some() {
+            return Err(Ext4Error::already_exists());
+        }
+    }
+    let file_type = if target_inode.is_file() {
+        Ext4DirEntry2::EXT4_FT_REG_FILE
+    } else if target_inode.is_symlink() {
+        Ext4DirEntry2::EXT4_FT_SYMLINK
+    } else {
+        Ext4DirEntry2::EXT4_FT_UNKNOWN
+    };
+    insert_dir_entry(fs, device, parent, &mut dir, target_ino, name, file_type)?;
+    let new_links = target_inode.i_links_count + 1;
+    if let Err(err) = fs.set_inode_links_count(device, target_ino, new_links) {
+        if let Ok(entry) = find_named_entry_in_parent(fs, device, parent, &dir, name.as_bytes()) {
+            let _ = remove_named_entry_at(fs, device, parent, &dir, entry.phys, name.as_bytes());
+        }
+        return Err(err);
+    }
+    Ok(())
+}
 
 /// Create a hard link.
 pub fn link<B: BlockDevice>(

@@ -170,6 +170,16 @@ impl OwnedFrame {
     pub fn addr(&self) -> PhysAddr {
         self.pa
     }
+    /// 独占借用整页只读字节视图；`&mut self` 保证无 `FrameRef` 共享别名与用户映射。
+    pub fn as_slice(&mut self) -> &[u8] {
+        // SAFETY: self 独占已分配整页，直映虚拟地址有效且在 `&mut self` 借用期内无其他别名。
+        unsafe { core::slice::from_raw_parts(direct_map_addr(self.pa) as *const u8, PAGE_SIZE) }
+    }
+    /// 独占借用整页可写字节视图；`&mut self` 保证无 `FrameRef` 共享别名与用户映射。
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: self 独占已分配整页，直映虚拟地址有效且在 `&mut self` 借用期内无其他别名。
+        unsafe { core::slice::from_raw_parts_mut(direct_map_addr(self.pa) as *mut u8, PAGE_SIZE) }
+    }
     /// 从所拥有的页复制字节到内核缓冲区；越过页边界返回 InvalidRange。
     pub fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), FrameError> {
         if offset > PAGE_SIZE || out.len() > PAGE_SIZE - offset {
@@ -202,6 +212,24 @@ impl OwnedFrame {
         }
         Ok(())
     }
+    /// 将页内指定范围经内核直映可变切片交给回调填充，避免经临时栈缓冲二次拷贝。
+    pub(crate) fn fill_range_with<E>(
+        &self,
+        offset: usize,
+        len: usize,
+        f: impl FnOnce(&mut [u8]) -> Result<usize, E>,
+    ) -> Result<usize, E> {
+        let end = offset.saturating_add(len).min(PAGE_SIZE);
+        let slice_len = end.saturating_sub(offset);
+        // SAFETY: self 独占持有该物理页帧，offset..end 位于单页内，单核内核态无并发别名。
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(
+                (direct_map_addr(self.pa) + offset) as *mut u8,
+                slice_len,
+            )
+        };
+        f(dst)
+    }
     /// 清零页内半开区间；边界裁剪到本页，空区间无副作用。
     pub(crate) fn clear_range(&self, start: usize, end: usize) {
         let end = end.min(PAGE_SIZE);
@@ -218,12 +246,15 @@ impl OwnedFrame {
     }
     /// 将另一拥有页复制到本页；传入自身也合法。
     pub fn copy_from(&self, source: &OwnedFrame) {
-        // SAFETY: 两个 OwnedFrame 在复制期间均持有已分配页；copy 允许传入同一页。
+        if self.pa == source.pa {
+            return;
+        }
+        // SAFETY: 两个所有者持有不同的完整物理页，页对齐且范围无重叠。
         unsafe {
-            core::ptr::copy(
-                direct_map_addr(source.pa) as *const u8,
-                direct_map_addr(self.pa) as *mut u8,
-                PAGE_SIZE,
+            core::ptr::copy_nonoverlapping(
+                direct_map_addr(source.pa) as *const usize,
+                direct_map_addr(self.pa) as *mut usize,
+                PAGE_SIZE / core::mem::size_of::<usize>(),
             );
         }
     }
@@ -243,7 +274,19 @@ pub struct FrameRef(Arc<OwnedFrame>);
 impl FrameRef {
     /// 分配并清零一页；Arc 元数据分配失败返回 OOM。
     pub fn new() -> Result<Self, FrameError> {
-        let frame = OwnedFrame::new()?;
+        Self::share(OwnedFrame::new()?)
+    }
+
+    /// 复制一整页。目标页由源页完整初始化后才交给调用方；分配失败时回收。
+    pub(super) fn duplicate(&self) -> Result<Self, FrameError> {
+        let dest = OwnedFrame {
+            pa: frame_alloc(1)?,
+        };
+        dest.copy_from(&self.0);
+        Self::share(dest)
+    }
+
+    fn share(frame: OwnedFrame) -> Result<Self, FrameError> {
         Arc::try_new(frame)
             .map(Self)
             .map_err(|_| FrameError::OutOfMemory)
@@ -258,11 +301,6 @@ impl FrameRef {
     #[allow(dead_code)]
     pub fn strong_count(&self) -> usize {
         Arc::strong_count(&self.0)
-    }
-
-    /// 将另一页内容复制到本页；传入自身也合法。
-    pub fn copy_from(&self, source: &Self) {
-        self.0.copy_from(&source.0);
     }
 }
 impl core::ops::Deref for FrameRef {

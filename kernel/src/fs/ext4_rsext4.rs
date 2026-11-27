@@ -1,7 +1,8 @@
 //! rsext4 根卷和有界分区块设备适配。
 //! 使用 rsext4 0.8.1（Apache-2.0），来源见 docs/third-party.md。
+use super::block_cache::BlockCache;
 use crate::{drivers, syscall::Errno};
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use rsext4::{
     bmalloc::{AbsoluteBN, InodeNumber},
     superblock::Ext4Superblock,
@@ -21,10 +22,29 @@ struct Partition {
     time_base: i64,
 }
 
+const DCACHE_SLOTS: usize = 256;
+
+struct DentrySlot {
+    path: String,
+    ino: u32,
+    /// 整条路径（含末项）已确认无符号链接，允许 stat/query 直接读 inode。
+    direct_stat: bool,
+}
+
+fn dcache_slot(path: &str) -> usize {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in path.as_bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    (hash as usize) & (DCACHE_SLOTS - 1)
+}
+
 struct Volume {
     fs: Ext4FileSystem,
-    device: Jbd2Dev<Partition>,
+    device: Jbd2Dev<BlockCache<Partition>>,
     opens: Vec<(u32, usize)>,
+    dcache: Vec<Option<DentrySlot>>,
     failed: bool,
 }
 
@@ -35,6 +55,43 @@ impl Volume {
         } else {
             Ok(())
         }
+    }
+
+    fn invalidate_dcache(&mut self) {
+        for slot in &mut self.dcache {
+            *slot = None;
+        }
+    }
+
+    fn dcache_get(&self, path: &str) -> Option<&DentrySlot> {
+        let idx = dcache_slot(path);
+        self.dcache
+            .get(idx)
+            .and_then(|s| s.as_ref())
+            .filter(|s| s.path == path)
+    }
+
+    fn dcache_insert(&mut self, path: &str, ino: u32, direct_stat: bool) {
+        if path.len() > 256 || self.dcache.len() != DCACHE_SLOTS {
+            return;
+        }
+        let idx = dcache_slot(path);
+        if let Some(existing) = self.dcache[idx].as_mut() {
+            if existing.path == path && existing.ino == ino {
+                existing.direct_stat |= direct_stat;
+                return;
+            }
+        }
+        let mut owned = String::new();
+        if owned.try_reserve_exact(path.len()).is_err() {
+            return;
+        }
+        owned.push_str(path);
+        self.dcache[idx] = Some(DentrySlot {
+            path: owned,
+            ino,
+            direct_stat,
+        });
     }
 }
 
@@ -94,11 +151,16 @@ impl BlockDevice for Partition {
         !WRITABLE
     }
     fn current_time(&self) -> Ext4Result<Ext4Timestamp> {
-        let elapsed = crate::time::monotonic();
-        Ok(Ext4Timestamp::new(
-            self.time_base.saturating_add(elapsed.as_secs() as i64),
-            elapsed.subsec_nanos(),
-        ))
+        let now = crate::time::realtime();
+        if now.as_secs() > 0 {
+            Ok(Ext4Timestamp::new(now.as_secs() as i64, now.subsec_nanos()))
+        } else {
+            let elapsed = crate::time::monotonic();
+            Ok(Ext4Timestamp::new(
+                self.time_base.saturating_add(elapsed.as_secs() as i64),
+                elapsed.subsec_nanos(),
+            ))
+        }
     }
 }
 
@@ -193,7 +255,7 @@ fn try_mount(id: usize, start: usize, len: usize) -> Result<(), Errno> {
         len,
         time_base: i64::from(u32at(48)),
     };
-    let mut device = Jbd2Dev::initial_jbd2dev(0, partition, journal);
+    let mut device = Jbd2Dev::initial_jbd2dev(0, BlockCache::new(partition), journal);
     let options = MountOptions {
         readonly: !WRITABLE,
         replay_journal: false,
@@ -202,10 +264,16 @@ fn try_mount(id: usize, start: usize, len: usize) -> Result<(), Errno> {
     if !fs.get_root(&mut device).map_err(error)?.is_dir() {
         return Err(Errno::Invalid);
     }
+    let mut dcache = Vec::new();
+    dcache
+        .try_reserve_exact(DCACHE_SLOTS)
+        .map_err(|_| Errno::NoMem)?;
+    dcache.resize_with(DCACHE_SLOTS, || None);
     *ROOT.lock() = Some(Volume {
         fs,
         device,
         opens: Vec::new(),
+        dcache,
         failed: false,
     });
     log::info!("EXT4 root mounted (rsext4, writable={WRITABLE})");
@@ -223,6 +291,8 @@ fn error(err: Ext4Error) -> Errno {
     use rsext4::Errno as Ext4Errno;
     match err.code {
         Ext4Errno::ENOENT => Errno::NoEntry,
+        Ext4Errno::EPERM => Errno::Perm,
+        Ext4Errno::EACCES => Errno::Access,
         Ext4Errno::ENOTDIR => Errno::NotDir,
         Ext4Errno::EISDIR => Errno::IsDir,
         Ext4Errno::EINVAL => Errno::Invalid,
@@ -239,17 +309,46 @@ fn error(err: Ext4Error) -> Errno {
     }
 }
 
-/// 查找路径并返回 Ext4 inode 编号。
+/// 查找路径并返回 Ext4 inode 编号；命中路径目录项缓存时直接返回。
 pub(super) fn lookup(path: &str) -> Result<u32, Errno> {
     access(|v| {
+        if let Some(slot) = v.dcache_get(path) {
+            return Ok(slot.ino);
+        }
         let (ino, _) = rsext4::loopfile::get_file_inode(&mut v.fs, &mut v.device, path)?
             .ok_or_else(Ext4Error::not_found)?;
         // 高位由上层用于区分 FAT inode。
         if ino.raw() & 0x8000_0000 != 0 {
             return Err(Ext4Error::unsupported());
         }
-        Ok(ino.raw())
+        let raw = ino.raw();
+        v.dcache_insert(path, raw, false);
+        Ok(raw)
     })
+}
+
+/// 若规范绝对路径命中无符号链接标记的目录项缓存，在单次锁内直接读取最新 inode 元数据。
+pub(super) fn fast_metadata(path: &str) -> Result<Option<super::Metadata>, Errno> {
+    access(|v| {
+        let Some(ino) = v
+            .dcache_get(path)
+            .filter(|slot| slot.direct_stat)
+            .map(|slot| slot.ino)
+        else {
+            return Ok(None);
+        };
+        build_metadata(v, ino).map(Some)
+    })
+}
+
+/// 标记规范绝对路径（整条路径及末项均无符号链接）允许走 `fast_metadata` 快路径。
+pub(super) fn mark_direct_stat(path: &str, ino: u32) {
+    let mut root = ROOT.lock();
+    if let Some(v) = root.as_mut() {
+        if v.check_io().is_ok() {
+            v.dcache_insert(path, ino, true);
+        }
+    }
 }
 
 /// 返回 inode 类型、长度、链接数和磁盘占用。
@@ -266,50 +365,52 @@ pub(super) fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
     })
 }
 
+fn build_metadata(v: &mut Volume, ino: u32) -> Ext4Result<super::Metadata> {
+    let inode =
+        v.fs.get_inode_by_num(&mut v.device, InodeNumber::new(ino)?)?;
+    let size = v.fs.superblock.s_inode_size;
+    let time = |t: Ext4Timestamp| super::Timestamp {
+        sec: t.sec,
+        nsec: t.nsec,
+    };
+    let rdev = if matches!(inode.i_mode & 0xf000, 0x2000 | 0x6000) {
+        if inode.i_block[0] != 0 {
+            inode.i_block[0]
+        } else {
+            inode.i_block[1]
+        }
+    } else {
+        0
+    };
+    Ok(super::Metadata {
+        ino: ino as u64,
+        dev: 1,
+        rdev: rdev as u64,
+        mode: inode.i_mode,
+        links: inode.i_links_count as u32,
+        uid: inode.uid(),
+        gid: inode.gid(),
+        size: inode.size(),
+        blocks: inode
+            .blocks_count()
+            // HUGE_FILE 将 i_blocks 的单位从扇区切换为文件系统块。
+            .checked_mul(if inode.i_flags & 0x40000 != 0 {
+                (BLOCK_SIZE / 512) as u64
+            } else {
+                1
+            })
+            .ok_or_else(Ext4Error::io)?,
+        block_size: BLOCK_SIZE as u32,
+        atime: Some(time(inode.atime_ts(size))),
+        mtime: Some(time(inode.mtime_ts(size))),
+        ctime: Some(time(inode.ctime_ts(size))),
+        btime: inode.crtime_ts(size).map(time),
+    })
+}
+
 /// 读取 inode 的所有者、精确时间及基本属性。
 pub(super) fn metadata(ino: u32) -> Result<super::Metadata, Errno> {
-    access(|v| {
-        let inode =
-            v.fs.get_inode_by_num(&mut v.device, InodeNumber::new(ino)?)?;
-        let size = v.fs.superblock.s_inode_size;
-        let time = |t: Ext4Timestamp| super::Timestamp {
-            sec: t.sec,
-            nsec: t.nsec,
-        };
-        let rdev = if matches!(inode.i_mode & 0xf000, 0x2000 | 0x6000) {
-            if inode.i_block[0] != 0 {
-                inode.i_block[0]
-            } else {
-                inode.i_block[1]
-            }
-        } else {
-            0
-        };
-        Ok(super::Metadata {
-            ino: ino as u64,
-            dev: 1,
-            rdev: rdev as u64,
-            mode: inode.i_mode,
-            links: inode.i_links_count as u32,
-            uid: inode.uid(),
-            gid: inode.gid(),
-            size: inode.size(),
-            blocks: inode
-                .blocks_count()
-                // HUGE_FILE 将 i_blocks 的单位从扇区切换为文件系统块。
-                .checked_mul(if inode.i_flags & 0x40000 != 0 {
-                    (BLOCK_SIZE / 512) as u64
-                } else {
-                    1
-                })
-                .ok_or_else(Ext4Error::io)?,
-            block_size: BLOCK_SIZE as u32,
-            atime: Some(time(inode.atime_ts(size))),
-            mtime: Some(time(inode.mtime_ts(size))),
-            ctime: Some(time(inode.ctime_ts(size))),
-            btime: inode.crtime_ts(size).map(time),
-        })
-    })
+    access(|v| build_metadata(v, ino))
 }
 
 /// 更新 inode 时间，保留后端的时间编码、校验和与日志写回流程。
@@ -346,6 +447,16 @@ pub(super) fn update_times(ino: u32, times: [super::TimeUpdate; 2]) -> Result<()
             convert(times[0], Ext4Inode::FIELD_END_I_ATIME_EXTRA),
             convert(times[1], Ext4Inode::FIELD_END_I_MTIME_EXTRA),
         )
+    })
+}
+
+/// 按 inode 更新属主和属组，写入只读卷时返回 EROFS。
+pub(super) fn set_owner(ino: u32, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        rsext4::metadata::chown_inode(&mut v.device, &mut v.fs, InodeNumber::new(ino)?, uid, gid)
     })
 }
 
@@ -451,6 +562,42 @@ pub(super) fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
     })
 }
 
+/// 在指定父目录创建符号链接，允许相对或悬空目标。
+pub(super) fn symlink(parent: u32, name: &str, target: &str) -> Result<u32, Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        let ino = rsext4::file::create_symlink_inode(
+            &mut v.device,
+            &mut v.fs,
+            InodeNumber::new(parent)?,
+            name,
+            target,
+        )?;
+        v.invalidate_dcache();
+        Ok(ino.raw())
+    })
+}
+
+/// 在指定父目录为已有非目录 inode 创建硬链接。
+pub(super) fn link(target_ino: u32, parent: u32, name: &str) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        rsext4::file::link_inode(
+            &mut v.device,
+            &mut v.fs,
+            InodeNumber::new(target_ino)?,
+            InodeNumber::new(parent)?,
+            name,
+        )?;
+        v.invalidate_dcache();
+        Ok(())
+    })
+}
+
 /// 按块读取 Ext4 目录，逐项交付解析结果。
 pub(super) fn read_dir(
     ino: u32,
@@ -515,14 +662,29 @@ pub(super) fn read_dir(
 
 /// 将数据写到普通文件的指定偏移。
 pub(super) fn write_raw(ino: u32, offset: usize, data: &[u8]) -> Result<usize, Errno> {
+    write_raw_with_old_size(ino, offset, data).map(|(n, _)| n)
+}
+
+/// 将数据写到普通文件的指定偏移，并在同一次锁内返回写入前的文件长度。
+pub(super) fn write_raw_with_old_size(
+    ino: u32,
+    offset: usize,
+    data: &[u8],
+) -> Result<(usize, u64), Errno> {
     if !WRITABLE {
         return Err(Errno::ReadOnly);
     }
     offset.checked_add(data.len()).ok_or(Errno::Invalid)?;
     access(|v| {
-        let ino = regular_inode(v, ino)?;
-        rsext4::file::write_inode_data(&mut v.device, &mut v.fs, ino, offset as u64, data)?;
-        Ok(data.len())
+        let ino = InodeNumber::new(ino)?;
+        let old_size = rsext4::file::write_regular_inode_data(
+            &mut v.device,
+            &mut v.fs,
+            ino,
+            offset as u64,
+            data,
+        )?;
+        Ok((data.len(), old_size))
     })
 }
 
@@ -598,26 +760,28 @@ pub fn chmod_by_ino(ino: u32, path: &str, mode: u16) -> Result<(), Errno> {
     })
 }
 
-/// 删除空目录（rmdir 语义）：非目录 ENOTDIR、非空 ENOTEMPTY；目录项与
-/// inode 立即回收，有进程打开该目录时拒绝（EBUSY，见契约偏差）。
-pub(super) fn rmdir(path: &str, ino: u32) -> Result<(), Errno> {
+/// 从父目录移除空目录，最后一个引用释放后回收 inode。
+pub(super) fn rmdir(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
     if !WRITABLE {
         return Err(Errno::ReadOnly);
     }
     access(|v| {
-        if v.opens.iter().any(|&(id, _)| id == ino) {
-            return Err(Ext4Error::new(rsext4::Errno::EBUSY));
+        rsext4::file::unlink_empty_directory(
+            &mut v.fs,
+            &mut v.device,
+            InodeNumber::new(parent)?,
+            InodeNumber::new(ino)?,
+            name,
+        )
+        .inspect_err(|e| {
+            if matches!(e.code, rsext4::Errno::EIO | rsext4::Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })?;
+        v.invalidate_dcache();
+        if !v.opens.iter().any(|&(id, _)| id == ino) {
+            reclaim_unlinked(v, ino)?;
         }
-        let ino_num = InodeNumber::new(ino)?;
-        let mut inode = v.fs.get_inode_by_num(&mut v.device, ino_num)?;
-        if !inode.is_dir() {
-            return Err(Ext4Error::not_dir());
-        }
-        if !rsext4::file::is_dir_empty(&mut v.fs, &mut v.device, &mut inode)? {
-            return Err(Ext4Error::new(rsext4::Errno::ENOTEMPTY));
-        }
-        // 目标已确认是空目录，delete_dir 只做这一层的目录项与 inode 回收
-        rsext4::file::delete_dir(&mut v.fs, &mut v.device, path)?;
         Ok(())
     })
 }
@@ -642,6 +806,7 @@ pub(super) fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
                 v.failed = true;
             }
         })?;
+        v.invalidate_dcache();
         if links == 0 && !v.opens.iter().any(|&(id, _)| id == ino) {
             reclaim_unlinked(v, ino)?;
         }
@@ -675,10 +840,10 @@ pub(super) fn rename(
                 v.failed = true;
             }
         })?;
+        v.invalidate_dcache();
         if let Some(ino) = replaced {
             if !v.opens.iter().any(|&(id, _)| id == ino.raw()) {
-                rsext4::file::reclaim_rename_target(&mut v.fs, &mut v.device, ino)
-                    .inspect_err(|_| v.failed = true)?;
+                reclaim_unlinked(v, ino.raw())?;
             }
         }
         Ok(())
@@ -686,14 +851,8 @@ pub(super) fn rename(
 }
 
 fn reclaim_unlinked(v: &mut Volume, ino: u32) -> Ext4Result<()> {
-    let result = (|| {
-        let ino = InodeNumber::new(ino)?;
-        let mut inode = v.fs.get_inode_by_num(&mut v.device, ino)?;
-        if inode.i_links_count == 0 {
-            rsext4::file::free_inode(&mut v.fs, &mut v.device, ino, &mut inode)?;
-        }
-        Ok(())
-    })();
+    let result =
+        rsext4::file::reclaim_unlinked_inode(&mut v.fs, &mut v.device, InodeNumber::new(ino)?);
     if result.is_err() {
         v.failed = true;
     }

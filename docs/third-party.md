@@ -11,6 +11,10 @@
 | [rust-fatfs](https://github.com/rafalh/rust-fatfs) 38b3a7950bf0e765e34286d1dfe76c519ee347e2 | MIT | 锁定 Git revision，no_std + alloc + lfn，FAT 挂载/读写/unlink（无目录列举） | 2026-11-10 |
 | [Linux](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git) 6.x `arch/{riscv,loongarch}/kernel/signal.c` 与 UAPI 头（signal/sigcontext/ucontext/siginfo） | GPL-2.0（仅对照，未复制代码） | 信号帧布局/魔数/stub 指令编码的 ABI 事实标准：`kernel/src/sigframe/` 逐项对照并经交叉 gcc offsetof 实测核验；投递/EINTR 语义参考 `kernel/signal.c`（仅思路） | 2026-11-19 |
 
+目录删除补丁：rsext4 新增按父目录 inode 移除空目录名的接口，复用目录项回滚和无引用 inode 回收。
+
+属主更新补丁：rsext4 新增 `metadata::chown_inode`，复用现有元数据更新流程。Linux v6.12 `fs/attr.c` 仅用于核对基本授权语义，未复制源码。
+
 历史条目：ext4_rs 1.3.3（MIT）曾作为 Ext4 后端 vendor 于 `third_party/ext4_rs`，含块分配起点与 panic 审计 9 处补丁，随 rsext4 接入而移除（fs/rsext4 集成分支）；审计工作待在 rsext4 上重做（见 ostd-contracts §6 欠账）。
 
 本地 JBD2 栈占用补丁：提交临时块改为预先可失败分配的堆缓冲，复用单个 payload，避免多块数组叠加；版本与协议不变，详见 rsext4 README。
@@ -35,3 +39,18 @@ LoongArch 关机使用 PolyHAL 0.4.0（MIT）中 QEMU virt GED 的寄存器地�
 - BoarOS（GPL-2.0，github/gitlab 同期参赛作品）仅参考其公开文档中的
   思路与测例勘误（辅助盘分区布局、解释器别名路径、LA musl 调度包装
   ENOSYS 等事实），未复制任何代码。
+
+## 本轮块缓存与读写热路径涉及的第三方补丁（2026-11-26）
+
+- `third_party/rsext4`（Apache-2.0，rsext4 0.8.1）新增补丁（均标注 `// OuroOS patch:`，明细见 `third_party/rsext4/README.md`）：
+  - `BlockDevice::{read_slice, write_slice}` 默认方法及 `BlockDev`/`Jbd2Dev`/`DataBlockCache` 块内切片直读直写透传、`write_block_static` 整块写回免多余读块；
+  - `file/io.rs` 单块读免 `Vec<ExtentRun>` 堆分配与 `write_regular_inode_data` 合并加载；
+  - `metadata/apply.rs` 按 Linux `mount(8)` 默认 `relatime` 语义更新 `atime`；
+  - `cache/inode_table.rs` 与 `checksum/inode.rs` 命中单次查找及落盘编码前延迟更新 inode CRC32C（思路参考 Linux Ext4 `ext4_do_update_inode`，未复制 GPL 源码）。
+
+## 本轮符号链接与硬链接涉及的第三方补丁（2026-11-27）
+
+- `third_party/rsext4`（Apache-2.0，rsext4 0.8.1）新增补丁（均标注 `// OuroOS patch:`，明细见 `third_party/rsext4/README.md`）：
+  - `file/create.rs` 新增 `create_symlink_inode`（支持相对与悬空目标，区分 <60 字节快速内联与块存储长链接）；
+  - `file/link.rs` 新增 `link_inode`（按 inode 创建非目录硬链接，支持 `EMLINK` 检查与失败回滚）；
+  - `file/delete.rs` 扩展 `unlink_regular_entry` 支持删除符号链接，并在 `free_inode` 中为快速内联符号链接跳过块指针遍历。

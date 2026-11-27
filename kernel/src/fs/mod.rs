@@ -7,14 +7,21 @@ mod ext4;
 
 pub use ext4::mounted;
 
+pub mod block_cache;
 pub mod cache;
 pub mod context;
 pub mod fat;
+pub mod locks;
 pub mod mapping;
 mod metadata;
 pub mod procfs;
 
-pub(crate) use metadata::{query, Metadata, Timestamp};
+/// 仍被文件系统页缓存与块缓存持有的物理页帧总数（任务退出帧守恒自检用）。
+pub(crate) fn retained_frames() -> usize {
+    cache::retained_frames() + block_cache::retained_frames()
+}
+
+pub(crate) use metadata::{query, resolve, Metadata, Timestamp};
 
 /// 文件时间的更新方式；Omit 保留对应字段。
 #[derive(Clone, Copy)]
@@ -31,6 +38,29 @@ pub(crate) fn update_times(ino: u32, times: [TimeUpdate; 2]) -> Result<(), Errno
     } else {
         ext4::update_times(ino, times)
     }
+}
+
+/// 更新 Ext4 inode 的属主和属组。None 保留对应字段。
+pub(crate) fn set_owner(
+    ino: u32,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    credentials: &crate::task::Credentials,
+) -> Result<(), Errno> {
+    if ino & FAT_INODE != 0 || procfs::pid_ino_parts(ino).is_some() {
+        return Err(Errno::NotSupported);
+    }
+    let info = ext4::metadata(ino)?;
+    if credentials.euid != 0 {
+        let changes_owner = uid.is_some_and(|uid| uid != info.uid);
+        let forbidden_group = gid.is_some_and(|gid| {
+            gid != info.gid && gid != credentials.fsgid && !credentials.groups.contains(&gid)
+        });
+        if credentials.fsuid != info.uid || changes_owner || forbidden_group {
+            return Err(Errno::Perm);
+        }
+    }
+    ext4::set_owner(ino, uid, gid)
 }
 
 /// 已挂载文件系统的容量快照，块数以 block_size 字节为单位。
@@ -83,6 +113,15 @@ pub(crate) fn sync_inode(ino: u32) -> Result<(), Errno> {
     ext4::sync()
 }
 
+/// 同步全部已挂载可写文件系统缓存。
+pub(crate) fn sync() -> Result<(), Errno> {
+    #[cfg(not(feature = "rsext4-readonly"))]
+    {
+        ext4::sync()?;
+    }
+    Ok(())
+}
+
 /// 在任务退出后同步并卸载可写 Ext4 根卷。
 #[cfg(not(feature = "rsext4-readonly"))]
 pub fn shutdown() -> Result<(), Errno> {
@@ -101,6 +140,9 @@ static DEVICE_NODES: crate::sync::DebugMutex<
 /// 核分配的块设备 major（254）。盘号/分区号必须真实存在（总线枚举取
 /// 得），否则 ENODEV。
 pub fn mknod_blk(name: &str, mode: usize, dev: u64) -> Result<(), Errno> {
+    if name == "zero" {
+        return Err(Errno::Exists);
+    }
     let major = (dev >> 8) & 0xfff;
     let minor = dev & 0xff; // minor ≤ 255 场景（本内核盘数/分区数远小于）
                             // 本内核所有 virtio-blk 固定 major 254（自分配块设备号空间）
@@ -134,13 +176,49 @@ pub fn lookup_blk_node(name: &str) -> Option<(usize, usize)> {
         .map(|&(_, d, p)| (d, p))
 }
 
+/// 解析 `/proc/` 之后的进程子路径，支持 `<pid|self>[/task/<tid>][/<file>]`。
+fn parse_proc_pid_path(rest: &str) -> Result<(u32, &str), Errno> {
+    let (pid_part, tail) = match rest.split_once('/') {
+        Some((p, f)) => (p, f),
+        None => (rest, ""),
+    };
+    let pid = if pid_part == "self" {
+        crate::task::sched::current_tgid().ok_or(Errno::NoEntry)?
+    } else if !pid_part.is_empty() && pid_part.bytes().all(|b| b.is_ascii_digit()) {
+        pid_part.parse::<u32>().map_err(|_| Errno::NoEntry)?
+    } else {
+        return Err(Errno::NoEntry);
+    };
+    if let Some(after_task) = tail.strip_prefix("task/") {
+        let (tid_part, file) = match after_task.split_once('/') {
+            Some((t, f)) => (t, f),
+            None => (after_task, ""),
+        };
+        if tid_part.is_empty() || !tid_part.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Errno::NoEntry);
+        }
+        let _tid = tid_part.parse::<u32>().map_err(|_| Errno::NoEntry)?;
+        return Ok((pid, file));
+    }
+    Ok((pid, tail))
+}
+
 /// 按绝对路径查找 inode。
 pub fn lookup(path: &str) -> Result<u32, Errno> {
     if path == "/dev/null" {
         return Ok(procfs::DEVNULL);
     }
+    if path == "/dev/zero" {
+        return Ok(procfs::DEVZERO);
+    }
+    if path == "/dev/urandom" {
+        return Ok(procfs::DEVURANDOM);
+    }
+    if path == "/dev/random" {
+        return Ok(procfs::DEVRANDOM);
+    }
     if path == "/dev" {
-        return Ok(procfs::DEVDIR);
+        return Ok(ext4::lookup("/dev").unwrap_or(procfs::DEVDIR));
     }
     if path == "/dev/misc" {
         return Ok(procfs::MISC_DIR);
@@ -149,11 +227,10 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
         return Ok(procfs::RTC);
     }
     if let Some(rest) = path.strip_prefix("/dev/") {
-        // mknodat 注册的块设备节点（如 /dev/vda2）
+        // mknodat 注册的块设备节点（如 /dev/vda2）优先；其余路径（如 /dev/shm）交由后端解析。
         if lookup_blk_node(rest).is_some() {
             return Ok(procfs::DEVBLK);
         }
-        return Err(Errno::NoEntry);
     }
     if path == "/proc" {
         return Ok(procfs::DIR);
@@ -164,26 +241,48 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
     if path == "/proc/mounts" {
         return Ok(procfs::MOUNTS);
     }
+    if path == "/proc/version" {
+        return Ok(procfs::VERSION);
+    }
+    if path == "/proc/sys" {
+        return Ok(procfs::SYS_DIR);
+    }
+    if path == "/proc/sys/kernel" {
+        return Ok(procfs::SYS_KERNEL_DIR);
+    }
+    if path == "/proc/sys/kernel/pid_max" {
+        return Ok(procfs::PID_MAX);
+    }
+    if path == "/proc/sys/kernel/tainted" {
+        return Ok(procfs::TAINTED);
+    }
+    if path == "/proc/sys/fs" {
+        return Ok(procfs::SYS_FS_DIR);
+    }
+    if path == "/proc/sys/fs/pipe-max-size" {
+        return Ok(procfs::PIPE_MAX_SIZE_NODE);
+    }
+    if path == "/proc/self" {
+        return Ok(procfs::SELF_DIR);
+    }
+    if path == "/proc/self/maps" {
+        return Ok(procfs::SELF_MAPS);
+    }
+    if path == "/proc/self/fd" {
+        return Ok(procfs::SELF_FD_DIR);
+    }
     if let Some(rest) = path.strip_prefix("/proc/") {
-        // /proc/<pid> 与 /proc/<pid>/{stat,cmdline}；只接受纯数字 pid
-        let (pid, file) = match rest.split_once('/') {
-            Some((p, f)) => (p, f),
-            None => (rest, ""),
+        let (pid, file) = parse_proc_pid_path(rest)?;
+        let base = procfs::pid_dir_ino(pid);
+        return match file {
+            "" => Ok(base),
+            "stat" => Ok(base + 1),
+            "cmdline" => Ok(base + 2),
+            "status" => Ok(base + 3),
+            "comm" => Ok(base + 4),
+            "timerslack_ns" => Ok(base + 5),
+            _ => Err(Errno::NoEntry),
         };
-        if !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) {
-            let Ok(pid) = pid.parse::<u32>() else {
-                return Err(Errno::NoEntry);
-            };
-            let base = procfs::pid_dir_ino(pid);
-            return match file {
-                "" => Ok(base),
-                "stat" => Ok(base + 1),
-                "cmdline" => Ok(base + 2),
-                "status" => Ok(base + 3),
-                _ => Err(Errno::NoEntry),
-            };
-        }
-        return Err(Errno::NoEntry);
     }
     match fat::lookup(path)? {
         Some(ino) => Ok(ino),
@@ -193,7 +292,10 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
 
 /// 返回 inode 类型、长度、链接数和磁盘占用。
 pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
-    if ino == procfs::DEVNULL {
+    if matches!(
+        ino,
+        procfs::DEVNULL | procfs::DEVZERO | procfs::DEVURANDOM | procfs::DEVRANDOM
+    ) {
         return Ok((0o020666, 0, 1, 0));
     }
     if ino == procfs::DEVDIR || ino == procfs::MISC_DIR {
@@ -205,16 +307,41 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
     if ino == procfs::MOUNTS {
         return Ok((0o100444, procfs::mounts()?.len() as u64, 1, 0));
     }
+    if ino == procfs::PID_MAX {
+        return Ok((0o100444, procfs::pid_max().len() as u64, 1, 0));
+    }
+    if ino == procfs::TAINTED {
+        return Ok((0o100444, procfs::tainted().len() as u64, 1, 0));
+    }
+    if ino == procfs::PIPE_MAX_SIZE_NODE {
+        return Ok((0o100444, procfs::pipe_max_size().len() as u64, 1, 0));
+    }
+    if ino == procfs::VERSION {
+        return Ok((0o100444, procfs::version().len() as u64, 1, 0));
+    }
+    if ino == procfs::SELF_MAPS {
+        return Ok((0o100444, 0, 1, 0));
+    }
+    if matches!(
+        ino,
+        procfs::DIR
+            | procfs::SYS_DIR
+            | procfs::SYS_KERNEL_DIR
+            | procfs::SYS_FS_DIR
+            | procfs::SELF_DIR
+            | procfs::SELF_FD_DIR
+    ) {
+        return Ok((0o040555, 0, 2, 0));
+    }
     if let Some((pid, file)) = procfs::pid_ino_parts(ino) {
         return match file {
             0 => Ok((0o040555, 0, 2, 0)),
             1 => Ok((0o100444, procfs::pid_stat(pid)?.len() as u64, 1, 0)),
             2 => Ok((0o100444, procfs::pid_cmdline(pid)?.len() as u64, 1, 0)),
-            _ => Ok((0o100444, procfs::pid_status(pid)?.len() as u64, 1, 0)),
+            3 => Ok((0o100444, procfs::pid_status(pid)?.len() as u64, 1, 0)),
+            4 => Ok((0o100444, procfs::pid_comm(pid)?.len() as u64, 1, 0)),
+            _ => Ok((0o100444, procfs::pid_timerslack(pid)?.len() as u64, 1, 0)),
         };
-    }
-    if ino == procfs::DIR {
-        return Ok((0o040555, 0, 2, 0));
     }
     if ino & FAT_INODE != 0 {
         fat::stat(ino)
@@ -243,11 +370,47 @@ pub(crate) fn read_link(ino: u32) -> Result<alloc::string::String, Errno> {
 
 /// 在指定父目录下创建新对象。
 pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
+    if parent == procfs::DEVDIR {
+        let dev_ino = match ext4::lookup("/dev") {
+            Ok(ino) => ino,
+            Err(Errno::NoEntry) => {
+                let root = ext4::lookup("/")?;
+                ext4::create(root, "dev", 0o040755)?
+            }
+            Err(e) => return Err(e),
+        };
+        return ext4::create(dev_ino, name, mode);
+    }
     if parent & FAT_INODE != 0 {
         fat::create(parent, name, mode)
     } else {
         ext4::create(parent, name, mode)
     }
+}
+
+/// 在指定父目录下创建符号链接；FAT 与虚拟目录不支持。
+pub(crate) fn symlink(parent: u32, name: &str, target: &str) -> Result<u32, Errno> {
+    if procfs::is_virtual_ino(parent) {
+        return Err(Errno::Perm);
+    }
+    if parent & FAT_INODE != 0 {
+        return Err(Errno::NotSupported);
+    }
+    ext4::symlink(parent, name, target)
+}
+
+/// 在指定父目录下为已有 inode 建立硬链接；跨挂载返回 EXDEV，FAT 与虚拟节点不支持。
+pub(crate) fn link(target_ino: u32, parent: u32, name: &str) -> Result<(), Errno> {
+    if procfs::is_virtual_ino(target_ino) || procfs::is_virtual_ino(parent) {
+        return Err(Errno::Perm);
+    }
+    if metadata::metadata(target_ino)?.dev != metadata::metadata(parent)?.dev {
+        return Err(Errno::CrossDevice);
+    }
+    if (target_ino | parent) & FAT_INODE != 0 {
+        return Err(Errno::NotSupported);
+    }
+    ext4::link(target_ino, parent, name)
 }
 
 /// 在同一挂载内改名；FAT 暂不支持，跨挂载返回 EXDEV。
@@ -400,7 +563,7 @@ pub fn sync_mapping(_ino: u32, _offset: usize, _length: usize) -> Result<(), Err
 /// 持有 inode 的打开引用。
 pub fn retain(ino: u32) -> Result<(), Errno> {
     // procfs 虚拟节点（/proc、/proc/<pid>、/dev/*）无后端引用计数
-    if ino >= procfs::MISC_DIR || procfs::pid_ino_parts(ino).is_some() {
+    if procfs::is_virtual_ino(ino) {
         return Ok(());
     }
     if ino & FAT_INODE != 0 {
@@ -412,7 +575,7 @@ pub fn retain(ino: u32) -> Result<(), Errno> {
 
 /// 释放 inode 的打开引用。
 pub fn release(ino: u32) {
-    if ino >= procfs::MISC_DIR || procfs::pid_ino_parts(ino).is_some() {
+    if procfs::is_virtual_ino(ino) {
         return;
     }
     if ino & FAT_INODE != 0 {
@@ -431,28 +594,79 @@ pub fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
     }
 }
 
+/// 判断路径是否属于按需生成快照的 procfs 只读文本文件。
+pub fn is_procfs_text(path: &str) -> bool {
+    if matches!(
+        path,
+        "/proc/mounts"
+            | "/proc/sys/kernel/pid_max"
+            | "/proc/sys/kernel/tainted"
+            | "/proc/sys/fs/pipe-max-size"
+            | "/proc/version"
+    ) {
+        return true;
+    }
+    let Some(rest) = path.strip_prefix("/proc/") else {
+        return false;
+    };
+    matches!(
+        parse_proc_pid_path(rest),
+        Ok((_, "stat" | "cmdline" | "status" | "comm" | "timerslack_ns"))
+    )
+}
+
 /// procfs 只读文本文件的内容快照（open 时捕获一次）。
 pub fn procfs_text(path: &str) -> Result<alloc::string::String, Errno> {
     if path == "/proc/mounts" {
         return procfs::mounts();
     }
+    if path == "/proc/sys/kernel/pid_max" {
+        let mut s = alloc::string::String::new();
+        let src = procfs::pid_max();
+        s.try_reserve_exact(src.len()).map_err(|_| Errno::NoMem)?;
+        s.push_str(src);
+        return Ok(s);
+    }
+    if path == "/proc/sys/kernel/tainted" {
+        let mut s = alloc::string::String::new();
+        let src = procfs::tainted();
+        s.try_reserve_exact(src.len()).map_err(|_| Errno::NoMem)?;
+        s.push_str(src);
+        return Ok(s);
+    }
+    if path == "/proc/sys/fs/pipe-max-size" {
+        let mut s = alloc::string::String::new();
+        let src = procfs::pipe_max_size();
+        s.try_reserve_exact(src.len()).map_err(|_| Errno::NoMem)?;
+        s.push_str(src);
+        return Ok(s);
+    }
+    if path == "/proc/version" {
+        let mut s = alloc::string::String::new();
+        let src = procfs::version();
+        s.try_reserve_exact(src.len()).map_err(|_| Errno::NoMem)?;
+        s.push_str(src);
+        return Ok(s);
+    }
     if let Some(rest) = path.strip_prefix("/proc/") {
-        if let Some((pid, file)) = rest.split_once('/') {
-            if !pid.bytes().all(|b| b.is_ascii_digit()) || pid.is_empty() {
-                return Err(Errno::NoEntry);
-            }
-            let Ok(pid) = pid.parse::<u32>() else {
-                return Err(Errno::NoEntry);
-            };
-            return match file {
-                "stat" => procfs::pid_stat(pid),
-                "cmdline" => procfs::pid_cmdline(pid),
-                "status" => procfs::pid_status(pid),
-                _ => Err(Errno::NoEntry),
-            };
-        }
+        let (pid, file) = parse_proc_pid_path(rest)?;
+        return match file {
+            "stat" => procfs::pid_stat(pid),
+            "cmdline" => procfs::pid_cmdline(pid),
+            "status" => procfs::pid_status(pid),
+            "comm" => procfs::pid_comm(pid),
+            "timerslack_ns" => procfs::pid_timerslack(pid),
+            _ => Err(Errno::NoEntry),
+        };
     }
     Err(Errno::NoEntry)
+}
+
+/// 生成当前进程的 /proc/self/maps 只读文本快照。
+pub fn procfs_maps(
+    space: &crate::mm::address_space::UserAddressSpace,
+) -> Result<alloc::string::String, Errno> {
+    procfs::format_maps(space)
 }
 
 /// 路径是否落在任何 FAT 挂载点之下（rmdir/rename 的 EBUSY 检查用）。
@@ -486,12 +700,13 @@ pub fn chmod_by_ino(ino: u32, path: &str, mode: u16) -> Result<(), Errno> {
 }
 
 /// 删除空目录（rmdir 语义）；FAT 未接入目录删除，返回 ENOTSUP。
-pub fn rmdir(path: &str, ino: u32) -> Result<(), Errno> {
-    if ino & FAT_INODE != 0 {
-        Err(Errno::NotSupported)
-    } else {
-        ext4::rmdir(path, ino)
+pub fn rmdir(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
+    if (parent | ino) & FAT_INODE != 0 || procfs::pid_ino_parts(ino).is_some() {
+        return Err(Errno::NotSupported);
     }
+    ext4::rmdir(parent, ino, name)?;
+    context::detach_directory(ino);
+    Ok(())
 }
 
 /// 读取文件并叠加尚未写回的共享页。
@@ -503,21 +718,20 @@ pub fn read(ino: u32, offset: usize, data: &mut [u8]) -> Result<usize, Errno> {
 }
 /// 写磁盘后同步共享页。
 pub fn write(ino: u32, offset: usize, data: &[u8]) -> Result<usize, Errno> {
-    let old = stat(ino)?.1 as usize;
-    let n = write_raw(ino, offset, data)?;
+    let (n, old) = if ino & FAT_INODE != 0 {
+        let old = fat::stat(ino)?.1 as usize;
+        let n = fat::write(ino, offset, data)?;
+        (n, old)
+    } else {
+        let (n, old) = ext4::write_raw_with_old_size(ino, offset, data)?;
+        (n, old as usize)
+    };
     let end = offset.checked_add(n).ok_or(Errno::Invalid)?;
     if end > old {
         cache::resize_inode(ino, old, end);
         mapping::commit_resize(ino, old as u64, end as u64);
     }
-    let mut buf = [0; 4096];
-    let mut done = 0;
-    while done < n {
-        let k = (n - done).min(buf.len());
-        buf[..k].copy_from_slice(&data[done..done + k]);
-        cache::coherent(ino, offset + done, &mut buf[..k], true);
-        done += k;
-    }
+    cache::coherent_write(ino, offset, &data[..n]);
     Ok(n)
 }
 

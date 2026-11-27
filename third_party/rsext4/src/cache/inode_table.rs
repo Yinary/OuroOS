@@ -89,6 +89,9 @@ struct InodeCacheInner {
     /// On-disk inode size in bytes (immutable after construction;
     /// mirrored in `InodeCache` for lock-free access).
     inode_size: usize,
+    // OuroOS patch: 预计算超级块 CRC32C 种子；启用元数据校验时在落盘序列化前统一重算，
+    // 避免高频小写入在内存中反复计算 inode CRC32C（与 Linux ext4_do_update_inode 同思路）。
+    csum_seed: Option<u32>,
 }
 
 /// Inode cache manager with internal spinlock for SMP-safe concurrent access.
@@ -115,9 +118,20 @@ impl InodeCache {
                 max_entries,
                 access_counter: 0,
                 inode_size,
+                csum_seed: None,
             }),
             inode_size,
         }
+    }
+
+    // OuroOS patch: 配置延迟 inode 校验种子。
+    pub(crate) fn set_checksum_seed(&self, seed: Option<u32>) {
+        self.inner.lock().csum_seed = seed;
+    }
+
+    // OuroOS patch: 查询是否已启用落盘时延迟计算 inode 校验和。
+    pub(crate) fn has_checksum_seed(&self) -> bool {
+        self.inner.lock().csum_seed.is_some()
     }
 
     /// Creates an inode cache with the default size.
@@ -180,8 +194,18 @@ impl InodeCache {
     ) -> Ext4Result<CachedInode> {
         let mut inner = self.inner.lock();
 
+        // OuroOS patch: 缓存命中快路径只需单次 BTreeMap 查找。
+        let next_counter = inner.access_counter + 1;
+        if let Some(cached) = inner.cache.get_mut(&inode_num) {
+            cached.last_access = next_counter;
+            cached.generation += 1;
+            let result = cached.clone();
+            inner.access_counter = next_counter;
+            return Ok(result);
+        }
+
         // Load the inode from disk on the first cache miss.
-        if !inner.cache.contains_key(&inode_num) {
+        {
             // Phase 1: snapshot LRU eviction info while holding the lock.
             let evict_info = if inner.cache.len() >= inner.max_entries {
                 inner.snapshot_lru()
@@ -234,16 +258,13 @@ impl InodeCache {
         // Refresh the LRU timestamp on every access.
         let new_counter = inner.access_counter + 1;
         inner.access_counter = new_counter;
-        if let Some(cached) = inner.cache.get_mut(&inode_num) {
-            cached.last_access = new_counter;
-            cached.generation += 1;
-        }
-
-        inner
+        let cached = inner
             .cache
-            .get(&inode_num)
-            .cloned()
-            .ok_or(Ext4Error::corrupted())
+            .get_mut(&inode_num)
+            .ok_or(Ext4Error::corrupted())?;
+        cached.last_access = new_counter;
+        cached.generation += 1;
+        Ok(cached.clone())
     }
 
     /// Returns a mutable cached inode, loading it from disk on demand.
@@ -358,10 +379,23 @@ impl InodeCache {
         B: BlockDevice,
         F: FnOnce(&mut Ext4Inode),
     {
+        // OuroOS patch: 启用多级缓存且 inode 已命中时，单次加锁与单次 BTreeMap 查找原地修改。
+        if USE_MULTILEVEL_CACHE {
+            let mut inner = self.inner.lock();
+            let next_counter = inner.access_counter + 1;
+            if let Some(cached) = inner.cache.get_mut(&inode_num) {
+                f(&mut cached.inode);
+                cached.mark_dirty();
+                cached.last_access = next_counter;
+                cached.generation += 1;
+                inner.access_counter = next_counter;
+                return Ok(());
+            }
+        }
+
         self.get_or_load_mut(block_dev, inode_num, block_num, offset)?;
 
         let mut inner = self.inner.lock();
-        let inode_size = inner.inode_size;
         // get_or_load_mut succeeded above, so the entry must exist unless
         // concurrently evicted — treat that as filesystem corruption.
         let cached = inner
@@ -376,8 +410,8 @@ impl InodeCache {
             // Drop lock during synchronous I/O
             let block_num = cached.block_num;
             let offset = cached.offset_in_block;
-            let mut buf = alloc::vec![0u8; inode_size];
-            cached.inode.to_disk_bytes(&mut buf);
+            let inode_copy = cached.inode;
+            let buf = inner.encode_inode(inode_num, &inode_copy);
             drop(inner);
 
             Self::write_inode_bytes_static(block_dev, block_num, offset, &buf)?;
@@ -531,6 +565,23 @@ pub struct InodeCacheStats {
 // ── Inner methods (caller holds `self.inner.lock()`) ─────────────────────────
 
 impl InodeCacheInner {
+    // OuroOS patch: 落盘编码统一刷新延迟计算的 inode 元数据校验和。
+    fn encode_inode(&self, inode_num: InodeNumber, inode: &Ext4Inode) -> Vec<u8> {
+        let mut copy = *inode;
+        if let Some(seed) = self.csum_seed {
+            crate::checksum::ext4_update_inode_checksum_with_seed(
+                seed,
+                inode_num,
+                copy.i_generation,
+                &mut copy,
+                self.inode_size,
+            );
+        }
+        let mut buf = alloc::vec![0u8; self.inode_size];
+        copy.to_disk_bytes(&mut buf);
+        buf
+    }
+
     /// Snapshots the LRU entry for lock-free eviction.
     ///
     /// Returns `(lru_key, generation, dirty_write_info)` where `generation`
@@ -548,8 +599,7 @@ impl InodeCacheInner {
 
         let dirty_info = self.cache.get(&lru_key).and_then(|cached| {
             if cached.dirty {
-                let mut buf = alloc::vec![0u8; self.inode_size];
-                cached.inode.to_disk_bytes(&mut buf);
+                let buf = self.encode_inode(lru_key, &cached.inode);
                 Some((cached.block_num, cached.offset_in_block, buf))
             } else {
                 None
@@ -563,8 +613,7 @@ impl InodeCacheInner {
         self.cache.get(&inode_num).and_then(|cached| {
             if cached.dirty {
                 let generation = cached.generation;
-                let mut buf = alloc::vec![0u8; self.inode_size];
-                cached.inode.to_disk_bytes(&mut buf);
+                let buf = self.encode_inode(inode_num, &cached.inode);
                 Some((generation, cached.block_num, cached.offset_in_block, buf))
             } else {
                 None
@@ -598,8 +647,7 @@ impl InodeCacheInner {
                 let generation = cached.generation;
                 let block_num = cached.block_num;
                 let offset = cached.offset_in_block;
-                let mut buf = alloc::vec![0u8; self.inode_size];
-                cached.inode.to_disk_bytes(&mut buf);
+                let buf = self.encode_inode(inode_num, &cached.inode);
                 Some((generation, block_num, offset, buf))
             } else {
                 None
@@ -613,8 +661,7 @@ impl InodeCacheInner {
             .iter()
             .filter(|(_, cached)| cached.dirty)
             .map(|(inode_num, cached)| {
-                let mut buf = alloc::vec![0u8; self.inode_size];
-                cached.inode.to_disk_bytes(&mut buf);
+                let buf = self.encode_inode(*inode_num, &cached.inode);
                 (
                     *inode_num,
                     cached.generation,

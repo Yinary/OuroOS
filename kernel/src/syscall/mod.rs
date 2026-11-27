@@ -4,6 +4,7 @@
 
 pub(crate) mod fs;
 mod memory;
+pub(crate) mod net;
 // UAPI 常量集中在本模块定义。
 pub(crate) mod signal;
 
@@ -28,8 +29,11 @@ pub mod sysnr {
     pub const DUP3: usize = 24;
     pub const IOCTL: usize = 29;
     pub const FCNTL: usize = 25;
+    pub const FLOCK: usize = 32;
     pub const MKDIRAT: usize = 34;
     pub const UNLINKAT: usize = 35;
+    pub const SYMLINKAT: usize = 36;
+    pub const LINKAT: usize = 37;
     pub const RENAMEAT: usize = 38;
     pub const UMOUNT2: usize = 39;
     pub const MOUNT: usize = 40;
@@ -51,9 +55,11 @@ pub mod sysnr {
     pub const PWRITE64: usize = 68;
     pub const PREADV: usize = 69;
     pub const PWRITEV: usize = 70;
+    pub const SENDFILE: usize = 71;
     pub const READLINKAT: usize = 78;
     pub const FSTATAT: usize = 79;
     pub const FSTAT: usize = 80;
+    pub const SYNC: usize = 81;
     pub const FSYNC: usize = 82;
     pub const UTIMENSAT: usize = 88;
     pub const UMASK: usize = 166;
@@ -63,9 +69,15 @@ pub mod sysnr {
     pub const EXIT: usize = 93;
     pub const EXIT_GROUP: usize = 94;
     pub const SYSINFO: usize = 179;
+    pub const PSELECT6: usize = 72;
     pub const PPOLL: usize = 73;
     pub const FUTEX: usize = 98;
+    pub const SET_ROBUST_LIST: usize = 99;
+    pub const GET_ROBUST_LIST: usize = 100;
     pub const NANOSLEEP: usize = 101;
+    pub const GETITIMER: usize = 102;
+    pub const SETITIMER: usize = 103;
+    pub const CLOCK_SETTIME: usize = 112;
     pub const CLOCK_GETTIME: usize = 113;
     pub const CLOCK_GETRES: usize = 114;
     pub const CLOCK_NANOSLEEP: usize = 115;
@@ -86,8 +98,12 @@ pub mod sysnr {
     pub const SET_TID_ADDRESS: usize = 96;
     pub const WAITID: usize = 95;
     pub const GETRUSAGE: usize = 165;
+    pub const SCHED_SETPARAM: usize = 118;
+    pub const SCHED_SETSCHEDULER: usize = 119;
     pub const SCHED_GETSCHEDULER: usize = 120;
     pub const SCHED_GETPARAM: usize = 121;
+    pub const SETPRIORITY: usize = 140;
+    pub const GETPRIORITY: usize = 141;
     pub const SCHED_SETAFFINITY: usize = 122;
     pub const SCHED_GETAFFINITY: usize = 123;
     pub const SCHED_GET_PRIORITY_MAX: usize = 125;
@@ -98,6 +114,12 @@ pub mod sysnr {
     pub const GETSID: usize = 156;
     pub const SETSID: usize = 157;
     pub const UNAME: usize = 160;
+    pub const SETHOSTNAME: usize = 161;
+    pub const SETDOMAINNAME: usize = 162;
+    pub const GETRLIMIT: usize = 163;
+    pub const SETRLIMIT: usize = 164;
+    pub const PRCTL: usize = 167;
+    pub const GETCPU: usize = 168;
     pub const GETPID: usize = 172;
     pub const GETPPID: usize = 173;
     pub const GETRESUID: usize = 148;
@@ -118,9 +140,14 @@ pub mod sysnr {
     pub const GETEGID: usize = 177;
     pub const GETTID: usize = 178;
     pub const GETTIMEOFDAY: usize = 169;
+    pub const SETTIMEOFDAY: usize = 170;
+    pub const PRLIMIT64: usize = 261;
     pub const FACCESSAT: usize = 48;
     pub const FCHMODAT: usize = 53;
-    pub const CHMOD: usize = 90;
+    pub const FCHOWNAT: usize = 54;
+    pub const FCHOWN: usize = 55;
+    pub const CAPGET: usize = 90;
+    pub const CAPSET: usize = 91;
     pub const MKNODAT: usize = 33;
     pub const FCHMOD: usize = 52;
     pub const SYSLOG: usize = 116;
@@ -129,6 +156,26 @@ pub mod sysnr {
     pub const CLONE: usize = 220;
     pub const EXECVE: usize = 221;
     pub const WAIT4: usize = 260;
+    // System V 共享内存
+    pub const SHMGET: usize = 194;
+    pub const SHMCTL: usize = 195;
+    pub const SHMAT: usize = 196;
+    pub const SHMDT: usize = 197;
+    // 网络（AF_INET 本地回环与 AF_UNIX 匿名套接字）
+    pub const SOCKET: usize = 198;
+    pub const SOCKETPAIR: usize = 199;
+    pub const BIND: usize = 200;
+    pub const LISTEN: usize = 201;
+    pub const ACCEPT: usize = 202;
+    pub const CONNECT: usize = 203;
+    pub const GETSOCKNAME: usize = 204;
+    pub const GETPEERNAME: usize = 205;
+    pub const SENDTO: usize = 206;
+    pub const RECVFROM: usize = 207;
+    pub const SETSOCKOPT: usize = 208;
+    pub const GETSOCKOPT: usize = 209;
+    pub const SHUTDOWN: usize = 210;
+    pub const ACCEPT4: usize = 242;
     // 内存
     pub const READAHEAD: usize = 213;
     pub const BRK: usize = 214;
@@ -196,6 +243,36 @@ pub enum Errno {
     NoSys,
     /// ETIMEDOUT: 等待超过期限。
     TimedOut,
+    /// ENOTSOCK: 对非套接字描述符执行套接字操作。
+    NotSock,
+    /// EDESTADDRREQ: 未指定目标地址。
+    DestAddrReq,
+    /// EMSGSIZE: 消息过长。
+    MsgSize,
+    /// EPROTOTYPE: 套接字类型与协议不匹配。
+    ProtoType,
+    /// ENOPROTOOPT: 不支持的套接字选项。
+    NoProtoOpt,
+    /// EPROTONOSUPPORT: 不支持的传输协议。
+    ProtoNoSupport,
+    /// EAFNOSUPPORT: 不支持的地址族。
+    AfNoSupport,
+    /// EADDRINUSE: 地址或端口已被占用。
+    AddrInUse,
+    /// EADDRNOTAVAIL: 无法绑定请求的地址。
+    AddrNotAvail,
+    /// ENETUNREACH: 网络不可达。
+    NetUnreach,
+    /// ECONNRESET: 对端重置连接。
+    ConnReset,
+    /// EISCONN: 套接字已连接。
+    IsConn,
+    /// ENOTCONN: 套接字未连接。
+    NotConn,
+    /// ECONNREFUSED: 连接被拒绝。
+    ConnRefused,
+    /// EINPROGRESS: 非阻塞连接正在进行中。
+    InProgress,
 }
 
 impl Errno {
@@ -237,6 +314,21 @@ impl Errno {
             Errno::Fault => 14,
             Errno::NoSys => 38,
             Errno::TimedOut => 110,
+            Self::NotSock => 88,
+            Self::DestAddrReq => 89,
+            Self::MsgSize => 90,
+            Self::ProtoType => 91,
+            Self::NoProtoOpt => 92,
+            Self::ProtoNoSupport => 93,
+            Self::AfNoSupport => 97,
+            Self::AddrInUse => 98,
+            Self::AddrNotAvail => 99,
+            Self::NetUnreach => 101,
+            Self::ConnReset => 104,
+            Self::IsConn => 106,
+            Self::NotConn => 107,
+            Self::ConnRefused => 111,
+            Self::InProgress => 115,
         }
     }
 }
@@ -270,6 +362,7 @@ pub fn dispatch(
     space: &mut UserAddressSpace,
     fs: &mut crate::fs::context::Context,
     signal: &mut crate::task::signal::SignalGroup,
+    credentials: &crate::task::Credentials,
     thread: &mut crate::task::ThreadRecord,
 ) -> Flow {
     // 调用号在 a7（TrapFrameArgs::SYSCALL），参数在 a0..；返回值写回 a0
@@ -281,8 +374,11 @@ pub fn dispatch(
         | sysnr::DUP
         | sysnr::DUP3
         | sysnr::FCNTL
+        | sysnr::FLOCK
         | sysnr::MKDIRAT
         | sysnr::UNLINKAT
+        | sysnr::SYMLINKAT
+        | sysnr::LINKAT
         | sysnr::RENAMEAT
         | sysnr::RENAMEAT2
         | sysnr::UMOUNT2
@@ -305,16 +401,19 @@ pub fn dispatch(
         | sysnr::PWRITE64
         | sysnr::PREADV
         | sysnr::PWRITEV
+        | sysnr::SENDFILE
         | sysnr::READLINKAT
         | sysnr::FSTAT
         | sysnr::FSTATAT
+        | sysnr::SYNC
         | sysnr::FSYNC
         | sysnr::UTIMENSAT
         | sysnr::UMASK
         | sysnr::FACCESSAT
         | sysnr::FACCESSAT2
         | sysnr::FCHMODAT
-        | sysnr::CHMOD
+        | sysnr::FCHOWNAT
+        | sysnr::FCHOWN
         | sysnr::FCHMOD
         | sysnr::MKNODAT
         | sysnr::IOCTL
@@ -324,23 +423,51 @@ pub fn dispatch(
                 [args[0], args[1], args[2], args[3], args[4], args[5]],
                 space,
                 fs,
+                credentials,
+                thread.tgid as u32,
             );
-            // pipe 无数据/无空间且非 O_NONBLOCK：转为阻塞等待
+            // pipe/套接字/文件锁无数据或锁冲突且阻塞：等待唤醒。
             if ret == Err(Errno::WouldBlock) {
+                if matches!(nr, sysnr::FCNTL | sysnr::FLOCK) {
+                    return Flow::Wait(WaitReason::Pipe);
+                }
+                if let Some(id) = fs.wait_id(args[0]) {
+                    return Flow::Wait(WaitReason::PipeId(id));
+                }
                 return Flow::Wait(WaitReason::Pipe);
             }
             // 向无读者的管道写入：SIGPIPE 入队并与 -EPIPE 返回并行。
-            if ret == Err(Errno::Pipe) && (nr == sysnr::WRITE || nr == sysnr::WRITEV) {
+            if ret == Err(Errno::Pipe)
+                && (nr == sysnr::WRITE || nr == sysnr::WRITEV || nr == sysnr::SENDFILE)
+            {
                 signal.generate(
                     SIGPIPE,
-                    // code=0 即 SI_USER，发送者为调用进程自身。
+                    // code=0 即 SI_USER，发送者为调用进程自身（线程组号）。
                     SigInfoSlot {
-                        pid: pid as u32,
+                        pid: thread.tgid as u32,
                         ..Default::default()
                     },
                     thread.signal.blocked(),
                 );
             }
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        sysnr::SOCKET
+        | sysnr::SOCKETPAIR
+        | sysnr::BIND
+        | sysnr::LISTEN
+        | sysnr::GETSOCKNAME
+        | sysnr::GETPEERNAME
+        | sysnr::SETSOCKOPT
+        | sysnr::GETSOCKOPT
+        | sysnr::SHUTDOWN => {
+            let ret = self::net::dispatch_sync(
+                nr,
+                [args[0], args[1], args[2], args[3], args[4], args[5]],
+                space,
+                fs,
+            );
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
@@ -368,25 +495,19 @@ pub fn dispatch(
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
-        163 | 164 | 261 => {
-            let (resource, new_ptr, old_ptr) = match nr {
-                163 => (a0, 0, a1),
-                164 => (a0, a1, 0),
-                _ => (a1, a2, args[3]),
-            };
-            let ret = if (nr == 163 || nr == 164) && a1 == 0 {
-                Err(Errno::Fault)
-            } else if nr == 261 && a0 != 0 && a0 != pid {
-                Err(Errno::NoProcess)
-            } else {
-                memory::limit(space, resource, new_ptr, old_ptr)
-            };
-            cx[TrapFrameArgs::RET] = to_abi(ret);
-            Flow::Continue
-        }
         sysnr::SET_TID_ADDRESS => {
             thread.clear_child_tid = a0;
             cx[TrapFrameArgs::RET] = pid;
+            Flow::Continue
+        }
+        sysnr::SET_ROBUST_LIST => {
+            let ret = if a1 != crate::task::futex::ROBUST_LIST_HEAD_SIZE {
+                Err(Errno::Invalid)
+            } else {
+                thread.robust_list = a0;
+                Ok(0)
+            };
+            cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
         sysnr::EXIT => Flow::Exited(a0 as i32),
@@ -397,6 +518,16 @@ pub fn dispatch(
         }
         sysnr::BRK => {
             cx[TrapFrameArgs::RET] = space.brk(a0);
+            Flow::Continue
+        }
+        sysnr::SHMGET | sysnr::SHMCTL | sysnr::SHMAT | sysnr::SHMDT => {
+            let ret = match nr {
+                sysnr::SHMGET => memory::shmget(a0, a1, a2, thread.tgid, credentials),
+                sysnr::SHMCTL => memory::shmctl(space, a0, a1, a2),
+                sysnr::SHMAT => memory::shmat(space, a0, a1, a2, thread.tgid),
+                _ => memory::shmdt(space, a0, thread.tgid),
+            };
+            cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
         sysnr::MUNMAP
@@ -484,16 +615,27 @@ pub fn dispatch(
         | sysnr::RT_SIGTIMEDWAIT
         | sysnr::RT_SIGQUEUEINFO
         | sysnr::SYSINFO
+        | sysnr::PSELECT6
         | sysnr::PPOLL
         | sysnr::NANOSLEEP
+        | sysnr::GETITIMER
+        | sysnr::SETITIMER
+        | sysnr::CLOCK_SETTIME
         | sysnr::CLOCK_GETTIME
         | sysnr::CLOCK_GETRES
         | sysnr::CLOCK_NANOSLEEP
+        | sysnr::GETRLIMIT
+        | sysnr::SETRLIMIT
+        | sysnr::PRLIMIT64
+        | sysnr::PRCTL
+        | sysnr::SETTIMEOFDAY
         | sysnr::TIMES
         | sysnr::GETPPID
         | sysnr::GETRESUID
         | sysnr::GETRESGID
         | sysnr::GETGROUPS
+        | sysnr::CAPGET
+        | sysnr::CAPSET
         | sysnr::SETREGID
         | sysnr::SETGID
         | sysnr::SETREUID
@@ -510,12 +652,17 @@ pub fn dispatch(
         | sysnr::GETTID
         | sysnr::CLONE
         | sysnr::FUTEX
+        | sysnr::GET_ROBUST_LIST
         | sysnr::EXECVE
         | sysnr::WAIT4
         | sysnr::WAITID
         | sysnr::GETRUSAGE
+        | sysnr::SCHED_SETPARAM
+        | sysnr::SCHED_SETSCHEDULER
         | sysnr::SCHED_GETSCHEDULER
         | sysnr::SCHED_GETPARAM
+        | sysnr::SETPRIORITY
+        | sysnr::GETPRIORITY
         | sysnr::SCHED_SETAFFINITY
         | sysnr::SCHED_GETAFFINITY
         | sysnr::SCHED_GET_PRIORITY_MAX
@@ -524,7 +671,12 @@ pub fn dispatch(
         | sysnr::SETPGID
         | sysnr::GETPGID
         | sysnr::GETSID
-        | sysnr::SETSID => Flow::Process,
+        | sysnr::SETSID
+        | sysnr::ACCEPT
+        | sysnr::ACCEPT4
+        | sysnr::CONNECT
+        | sysnr::SENDTO
+        | sysnr::RECVFROM => Flow::Process,
         sysnr::GETRANDOM => {
             // getrandom(2)：flags 只认 NONBLOCK(1)/RANDOM(2)（后者与默认
             // 等价）；无种子或熵流耗尽一律 EAGAIN（无合法阻塞唤醒来源），
@@ -612,22 +764,67 @@ pub fn dispatch(
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
+        sysnr::SETHOSTNAME | sysnr::SETDOMAINNAME => {
+            // sethostname(2) / setdomainname(2)：需要 CAP_SYS_ADMIN，长度限 0..=64 字节。
+            let ret = if !credentials.has_cap(crate::task::CAP_SYS_ADMIN) {
+                Err(Errno::Perm)
+            } else if a1 > UTS_MAX_LEN {
+                Err(Errno::Invalid)
+            } else {
+                let mut buf = [0u8; UTS_MAX_LEN];
+                let copied = if a1 == 0 {
+                    Ok(())
+                } else {
+                    user_access::copy_from_user(space, a0, &mut buf[..a1]).map_err(|_| Errno::Fault)
+                };
+                copied.map(|()| {
+                    let mut uts = UTS_NAMES.lock();
+                    let target = if nr == sysnr::SETHOSTNAME {
+                        &mut uts.nodename
+                    } else {
+                        &mut uts.domainname
+                    };
+                    target.fill(0);
+                    target[..a1].copy_from_slice(&buf[..a1]);
+                    0
+                })
+            };
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        sysnr::GETCPU => {
+            // getcpu(2)：单核内核恒返回 CPU 0、NUMA 节点 0；第三参数 tcache 忽略。
+            let ret = (|| {
+                if a0 != 0 {
+                    user_access::copy_to_user(space, a0, &0u32.to_ne_bytes())
+                        .map_err(|_| Errno::Fault)?;
+                }
+                if a1 != 0 {
+                    user_access::copy_to_user(space, a1, &0u32.to_ne_bytes())
+                        .map_err(|_| Errno::Fault)?;
+                }
+                Ok(0)
+            })();
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
         sysnr::UNAME | sysnr::GETTIMEOFDAY => {
             let ret = if nr == sysnr::UNAME {
                 let mut data = [0u8; 390];
-                for (i, text) in [
-                    crate::config::KERNEL_NAME,
-                    "ouro",
-                    crate::config::KERNEL_RELEASE,
-                    crate::config::KERNEL_NAME,
-                    crate::config::ARCH_NAME,
-                    "local",
-                ]
-                .iter()
-                .enumerate()
-                {
-                    data[i * 65..i * 65 + text.len()].copy_from_slice(text.as_bytes());
-                }
+                let (nodename, domainname) = {
+                    let uts = UTS_NAMES.lock();
+                    (uts.nodename, uts.domainname)
+                };
+                data[0..crate::config::KERNEL_NAME.len()]
+                    .copy_from_slice(crate::config::KERNEL_NAME.as_bytes());
+                data[65..130].copy_from_slice(&nodename);
+                data[130..130 + crate::config::KERNEL_RELEASE.len()]
+                    .copy_from_slice(crate::config::KERNEL_RELEASE.as_bytes());
+                data[195..195 + crate::config::KERNEL_NAME.len()]
+                    .copy_from_slice(crate::config::KERNEL_NAME.as_bytes());
+                data[260..260 + crate::config::ARCH_NAME.len()]
+                    .copy_from_slice(crate::config::ARCH_NAME.as_bytes());
+                data[325..390].copy_from_slice(&domainname);
                 user_access::copy_to_user(space, a0, &data)
                     .map(|_| 0)
                     .map_err(|_| Errno::Fault)
@@ -656,8 +853,8 @@ pub fn dispatch(
             Flow::Continue
         }
         sysnr::GETPID => {
-            // getpid(2)：总成功；pid 由进程注册表分配，见 task 契约
-            cx[TrapFrameArgs::RET] = pid;
+            // getpid(2)：返回调用线程所属的线程组号（tgid），同线程组内各线程一致。
+            cx[TrapFrameArgs::RET] = thread.tgid;
             Flow::Continue
         }
         _ => {
@@ -666,6 +863,38 @@ pub fn dispatch(
         }
     }
 }
+
+/// UTS 主机名与域名最大字节数（Linux __NEW_UTS_LEN = 64，utsname 每字段 65 字节含 NUL）。
+const UTS_MAX_LEN: usize = 64;
+
+/// 全局 UTS 主机名与域名状态；叶锁，锁序 REGISTRY → UTS_NAMES。
+struct UtsNames {
+    nodename: [u8; 65],
+    domainname: [u8; 65],
+}
+
+impl UtsNames {
+    const fn new() -> Self {
+        let mut nodename = [0u8; 65];
+        nodename[0] = b'o';
+        nodename[1] = b'u';
+        nodename[2] = b'r';
+        nodename[3] = b'o';
+        let mut domainname = [0u8; 65];
+        domainname[0] = b'l';
+        domainname[1] = b'o';
+        domainname[2] = b'c';
+        domainname[3] = b'a';
+        domainname[4] = b'l';
+        Self {
+            nodename,
+            domainname,
+        }
+    }
+}
+
+static UTS_NAMES: crate::sync::DebugMutex<UtsNames> =
+    crate::sync::DebugMutex::new("UTS_NAMES", UtsNames::new());
 
 /// Result → Linux ABI 返回值：Ok(n) → n；Err(e) → -errno
 pub(crate) fn to_abi(ret: Result<usize, Errno>) -> usize {

@@ -2,11 +2,18 @@
 #![deny(unsafe_code)]
 use crate::{mm::frame::OwnedFrame, syscall::Errno};
 use alloc::{sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use polyhal::PhysAddr;
 use spin::Mutex;
 
 static PAGES: Mutex<Vec<(u32, usize, Arc<SharedPage>)>> = Mutex::new(Vec::new());
+/// `PAGES` 向量当前条目数，用于无 mmap 共享页时零锁跳过读写一致性检查。
+static PAGE_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn sync_entries_count(pages: &[(u32, usize, Arc<SharedPage>)]) {
+    PAGE_ENTRIES.store(pages.len(), Ordering::Release);
+}
 
 /// 是否有存活共享页；调用方保证单核非抢占的检查与截断顺序。
 pub(super) fn has_live(ino: u32) -> bool {
@@ -137,6 +144,9 @@ impl Drop for SharedPage {
 
 /// 文件长度变化后调整共享页：整页越过新 EOF 的失效，保留页清零新暴露/截掉区间。
 pub(crate) fn resize_inode(ino: u32, old: usize, new: usize) {
+    if PAGE_ENTRIES.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let mut pages = PAGES.lock();
     for (id, off, page) in pages.iter() {
         if *id != ino {
@@ -162,6 +172,7 @@ pub(crate) fn resize_inode(ino: u32, old: usize, new: usize) {
         }
     }
     pages.retain(|(id, off, page)| *id != ino || (*off < new && page.is_valid()));
+    sync_entries_count(&pages);
 }
 
 /// 截断前使某 inode 的旧共享页失效，后续不再写回；索引立即移除。
@@ -174,6 +185,7 @@ pub(crate) fn invalidate_inode(ino: u32) {
         }
     }
     pages.retain(|(id, _, _)| *id != ino);
+    sync_entries_count(&pages);
 }
 
 /// 写回指定文件偏移范围内的驻留共享页；无外部映射时成功后可回收。
@@ -192,6 +204,7 @@ pub(crate) fn sync_span(ino: u32, offset: usize, length: usize) -> Result<(), Er
     pages.retain(|(id, off, page)| {
         *id != ino || *off < offset || *off >= end || Arc::strong_count(page) != 1
     });
+    sync_entries_count(&pages);
     Ok(())
 }
 
@@ -208,6 +221,7 @@ pub(super) fn sync_inode(ino: u32) -> Result<(), Errno> {
         }
     }
     pages.retain(|(id, _, page)| *id != ino || Arc::strong_count(page) != 1);
+    sync_entries_count(&pages);
     Ok(())
 }
 
@@ -233,6 +247,7 @@ pub(crate) fn flush(ino: Option<u32>) -> Result<(), Errno> {
             || Arc::strong_count(page) != 1
             || !page.clean.load(Ordering::Acquire)
     });
+    sync_entries_count(&pages);
     first_error.map_or(Ok(()), Err)
 }
 
@@ -251,6 +266,7 @@ pub(crate) fn release_idle(ino: u32, offset: usize) {
     if pages[index].2.write_back().is_ok() {
         pages[index].2.mark_clean();
         pages.swap_remove(index);
+        sync_entries_count(&pages);
     }
 }
 
@@ -300,11 +316,15 @@ pub fn page(ino: u32, offset: usize) -> Result<Arc<SharedPage>, Errno> {
     page_ref.retained = true;
     let cached = page.clone();
     pages.push((ino, offset, page));
+    sync_entries_count(&pages);
     Ok(cached)
 }
 
 /// 文件 read 覆盖共享页中的最新内容，write 同步更新已有映射。
 pub fn coherent(ino: u32, offset: usize, data: &mut [u8], write: bool) {
+    if PAGE_ENTRIES.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let Some(request_end) = offset.checked_add(data.len()) else {
         return;
     };
@@ -329,5 +349,30 @@ pub fn coherent(ino: u32, offset: usize, data: &mut [u8], write: bool) {
         if write {
             page.clean.store(false, Ordering::Release);
         }
+    }
+}
+
+/// 文件 write 同步更新已有共享页；接收只读切片，避免额外暂存复制。
+pub(crate) fn coherent_write(ino: u32, offset: usize, data: &[u8]) {
+    if PAGE_ENTRIES.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let Some(request_end) = offset.checked_add(data.len()) else {
+        return;
+    };
+    let pages = PAGES.lock();
+    for (id, start, page) in pages.iter() {
+        if *id != ino || !page.is_valid() {
+            continue;
+        }
+        let begin = offset.max(*start);
+        let end = request_end.min(*start + 4096);
+        if begin >= end {
+            continue;
+        }
+        if let Err(e) = page.store(begin - *start, &data[begin - offset..end - offset]) {
+            log::error!("shared page coherence failed: {:?}", e);
+        }
+        page.clean.store(false, Ordering::Release);
     }
 }

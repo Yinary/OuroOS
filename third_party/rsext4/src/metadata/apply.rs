@@ -123,7 +123,30 @@ impl Ext4FileSystem {
             return Ok(());
         }
         let inode = self.get_inode_by_num(device, inode_num)?;
-        if inode.i_flags & Ext4Inode::EXT4_NOATIME_FL != 0 {
+        self.touch_inode_atime_if_needed_loaded(device, inode_num, &inode)
+    }
+
+    // OuroOS patch: 复用已加载的 inode 做 relatime 判定（Linux mount(8) 默认语义），
+    // 避免高频小读重复查找 inode 表、重算 CRC32C 与标脏。
+    pub(crate) fn touch_inode_atime_if_needed_loaded<B: BlockDevice>(
+        &mut self,
+        device: &mut Jbd2Dev<B>,
+        inode_num: InodeNumber,
+        inode: &Ext4Inode,
+    ) -> Ext4Result<()> {
+        if self.readonly || inode.i_flags & Ext4Inode::EXT4_NOATIME_FL != 0 {
+            return Ok(());
+        }
+        let inode_size = self.superblock.s_inode_size;
+        let atime = inode.atime_ts(inode_size);
+        let mtime = inode.mtime_ts(inode_size);
+        let ctime = inode.ctime_ts(inode_size);
+        let now = device.current_time()?;
+        let older_than_mod =
+            (atime.sec, atime.nsec) <= (mtime.sec, mtime.nsec)
+                || (atime.sec, atime.nsec) <= (ctime.sec, ctime.nsec);
+        let stale = now.sec.saturating_sub(atime.sec) >= 86_400;
+        if !older_than_mod && !stale {
             return Ok(());
         }
 

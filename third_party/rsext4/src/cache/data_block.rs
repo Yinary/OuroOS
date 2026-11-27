@@ -481,6 +481,76 @@ impl DataBlockCache {
         Ok(())
     }
 
+    // OuroOS patch: 单块切片读优先命中数据块缓存，未命中直通底层块缓存切片读，
+    // 避免整块拷贝与堆分配。
+    pub fn read_block_slice<B: BlockDevice>(
+        &self,
+        block_dev: &mut Jbd2Dev<B>,
+        block_num: AbsoluteBN,
+        offset: usize,
+        dst: &mut [u8],
+    ) -> Ext4Result<()> {
+        let end = offset
+            .checked_add(dst.len())
+            .ok_or_else(|| Ext4Error::from(Errno::EOVERFLOW))?;
+        if end > self.block_size {
+            return Err(Ext4Error::invalid_input());
+        }
+        {
+            let mut inner = self.inner.lock();
+            if inner.cache.contains_key(&block_num) {
+                let new_counter = inner.access_counter + 1;
+                inner.access_counter = new_counter;
+                let cached = inner
+                    .cache
+                    .get_mut(&block_num)
+                    .ok_or(Ext4Error::corrupted())?;
+                dst.copy_from_slice(&cached.data[offset..end]);
+                cached.last_access = new_counter;
+                return Ok(());
+            }
+        }
+        block_dev.read_slice(dst, block_num, offset)
+    }
+
+    // OuroOS patch: 数据块切片写；若块已在数据块缓存中则原地修改，否则直接经
+    // 底层块缓存切片写，避免 32 块小 BTreeMap 淘汰与整块读-改-写搬运。
+    pub fn write_block_slice<B: BlockDevice>(
+        &self,
+        block_dev: &mut Jbd2Dev<B>,
+        block_num: AbsoluteBN,
+        offset: usize,
+        src: &[u8],
+        zero_rest: bool,
+    ) -> Ext4Result<()> {
+        let end = offset
+            .checked_add(src.len())
+            .ok_or_else(|| Ext4Error::from(Errno::EOVERFLOW))?;
+        if end > self.block_size {
+            return Err(Ext4Error::invalid_input());
+        }
+        {
+            let mut inner = self.inner.lock();
+            if inner.cache.contains_key(&block_num) {
+                let new_counter = inner.access_counter + 1;
+                inner.access_counter = new_counter;
+                let cached = inner
+                    .cache
+                    .get_mut(&block_num)
+                    .ok_or(Ext4Error::corrupted())?;
+                if zero_rest && (offset != 0 || end != self.block_size) {
+                    cached.data.fill(0);
+                }
+                cached.data[offset..end].copy_from_slice(src);
+                cached.mark_dirty();
+                cached.last_access = new_counter;
+                cached.generation += 1;
+                return Ok(());
+            }
+        }
+        block_dev.write_slice(src, block_num, offset, zero_rest)
+    }
+
     /// Evicts one cached block.
     pub fn evict<B: BlockDevice>(
         &self,
@@ -631,6 +701,10 @@ impl DataBlockCache {
         data: &[u8],
         block_size: usize,
     ) -> Ext4Result<()> {
+        // OuroOS patch: 整块写回无需先读旧块与堆分配，避免新分配块淘汰时多余磁盘读。
+        if data.len() == block_size {
+            return block_dev.write_blocks(data, block_num, 1, false);
+        }
         let mut buf = alloc::vec![0u8; block_size];
         block_dev.read_blocks(&mut buf, block_num, 1)?;
         let len = core::cmp::min(data.len(), block_size);

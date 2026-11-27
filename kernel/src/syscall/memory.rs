@@ -79,11 +79,15 @@ fn mmap_region(
     ctx: &crate::fs::context::Context,
 ) -> Result<usize, Errno> {
     let [addr, len, prot, map_flags, _fd, offset] = a;
-    let n = pages(len)?;
-    let f = flags(prot)?;
     if offset % PAGE_SIZE != 0 {
         return Err(Errno::Invalid);
     }
+    // 对齐 Linux ksys_mmap_pgoff：非匿名映射先校验 FD 有效性（EBADF），再校验长度
+    if map_flags & 0x20 == 0 {
+        ctx.get(_fd)?;
+    }
+    let n = pages(len)?;
+    let f = flags(prot)?;
     if map_flags & 3 == 0 || (map_flags & 3 == 3 && map_flags & 0x20 != 0) {
         return Err(Errno::Invalid);
     }
@@ -392,38 +396,6 @@ pub(super) fn msync(
     Ok(0)
 }
 
-/// 内存相关 getrlimit/setrlimit/prlimit64；进程凭证模型接入前不处理其他资源。
-pub(super) fn limit(
-    space: &mut UserAddressSpace,
-    resource: usize,
-    new_ptr: usize,
-    old_ptr: usize,
-) -> Result<usize, Errno> {
-    let old = space.memory_limit(resource).ok_or(Errno::Invalid)?;
-    let mut next = None;
-    if new_ptr != 0 {
-        let mut bytes = [0; 16];
-        crate::mm::user_access::copy_from_user(space, new_ptr, &mut bytes)
-            .map_err(|_| Errno::Fault)?;
-        let soft = usize::from_ne_bytes(bytes[..8].try_into().map_err(|_| Errno::Invalid)?);
-        let hard = usize::from_ne_bytes(bytes[8..].try_into().map_err(|_| Errno::Invalid)?);
-        if soft > hard {
-            return Err(Errno::Invalid);
-        }
-        next = Some([soft, hard]);
-    }
-    if old_ptr != 0 {
-        let mut bytes = [0; 16];
-        bytes[..8].copy_from_slice(&old[0].to_ne_bytes());
-        bytes[8..].copy_from_slice(&old[1].to_ne_bytes());
-        crate::mm::user_access::copy_to_user(space, old_ptr, &bytes).map_err(|_| Errno::Fault)?;
-    }
-    if let Some(next) = next {
-        space.set_memory_limit(resource, next).map_err(error)?;
-    }
-    Ok(0)
-}
-
 /// 普通文件的有界预读建议。通过存储后端读入，不占用调用者文件游标。
 pub(super) fn readahead(
     ctx: &crate::fs::context::Context,
@@ -459,4 +431,105 @@ pub(super) fn readahead(
         pos += read;
     }
     Ok(0)
+}
+
+/// shmget(2)：按 key 获取或创建 System V 共享内存段。
+pub(super) fn shmget(
+    key: usize,
+    size: usize,
+    shmflg: usize,
+    pid: usize,
+    creds: &crate::task::Credentials,
+) -> Result<usize, Errno> {
+    crate::mm::shm::get(key as u32 as i32, size, shmflg, pid, creds)
+}
+
+/// shmat(2)：将共享内存段挂接到当前进程用户地址空间，返回挂接起始地址。
+pub(super) fn shmat(
+    space: &mut UserAddressSpace,
+    shmid: usize,
+    shmaddr: usize,
+    shmflg: usize,
+    pid: usize,
+) -> Result<usize, Errno> {
+    const SHM_RDONLY: usize = 0o10000;
+    const SHM_RND: usize = 0o20000;
+    const SHM_REMAP: usize = 0o40000;
+    const SHM_EXEC: usize = 0o100000;
+
+    let (first, count) = crate::mm::shm::lookup_for_attach(shmid)?;
+    let remap = shmflg & SHM_REMAP != 0;
+    let start = if shmaddr == 0 {
+        if remap {
+            return Err(Errno::Invalid);
+        }
+        space.find_free(0, count).map_err(error)?
+    } else if shmflg & SHM_RND != 0 {
+        shmaddr & !(PAGE_SIZE - 1)
+    } else if shmaddr % PAGE_SIZE != 0 {
+        return Err(Errno::Invalid);
+    } else {
+        shmaddr
+    };
+    let mut map_flags = F::U | F::R;
+    if shmflg & SHM_RDONLY == 0 {
+        map_flags |= F::W;
+    }
+    if shmflg & SHM_EXEC != 0 {
+        map_flags |= F::X;
+    }
+    space
+        .attach_shm(shmid, start, &first, count, map_flags, remap)
+        .map_err(|e| match e {
+            MapError::Overlap | MapError::HitsStack | MapError::OutOfUserRange => Errno::Invalid,
+            other => error(other),
+        })?;
+    crate::mm::shm::commit_attach(shmid, pid);
+    Ok(start)
+}
+
+/// shmdt(2)：按挂接起始地址解除共享内存段映射并更新挂接计数。
+pub(super) fn shmdt(
+    space: &mut UserAddressSpace,
+    shmaddr: usize,
+    pid: usize,
+) -> Result<usize, Errno> {
+    let shmid = space.detach_shm(shmaddr).ok_or(Errno::Invalid)?;
+    crate::mm::shm::detach(shmid, pid);
+    Ok(0)
+}
+
+/// shmctl(2)：控制 System V 共享内存段（支持 IPC_RMID、IPC_STAT、IPC_SET）。
+pub(super) fn shmctl(
+    space: &UserAddressSpace,
+    shmid: usize,
+    cmd: usize,
+    buf: usize,
+) -> Result<usize, Errno> {
+    use crate::mm::shm;
+    match shm::normalize_cmd(cmd as u32 as i32) {
+        shm::IPC_RMID => {
+            shm::remove(shmid)?;
+            Ok(0)
+        }
+        shm::IPC_STAT => {
+            if buf == 0 {
+                return Err(Errno::Fault);
+            }
+            let encoded = shm::stat(shmid)?;
+            crate::mm::user_access::copy_to_user(space, buf, &encoded).map_err(|_| Errno::Fault)?;
+            Ok(0)
+        }
+        shm::IPC_SET => {
+            if buf == 0 {
+                return Err(Errno::Fault);
+            }
+            let mut raw = [0u8; 112];
+            crate::mm::user_access::copy_from_user(space, buf, &mut raw)
+                .map_err(|_| Errno::Fault)?;
+            shm::set(shmid, &raw)?;
+            Ok(0)
+        }
+        _ => Err(Errno::Invalid),
+    }
 }

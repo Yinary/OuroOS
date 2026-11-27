@@ -7,12 +7,13 @@ use alloc::vec::Vec;
 use core::{
     cell::Cell,
     ptr::{addr_of, addr_of_mut},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use polyhal::kcontext::KContext;
 
 use crate::{
+    mm::address_space::FutexKey,
     sync::{self, DebugMutex},
     time::monotonic,
     timer,
@@ -20,7 +21,7 @@ use crate::{
 
 use super::{
     registry,
-    task::{FutexKey, Task, TaskBody, TaskState, WaitReason},
+    task::{FutexEnd, Pid, Task, TaskBody, TaskState, WaitReason},
     ExitInfo, REGISTRY,
 };
 
@@ -28,6 +29,14 @@ use super::{
 /// 单核 + 内核关中断下仅被调度器与当前任务自身访问。
 #[polyhal::percpu]
 static CURRENT: Cell<usize> = Cell::new(0);
+/// 当前任务的线程组号（0 = idle）；供 procfs 解析 `/proc/self` 无锁读取。
+static CURRENT_TGID: AtomicUsize = AtomicUsize::new(0);
+
+/// 读取当前运行任务的线程组号；idle 或尚未启动任务时返回 None。
+pub fn current_tgid() -> Option<u32> {
+    let tgid = CURRENT_TGID.load(Ordering::Relaxed);
+    (tgid != 0).then_some(tgid as u32)
+}
 
 /// 事件方（fs 层、退出路径）请求唤醒的合并标志；无锁置位，
 /// 在下一次调度边界统一消费。避免 fs 层在 REGISTRY 锁内反向取 SCHED。
@@ -35,14 +44,50 @@ static WAKE_CHILDREN: AtomicBool = AtomicBool::new(false);
 static WAKE_PIPES: AtomicBool = AtomicBool::new(false);
 static WAKE_SIGNALS: AtomicBool = AtomicBool::new(false);
 
+/// 定向管道/套接字唤醒槽位容量；槽满时退回全局 WAKE_PIPES 广播，保证不丢唤醒。
+const PIPE_WAKE_SLOTS: usize = 64;
+static WAKE_PIPE_IDS: [AtomicU64; PIPE_WAKE_SLOTS] = [const { AtomicU64::new(0) }; PIPE_WAKE_SLOTS];
+
 /// 请求唤醒等待子进程的任务（子进程退出时调用）。
 pub fn request_children_wake() {
     WAKE_CHILDREN.store(true, Ordering::Release);
 }
 
-/// 请求唤醒 pipe 等待者（pipe 读/写/对端关闭时调用）。
+/// 请求广播唤醒全部管道/套接字等待者（套接字或回退路径调用）。
 pub fn request_pipe_wake() {
     WAKE_PIPES.store(true, Ordering::Release);
+}
+
+/// 请求唤醒等待指定管道实例的任务；槽满或编号无效时退回广播。
+pub fn request_pipe_id_wake(id: u64) {
+    if id == 0 {
+        request_pipe_wake();
+        return;
+    }
+    for slot in &WAKE_PIPE_IDS {
+        let cur = slot.load(Ordering::Acquire);
+        if cur == id {
+            return;
+        }
+        if cur == 0
+            && slot
+                .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return;
+        }
+    }
+    request_pipe_wake();
+}
+
+/// 是否有待消费的异步唤醒请求。
+fn has_pending_wake() -> bool {
+    WAKE_CHILDREN.load(Ordering::Acquire)
+        || WAKE_PIPES.load(Ordering::Acquire)
+        || WAKE_SIGNALS.load(Ordering::Acquire)
+        || WAKE_PIPE_IDS
+            .iter()
+            .any(|slot| slot.load(Ordering::Acquire) != 0)
 }
 
 /// 请求唤醒有可投递信号的等待任务（信号实际入队后调用）。
@@ -74,13 +119,12 @@ pub(super) fn take_body() -> TaskBody {
 const SLICE: core::time::Duration = core::time::Duration::from_millis(crate::config::TICK_MS);
 
 /// 回用户态前的调度检查：时钟中断之后把到期的等待者搬回就绪表；
-/// 有任务因此就绪，或当前任务的时间片用尽时让出。
+/// 有任务因此就绪、就绪表出现等级更高的任务，或当前任务的时间片用尽时让出。
 pub fn resume_check() {
     let yield_cpu = {
         let mut slot = SCHED.lock();
         let s = slot.as_mut().expect("scheduler not initialized");
         let now = monotonic();
-        let expired = s.current.as_ref().is_some_and(|task| now >= task.slice_end);
         let events = timer::events();
         let woke = if s.last_timer_event != events {
             s.last_timer_event = events;
@@ -90,7 +134,29 @@ pub fn resume_check() {
         } else {
             false
         };
-        expired || woke
+        let expired = if let Some(task) = s.current.as_mut() {
+            if now >= task.slice_end {
+                if s.ready.is_empty() && !has_pending_wake() {
+                    // 无其他就绪任务与待消费唤醒时直接续期时间片，避免空转切回自身。
+                    let slice_end = now + SLICE;
+                    task.slice_end = slice_end;
+                    let timed = matches!(task.body, Some(TaskBody::User { .. }));
+                    timer::set_slice_end(timed.then_some(slice_end));
+                    false
+                } else {
+                    true
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let outranked = match s.current.as_ref() {
+            Some(cur) => s.ready.iter().any(|task| rank(task) > rank(cur)),
+            None => false,
+        };
+        expired || woke || outranked
     };
     if yield_cpu {
         yield_now();
@@ -118,7 +184,30 @@ struct Scheduler {
 
 static SCHED: DebugMutex<Option<Scheduler>> = DebugMutex::new("SCHED", None);
 
+/// 就绪等级：实时策略（先进先出、轮转）高于普通策略（其他、批处理），
+/// 空闲策略最低；实时策略之间比较优先级数值，其余策略数值为 0。
+fn rank(task: &Task) -> (i8, i32) {
+    match task.policy {
+        1 | 2 => (2, task.priority),
+        5 => (0, 0),
+        _ => (1, 0),
+    }
+}
+
 impl Scheduler {
+    /// 取出就绪等级最高的任务；同等级按就绪先后。
+    fn pick_next(&mut self) -> Option<Box<Task>> {
+        let mut best: Option<(usize, (i8, i32))> = None;
+        for (i, task) in self.ready.iter().enumerate() {
+            let r = rank(task);
+            if best.is_none_or(|(_, b)| r > b) {
+                best = Some((i, r));
+            }
+        }
+        let (i, _) = best?;
+        self.ready.remove(i)
+    }
+
     /// 把任务立为当前任务：置 Running、刷新时间片终点、更新 CURRENT。
     /// 返回其 KContext 地址（Box 保证稳定）。
     fn promote(&mut self, mut task: Box<Task>) -> *const KContext {
@@ -127,10 +216,12 @@ impl Scheduler {
         task.slice_end = slice_end;
         let timed = matches!(task.body, Some(TaskBody::User { .. }));
         let pid = task.pid;
+        let tgid = task.tgid;
         let ptr: *mut Task = &mut *task;
         let context = task.context_ptr() as *const KContext;
         self.current = Some(task);
         set_current(ptr);
+        CURRENT_TGID.store(tgid, Ordering::Relaxed);
         sync::set_holder(pid);
         timer::set_slice_end(timed.then_some(slice_end));
         context
@@ -164,40 +255,86 @@ impl Scheduler {
             self.move_waiting(|_, r| matches!(r, WaitReason::Children));
         }
         if WAKE_PIPES.swap(false, Ordering::AcqRel) {
-            self.move_waiting(|_, r| matches!(r, WaitReason::Pipe | WaitReason::PollUntil(_)));
+            for slot in &WAKE_PIPE_IDS {
+                slot.store(0, Ordering::Release);
+            }
+            self.move_waiting(|_, r| {
+                matches!(
+                    r,
+                    WaitReason::Pipe | WaitReason::PipeId(_) | WaitReason::PollUntil(_)
+                )
+            });
+        } else {
+            let mut ids = [0u64; PIPE_WAKE_SLOTS];
+            let mut count = 0usize;
+            for slot in &WAKE_PIPE_IDS {
+                let id = slot.swap(0, Ordering::AcqRel);
+                if id != 0 {
+                    ids[count] = id;
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                let active = &ids[..count];
+                self.move_waiting(|_, r| match r {
+                    WaitReason::PipeId(id) => active.contains(id),
+                    WaitReason::Pipe | WaitReason::PollUntil(_) => true,
+                    _ => false,
+                });
+            }
         }
         if WAKE_SIGNALS.swap(false, Ordering::AcqRel) {
             // 信号唤醒：持 REGISTRY 锁按可投递性搬回等待者（锁序
             // SCHED→REGISTRY，见 docs/ostd-contracts.md §5）。
+            // rt_sigtimedwait 允许消费等待集内的已屏蔽信号，唤醒条件同步放宽到等待集。
             let reg = super::REGISTRY.lock();
-            self.move_waiting(|task, _| {
+            self.move_waiting(|task, reason| {
+                let extra = match reason {
+                    WaitReason::SigTimedWait { set, .. } => *set,
+                    _ => 0,
+                };
                 reg.group(task.pid).is_some_and(|r| {
                     r.exit.is_none()
                         && reg.thread(task.pid).is_some_and(|t| {
-                            (r.signal.pending() | t.signal.pending()) & !t.signal.blocked() != 0
+                            (r.signal.pending() | t.signal.pending())
+                                & (!t.signal.blocked() | extra)
+                                != 0
                         })
                 })
             });
         }
     }
 
-    /// 到期扫描：Deadline 已到的等待者搬回就绪表。
+    /// 到期扫描：Deadline 已到的等待者搬回就绪表，并触发已到期的 ITIMER_REAL。
     fn wake_expired(&mut self) {
         let now = crate::time::monotonic();
-        self.move_waiting(|_, r| match r {
-            WaitReason::Deadline(d) | WaitReason::PollUntil(d) => now >= *d,
-            WaitReason::Futex { deadline, .. } => deadline.is_some_and(|d| now >= d),
+        let itimer_fired = super::fire_expired_itimers(now);
+        self.move_waiting(|task, r| match r {
+            WaitReason::Deadline(d)
+            | WaitReason::PollUntil(d)
+            | WaitReason::SigTimedWait { deadline: d, .. } => now >= *d,
+            WaitReason::Futex {
+                deadline: Some(d), ..
+            } if now >= *d => {
+                task.futex_end = Some(FutexEnd::TimedOut);
+                true
+            }
             _ => false,
         });
+        if itimer_fired {
+            self.drain_wake_requests();
+            self.refresh_deadline();
+        }
     }
 
     /// 把谓词匹配的等待任务搬回就绪表；谓词可按任务与其等待原因联合判定。
-    fn move_waiting(&mut self, f: impl Fn(&Task, &WaitReason) -> bool) {
+    fn move_waiting(&mut self, f: impl Fn(&mut Task, &WaitReason) -> bool) {
         // 自检：每次集中唤醒前，就绪表足以容纳全部等待任务。
         debug_assert!(self.ready.capacity() >= self.ready.len() + self.waiting.len());
         let mut i = 0;
         while i < self.waiting.len() {
-            if f(&self.waiting[i].0, &self.waiting[i].1) {
+            let (task, reason) = &mut self.waiting[i];
+            if f(task, reason) {
                 let (task, _) = self.waiting.swap_remove(i);
                 self.ready.push_back(task);
             } else {
@@ -207,9 +344,23 @@ impl Scheduler {
         self.refresh_deadline();
     }
 
-    /// 把等待表里最早的到期时刻登记给定时器。
+    /// 把等待表与活动 ITIMER_REAL 中最早的到期时刻登记给定时器。
     fn refresh_deadline(&self) {
-        timer::set_deadline(self.waiting.iter().filter_map(|(_, r)| r.deadline()).min());
+        let wait_min = self.waiting.iter().filter_map(|(_, r)| r.deadline()).min();
+        let itimer_min = super::next_itimer_deadline();
+        let earliest = match (wait_min, itimer_min) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        timer::set_deadline(earliest);
+    }
+}
+
+/// 刷新硬件定时器的最早到期时刻（setitimer 更新 ITIMER_REAL 后在锁外调用）。
+pub(super) fn refresh_timer_deadline() {
+    let slot = SCHED.lock();
+    if let Some(s) = slot.as_ref() {
+        s.refresh_deadline();
     }
 }
 
@@ -245,6 +396,81 @@ pub(super) fn reserve_task() -> Result<(), crate::mm::frame::FrameError> {
     debug_assert!(s.ready.capacity() >= live && s.waiting.capacity() >= live);
     Ok(())
 }
+/// 按 pid 取调度属性三元组（策略、优先级、谦让值）；任务不在调度器的三张表里时返回 None。
+pub fn attrs_of(pid: Pid) -> Option<(u8, i32, i32)> {
+    let slot = SCHED.lock();
+    let s = slot.as_ref()?;
+    if let Some(task) = s.current.as_ref().filter(|t| t.pid == pid) {
+        return Some((task.policy, task.priority, task.nice));
+    }
+    if let Some(task) = s.ready.iter().find(|t| t.pid == pid) {
+        return Some((task.policy, task.priority, task.nice));
+    }
+    s.waiting
+        .iter()
+        .find(|(t, _)| t.pid == pid)
+        .map(|(t, _)| (t.policy, t.priority, t.nice))
+}
+
+/// 按 pid 取调度策略与优先级；任务不在调度器的三张表里时返回 None。
+pub fn sched_of(pid: Pid) -> Option<(u8, i32)> {
+    attrs_of(pid).map(|(policy, priority, _)| (policy, priority))
+}
+
+/// 设置某个任务的策略与优先级；pid 不在调度器表里返回 false。
+pub fn set_sched(pid: Pid, policy: u8, priority: i32) -> bool {
+    let mut slot = SCHED.lock();
+    let Some(s) = slot.as_mut() else {
+        return false;
+    };
+    if let Some(task) = s.current.as_mut().filter(|t| t.pid == pid) {
+        task.policy = policy;
+        task.priority = priority;
+        return true;
+    }
+    if let Some(task) = s.ready.iter_mut().find(|t| t.pid == pid) {
+        task.policy = policy;
+        task.priority = priority;
+        return true;
+    }
+    s.waiting
+        .iter_mut()
+        .find(|(t, _)| t.pid == pid)
+        .is_some_and(|(t, _)| {
+            t.policy = policy;
+            t.priority = priority;
+            true
+        })
+}
+
+/// 按 pid 取谦让值；任务不在调度器的三张表里时返回 None。
+pub fn nice_of(pid: Pid) -> Option<i32> {
+    attrs_of(pid).map(|(_, _, nice)| nice)
+}
+
+/// 设置某个任务的谦让值；pid 不在调度器表里返回 false。
+pub fn set_nice(pid: Pid, nice: i32) -> bool {
+    let mut slot = SCHED.lock();
+    let Some(s) = slot.as_mut() else {
+        return false;
+    };
+    if let Some(task) = s.current.as_mut().filter(|t| t.pid == pid) {
+        task.nice = nice;
+        return true;
+    }
+    if let Some(task) = s.ready.iter_mut().find(|t| t.pid == pid) {
+        task.nice = nice;
+        return true;
+    }
+    s.waiting
+        .iter_mut()
+        .find(|(t, _)| t.pid == pid)
+        .is_some_and(|(t, _)| {
+            t.nice = nice;
+            true
+        })
+}
+
 /// 任务入就绪队列队尾。
 pub(super) fn enqueue(task: Box<Task>) {
     let mut slot = SCHED.lock();
@@ -270,8 +496,7 @@ pub fn yield_now() {
         s.drain_wake_requests();
         s.wake_expired();
         let next = s
-            .ready
-            .pop_front()
+            .pick_next()
             .expect("ready queue must contain the yielding task");
         let to = s.promote(next);
         (from, to)
@@ -283,7 +508,7 @@ pub fn yield_now() {
 /// 当前任务挂起等待：移入等待表并切到下一个就绪任务（或 idle）。
 /// 切回点即 park 调用点，syscall PC 由调用方保留以便重执行重查条件；
 /// 等待表容量耗尽时退化为就绪让出（不分配、不失败，条件重查仍正确）。
-pub fn park(reason: WaitReason) {
+pub(super) fn park(reason: WaitReason) -> Option<FutexEnd> {
     sync::assert_no_held("park");
     let cur_ptr = current_ptr();
     let (from, to) = {
@@ -302,10 +527,11 @@ pub fn park(reason: WaitReason) {
             s.ready.push_back(cur);
         }
         s.refresh_deadline();
-        let to = match s.ready.pop_front() {
+        let to = match s.pick_next() {
             Some(next) => s.promote(next),
             None => {
                 set_current(core::ptr::null_mut());
+                CURRENT_TGID.store(0, Ordering::Relaxed);
                 sync::set_holder(0);
                 timer::set_slice_end(None);
                 addr_of!(s.idle_ctx)
@@ -314,62 +540,50 @@ pub fn park(reason: WaitReason) {
         (from, to)
     };
     switch_context(from, to);
-    reap_switched();
+    let mut slot = SCHED.lock();
+    let s = slot.as_mut().expect("scheduler not initialized");
+    s.reap_dead();
+    s.current.as_mut().and_then(|task| task.futex_end.take())
 }
 
-/// 唤醒某个 futex 键上至多 n 个 bitset 有交集的等待者，返回实际唤醒数。
-pub fn wake_futex(key: FutexKey, n: usize, bitset: u32) -> usize {
+/// 按键和位掩码匹配一次等待表。先唤醒，再把至多指定数量的后续等待者迁往目标键。
+pub(super) fn wake_futex(
+    from: FutexKey,
+    nr_wake: usize,
+    bits: u32,
+    requeue: Option<(FutexKey, usize)>,
+) -> usize {
     let mut slot = SCHED.lock();
-    let Some(s) = slot.as_mut() else {
-        return 0;
-    };
-    let mut woken = 0;
-    let mut i = 0;
-    while i < s.waiting.len() && woken < n {
-        if matches!(s.waiting[i].1, WaitReason::Futex { key: k, bitset: b, .. } if k == key && b & bitset != 0)
+    let Some(s) = slot.as_mut() else { return 0 };
+    let (to, nr_requeue) = requeue.unwrap_or((from, 0));
+    let (mut woken, mut moved, mut i) = (0, 0, 0);
+    let mut removed_deadline = false;
+    while i < s.waiting.len() && (woken < nr_wake || moved < nr_requeue) {
+        if let WaitReason::Futex {
+            key,
+            bitset,
+            deadline,
+        } = &mut s.waiting[i].1
         {
-            let (task, _) = s.waiting.swap_remove(i);
-            s.ready.push_back(task);
-            woken += 1;
-        } else {
-            i += 1;
-        }
-    }
-    s.refresh_deadline();
-    woken
-}
-
-/// 先唤醒 from 键上至多 nr_wake 个，再把至多 nr_requeue 个从 from 键改为等 to 键；返回唤醒数。
-pub fn requeue_futex(from: FutexKey, to: FutexKey, nr_wake: usize, nr_requeue: usize) -> usize {
-    let mut slot = SCHED.lock();
-    let Some(s) = slot.as_mut() else {
-        return 0;
-    };
-    let mut woken = 0;
-    let mut i = 0;
-    while i < s.waiting.len() && woken < nr_wake {
-        if matches!(s.waiting[i].1, WaitReason::Futex { key, .. } if key == from) {
-            let (task, _) = s.waiting.swap_remove(i);
-            s.ready.push_back(task);
-            woken += 1;
-        } else {
-            i += 1;
-        }
-    }
-    let mut requeued = 0;
-    for (_, reason) in s.waiting.iter_mut() {
-        if requeued >= nr_requeue {
-            break;
-        }
-        if let WaitReason::Futex { key, .. } = reason {
-            if *key == from {
+            if *key == from && *bitset & bits != 0 {
+                if woken < nr_wake {
+                    removed_deadline |= deadline.is_some();
+                    let (mut task, _) = s.waiting.swap_remove(i);
+                    task.futex_end = Some(FutexEnd::Notified);
+                    s.ready.push_back(task);
+                    woken += 1;
+                    continue;
+                }
                 *key = to;
-                requeued += 1;
+                moved += 1;
             }
         }
+        i += 1;
     }
-    s.refresh_deadline();
-    woken
+    if removed_deadline {
+        s.refresh_deadline();
+    }
+    woken + moved
 }
 
 /// 切到当前任务的栈后，回收此前退出任务的内核栈。
@@ -395,6 +609,32 @@ pub(super) fn exit_group_current(exit: ExitInfo) -> ! {
         (task.pid, task.tgid, task.name)
     };
     log::debug!("thread group of '{}' (pid {}) exiting", name, pid);
+    let robust_wakes = {
+        let reg = REGISTRY.lock();
+        let mut wakes = alloc::vec::Vec::new();
+        if let Some(space) = reg.group(tgid).and_then(|r| r.space.as_ref()) {
+            let space = space.as_space();
+            for thread in reg
+                .threads
+                .iter()
+                .filter(|t| t.tgid == tgid && t.robust_list != 0)
+            {
+                let list = super::futex::collect_robust_list_wakes(
+                    space,
+                    tgid,
+                    thread.tid,
+                    thread.robust_list,
+                );
+                if wakes.try_reserve(list.len()).is_ok() {
+                    wakes.extend(list);
+                }
+            }
+        }
+        wakes
+    };
+    for key in robust_wakes {
+        wake_futex(key, 1, u32::MAX, None);
+    }
     registry::record_exit(tgid, exit);
     request_children_wake();
     wake_vfork(pid);
@@ -414,13 +654,14 @@ pub(super) fn exit_group_current(exit: ExitInfo) -> ! {
         s.waiting.retain(|(task, _)| task.tgid != tgid);
         s.drain_wake_requests();
         s.wake_expired();
-        match s.ready.pop_front() {
+        match s.pick_next() {
             Some(next) => {
                 let to = s.promote(next);
                 (from, to)
             }
             None => {
                 set_current(core::ptr::null_mut());
+                CURRENT_TGID.store(0, Ordering::Relaxed);
                 sync::set_holder(0);
                 timer::set_slice_end(None);
                 (from, addr_of!(s.idle_ctx))
@@ -455,25 +696,39 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
         (task.pid, task.tgid, task.name)
     };
     log::debug!("task '{}' (pid {}) exiting", name, pid);
-    let key = {
+    let (robust_wakes, clear_key) = {
         let reg = REGISTRY.lock();
-        let clear = reg.thread(pid).map_or(0, |t| t.clear_child_tid);
-        if clear == 0 {
+        let (clear, robust) = reg
+            .thread(pid)
+            .map_or((0, 0), |t| (t.clear_child_tid, t.robust_list));
+        let robust_wakes = if robust == 0 {
+            alloc::vec::Vec::new()
+        } else {
+            reg.group(pid)
+                .and_then(|r| r.space.as_ref())
+                .map_or_else(alloc::vec::Vec::new, |s| {
+                    super::futex::collect_robust_list_wakes(s.as_space(), tgid, pid, robust)
+                })
+        };
+        let clear_key = if clear == 0 {
             None
         } else {
             reg.group(pid).and_then(|r| r.space.as_ref()).and_then(|s| {
                 let space = s.as_space();
-                let key = space.translate(clear).map(|(pa, _)| FutexKey {
-                    frame: pa.raw() & !0xfff,
-                    offset: clear & 0xfff,
-                });
-                let _ = crate::mm::user_access::copy_to_user(space, clear, &[0; 4]);
-                key
+                if clear % core::mem::align_of::<u32>() != 0 {
+                    return None;
+                }
+                crate::mm::user_access::copy_to_user(space, clear, &[0; 4]).ok()?;
+                space.futex_key(tgid, clear, false)
             })
-        }
+        };
+        (robust_wakes, clear_key)
     };
-    if let Some(key) = key {
-        wake_futex(key, 1, u32::MAX);
+    for key in robust_wakes {
+        wake_futex(key, 1, u32::MAX, None);
+    }
+    if let Some(key) = clear_key {
+        wake_futex(key, 1, u32::MAX, None);
     }
     if let Some(info) = registry::record_thread_exit(pid, exit) {
         // 登记退出信息并释放地址空间：UserAddressSpace 的 Drop 会先切回
@@ -493,13 +748,14 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
         s.dead.push(cur);
         s.drain_wake_requests();
         s.wake_expired();
-        match s.ready.pop_front() {
+        match s.pick_next() {
             Some(next) => {
                 let to = s.promote(next);
                 (from, to)
             }
             None => {
                 set_current(core::ptr::null_mut());
+                CURRENT_TGID.store(0, Ordering::Relaxed);
                 sync::set_holder(0);
                 timer::set_slice_end(None);
                 (from, addr_of!(s.idle_ctx))
@@ -532,7 +788,7 @@ pub(super) fn run_loop() {
             s.reap_dead();
             s.drain_wake_requests();
             s.wake_expired();
-            s.ready.pop_front().map(|task| s.promote(task))
+            s.pick_next().map(|task| s.promote(task))
         };
         match next {
             Some(to) => {

@@ -32,9 +32,21 @@ pub(crate) struct Metadata {
 
 /// 按 inode 取得后端元数据，失败返回后端错误。
 pub(super) fn metadata(ino: u32) -> Result<Metadata, Errno> {
+    if ino == super::procfs::DEVNULL {
+        return Ok(super::procfs::null_metadata());
+    }
+    if ino == super::procfs::DEVZERO {
+        return Ok(super::procfs::zero_metadata());
+    }
+    if ino == super::procfs::DEVURANDOM {
+        return Ok(super::procfs::random_metadata(true));
+    }
+    if ino == super::procfs::DEVRANDOM {
+        return Ok(super::procfs::random_metadata(false));
+    }
     // procfs 虚拟节点（/proc、/proc/<pid>、/dev/*）无后端 inode，按统一
     // stat 结果合成，避免 resolve 逐分量解析时把虚拟节点当 ext4 处理
-    if ino >= super::procfs::MISC_DIR || super::procfs::pid_ino_parts(ino).is_some() {
+    if super::procfs::is_virtual_ino(ino) {
         let (mode, size, links, _) = super::stat(ino)?;
         return Ok(Metadata {
             ino: ino as u64,
@@ -59,18 +71,46 @@ fn string(s: &str) -> Result<String, Errno> {
     Ok(out)
 }
 
+fn is_clean_ext4_path(path: &str) -> bool {
+    if path == "/" {
+        return true;
+    }
+    if !path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains("//")
+        || path == "/proc"
+        || path.starts_with("/proc/")
+        || path == "/dev"
+        || path.starts_with("/dev/")
+    {
+        return false;
+    }
+    !path.split('/').any(|s| s == "." || s == "..")
+}
+
 /// 查询绝对路径；follow 只控制末项链接，最多跟随 40 个链接。
 pub(crate) fn query(path: &str, follow: bool) -> Result<Metadata, Errno> {
+    if is_clean_ext4_path(path) && !fat::has_mounts() {
+        if let Ok(Some(info)) = ext4::fast_metadata(path) {
+            return Ok(info);
+        }
+    }
     resolve(path, follow).map(|(_, info)| info)
 }
 
 /// 解析绝对路径并返回规范路径及属性；保留与 query 相同的链接规则。
-pub(super) fn resolve(path: &str, follow: bool) -> Result<(String, Metadata), Errno> {
+pub(crate) fn resolve(path: &str, follow: bool) -> Result<(String, Metadata), Errno> {
+    if is_clean_ext4_path(path) && !fat::has_mounts() {
+        if let Ok(Some(info)) = ext4::fast_metadata(path) {
+            return Ok((string(path)?, info));
+        }
+    }
     let mut pending = string(path)?;
     let mut current = string("/")?;
     let mut info = metadata(lookup("/")?)?;
     let mut cursor = 0;
     let mut links = 0;
+    let mut saw_symlink = false;
     while cursor < pending.len() {
         if info.mode & 0xf000 != 0x4000 {
             return Err(Errno::NotDir);
@@ -107,6 +147,7 @@ pub(super) fn resolve(path: &str, follow: bool) -> Result<(String, Metadata), Er
                 let ino = lookup(&candidate)?;
                 let child = metadata(ino)?;
                 if child.mode & 0xf000 == 0xa000 && (follow || !suffix.is_empty()) {
+                    saw_symlink = true;
                     links += 1;
                     if links > 40 {
                         return Err(Errno::Loop);
@@ -138,6 +179,14 @@ pub(super) fn resolve(path: &str, follow: bool) -> Result<(String, Metadata), Er
             }
         }
         cursor = next;
+    }
+    if !saw_symlink
+        && info.mode & 0xf000 != 0xa000
+        && is_clean_ext4_path(&current)
+        && (info.ino as u32) & FAT_INODE == 0
+        && !fat::has_mounts()
+    {
+        ext4::mark_direct_stat(&current, info.ino as u32);
     }
     Ok((current, info))
 }

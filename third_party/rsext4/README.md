@@ -14,6 +14,8 @@ OuroOS 随库维护以下补丁。
 - 单独读取目录块中的目录项字节，供 OuroOS 实现 `getdents64`。
 - 普通文件删除。单独移除目录项并更新链接数，由内核在最后一个打开引用释放后回收 inode、已写入和预分配的 extent。回收前丢弃对应的数据块缓存。暂不回收外部扩展属性块或旧式块映射。
 - JBD2 同步。自动提交和显式同步使用日志 inode 的物理块映射。挂载时先落盘恢复标志，卸载时先提交并写回日志事务，再清除标志。
+- 按父目录 inode 移除空目录名。更新父目录链接数和被移除目录的链接数，复用目录块与 inode 回滚，以及无引用时的 inode 回收。
+- 按 inode 修改归属。新增 `metadata::chown_inode`，路径和 FD 共用现有属主、属组、ctime 和校验和更新。
 - 按 inode 更新时间。新增 `metadata::utimens_inode`，复用已有时间字段、校验和与元数据更新流程，供 FD 和符号链接操作使用；双方均 Omit 时不写入，只读卷拒绝实际更新。
 
 - 按父 inode 重命名。新增 `file::rename_entry` 与旧目标延迟回收接口，路径版 rename/mv 复用；替换时不先删除目标，校验类型与空目录，更新父目录链接数及 `..`。失败恢复保存的目录块和 inode，插入失败撤销已发布名称，已扩容空间保留作目录容量；不保证掉电原子性。外部 xattr 或有块的旧式映射目标暂拒绝替换。
@@ -31,3 +33,12 @@ Cargo 清单移除了随上游测试程序提供的目标。内核默认启用�
   标准工具重放；未支持特性组合仍拒绝。已知上游缺陷：目录块经数据块缓存
   直写 home 块、绕过日志（data=writeback 式），断电窗口可留下指向未分配
   inode 的目录项，标准 e2fsck 会清理。
+- 读写热路径优化（`fs/io-cache`）：
+  1. `BlockDevice` 新增带默认实现的 `read_slice`/`write_slice`，`BlockDev`、`Jbd2Dev` 与 `DataBlockCache::read_block_slice`/`write_block_slice` 在未命中 32 块小缓存时透传底层块缓存切片直读直写，免除 4 KiB 堆分配、小缓存淘汰抖动与整块搬运；`write_block_static` 整块写回跳过冗余读块；
+  2. `file/io.rs` 单块读直接走 `resolve_inode_block` 免除 `Vec<ExtentRun>` 堆分配，新增 `write_regular_inode_data` 合并类型校验与旧长度返回；
+  3. `metadata/apply.rs` 采用 Linux `mount(8)` 默认 `relatime` 语义（仅当 `atime <= mtime/ctime` 或超过 24 小时才更新 `atime`）并复用已加载 inode；
+  4. `cache/inode_table.rs` 与 `checksum/inode.rs` 优化命中单次 `BTreeMap` 查找，并将元数据校验和计算延迟至 `InodeCache` 落盘编码前统一执行（复用挂载时预计算的超级块校验种子与 256 字节栈缓冲），落盘结果与原逐次重算位级一致。
+- 符号链接与硬链接补丁（`fs/link-symlink-sendfile`）：
+  1. `file/create.rs` 新增 `create_symlink_inode`，按父 inode 在线性目录创建符号链接，允许相对与悬空目标（不校验目标存在性），同时支持 <60 字节内联快速链接与块存储长链接；
+  2. `file/link.rs` 新增 `link_inode`，按目标 inode 与父目录 inode 创建硬链接（拒绝目录返回 `EPERM`，超 `65000` 链接数返回 `EMLINK`，更新链接计数失败时回滚目录项）；
+  3. `file/delete.rs` 扩展 `unlink_regular_entry` 放行符号链接，并在 `free_inode` 中跳过内联快速符号链接的 `extent_block_map` 遍历，避免把内联目标文本误作块号释放。

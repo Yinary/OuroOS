@@ -7,7 +7,7 @@ use polyhal_trap::trapframe::TrapFrame;
 
 use crate::{
     config,
-    mm::{frame::FrameError, kstack::KernelStack},
+    mm::{address_space::FutexKey, frame::FrameError, kstack::KernelStack},
 };
 
 use super::{sched, user_task};
@@ -34,11 +34,11 @@ pub enum TaskState {
     Exited,
 }
 
-/// futex 等待的地址键：物理页帧号与页内字偏移。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FutexKey {
-    pub frame: usize,
-    pub offset: usize,
+/// 调度器从等待队列中移除任务时记录结果，之后到达的事件不能覆盖它。
+#[derive(Clone, Copy)]
+pub(super) enum FutexEnd {
+    Notified,
+    TimedOut,
 }
 
 /// 任务挂起的原因；唤醒采用宽松匹配（醒来重查条件）而非精确订阅。
@@ -46,12 +46,19 @@ pub struct FutexKey {
 /// 子进程退出唤醒全部 Children 等待者。
 #[derive(Clone, Copy, Debug)]
 pub enum WaitReason {
-    /// 绝对截止时间（nanosleep / rt_sigtimedwait）。
+    /// 绝对截止时间（nanosleep / clock_nanosleep）。
     Deadline(core::time::Duration),
+    /// rt_sigtimedwait 等待集合内信号（含已屏蔽信号）或截止时间。
+    SigTimedWait {
+        set: super::signal::SignalSet,
+        deadline: core::time::Duration,
+    },
     /// 等待子进程退出（waitpid 无可收割孩子）。
     Children,
-    /// 等待任意 pipe 可读/可写。
+    /// 等待任意 pipe/套接字可读或可写。
     Pipe,
+    /// 等待指定管道实例可读或可写，避免多管道场景下的惊群唤醒。
+    PipeId(u64),
     /// 等待任意可投递信号（rt_sigsuspend），仅经 WAKE_SIGNALS 通道唤醒。
     Signal,
     /// ppoll 同时等待管道变化或截止时间。
@@ -69,7 +76,9 @@ impl WaitReason {
     /// 带期限的等待原因返回其到期时刻。
     pub fn deadline(&self) -> Option<core::time::Duration> {
         match self {
-            WaitReason::Deadline(d) | WaitReason::PollUntil(d) => Some(*d),
+            WaitReason::Deadline(d)
+            | WaitReason::PollUntil(d)
+            | WaitReason::SigTimedWait { deadline: d, .. } => Some(*d),
             WaitReason::Futex { deadline, .. } => *deadline,
             _ => None,
         }
@@ -82,6 +91,7 @@ pub struct Task {
     context: KContext,
     pub(super) body: Option<TaskBody>,
     pub(super) state: TaskState,
+    pub(super) futex_end: Option<FutexEnd>,
     pub(super) pid: Pid,
     pub(super) tgid: Pid,
     /// 调试与日志用名。
@@ -89,6 +99,12 @@ pub struct Task {
     /// 本时间片的终点；由调度器在切入（promote）时刷新，
     /// 用户任务回用户态前比较当前时间与它决定让出。
     pub(super) slice_end: core::time::Duration,
+    /// 调度策略：0 其他、1 先进先出、2 轮转、3 批处理、5 空闲。
+    pub(super) policy: u8,
+    /// 实时策略的优先级 1 到 99；普通策略为 0。
+    pub(super) priority: i32,
+    /// 普通策略的谦让值，-20 到 19，越小越优先。
+    pub(super) nice: i32,
     /// 内核栈（纯所有权字段，仅 Drop 生效，无读取方；下划线豁免
     /// dead_code 检查）。任务回收时最终释放。
     _kstack: KernelStack,
@@ -116,10 +132,14 @@ impl Task {
             context,
             body: Some(TaskBody::Kernel(entry)),
             state: TaskState::Ready,
+            futex_end: None,
             pid,
             tgid,
             name,
             slice_end: core::time::Duration::ZERO,
+            policy: 0,
+            priority: 0,
+            nice: 0,
             _kstack: kstack,
         })
     }
@@ -140,10 +160,14 @@ impl Task {
             context,
             body: Some(TaskBody::User { frame, pid }),
             state: TaskState::Ready,
+            futex_end: None,
             pid,
             tgid,
             name,
             slice_end: core::time::Duration::ZERO,
+            policy: 0,
+            priority: 0,
+            nice: 0,
             _kstack: kstack,
         })
     }

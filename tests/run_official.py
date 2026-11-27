@@ -16,8 +16,7 @@ import sys
 GROUP_START = re.compile(r"#### OS COMP TEST GROUP START ([a-zA-Z0-9-]+) ####")
 GROUP_END = re.compile(r"#### OS COMP TEST GROUP END ([a-zA-Z0-9-]+) ####")
 QEMU_VERSION = re.compile(r"version 10\.0\.2\b")
-TARGET_GROUPS = ("basic-musl", "basic-glibc", "busybox-musl", "busybox-glibc",
-                 "libcbench-musl", "libcbench-glibc")
+TARGET_GROUPS = ("basic-musl", "basic-glibc", "busybox-musl", "busybox-glibc")
 IMAGES_DIR_DEFAULT = pathlib.Path("sdcard") / "pre-20250615"
 # judge 目录搜索链（--judge-dir 显式指定优先；末项为本机历史位置，向后兼容）
 JUDGE_DIR_CANDIDATES = (
@@ -56,28 +55,84 @@ def qemu_binary(arch, override):
     return str(qemu)
 
 
-def qemu_command(qemu, arch, kernel, disk, extra_disk=None):
+def qemu_img_binary(qemu_path):
+    """定位 qemu-img：优先取与 qemu 同目录或真实构建目录，再回退 PATH。"""
+    q = pathlib.Path(qemu_path)
+    for parent in (q.parent, q.resolve().parent):
+        candidate = parent / "qemu-img"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    found = shutil.which("qemu-img")
+    if found is None:
+        sys.exit("错误：未找到 qemu-img（无法创建 QCOW2 写时复制覆盖层；可传 --raw-copy 回退整盘复制）")
+    return found
+
+
+def create_qcow2_overlay(qemu_img, backing_path, overlay_path):
+    """基于只读 raw 原盘秒级创建 QCOW2 写时复制覆盖层，避免整盘拷贝。"""
+    backing = backing_path.resolve()
+    overlay_path.unlink(missing_ok=True)
+    res = subprocess.run(
+        [qemu_img, "create", "-q", "-f", "qcow2",
+         "-b", str(backing), "-F", "raw", str(overlay_path)],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        sys.exit(f"错误：创建 QCOW2 覆盖层失败：{res.stderr.strip() or res.stdout.strip()}")
+
+
+def qemu_command(qemu, arch, kernel, disk, extra_disk=None,
+                 disk_format="raw", extra_format="raw"):
     """官方 run_qemu.py 的正式启动命令；extra_disk 对应官方挂第二块盘的行为。"""
     cmd = [qemu, "-kernel", kernel, "-m", "1G", "-nographic",
            "-smp", "1", "-no-reboot", "-rtc", "base=utc",
-           "-drive", f"file={disk},if=none,format=raw,id=x0"]
+           "-drive", f"file={disk},if=none,format={disk_format},id=x0"]
     if arch == "rv":
         cmd = [qemu, "-machine", "virt", "-kernel", kernel, "-m", "1G",
                "-nographic", "-smp", "1", "-bios", "default",
-               "-drive", f"file={disk},if=none,format=raw,id=x0",
+               "-drive", f"file={disk},if=none,format={disk_format},id=x0",
                "-device", "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0",
                "-no-reboot", "-device", "virtio-net-device,netdev=net",
                "-netdev", "user,id=net", "-rtc", "base=utc"]
         if extra_disk:
-            cmd += ["-drive", f"file={extra_disk},if=none,format=raw,id=x1",
+            cmd += ["-drive", f"file={extra_disk},if=none,format={extra_format},id=x1",
                     "-device", "virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1"]
         return cmd
     cmd += ["-device", "virtio-blk-pci,drive=x0",
             "-device", "virtio-net-pci,netdev=net0", "-netdev", "user,id=net0"]
     if extra_disk:
-        cmd += ["-drive", f"file={extra_disk},if=none,format=raw,id=x1",
+        cmd += ["-drive", f"file={extra_disk},if=none,format={extra_format},id=x1",
                 "-device", "virtio-blk-pci,drive=x1"]
     return cmd
+
+
+def build_split_kernel(arch, out_dir, groups, ltp_filter, ltp_timeout):
+    """按本地拆组/拆例参数编译临时测试内核，绝不覆盖根目录交付产物 kernel-rv/la。"""
+    env = os.environ.copy()
+    if groups:
+        env["OUROOS_INIT_GROUPS"] = groups
+    else:
+        env.pop("OUROOS_INIT_GROUPS", None)
+    if ltp_filter:
+        env["OUROOS_LTP_FILTER"] = ltp_filter
+    else:
+        env.pop("OUROOS_LTP_FILTER", None)
+    if ltp_timeout is not None:
+        env["OUROOS_LTP_TIMEOUT"] = str(ltp_timeout)
+    else:
+        env.pop("OUROOS_LTP_TIMEOUT", None)
+    targets = [f"build-user-{arch}", f"build-{arch}"]
+    print(f"[{arch}] 构建本地拆组内核（groups={groups or 'default'}"
+          f"{f', ltp_filter={ltp_filter}' if ltp_filter else ''}"
+          f"{f', ltp_timeout={ltp_timeout}s' if ltp_timeout else ''}）", flush=True)
+    res = subprocess.run(["make", "--no-print-directory", *targets], env=env)
+    if res.returncode != 0:
+        sys.exit(f"错误：本地拆组内核构建失败（arch={arch}）")
+    triple = "riscv64gc-unknown-none-elf" if arch == "rv" else "loongarch64-unknown-none"
+    built = pathlib.Path("target") / triple / "release" / "kernel"
+    dst = out_dir / f"kernel-local-{arch}"
+    shutil.copyfile(built, dst)
+    return dst
 
 
 def sha256_of(path):
@@ -164,13 +219,22 @@ def score_serial(judge_dir, serial_path):
     return results, notes
 
 
-def group_score(name, cases):
-    """保留原版 judge 的分数；性能组另计实际返回耗时的子项数。"""
-    score = sum(case.get("score", 0) for case in cases)
-    if name.startswith("libcbench-"):
-        return {"score": score, "measured": sum(case["res"] > 0 for case in cases),
-                "cases": len(cases), "all": None}
-    return {"score": score, "all": sum(case.get("all", 0) for case in cases)}
+def group_score(result):
+    """单组总分：judge 输出的明细列表求和（兼容 all/total/性能组）。"""
+    total_score = sum(item.get("score", 0) for item in result)
+    if any("all" in item for item in result):
+        total_all = sum(item.get("all", 0) for item in result)
+    elif any("total" in item for item in result):
+        total_all = sum(item.get("total", 0) for item in result)
+    else:
+        total_all = len(result)
+    return (total_score, total_all)
+
+
+def format_score(val):
+    if isinstance(val, float):
+        return f"{val:.2f}"
+    return str(val)
 
 
 def run_arch(arch, args):
@@ -185,21 +249,50 @@ def run_arch(arch, args):
             f"  从 https://github.com/oscomp/testsuits-for-oskernel/releases/tag/pre-20250615 "
             f"下载并解压到 {images_dir}/"
         )
-    recorded_sha = sha256_of(disk)
+    recorded_sha = sha256_of(disk) if args.sha256 else None
     if args.sha256 and args.sha256 != recorded_sha:
         sys.exit(f"错误：镜像 SHA-256 不匹配：期望 {args.sha256}，实际 {recorded_sha}")
-    # 环境检查前移，避免 QEMU/辅助盘缺失时白留 4 GiB 副本
     qemu = qemu_binary(arch, args.qemu)
     default_extra = pathlib.Path("disk.img" if arch == "rv" else "disk-la.img")
-    extra = str(args.extra_disk or default_extra) if (
-        args.extra_disk or default_extra.exists()
-    ) else None
-    copy = out / f"sdcard-{arch}.img"
-    print(f"[{arch}] 复制干净盘副本 {disk} -> {copy}", flush=True)
-    shutil.copyfile(disk, copy)
+    extra_src = args.extra_disk or (default_extra if default_extra.exists() else None)
+
+    temp_kernel = None
+    kernel_path = args.kernel
+    if args.groups or args.ltp_filter or args.ltp_timeout is not None:
+        if args.kernel_explicit:
+            sys.exit("错误：--groups/--ltp-filter/--ltp-timeout 会按参数构建本地启动器内核，不能同时指定 --kernel")
+        temp_kernel = build_split_kernel(
+            arch, out, args.groups, args.ltp_filter, args.ltp_timeout
+        )
+        kernel_path = temp_kernel
+
+    extra_overlay = None
+    if args.raw_copy:
+        run_disk = out / f"sdcard-{arch}.img"
+        disk_format = "raw"
+        print(f"[{arch}] 复制干净盘副本 {disk} -> {run_disk}", flush=True)
+        shutil.copyfile(disk, run_disk)
+        extra_arg = str(extra_src) if extra_src else None
+        extra_format = "raw"
+    else:
+        qemu_img = qemu_img_binary(qemu)
+        run_disk = out / f"sdcard-{arch}.qcow2"
+        disk_format = "qcow2"
+        create_qcow2_overlay(qemu_img, disk, run_disk)
+        print(f"[{arch}] 已创建 QCOW2 覆盖层 {run_disk} -> {disk.resolve()}", flush=True)
+        if extra_src:
+            extra_overlay = out / f"extra-{arch}.qcow2"
+            create_qcow2_overlay(qemu_img, extra_src, extra_overlay)
+            extra_arg = str(extra_overlay)
+            extra_format = "qcow2"
+        else:
+            extra_arg = None
+            extra_format = "raw"
 
     cmd = ["timeout", "-k", "5", str(args.timeout)] + qemu_command(
-        qemu, arch, str(args.kernel), str(copy), extra)
+        qemu, arch, str(kernel_path), str(run_disk), extra_arg,
+        disk_format=disk_format, extra_format=extra_format,
+    )
     try:
         (out / "qemu-cmd.txt").write_text(" ".join(cmd) + "\n")
         with open(out / "serial.txt", "w", errors="ignore", buffering=1) as serial:
@@ -210,43 +303,49 @@ def run_arch(arch, args):
             print(f"[{arch}] 警告：QEMU 到达超时 {args.timeout}s 被 kill",
                   flush=True)
         serial_text = (out / "serial.txt").read_text(errors="ignore")
-    # 内核 panic / rust 运行时崩溃无论组标记是否齐全都判运行不完整
+        # 内核 panic / rust 运行时崩溃无论组标记是否齐全都判运行不完整
         panicked = "[panic]" in serial_text or "panicked at" in serial_text
 
         results, notes = score_serial(args.judge_dir, out / "serial.txt")
 
         summary = {
-        "arch": arch, "kernel": str(args.kernel), "disk": str(disk),
-        "disk_sha256": recorded_sha, "qemu": qemu, "timeout_sec": args.timeout,
-        "qemu_timed_out": timed_out, "qemu_returncode": run.returncode,
-        "panicked": panicked,
-        "serial": str(out / "serial.txt"),
-        "groups": notes["groups_seen"], "truncated": notes["truncated"],
-        "anomalies": notes["anomalies"],
-        "group_lines": notes["group_lines"],
-        "judge_errors": notes["judge_errors"],
-        "scores": {name: group_score(name, result)
-                   for name, result in results.items()},
-        "detail": results,
-    }
+            "arch": arch, "kernel": str(kernel_path), "disk": str(disk),
+            "disk_format": disk_format,
+            "disk_sha256": recorded_sha, "qemu": qemu, "timeout_sec": args.timeout,
+            "requested_groups": args.requested_groups,
+            "ltp_filter": args.ltp_filter,
+            "qemu_timed_out": timed_out, "qemu_returncode": run.returncode,
+            "panicked": panicked,
+            "serial": str(out / "serial.txt"),
+            "groups": notes["groups_seen"], "truncated": notes["truncated"],
+            "anomalies": notes["anomalies"],
+            "group_lines": notes["group_lines"],
+            "judge_errors": notes["judge_errors"],
+            "scores": {name: dict(zip(("score", "all"), group_score(result)))
+                       for name, result in results.items()},
+            "detail": results,
+        }
         (out / "result.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
-        for name in TARGET_GROUPS:
-            score = summary["scores"].get(name)
+        display_groups = list(args.requested_groups or TARGET_GROUPS)
+        for seen_group in notes["groups_seen"]:
+            if seen_group not in display_groups:
+                display_groups.append(seen_group)
+        for name in display_groups:
+            score = summary["scores"].get(name, {"score": None, "all": None})
             seen = notes["groups_seen"].get(name, 0)
-            if score is None:
-                display = "缺少判分结果"
-            elif "measured" in score:
-                display = f"{score['score']:.2f} 分，{score['measured']}/{score['cases']} 项有耗时"
-            else:
-                display = f"{score['score']}/{score['all']}"
-            print(f"[{arch}] {name:16s} {display}（串口出现 {seen} 次组标记）", flush=True)
+            print(f"[{arch}] {name:16s} {format_score(score['score'])}/{score['all']}"
+                  f"（串口出现 {seen} 次组标记）", flush=True)
         if notes["judge_errors"]:
             print(f"[{arch}] judge 异常：{notes['judge_errors']}", flush=True)
         print(f"[{arch}] 串口：{out / 'serial.txt'}  判分明细：{out / 'result.json'}",
               flush=True)
     finally:
-        # 运行副本用完即清，异常路径同样
-        copy.unlink(missing_ok=True)
+        # 运行盘覆盖层与临时拆组内核用完即清，异常路径同样
+        run_disk.unlink(missing_ok=True)
+        if extra_overlay is not None:
+            extra_overlay.unlink(missing_ok=True)
+        if temp_kernel is not None:
+            temp_kernel.unlink(missing_ok=True)
     return summary
 
 
@@ -265,9 +364,20 @@ def main():
     parser.add_argument("--qemu", help="QEMU 可执行文件覆盖（须为 10.0.2）")
     parser.add_argument("--extra-disk", type=pathlib.Path,
                         help="第二块盘（默认取仓库 disk.img / disk-la.img，make all 生成）")
+    parser.add_argument("--raw-copy", action="store_true",
+                        help="改用整盘 raw 拷贝（默认用 QCOW2 写时复制覆盖层）")
+    parser.add_argument("--groups",
+                        help="本地拆组运行，逗号分隔（如 libctest-musl,lmbench-musl）；不改根目录内核")
+    parser.add_argument("--ltp-filter",
+                        help="本地 LTP 前缀过滤，逗号分隔（如 chown,statx），须与 --groups ltp-* 同用")
+    parser.add_argument("--ltp-timeout", type=int,
+                        help="本地 LTP 逐例时限（秒），覆盖默认 2 秒")
     args = parser.parse_args()
     args.judge_dir = resolve_judge_dir(args.judge_dir)
-
+    args.kernel_explicit = args.kernel is not None
+    args.requested_groups = [
+        g.strip() for g in args.groups.split(",") if g.strip()
+    ] if args.groups else None
 
     archs = ["rv", "la"] if args.arch == "both" else [args.arch]
     if args.arch == "both" and args.kernel is not None:
@@ -279,20 +389,21 @@ def main():
         kernel = pathlib.Path(f"kernel-{arch}") if len(archs) > 1 else (
             args.kernel or pathlib.Path(f"kernel-{arch}")
         )
-        if not kernel.exists():
+        if not (args.groups or args.ltp_filter or args.ltp_timeout is not None) and not kernel.exists():
             sys.exit(f"错误：内核不存在 {kernel}（先 make all 或用 --kernel 指定）")
         args.kernel = kernel
         statuses.append(run_arch(arch, args))
 
     # 退出码只反映运行完整性，不把分数当门禁：0 完整、1 运行不完整、2 judge 失败
+    expected_groups = tuple(args.requested_groups) if args.requested_groups else TARGET_GROUPS
     exit_code = 0
     for status in statuses:
         if status["judge_errors"]:
             exit_code = max(exit_code, 2)
         groups_ok = all(
-            status["groups"].get(name, 0) == 1 for name in TARGET_GROUPS
+            status["groups"].get(name, 0) == 1 for name in expected_groups
         ) and all(
-            status["group_lines"].get(name, 0) > 0 for name in TARGET_GROUPS
+            status["group_lines"].get(name, 0) > 0 for name in expected_groups
         ) and not status["anomalies"] and not status["truncated"]
         run_ok = (
             groups_ok

@@ -6,7 +6,7 @@
 use polyhal_trap::trapframe::{TrapFrame, TrapFrameArgs};
 
 use crate::mm::{address_space::UserAddressSpace, user_access};
-use crate::syscall::signal::SA_ONSTACK;
+use crate::syscall::signal::{SA_NODEFER, SA_ONSTACK};
 use crate::task::signal::{
     SigInfoSlot, SignalDisposition, SignalSet, SignalSetExt, SIGKILL, SIGSTOP, SS_DISABLE,
 };
@@ -155,9 +155,11 @@ pub fn build_deliver(
     frame[TrapFrameArgs::ARG2] = frame_addr(base, OFF_UCONTEXT)?;
     frame[TrapFrameArgs::SEPC] = d.handler;
 
-    // handler 期间屏蔽：blocked_now | sa_mask | 本信号。
+    // handler 期间屏蔽：blocked_now | sa_mask，未置 SA_NODEFER 时另加本信号。
     let mut new_blocked = blocked_now | d.mask;
-    new_blocked.add(sig);
+    if d.flags & SA_NODEFER == 0 {
+        new_blocked.add(sig);
+    }
     Ok(new_blocked)
 }
 

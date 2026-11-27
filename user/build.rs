@@ -22,5 +22,8 @@ fn main() -> io::Result<()> {
     println!("cargo:rustc-link-arg=-T{}", path.display());
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=linker.lds");
+    println!("cargo:rerun-if-env-changed=OUROOS_INIT_GROUPS");
+    println!("cargo:rerun-if-env-changed=OUROOS_LTP_FILTER");
+    println!("cargo:rerun-if-env-changed=OUROOS_LTP_TIMEOUT");
     Ok(())
 }

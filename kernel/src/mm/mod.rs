@@ -11,6 +11,7 @@ mod page_table;
 pub mod region;
 mod self_test;
 mod shared;
+pub(crate) mod shm;
 pub mod user_access;
 use core::sync::atomic::{AtomicUsize, Ordering};
 static KERNEL_ROOT: AtomicUsize = AtomicUsize::new(0);
