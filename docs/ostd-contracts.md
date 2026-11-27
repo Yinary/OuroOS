@@ -282,7 +282,7 @@ try_lock 失败即报告“持锁跨调度”。
 | 访问检查/日志 | faccessat、faccessat2、syslog(klogctl) | `syscall/fs.rs`、`dmesg.rs` |
 | 设备/随机 | ioctl(29)（RTC 设备的 RTC_RD_TIME 与管道/普通文件的 FIONREAD，其余 ENOTTY）、getrandom(278)、/dev/urandom 与 /dev/random | `fs::context::ioctl`、`drivers/rtc.rs`、`entropy::fill_random` |
 | 信号 | kill、tkill、tgkill、rt_sigaction、rt_sigprocmask、rt_sigpending、rt_sigsuspend、rt_sigtimedwait、rt_sigqueueinfo、sigaltstack、rt_sigreturn | `syscall/signal.rs`、`task/signal.rs`、`sigframe/`（契约与偏差见 §4.5） |
-| 网络 | socket、socketpair、bind、listen、accept、accept4、connect、getsockname、getpeername、sendto、recvfrom、setsockopt、getsockopt、shutdown | `syscall/net.rs`、`net/mod.rs`（AF_INET 本地回环 UDP/TCP、AF_UNIX 匿名套接字对与未连接 AF_UNIX 套接字） |
+| 网络 | socket、socketpair、bind、listen、accept、accept4、connect、getsockname、getpeername、sendto、recvfrom、sendmsg、recvmsg、sendmmsg、recvmmsg、setsockopt、getsockopt、shutdown | `syscall/net.rs`、`net/mod.rs`（AF_INET 本地回环 UDP/TCP、AF_UNIX 匿名套接字对、SCM_RIGHTS 描述符传递与未连接 AF_UNIX 套接字） |
 | 内存 | brk、mmap、munmap、mprotect、mremap、mincore、madvise、msync、锁页系列、shmget、shmctl、shmat、shmdt | `syscall/memory.rs`、`mm/shm.rs` |
 | System V IPC | msgget、msgctl、msgrcv、msgsnd、semget、semctl、semop、semtimedop | `ipc/msg.rs`、`ipc/sem.rs`、`task::process_call` |
 | 其他 | uname、sethostname、setdomainname、getcpu、gettimeofday、set_tid_address(96) | `syscall/mod.rs` |
