@@ -99,7 +99,12 @@ pub(crate) fn query(path: &str, follow: bool) -> Result<Metadata, Errno> {
 }
 
 /// 解析绝对路径并返回规范路径及属性；保留与 query 相同的链接规则。
-pub(super) fn resolve(path: &str, follow: bool) -> Result<(String, Metadata), Errno> {
+pub(crate) fn resolve(path: &str, follow: bool) -> Result<(String, Metadata), Errno> {
+    if is_clean_ext4_path(path) && !fat::has_mounts() {
+        if let Ok(Some(info)) = ext4::fast_metadata(path) {
+            return Ok((string(path)?, info));
+        }
+    }
     let mut pending = string(path)?;
     let mut current = string("/")?;
     let mut info = metadata(lookup("/")?)?;

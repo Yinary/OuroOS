@@ -533,6 +533,153 @@ impl Context {
         Ok((canonical, info.ino as u32, string(name)?))
     }
 
+    /// 构造带基准目录的未词法折叠路径，供保留符号链接顺序的逐分量解析使用。
+    pub(crate) fn join_raw(&self, dir: usize, input: &str) -> Result<String, Errno> {
+        if input.is_empty() {
+            return Err(Errno::NoEntry);
+        }
+        if input.starts_with('/') {
+            return string(input);
+        }
+        let mut base = if dir as isize == -100 {
+            string(self.cwd()?)?
+        } else {
+            string(self.get(dir)?.lock().directory_path()?)?
+        };
+        base.try_reserve(input.len() + 1)
+            .map_err(|_| Errno::NoMem)?;
+        if base != "/" {
+            base.push('/');
+        }
+        base.push_str(input);
+        Ok(base)
+    }
+
+    /// 解析末项父目录（跟随中间符号链接）并返回规范全路径、父 inode 与末项名称。
+    pub(crate) fn resolve_parent_entry(
+        &self,
+        dir: usize,
+        input: &str,
+        dot_err: Errno,
+    ) -> Result<(String, u32, String), Errno> {
+        if input.is_empty() {
+            return Err(Errno::NoEntry);
+        }
+        let trimmed = input.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Err(dot_err);
+        }
+        let (parent, name) = match trimmed.rsplit_once('/') {
+            Some(("", name)) => ("/", name),
+            Some(parts) => parts,
+            None => (".", trimmed),
+        };
+        if name.is_empty() || matches!(name, "." | "..") {
+            return Err(dot_err);
+        }
+        if name.len() > 255 {
+            return Err(Errno::NameTooLong);
+        }
+        let mut base = if input.starts_with('/') {
+            string("")?
+        } else if dir as isize == -100 {
+            string(self.cwd()?)?
+        } else {
+            string(self.get(dir)?.lock().directory_path()?)?
+        };
+        base.try_reserve(parent.len() + 1)
+            .map_err(|_| Errno::NoMem)?;
+        if !base.is_empty() {
+            base.push('/');
+        }
+        base.push_str(parent);
+        let (mut canonical, info) = fs::metadata::resolve(&base, true)?;
+        if info.mode & 0xf000 != 0x4000 {
+            return Err(Errno::NotDir);
+        }
+        canonical
+            .try_reserve(name.len() + 1)
+            .map_err(|_| Errno::NoMem)?;
+        if canonical != "/" {
+            canonical.push('/');
+        }
+        canonical.push_str(name);
+        if canonical.len() >= 4096 {
+            return Err(Errno::NameTooLong);
+        }
+        Ok((canonical, info.ino as u32, string(name)?))
+    }
+
+    /// 创建符号链接（symlinkat 语义）；目标允许相对或悬空，不得为空。
+    pub(crate) fn symlink(&self, dir: usize, linkpath: &str, target: &str) -> Result<(), Errno> {
+        if target.is_empty() || linkpath.is_empty() {
+            return Err(Errno::NoEntry);
+        }
+        if target.len() >= 4096 {
+            return Err(Errno::NameTooLong);
+        }
+        if linkpath.ends_with('/') {
+            let (canonical, _, _) = self.resolve_parent_entry(dir, linkpath, Errno::Exists)?;
+            return match fs::query(&canonical, false) {
+                Ok(_) => Err(Errno::Exists),
+                Err(Errno::NoEntry) => Err(Errno::NoEntry),
+                Err(e) => Err(e),
+            };
+        }
+        let (_canonical, parent, name) = self.resolve_parent_entry(dir, linkpath, Errno::Exists)?;
+        fs::symlink(parent, &name, target)?;
+        Ok(())
+    }
+
+    /// 创建硬链接（linkat 语义）；拒绝目录，默认不跟随旧路径末项符号链接。
+    pub(crate) fn link(
+        &self,
+        old_dir: usize,
+        old_path: &str,
+        new_dir: usize,
+        new_path: &str,
+        follow: bool,
+        empty_path: bool,
+    ) -> Result<(), Errno> {
+        let (ino, mode) = if old_path.is_empty() {
+            if !empty_path {
+                return Err(Errno::NoEntry);
+            }
+            if old_dir as isize == -100 {
+                let ino = fs::lookup(self.cwd()?)?;
+                (ino, fs::stat(ino)?.0)
+            } else {
+                let handle = self.get(old_dir)?;
+                let f = handle.lock();
+                let ino = f.inode()?;
+                (ino, fs::stat(ino)?.0)
+            }
+        } else {
+            let info = self.query(old_dir, old_path, false, follow)?;
+            if old_path.ends_with('/') && info.mode & 0xf000 != 0x4000 {
+                return Err(Errno::NotDir);
+            }
+            (info.ino as u32, info.mode)
+        };
+        if mode & 0xf000 == 0x4000 {
+            return Err(Errno::Perm);
+        }
+        if new_path.is_empty() {
+            return Err(Errno::NoEntry);
+        }
+        if new_path.ends_with('/') {
+            let (canonical, _, _) = self.resolve_parent_entry(new_dir, new_path, Errno::Exists)?;
+            return match fs::query(&canonical, false) {
+                Ok(_) => Err(Errno::Exists),
+                Err(Errno::NoEntry) => Err(Errno::NoEntry),
+                Err(e) => Err(e),
+            };
+        }
+        let (_canonical, new_parent, new_name) =
+            self.resolve_parent_entry(new_dir, new_path, Errno::Exists)?;
+        fs::link(ino, new_parent, &new_name)
+    }
+
     /// 重命名文件或目录；拒绝移动仍由 cwd、目录 FD 或挂载引用的目录树。
     pub(crate) fn rename(
         &self,
@@ -1106,16 +1253,26 @@ impl OpenFile {
         self.offset = offset;
     }
 
-    /// 依据打开模式检查读写权限，失败返回 EBADF。
+    /// 依据打开模式检查读写权限，失败返回 EBADF（含 O_PATH）。
     pub(crate) fn check_access(&self, reading: bool) -> Result<(), Errno> {
-        if (matches!(self.kind, Kind::DevZero | Kind::DevRandom { .. })
-            && self.flags & 0x200000 != 0)
+        if self.flags & 0x200000 != 0
             || (reading && self.flags & 3 == 1)
             || (!reading && self.flags & 3 == 0)
         {
             return Err(Errno::BadF);
         }
         Ok(())
+    }
+
+    /// 是否指向目录打开对象。
+    pub(crate) fn is_directory(&self) -> bool {
+        matches!(
+            self.kind,
+            Kind::Inode {
+                directory: Some(_),
+                ..
+            } | Kind::ProcFdDir(_)
+        )
     }
 
     fn check_type(&self, first: bool) -> Result<(), Errno> {
@@ -1173,6 +1330,30 @@ impl OpenFile {
         }
         self.offset = offset as usize;
         Ok(self.offset)
+    }
+
+    /// 将一段内容直接读入调用方提供的内核缓冲区（供 sendfile 等内核态搬运使用）。
+    pub(crate) fn read_into_buf(
+        &mut self,
+        offset: Option<usize>,
+        dst: &mut [u8],
+        first: bool,
+    ) -> Result<usize, Errno> {
+        if let Kind::MemInfo(text) = &self.kind {
+            let start = offset.unwrap_or(self.offset);
+            let bytes = text.as_bytes().get(start..).unwrap_or(&[]);
+            let count = dst.len().min(bytes.len());
+            dst[..count].copy_from_slice(&bytes[..count]);
+            if offset.is_none() {
+                self.offset = self.offset.checked_add(count).ok_or(Errno::Invalid)?;
+            }
+            return Ok(count);
+        }
+        if let Some(off) = offset {
+            self.read_at(off, dst, first, |b| Ok(b.len()))
+        } else {
+            self.read_chunk(dst, first, |b| Ok(b.len()))
+        }
     }
 
     /// 读取一块内核缓冲区；交付成功后才消费管道数据或推进偏移。
@@ -1390,16 +1571,6 @@ impl OpenFile {
         };
         fs::write(ino, offset, data)
     }
-}
-
-/// 查找路径的父目录并返回末项名称。
-pub(crate) fn parent(path: &str) -> Result<(u32, &str), Errno> {
-    let i = path.rfind('/').ok_or(Errno::Invalid)?;
-    let dir = fs::lookup(if i == 0 { "/" } else { &path[..i] })?;
-    if fs::stat(dir)?.0 & 0xf000 != 0x4000 {
-        return Err(Errno::NotDir);
-    }
-    Ok((dir, &path[i + 1..]))
 }
 
 fn nonblock_or_wait(flags: usize) -> Errno {

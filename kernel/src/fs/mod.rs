@@ -20,7 +20,7 @@ pub(crate) fn retained_frames() -> usize {
     cache::retained_frames() + block_cache::retained_frames()
 }
 
-pub(crate) use metadata::{query, Metadata, Timestamp};
+pub(crate) use metadata::{query, resolve, Metadata, Timestamp};
 
 /// 文件时间的更新方式；Omit 保留对应字段。
 #[derive(Clone, Copy)]
@@ -354,6 +354,31 @@ pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
     } else {
         ext4::create(parent, name, mode)
     }
+}
+
+/// 在指定父目录下创建符号链接；FAT 与虚拟目录不支持。
+pub(crate) fn symlink(parent: u32, name: &str, target: &str) -> Result<u32, Errno> {
+    if procfs::is_virtual_ino(parent) {
+        return Err(Errno::Perm);
+    }
+    if parent & FAT_INODE != 0 {
+        return Err(Errno::NotSupported);
+    }
+    ext4::symlink(parent, name, target)
+}
+
+/// 在指定父目录下为已有 inode 建立硬链接；跨挂载返回 EXDEV，FAT 与虚拟节点不支持。
+pub(crate) fn link(target_ino: u32, parent: u32, name: &str) -> Result<(), Errno> {
+    if procfs::is_virtual_ino(target_ino) || procfs::is_virtual_ino(parent) {
+        return Err(Errno::Perm);
+    }
+    if metadata::metadata(target_ino)?.dev != metadata::metadata(parent)?.dev {
+        return Err(Errno::CrossDevice);
+    }
+    if (target_ino | parent) & FAT_INODE != 0 {
+        return Err(Errno::NotSupported);
+    }
+    ext4::link(target_ino, parent, name)
 }
 
 /// 在同一挂载内改名；FAT 暂不支持，跨挂载返回 EXDEV。

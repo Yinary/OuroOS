@@ -31,6 +31,8 @@ pub mod sysnr {
     pub const FCNTL: usize = 25;
     pub const MKDIRAT: usize = 34;
     pub const UNLINKAT: usize = 35;
+    pub const SYMLINKAT: usize = 36;
+    pub const LINKAT: usize = 37;
     pub const RENAMEAT: usize = 38;
     pub const UMOUNT2: usize = 39;
     pub const MOUNT: usize = 40;
@@ -52,6 +54,7 @@ pub mod sysnr {
     pub const PWRITE64: usize = 68;
     pub const PREADV: usize = 69;
     pub const PWRITEV: usize = 70;
+    pub const SENDFILE: usize = 71;
     pub const READLINKAT: usize = 78;
     pub const FSTATAT: usize = 79;
     pub const FSTAT: usize = 80;
@@ -362,6 +365,8 @@ pub fn dispatch(
         | sysnr::FCNTL
         | sysnr::MKDIRAT
         | sysnr::UNLINKAT
+        | sysnr::SYMLINKAT
+        | sysnr::LINKAT
         | sysnr::RENAMEAT
         | sysnr::RENAMEAT2
         | sysnr::UMOUNT2
@@ -384,6 +389,7 @@ pub fn dispatch(
         | sysnr::PWRITE64
         | sysnr::PREADV
         | sysnr::PWRITEV
+        | sysnr::SENDFILE
         | sysnr::READLINKAT
         | sysnr::FSTAT
         | sysnr::FSTATAT
@@ -415,7 +421,9 @@ pub fn dispatch(
                 return Flow::Wait(WaitReason::Pipe);
             }
             // 向无读者的管道写入：SIGPIPE 入队并与 -EPIPE 返回并行。
-            if ret == Err(Errno::Pipe) && (nr == sysnr::WRITE || nr == sysnr::WRITEV) {
+            if ret == Err(Errno::Pipe)
+                && (nr == sysnr::WRITE || nr == sysnr::WRITEV || nr == sysnr::SENDFILE)
+            {
                 signal.generate(
                     SIGPIPE,
                     // code=0 即 SI_USER，发送者为调用进程自身（线程组号）。
