@@ -51,6 +51,31 @@ impl Ext4FileSystem {
                 }
             }
 
+            // OuroOS patch: probe read-only before bitmap_cache.modify so failed contiguous
+            // searches do not dirty untouched bitmaps or emit false-positive fragmentation warns.
+            let has_run = {
+                let bm = self
+                    .bitmap_cache
+                    .get_or_load(block_dev, cache_key, bitmap_block)?;
+                self.block_allocator
+                    .find_contiguous_in_slice(&bm.data, count)
+                    .is_some()
+            };
+            if !has_run {
+                if count == 1 {
+                    warn!(
+                        "alloc_blocks: group={group_idx} descriptor claims {free} free blocks but \
+                         bitmap has none — descriptor/bitmap inconsistency, skipping group"
+                    );
+                } else {
+                    debug!(
+                        "alloc_blocks: group={group_idx} free={free} has no contiguous run of \
+                         {count}, skipping group"
+                    );
+                }
+                continue;
+            }
+
             // The actual allocation happens under the bitmap-cache mutation so
             // the updated bitmap bytes remain coherent with cache state.
             self.bitmap_cache
@@ -60,20 +85,9 @@ impl Ext4FileSystem {
                         .alloc_contiguous_blocks(data, group_idx, count);
                 })?;
 
-            // Check the allocation result *before* doing any mutable descriptor
-            // work. If the bitmap had no free block despite the descriptor claiming
-            // otherwise, the group is stale/inconsistent (e.g. dirty unmount with
-            // lazy initialisation). Skip to the next group instead of failing
-            // immediately so that groups with consistent bitmaps are still tried.
             let alloc = match alloc_res {
                 Ok(a) => a,
-                Err(e) if e.code == Errno::ENOSPC => {
-                    warn!(
-                        "alloc_blocks: group={group_idx} descriptor claims {free} free blocks but \
-                         bitmap has none — descriptor/bitmap inconsistency, skipping group"
-                    );
-                    continue;
-                }
+                Err(e) if e.code == Errno::ENOSPC => continue,
                 Err(e) => return Err(e),
             };
 

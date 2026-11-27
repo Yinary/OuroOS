@@ -718,13 +718,14 @@ impl DataBlockCache {
         dirty_blocks: &[(AbsoluteBN, u64, Vec<u8>)],
         block_size: usize,
     ) -> Ext4Result<()> {
-        let max_part_size = BLOCK_SIZE * 100;
+        // OuroOS patch: 限制单次合并写回为 16 块（64 KiB）并走可失败预留，修复原 BLOCK_SIZE * 100 单位错误及不可失败大分配。
+        let max_part_blocks = 16usize;
         let mut idx = 0usize;
         while idx < dirty_blocks.len() {
             let (start_block, ..) = dirty_blocks[idx];
             let mut run_len = 1usize;
 
-            while idx + run_len < dirty_blocks.len() && run_len <= max_part_size {
+            while idx + run_len < dirty_blocks.len() && run_len < max_part_blocks {
                 let expected = start_block.checked_add_usize(run_len)?;
                 if dirty_blocks[idx + run_len].0 == expected {
                     run_len += 1;
@@ -733,7 +734,12 @@ impl DataBlockCache {
                 }
             }
 
-            let mut buf: Vec<u8> = Vec::with_capacity(block_size * run_len);
+            let buf_bytes = block_size
+                .checked_mul(run_len)
+                .ok_or_else(|| Ext4Error::from(Errno::EOVERFLOW))?;
+            let mut buf: Vec<u8> = Vec::new();
+            buf.try_reserve_exact(buf_bytes)
+                .map_err(|_| Ext4Error::new(Errno::ENOMEM))?;
             for off in 0..run_len {
                 buf.extend_from_slice(&dirty_blocks[idx + off].2);
             }

@@ -1,7 +1,8 @@
 //! 文件数据读写与截断，维护 inode 长度、块映射和访问时间。
 use super::*;
 
-const MAX_RUN_IO_BYTES: usize = 1024 * 1024;
+// OuroOS patch: 限制单次连续读暂存缓冲为 64 KiB（与底层 BlockCache 合并批大小一致），避免每次加载大 ELF 时申请 1 MiB 连续内核堆。
+const MAX_RUN_IO_BYTES: usize = 64 * 1024;
 
 pub fn truncate<B: BlockDevice>(
     device: &mut Jbd2Dev<B>,
@@ -386,7 +387,12 @@ pub fn read_inode_data_into<B: BlockDevice>(
                 let run_bytes = BLOCK_SIZE
                     .checked_mul(part_blocks as usize)
                     .ok_or_else(|| Ext4Error::from(Errno::EOVERFLOW))?;
-                let mut run_buf = alloc::vec![0; run_bytes];
+                // OuroOS patch: 连续块读缓冲走可失败预留，内存不足时返回 ENOMEM 而非内核 OOM panic。
+                let mut run_buf = Vec::new();
+                run_buf
+                    .try_reserve_exact(run_bytes)
+                    .map_err(|_| Ext4Error::new(Errno::ENOMEM))?;
+                run_buf.resize(run_bytes, 0);
                 fs.datablock_cache
                     .read_run(device, phys, part_blocks, &mut run_buf)?;
 

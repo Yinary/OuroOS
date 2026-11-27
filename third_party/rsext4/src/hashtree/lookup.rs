@@ -3,7 +3,7 @@
 
 use alloc::vec::Vec;
 
-use log::{debug, error, warn};
+use log::{debug, error};
 
 use super::{
     Ext4InodeHashTreeExt, HashTreeError, HashTreeManager, HashTreeNode, HashTreeSearchResult,
@@ -36,6 +36,10 @@ pub(super) fn lookup<B: BlockDevice>(
 
     let root_block = manager.get_root_block(block_dev, dir_inode)?;
     let root_data = manager.read_block_data(fs, block_dev, root_block)?;
+    // OuroOS patch: "." and ".." reside in block 0 of an HTree root, not in leaf blocks.
+    if matches!(target_name, b"." | b"..") {
+        return manager.search_in_leaf_data(&root_data, target_name, root_block);
+    }
     let root_info = manager.parse_root_node(&root_data)?;
     let HashTreeNode::Root {
         hash_version,
@@ -68,9 +72,12 @@ pub(super) fn lookup<B: BlockDevice>(
             );
             Ok(result)
         }
+        // OuroOS patch: valid HTree EntryNotFound (including continuation blocks) is authoritative;
+        // do not emit warn! or linearly re-scan the entire directory on normal ENOENT.
         Err(HashTreeError::InvalidDirectoryEntry) => Err(HashTreeError::InvalidDirectoryEntry),
+        Err(HashTreeError::EntryNotFound) => Err(HashTreeError::EntryNotFound),
         Err(err) => {
-            warn!("Hash tree lookup failed: {err}, falling back to linear search");
+            debug!("Hash tree lookup failed: {err}, falling back to linear search");
             manager.fallback_to_linear_search(fs, block_dev, dir_inode, target_name)
         }
     }
@@ -138,33 +145,47 @@ impl HashTreeManager {
         target_name: &[u8],
         level: u32,
     ) -> Result<HashTreeSearchResult, HashTreeError> {
-        let mut selected_entry = None;
-        for entry in entries {
+        let mut selected_idx = None;
+        for (i, entry) in entries.iter().enumerate() {
             if entry.hash <= target_hash {
-                selected_entry = Some(entry);
+                selected_idx = Some(i);
             } else {
                 break;
             }
         }
 
-        let entry = selected_entry.ok_or(HashTreeError::EntryNotFound)?;
-        let block_num = resolve_inode_block(block_dev, &mut dir_inode.clone(), entry.block)
-            .map_err(|_| HashTreeError::BlockOutOfRange)?
-            .ok_or(HashTreeError::BlockOutOfRange)?;
-        let block_data = self.read_block_data(fs, block_dev, block_num)?;
+        let mut idx = selected_idx.ok_or(HashTreeError::EntryNotFound)?;
+        // OuroOS patch: follow Ext4 HTree hash-collision continuation blocks (bit 0 == 1).
+        loop {
+            let entry = &entries[idx];
+            let block_num = resolve_inode_block(block_dev, &mut dir_inode.clone(), entry.block)
+                .map_err(|_| HashTreeError::BlockOutOfRange)?
+                .ok_or(HashTreeError::BlockOutOfRange)?;
+            let block_data = self.read_block_data(fs, block_dev, block_num)?;
 
-        if level >= self.indirect_levels as u32 {
-            self.search_in_leaf_data(&block_data, target_name, block_num)
-        } else {
-            let internal_node = self.parse_internal_node(&block_data)?;
-            self.search_in_hash_tree(
-                fs,
-                block_dev,
-                dir_inode,
-                &internal_node,
-                target_hash,
-                target_name,
-            )
+            let res = if level >= self.indirect_levels as u32 {
+                self.search_in_leaf_data(&block_data, target_name, block_num)
+            } else {
+                let internal_node = self.parse_internal_node(&block_data)?;
+                self.search_in_hash_tree(
+                    fs,
+                    block_dev,
+                    dir_inode,
+                    &internal_node,
+                    target_hash,
+                    target_name,
+                )
+            };
+            match res {
+                Err(HashTreeError::EntryNotFound) => {
+                    idx += 1;
+                    if idx < entries.len() && (entries[idx].hash & 1) != 0 {
+                        continue;
+                    }
+                    return Err(HashTreeError::EntryNotFound);
+                }
+                other => return other,
+            }
         }
     }
 

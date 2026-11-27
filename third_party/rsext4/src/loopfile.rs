@@ -195,6 +195,10 @@ pub fn get_file_inode<B: BlockDevice>(
             Err(crate::hashtree::HashTreeError::InvalidDirectoryEntry) => {
                 return Err(Ext4Error::corrupted());
             }
+            // OuroOS patch: lookup_directory_entry already guarantees authoritative EntryNotFound.
+            Err(crate::hashtree::HashTreeError::EntryNotFound) => {
+                return Ok(None);
+            }
             Err(_) => {
                 debug!("Hash tree lookup failed, falling back to linear search");
 

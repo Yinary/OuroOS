@@ -212,9 +212,13 @@ impl FilePage {
         })
     }
     pub(super) fn discard(&self) {
+        if self.data.borrow_mut().take().is_none() {
+            return;
+        }
         let ino = self.file.ino;
-        self.data.borrow_mut().take();
-        crate::fs::cache::release_idle(ino, self.offset);
+        if matches!(self.mode, Mode::Shared { .. }) {
+            crate::fs::cache::release_idle(ino, self.offset);
+        }
         compact_ino(ino);
     }
     pub(super) fn addr(&self) -> Option<PhysAddr> {
@@ -297,6 +301,12 @@ impl FilePage {
             }
             _ => None,
         }
+    }
+}
+impl Drop for FilePage {
+    fn drop(&mut self) {
+        // 进程直接退出而不经 munmap 时同样需要回收共享页与 RESIDENT 弱引用组。
+        self.discard();
     }
 }
 fn map_io(error: Errno) -> MapError {

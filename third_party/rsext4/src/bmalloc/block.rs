@@ -73,12 +73,12 @@ impl BlockAllocator {
             return Err(Ext4Error::invalid_input());
         }
 
-        let mut bitmap = BlockBitmap::new(bitmap_data, self.blocks_per_group);
-
         // Look for the first contiguous free range with the requested length.
         let block_in_group = self
-            .find_contiguous_free_blocks(&bitmap, count)?
+            .find_contiguous_in_slice(bitmap_data, count)
             .ok_or(Ext4Error::no_space())?;
+
+        let mut bitmap = BlockBitmap::new(bitmap_data, self.blocks_per_group);
 
         // Mark the full range as allocated in one pass.
         bitmap
@@ -128,7 +128,56 @@ impl BlockAllocator {
         Ok(None)
     }
 
+    // OuroOS patch: byte-granularity fast scan for contiguous free blocks (0xff/0x00 skip).
+    /// Find the first contiguous free range with the requested length directly on a bitmap slice.
+    pub(crate) fn find_contiguous_in_slice(&self, bitmap_data: &[u8], count: u32) -> Option<u32> {
+        if count == 0 || count > self.blocks_per_group {
+            return None;
+        }
+        let total_bits = self.blocks_per_group as usize;
+        let need = count as usize;
+        let mut consecutive = 0usize;
+        let mut start_idx = 0usize;
+        let mut bit = 0usize;
+        while bit < total_bits {
+            let byte_idx = bit / 8;
+            let &byte = bitmap_data.get(byte_idx)?;
+            if bit.is_multiple_of(8) {
+                if byte == 0xff {
+                    consecutive = 0;
+                    bit += 8;
+                    continue;
+                }
+                if byte == 0x00 && bit + 8 <= total_bits {
+                    if consecutive == 0 {
+                        start_idx = bit;
+                    }
+                    consecutive += 8;
+                    if consecutive >= need {
+                        return Some(start_idx as u32);
+                    }
+                    bit += 8;
+                    continue;
+                }
+            }
+            if (byte & (1 << (bit % 8))) == 0 {
+                if consecutive == 0 {
+                    start_idx = bit;
+                }
+                consecutive += 1;
+                if consecutive == need {
+                    return Some(start_idx as u32);
+                }
+            } else {
+                consecutive = 0;
+            }
+            bit += 1;
+        }
+        None
+    }
+
     /// Find the first contiguous free range with the requested length.
+    #[allow(dead_code)]
     fn find_contiguous_free_blocks(
         &self,
         bitmap: &BlockBitmap,
