@@ -90,6 +90,11 @@ pub mod sysnr {
     pub const NANOSLEEP: usize = 101;
     pub const GETITIMER: usize = 102;
     pub const SETITIMER: usize = 103;
+    pub const TIMER_CREATE: usize = 107;
+    pub const TIMER_GETTIME: usize = 108;
+    pub const TIMER_GETOVERRUN: usize = 109;
+    pub const TIMER_SETTIME: usize = 110;
+    pub const TIMER_DELETE: usize = 111;
     pub const CLOCK_SETTIME: usize = 112;
     pub const CLOCK_GETTIME: usize = 113;
     pub const CLOCK_GETRES: usize = 114;
@@ -679,6 +684,11 @@ pub fn dispatch(
         | sysnr::NANOSLEEP
         | sysnr::GETITIMER
         | sysnr::SETITIMER
+        | sysnr::TIMER_CREATE
+        | sysnr::TIMER_GETTIME
+        | sysnr::TIMER_GETOVERRUN
+        | sysnr::TIMER_SETTIME
+        | sysnr::TIMER_DELETE
         | sysnr::CLOCK_SETTIME
         | sysnr::CLOCK_GETTIME
         | sysnr::CLOCK_GETRES

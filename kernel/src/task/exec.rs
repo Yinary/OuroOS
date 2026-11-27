@@ -288,6 +288,8 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
     // —— 提交段：发布备齐对象，无分配、无失败路径 ——
     rec.space = Some(LocalSpace(space));
     rec.signal.reset_for_exec();
+    let had_posix_timers = !rec.posix_timers.is_empty();
+    rec.posix_timers.clear();
     rec.dumpable = 1;
     rec.keepcaps = false;
     let new_comm = crate::task::comm_from_path(&path);
@@ -305,6 +307,9 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
         context::close_exec(ctx);
         // /proc/self/exe 记录（proc(5)）；值为空串时退化为 ENOENT
         ctx.set_exe_path_owned(exe_value);
+    }
+    if had_posix_timers {
+        super::recompute_next_itimer(reg);
     }
     *frame = next;
     drop(locked);
