@@ -264,3 +264,14 @@ python3 tests/run_official.py la --groups ltp-musl --ltp-filter chown,statx --lt
 - **双架构实测与一致性验证（QEMU 10.0.2 + QCOW2 覆盖层，`sdcard-rv.img`/`sdcard-la.img` `pre-20250615`）**：
   - 6 前缀专项 LTP（`symlink,link,readlink,sendfile,open,unlink`）：`rv` **`113/149`**、`la` **`111/149`**，零 panic；其中 14/14 可运行 `sendfile*`（`sendfile02`–`08` 及其 `_64` 变体，仅 `sendfile09*` 因需 5 GiB 空间报 `TCONF`）、`link02`/`link05`、`symlink02`/`symlink04`、`readlink01`/`readlinkat01`、`open01`/`open03`/`open04`/`open07`/`open09`/`openat01`、`unlink07`/`unlinkat01` 全部 100% 通过。
   - 双架构核心回归与文件系统一致性：`rv` 与 `la` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9 零回退；`tests/fs_stat.py`（默认及 `--metadata`，双架构 128/256 字节 inode + `e2fsck`）**8/8 全部通过**。
+
+### 5.11 LTP 第 3 批建议性文件锁与 `prctl` 验证结果（`fs/file-locks-and-prctl`）
+
+- **补齐范围（均为通用 Linux 语义，无测例特判）**：
+  1. **建议性文件锁表（`kernel/src/fs/locks.rs`、`kernel/src/fs/context.rs`、`kernel/src/syscall/{fs,mod}.rs`）**：为每个打开文件描述分配单调唯一 `ofd_id`，实现 BSD `flock(32)`（`LOCK_SH`/`LOCK_EX`/`LOCK_UN`/`LOCK_NB`）与 `fcntl(25)` 的 POSIX 记录锁（`F_GETLK`/`F_SETLK`/`F_SETLKW`，按线程组归属，关闭同文件任一 FD 或进程退出自动释放）及 OFD 记录锁（`F_OFD_GETLK`/`F_OFD_SETLK`/`F_OFD_SETLKW`，按打开文件描述归属，最后引用释放）；支持字节区间拆分、合并、最小起始偏移冲突返回（对齐 Linux `posix_test_lock`）与阻塞锁调度等待唤醒；同步在 `procfs` 暴露 `/proc/sys/fs/pipe-max-size`（`"1048576\n"`）。
+  2. **`prctl(167)` 核心选项与子进程收割（`kernel/src/task/{mod,exec,user_task}.rs`、`kernel/src/syscall/mod.rs`）**：支持 `PR_SET_PDEATHSIG`/`PR_GET_PDEATHSIG`（父进程退出向直接存活子进程投递信号，`fork` 清零）、`PR_SET_DUMPABLE`/`PR_GET_DUMPABLE`、`PR_SET_KEEPCAPS`/`PR_GET_KEEPCAPS`、`PR_SET_NAME`/`PR_GET_NAME`（16 字节 NUL 结尾进程名，`exec` 同步基名）、`PR_CAPBSET_READ`、`PR_SET_TIMERSLACK`/`PR_GET_TIMERSLACK`、`PR_SET_CHILD_SUBREAPER`/`PR_GET_CHILD_SUBREAPER`（孤儿与僵尸优先过继最近存活 subreaper 祖先，`fork` 清零）与 `PR_SET_NO_NEW_PRIVS`/`PR_GET_NO_NEW_PRIVS`（置位不可撤销，`fork`/`exec` 继承）。
+- **双架构实测对比（QEMU 10.0.2 + QCOW2 覆盖层，`sdcard-rv.img`/`sdcard-la.img` `pre-20250615`）**：
+  - 3 前缀专项 LTP（`fcntl,flock,prctl`）：
+    - 改动前基线（`fs/link-symlink-sendfile`）：`la` **`41/97`**（`fcntl` 40/68、`flock` 1/15、`prctl` 0/14）；
+    - 本批修复后：`rv` **`118/139`**、`la` **`118/139`**（双架构净增 **+77** 条通过断言，+187.8%，零 panic）；其中 `flock` 全部 **19/19（100%）**、`fcntl` 达 **80/94**（含 `fcntl11`/`fcntl21`/`fcntl30` 及其 `_64` 变体）、`prctl` 达 **19/26**。
+  - 双架构核心回归与专项：`rv` 与 `la` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9 零回退；`tests/fs_fcntl.py` 双架构 + `e2fsck` 全部通过。
