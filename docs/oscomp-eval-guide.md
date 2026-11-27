@@ -254,3 +254,13 @@ python3 tests/run_official.py la --groups ltp-musl --ltp-filter chown,statx --lt
     - 本批修复后：`rv` **`420/525`**（净增 **+176** 条通过断言，+72.1%）、`la` **`421/527`**（净增 **+177** 条通过断言），零 panic；其中 `socket01`/`socket02`/`socketpair01`/`socketpair02`/`waitpid04`/`wait403`/`mmap08`/`open01`/`pipe12` 均 100% 通过，`waitpid01` 通过 126/146，`readahead01` 提升至 9/25，`mmap04` 权限行匹配生效。
   - 资源限额专项 LTP（`getrlimit,setrlimit,prlimit`）：`rv` **`40/40`**、`la` **`40/40`**（双架构 100% 通过）。
   - 双架构回归与专项：`rv` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9、`cyclictest-musl` 5.14/4；`la` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9；`tests/fs_fcntl.py` 双架构 + `e2fsck` 全部通过。
+
+### 5.10 LTP 第 2 批符号链接、硬链接与 `sendfile` 验证结果（`fs/link-symlink-sendfile`）
+
+- **补齐范围（均为通用 Linux 文件系统与 VFS 语义，无测例特判）**：
+  1. **Ext4 符号链接与硬链接后端（`third_party/rsext4/src/file/{create,link,delete,mod}.rs`、`kernel/src/fs/{ext4_rsext4,mod}.rs`）**：新增 `create_symlink_inode`（允许相对与悬空目标，支持 <60 字节内联快速链接与块存储长链接）与 `link_inode`（按 inode 创建非目录硬链接，支持 `EPERM`/`EMLINK` 检查与失败回滚）；扩展 `unlink_regular_entry` 放行符号链接，并在 `free_inode` 中跳过内联快速符号链接的块指针遍历，防止破坏 Ext4 块分配表。
+  2. **`symlinkat(36)`、`linkat(37)` 与路径符号链接跟随（`kernel/src/fs/{context,metadata}.rs`、`kernel/src/syscall/{fs,mod}.rs`）**：接入 `symlinkat` 与 `linkat`（支持 `AT_SYMLINK_FOLLOW` 与 `AT_EMPTY_PATH`）；统一 `openat`/`mkdirat`/`chdir`/`unlinkat` 走中间符号链接跟随解析，`openat` 支持 `O_NOFOLLOW`（命中链接返回 `ELOOP`，配 `O_PATH` 允许打开链接本身）及悬空链接配合 `O_CREAT` 创建目标文件；`unlinkat` 末项不跟随且非法标志返回 `EINVAL`；`fs::resolve` 保留规范路径 `fast_metadata` 单锁快路径。
+  3. **`sendfile(71)` 内核搬运（`kernel/src/syscall/{fs,mod}.rs`、`kernel/src/fs/context.rs`）**：复用 64 KiB `IO_SCRATCH` 暂存池在两 FD 间搬运字节，校验读写模式、`O_PATH`、`O_APPEND`（返回 `EINVAL`）与可定位输入端，支持可选 `offset` 指针、同一 FD 自拷贝、管道/套接字短写偏移回退、零进度定向阻塞唤醒与 `SIGPIPE`。
+- **双架构实测与一致性验证（QEMU 10.0.2 + QCOW2 覆盖层，`sdcard-rv.img`/`sdcard-la.img` `pre-20250615`）**：
+  - 6 前缀专项 LTP（`symlink,link,readlink,sendfile,open,unlink`）：`rv` **`113/149`**、`la` **`111/149`**，零 panic；其中 14/14 可运行 `sendfile*`（`sendfile02`–`08` 及其 `_64` 变体，仅 `sendfile09*` 因需 5 GiB 空间报 `TCONF`）、`link02`/`link05`、`symlink02`/`symlink04`、`readlink01`/`readlinkat01`、`open01`/`open03`/`open04`/`open07`/`open09`/`openat01`、`unlink07`/`unlinkat01` 全部 100% 通过。
+  - 双架构核心回归与文件系统一致性：`rv` 与 `la` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9 零回退；`tests/fs_stat.py`（默认及 `--metadata`，双架构 128/256 字节 inode + `e2fsck`）**8/8 全部通过**。
