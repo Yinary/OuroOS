@@ -89,6 +89,17 @@ pub fn syscall6(nr: usize, args: [usize; 6]) -> isize {
     // SAFETY: 汇编桩依照 C ABI 按值搬运参数，并保留被调用者保存寄存器。
     unsafe { __syscall6(nr, args[0], args[1], args[2], args[3], args[4], args[5]) }
 }
+/// clock_gettime(2) 的 RV64/LA64 timespec 含秒、纳秒两个有符号字段。
+pub fn sys_clock_gettime(clock: i32, stamp: &mut [i64; 2]) -> isize {
+    syscall3(113, clock as usize, stamp.as_mut_ptr() as usize, 0)
+}
+
+/// clock_getres(2) 查询秒和纳秒分辨率；省略输出时只验证时钟编号。
+pub fn sys_clock_getres(clock: i32, result: Option<&mut [i64; 2]>) -> isize {
+    let ptr = result.map_or(0, |stamp| stamp.as_mut_ptr() as usize);
+    syscall3(114, clock as usize, ptr, 0)
+}
+
 /// 原始 brk ABI，失败时返回旧地址；传零查询。
 pub fn sys_brk(addr: usize) -> usize {
     syscall3(214, addr, 0, 0) as usize

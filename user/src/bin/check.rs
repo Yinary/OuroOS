@@ -61,6 +61,7 @@ extern "C" fn ouro_main() -> ! {
     expect(syscall3(SYS_BOGUS, 0, 0, 0), ENOSYS);
 
     mm_checks();
+    clock_checks();
     expect(user::sys_mmap(0x5000, 4096, 3, 0x32, usize::MAX, 0), 0x5000);
     expect(user::sys_munmap(0x5000, 4096), 0);
     // 前置检查全部通过；随后故意访问未映射地址（0x5000），
@@ -69,6 +70,52 @@ extern "C" fn ouro_main() -> ! {
     let sink = unsafe { core::ptr::read_volatile(0x5000usize as *const u64) };
     // 不应到达：若内核错误地放行，则以 3 退出暴露问题
     sys_exit(sink as _);
+}
+
+/// 覆盖两种时钟、错误参数，以及跨页 timespec 的权限校验。
+fn clock_checks() {
+    use user::{sys_clock_getres, sys_clock_gettime, sys_mmap, sys_mprotect, sys_munmap};
+    let mut first = [-1, -1];
+    let mut next = [-1, -1];
+    let mut realtime_res = [0, 0];
+    for clock in [0, 1] {
+        let mut res = [-1, -1];
+        expect(sys_clock_getres(clock, None), 0);
+        expect(sys_clock_getres(clock, Some(&mut res)), 0);
+        if res[0] < 0 || !(0..1_000_000_000).contains(&res[1]) || res == [0, 0] {
+            sys_exit(1);
+        }
+        if clock == 0 {
+            realtime_res = res;
+        } else if res != realtime_res {
+            sys_exit(1);
+        }
+        expect(sys_clock_gettime(clock, &mut first), 0);
+        expect(sys_clock_gettime(clock, &mut next), 0);
+        if first[0] < 0
+            || !(0..1_000_000_000).contains(&first[1])
+            || !(0..1_000_000_000).contains(&next[1])
+            || next < first
+        {
+            sys_exit(1);
+        }
+    }
+    expect(sys_clock_getres(-1, None), -22);
+    expect(sys_clock_getres(-1, Some(&mut next)), -22);
+    expect(sys_clock_gettime(-1, &mut next), -22);
+    expect(syscall3(113, 0, 0, 0), EFAULT);
+    let pages = sys_mmap(0, 8192, 3, 0x22, usize::MAX, 0);
+    if pages < 0 {
+        sys_exit(1);
+    }
+    let base = pages as usize;
+    expect(syscall3(113, 1, base + 4096 - 8, 0), 0);
+    expect(syscall3(114, 1, base + 4096 - 8, 0), 0);
+    expect(sys_mprotect(base + 4096, 4096, 1), 0);
+    expect(syscall3(113, 1, base + 4096 - 8, 0), EFAULT);
+    expect(syscall3(114, 1, base + 4096 - 8, 0), EFAULT);
+    expect(sys_munmap(base, 8192), 0);
+    sys_write(1, b"check: clock syscall paths ok\n");
 }
 
 /// 覆盖内存 syscall 错误、固定替换和权限；末尾非法访存仍由既有流程检查。
