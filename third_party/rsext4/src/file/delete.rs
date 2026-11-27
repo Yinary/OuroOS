@@ -20,9 +20,12 @@ pub fn free_inode<B: BlockDevice>(
     } else {
         (BLOCK_SIZE / 512) as u64
     };
-    let fast_symlink =
-        inode.is_symlink() && inode.size() < 60 && inode.blocks_count() == xattr_sectors;
-    let mut used_blocks: Vec<AbsoluteBN> = if fast_symlink {
+    let no_data_blocks = (inode.is_symlink() && inode.size() < 60 && inode.blocks_count() == xattr_sectors)
+        || matches!(
+            inode.i_mode & 0xf000,
+            Ext4Inode::S_IFIFO | Ext4Inode::S_IFCHR | Ext4Inode::S_IFBLK | Ext4Inode::S_IFSOCK
+        );
+    let mut used_blocks: Vec<AbsoluteBN> = if no_data_blocks {
         Vec::new()
     } else {
         let mut blocks: Vec<AbsoluteBN> = extent_block_map(block_dev, inode, true)?
@@ -88,8 +91,16 @@ pub fn unlink_regular_entry<B: BlockDevice>(
     if inode.is_dir() {
         return Err(Ext4Error::is_dir());
     }
-    // OuroOS patch: allow unlinking symlinks in addition to regular files.
-    if !inode.is_file() && !inode.is_symlink() {
+    // OuroOS patch: allow unlinking symlinks, FIFOs, devices, and sockets in addition to regular files.
+    if !matches!(
+        inode.i_mode & 0xf000,
+        Ext4Inode::S_IFREG
+            | Ext4Inode::S_IFLNK
+            | Ext4Inode::S_IFIFO
+            | Ext4Inode::S_IFCHR
+            | Ext4Inode::S_IFBLK
+            | Ext4Inode::S_IFSOCK
+    ) {
         return Err(Ext4Error::unsupported());
     }
     let links = inode.i_links_count.checked_sub(1).ok_or_else(Ext4Error::corrupted)?;

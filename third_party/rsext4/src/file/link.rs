@@ -42,12 +42,14 @@ pub fn link_inode<B: BlockDevice>(
             return Err(Ext4Error::already_exists());
         }
     }
-    let file_type = if target_inode.is_file() {
-        Ext4DirEntry2::EXT4_FT_REG_FILE
-    } else if target_inode.is_symlink() {
-        Ext4DirEntry2::EXT4_FT_SYMLINK
-    } else {
-        Ext4DirEntry2::EXT4_FT_UNKNOWN
+    let file_type = match target_inode.i_mode & 0xf000 {
+        Ext4Inode::S_IFREG => Ext4DirEntry2::EXT4_FT_REG_FILE,
+        Ext4Inode::S_IFLNK => Ext4DirEntry2::EXT4_FT_SYMLINK,
+        Ext4Inode::S_IFIFO => Ext4DirEntry2::EXT4_FT_FIFO,
+        Ext4Inode::S_IFCHR => Ext4DirEntry2::EXT4_FT_CHRDEV,
+        Ext4Inode::S_IFBLK => Ext4DirEntry2::EXT4_FT_BLKDEV,
+        Ext4Inode::S_IFSOCK => Ext4DirEntry2::EXT4_FT_SOCK,
+        _ => Ext4DirEntry2::EXT4_FT_UNKNOWN,
     };
     insert_dir_entry(fs, device, parent, &mut dir, target_ino, name, file_type)?;
     let new_links = target_inode.i_links_count + 1;

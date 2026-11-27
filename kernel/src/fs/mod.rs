@@ -367,6 +367,30 @@ pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
     }
 }
 
+/// 在指定父目录下创建普通或特殊节点（含设备号 rdev）；FAT 仅支持普通文件。
+pub fn create_node(parent: u32, name: &str, mode: u16, rdev: u64) -> Result<u32, Errno> {
+    if parent == procfs::DEVDIR {
+        let dev_ino = match ext4::lookup("/dev") {
+            Ok(ino) => ino,
+            Err(Errno::NoEntry) => {
+                let root = ext4::lookup("/")?;
+                ext4::create(root, "dev", 0o040755)?
+            }
+            Err(e) => return Err(e),
+        };
+        return ext4::create_node(dev_ino, name, mode, rdev);
+    }
+    if parent & FAT_INODE != 0 {
+        if mode & 0xf000 == 0x8000 {
+            fat::create(parent, name, mode)
+        } else {
+            Err(Errno::NotSupported)
+        }
+    } else {
+        ext4::create_node(parent, name, mode, rdev)
+    }
+}
+
 /// 在指定父目录下创建符号链接；FAT 与虚拟目录不支持。
 pub(crate) fn symlink(parent: u32, name: &str, target: &str) -> Result<u32, Errno> {
     if procfs::is_virtual_ino(parent) {
@@ -481,6 +505,11 @@ pub(crate) fn read_dir(
     } else {
         ext4::read_dir(ino, offset, visit)
     }
+}
+
+/// 按 inode 查询元数据快照。
+pub(crate) fn metadata(ino: u32) -> Result<Metadata, Errno> {
+    metadata::metadata(ino)
 }
 
 /// 写入文件指定偏移，返回实际字节数。
@@ -646,8 +675,8 @@ pub fn chmod_apply(
     _space: &crate::mm::address_space::UserAddressSpace,
 ) -> Result<usize, Errno> {
     let (cur_mode, ..) = stat(ino)?;
-    if cur_mode & 0xf000 != 0x8000 && cur_mode & 0xf000 != 0x4000 {
-        return Err(Errno::Invalid); // 仅普通文件与目录可 chmod
+    if !matches!(cur_mode & 0xf000, 0x8000 | 0x4000 | 0x1000) {
+        return Err(Errno::Invalid);
     }
     chmod_by_ino(ino, path, mode as u16 & 0o7777)?;
     Ok(0)

@@ -9,12 +9,32 @@ pub fn create_regular_inode<B: BlockDevice>(
     name: &str,
     mode: u16,
 ) -> Ext4Result<InodeNumber> {
+    create_special_inode(device, fs, parent, name, mode, 0)
+}
+
+// OuroOS patch: create a regular or special (FIFO/chr/blk/sock) inode by parent inode.
+/// Creates an empty regular, FIFO, device, or socket inode in an existing, linear directory.
+pub fn create_special_inode<B: BlockDevice>(
+    device: &mut Jbd2Dev<B>,
+    fs: &mut Ext4FileSystem,
+    parent: InodeNumber,
+    name: &str,
+    mode: u16,
+    rdev: u64,
+) -> Ext4Result<InodeNumber> {
     if fs.readonly {
         return Err(Ext4Error::read_only());
     }
-    if mode & 0xf000 != Ext4Inode::S_IFREG {
-        return Err(Ext4Error::unsupported());
-    }
+    let ftype = mode & 0xf000;
+    let dir_ft = match ftype {
+        Ext4Inode::S_IFREG => Ext4DirEntry2::EXT4_FT_REG_FILE,
+        Ext4Inode::S_IFIFO => Ext4DirEntry2::EXT4_FT_FIFO,
+        Ext4Inode::S_IFCHR => Ext4DirEntry2::EXT4_FT_CHRDEV,
+        Ext4Inode::S_IFBLK => Ext4DirEntry2::EXT4_FT_BLKDEV,
+        Ext4Inode::S_IFSOCK => Ext4DirEntry2::EXT4_FT_SOCK,
+        _ => return Err(Ext4Error::unsupported()),
+    };
+    let is_regular = ftype == Ext4Inode::S_IFREG;
     if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\0']) {
         return Err(Ext4Error::invalid_input());
     }
@@ -39,9 +59,17 @@ pub fn create_regular_inode<B: BlockDevice>(
     let mut inode = Ext4Inode::empty_for_reuse(fs.default_inode_extra_isize());
     inode.i_links_count = 1;
     inode.i_flags = Ext4Inode::mask_flags_for_mode(mode, dir.i_flags & Ext4Inode::EXT4_FL_INHERITED);
-    if fs.superblock.has_extents() {
+    if is_regular && fs.superblock.has_extents() {
         inode.i_flags |= Ext4Inode::EXT4_EXTENTS_FL;
         inode.write_extend_header();
+    } else if matches!(ftype, Ext4Inode::S_IFCHR | Ext4Inode::S_IFBLK) {
+        let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
+        let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff);
+        if major < 256 && minor < 256 {
+            inode.i_block[0] = ((major << 8) | minor) as u32;
+        } else {
+            inode.i_block[1] = ((minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)) as u32;
+        }
     }
     if let Err(error) =
         fs.finalize_inode_update(device, ino, &mut inode, Ext4InodeMetadataUpdate::create(mode))
@@ -49,9 +77,7 @@ pub fn create_regular_inode<B: BlockDevice>(
         discard_unpublished_inode(fs, device, ino, &[]);
         return Err(error);
     }
-    if let Err(error) =
-        insert_dir_entry(fs, device, parent, &mut dir, ino, name, Ext4DirEntry2::EXT4_FT_REG_FILE)
-    {
+    if let Err(error) = insert_dir_entry(fs, device, parent, &mut dir, ino, name, dir_ft) {
         // OuroOS patch: reclaim the child only when insertion failed before publication.
         if no_space_before_insert(error) {
             free_inode(fs, device, ino, &mut inode)?;

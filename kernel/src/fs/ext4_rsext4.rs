@@ -562,6 +562,18 @@ pub(super) fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
     })
 }
 
+/// 在指定父目录创建带设备号的特殊节点（普通文件、FIFO、字符/块设备或套接字）。
+pub(super) fn create_node(parent: u32, name: &str, mode: u16, rdev: u64) -> Result<u32, Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        let parent = InodeNumber::new(parent)?;
+        rsext4::file::create_special_inode(&mut v.device, &mut v.fs, parent, name, mode, rdev)
+            .map(|ino| ino.raw())
+    })
+}
+
 /// 在指定父目录创建符号链接，允许相对或悬空目标。
 pub(super) fn symlink(parent: u32, name: &str, target: &str) -> Result<u32, Errno> {
     if !WRITABLE {

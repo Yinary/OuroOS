@@ -42,6 +42,7 @@ pub mod sysnr {
     pub const TRUNCATE: usize = 45;
     pub const FTRUNCATE: usize = 46;
     pub const CHDIR: usize = 49;
+    pub const FCHDIR: usize = 50;
     pub const OPENAT: usize = 56;
     pub const CLOSE: usize = 57;
     pub const PIPE2: usize = 59;
@@ -56,6 +57,8 @@ pub mod sysnr {
     pub const PREADV: usize = 69;
     pub const PWRITEV: usize = 70;
     pub const SENDFILE: usize = 71;
+    pub const SPLICE: usize = 76;
+    pub const TEE: usize = 77;
     pub const READLINKAT: usize = 78;
     pub const FSTATAT: usize = 79;
     pub const FSTAT: usize = 80;
@@ -64,6 +67,8 @@ pub mod sysnr {
     pub const UTIMENSAT: usize = 88;
     pub const UMASK: usize = 166;
     pub const RENAMEAT2: usize = 276;
+    pub const FADVISE64: usize = 223;
+    pub const COPY_FILE_RANGE: usize = 285;
     pub const STATX: usize = 291;
     // 进程
     pub const EXIT: usize = 93;
@@ -210,6 +215,8 @@ pub enum Errno {
     Exists,
     NotDir,
     IsDir,
+    /// ENXIO: 无对应设备或无读端非阻塞打开 FIFO。
+    NxIo,
     NoDevice,
     TooManyFiles,
     Range,
@@ -289,6 +296,7 @@ impl Errno {
             Self::Exists => 17,
             Self::NotDir => 20,
             Self::IsDir => 21,
+            Self::NxIo => 6,
             Self::NoDevice => 19,
             Self::TooManyFiles => 24,
             Self::Range => 34,
@@ -379,6 +387,7 @@ pub fn dispatch(
         | sysnr::TRUNCATE
         | sysnr::FTRUNCATE
         | sysnr::CHDIR
+        | sysnr::FCHDIR
         | sysnr::OPENAT
         | sysnr::CLOSE
         | sysnr::PIPE2
@@ -393,6 +402,10 @@ pub fn dispatch(
         | sysnr::PREADV
         | sysnr::PWRITEV
         | sysnr::SENDFILE
+        | sysnr::SPLICE
+        | sysnr::TEE
+        | sysnr::FADVISE64
+        | sysnr::COPY_FILE_RANGE
         | sysnr::READLINKAT
         | sysnr::FSTAT
         | sysnr::FSTATAT
@@ -417,9 +430,28 @@ pub fn dispatch(
                 credentials,
                 thread.tgid as u32,
             );
-            // pipe/套接字/文件锁无数据或锁冲突且阻塞：等待唤醒。
+            // pipe/套接字/文件锁/FIFO 打开无数据或锁冲突且阻塞：等待唤醒。
             if ret == Err(Errno::WouldBlock) {
-                if matches!(nr, sysnr::FCNTL | sysnr::FLOCK) {
+                if matches!(nr, sysnr::FCNTL | sysnr::FLOCK | sysnr::OPENAT) {
+                    return Flow::Wait(WaitReason::Pipe);
+                }
+                if nr == sysnr::SPLICE || nr == sysnr::TEE {
+                    let out_fd = if nr == sysnr::SPLICE {
+                        args[2]
+                    } else {
+                        args[1]
+                    };
+                    let wait_fd = if fs.wait_id(args[0]).is_some() && !fs.has_readable_data(args[0])
+                    {
+                        args[0]
+                    } else if fs.wait_id(out_fd).is_some() {
+                        out_fd
+                    } else {
+                        args[0]
+                    };
+                    if let Some(id) = fs.wait_id(wait_fd) {
+                        return Flow::Wait(WaitReason::PipeId(id));
+                    }
                     return Flow::Wait(WaitReason::Pipe);
                 }
                 if let Some(id) = fs.wait_id(args[0]) {
@@ -429,7 +461,10 @@ pub fn dispatch(
             }
             // 向无读者的管道写入：SIGPIPE 入队并与 -EPIPE 返回并行。
             if ret == Err(Errno::Pipe)
-                && (nr == sysnr::WRITE || nr == sysnr::WRITEV || nr == sysnr::SENDFILE)
+                && matches!(
+                    nr,
+                    sysnr::WRITE | sysnr::WRITEV | sysnr::SENDFILE | sysnr::SPLICE | sysnr::TEE
+                )
             {
                 signal.generate(
                     SIGPIPE,
