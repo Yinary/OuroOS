@@ -212,6 +212,24 @@ impl OwnedFrame {
         }
         Ok(())
     }
+    /// 将页内指定范围经内核直映可变切片交给回调填充，避免经临时栈缓冲二次拷贝。
+    pub(crate) fn fill_range_with<E>(
+        &self,
+        offset: usize,
+        len: usize,
+        f: impl FnOnce(&mut [u8]) -> Result<usize, E>,
+    ) -> Result<usize, E> {
+        let end = offset.saturating_add(len).min(PAGE_SIZE);
+        let slice_len = end.saturating_sub(offset);
+        // SAFETY: self 独占持有该物理页帧，offset..end 位于单页内，单核内核态无并发别名。
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(
+                (direct_map_addr(self.pa) + offset) as *mut u8,
+                slice_len,
+            )
+        };
+        f(dst)
+    }
     /// 清零页内半开区间；边界裁剪到本页，空区间无副作用。
     pub(crate) fn clear_range(&self, start: usize, end: usize) {
         let end = end.min(PAGE_SIZE);
