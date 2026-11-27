@@ -327,8 +327,9 @@ try_lock 失败即报告“持锁跨调度”。
 | 状态查询路径与标志 | 支持绝对路径、cwd/目录 FD 相对路径、AT_EMPTY_PATH（含 NULL）、AT_SYMLINK_NOFOLLOW、AT_NO_AUTOMOUNT；查询时逐级跟随链接，最多 40 次，保留点分量与尾斜杠约束 | 查询与重命名父目录解析共用，不代表 open/exec 已支持跟随链接；cwd/目录 FD 仍按保存的路径字符串定位；沿用项目 UTF-8 路径限制，尚无进程身份驱动的目录搜索权限检查 | 取舍，理由待补：UTF-8 路径限制；未实现：目录搜索权限检查 |
 | statx 同步与 mask | 本地卷按当前 inode 缓存查询；接受 AS_STAT/FORCE_SYNC/DONT_SYNC，后两者不触发远端同步或额外文件数据写回；互斥同步标志、未知 flags、保留 mask 位 0x80000000 返回 EINVAL，其余未知 mask 位忽略 | 返回 mask 反映实际提供字段，可以多于请求；缺失时间不标有效，填零；当前 atime 更新策略仍沿用 rsext4 挂载选项 | 无偏差 |
 | fsync | EXT4 写回该 inode 的共享页并同步 rsext4 缓存/日志 | FAT 返回 ENOTSUP | 未实现：FAT |
-| mount | fstype 接受 vfat/fat；源设备 `/dev/vd<小写字母>[0-4]`（无后缀或 0 为整盘）；flags 必须 0，data 忽略；/proc/mounts 报告根卷（按实际设备号命名）与 FAT 挂载记录 | 仅 MBR 主分区；不限于 a-d | 未实现：非 MBR 主分区、flags 与 data |
-| 原始块设备读写 | 已注册块设备支持顺序和定位读写。有效 UID 为 0 的进程可打开数据描述符。按分区容量截断跨尾请求，读至末尾返回 EOF，末尾继续写返回 ENOSPC。 | 根卷或 FAT 卷占用的磁盘禁止原始写入，返回 EBUSY。只读构建返回 EROFS。 | 块设备专用同步、Ext4 非根卷挂载和只读重挂载待完善。 |
+| mount/umount2 | FAT 接受 vfat/fat，只支持 flags 为 0。Ext2 以独立辅助磁盘或其 MBR 主分区为源，支持可写挂载、只读挂载和从可写重挂载为只读，仅有效 UID 为 0 的进程可操作。Ext2 挂载点有存活引用时拒绝卸载或重挂载。/proc/mounts 报告各卷。 | Ext2 挂载点限于根 Ext4 上未被占用的目录，禁止与现有卷共用磁盘。卷有独立设备号，已覆盖目录在卸载后恢复可见。 | 通用挂载标志、嵌套 Ext2、非根 Ext4 和重挂载为可写未接入。 |
+| Ext2 辅助卷 | 支持 1 KiB 块、128 字节 inode 的干净无日志卷。支持线性目录遍历、文件和符号链接读取、普通文件创建、同卷硬链接与删名、容量查询和同步。 | 只写普通文件的前 12 个直接块，目录项插入使用现有目录空间。末次删名遇到存活引用返回 EBUSY。写入或刷盘失败时恢复受影响块，恢复失败后拒绝访问该卷。 | 散列目录、目录扩容、截断、重命名、符号链接创建与掉电恢复未实现。 |
+| 原始块设备读写 | 已注册块设备支持顺序和定位读写。有效 UID 为 0 的进程可打开数据描述符。按分区容量截断跨尾请求，读至末尾返回 EOF，末尾继续写返回 ENOSPC。 | 已挂载卷占用的磁盘禁止原始写入，返回 EBUSY。只读构建返回 EROFS。 | 块设备专用同步待完善。 |
 | 设备命名与根卷 | 设备号按总线枚举顺序分配，无内容特征重排；Ext4 根卷为扫描式选择：每盘先试分区 1..4 再试整盘，取第一个可挂载的 Ext4。官方 mount 测例写死的 `/dev/vda2`（辅助盘 FAT32 分区）由用户态启动器按授权清单 mknodat 建立块设备节点（major 254，minor=(盘<<4)\|分区，见 §6.3），内核按节点登记的真实设备身份解析挂载 | 设备节点是内核注册表条目而非文件系统实体；根卷语义与设备名无绑定；辅助盘由官方 harness 自动挂为第二块盘 | 取舍，理由待补 |
 | mmap | 匿名映射、普通文件和 /dev/zero 均支持 PRIVATE/SHARED；/dev/zero 按需提供零页，共享写权限由打开模式决定；文件整页在 EOF 外允许建图，直接访问按 SIGBUS 终止；MAP_FIXED 事务替换 | 最后不足一页的尾部补零且不回写；MAP_FIXED 可覆盖用户栈；flags 白名单，MAP_DENYWRITE、MAP_EXECUTABLE 与 MAP_STACK 按 Linux 忽略 | 无偏差 |
 | mprotect | 支持 PROT_NONE 和 R/W/X 组合；W 隐含 R，只读 FD 建立的共享映射禁止提升写权限（EACCES） | 两架构无 NX；VMA 记录请求权限，页表执行写保护，可访问页实际带 X | 取舍，理由待补：没有执行权限保护 |
@@ -477,7 +478,7 @@ signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综�
 | context | 每进程 cwd、FD 表、打开文件对象与管道 | `fs/context.rs` |
 | fs / metadata | 路径与 inode 分发、统一属性和目录接口、状态查询路径解析 | `fs/mod.rs`、`fs/metadata.rs` |
 | cache | 文件共享页、普通读写与已有映射间的内容同步 | `fs/cache.rs` |
-| 文件系统适配 | Ext4 根卷与 FAT 挂载卷、后端错误转换 | `fs/ext4_rsext4.rs`、`fs/fat.rs` |
+| 文件系统适配 | Ext4 根卷、FAT 和 Ext2 辅助卷、后端错误转换 | `fs/ext4_rsext4.rs`、`fs/fat.rs`、`fs/ext2_mount.rs` |
 | 第三方后端 | rsext4 0.8.1 的 inode、目录、数据块与日志；rust-fatfs 的 FAT 操作 | `third_party/rsext4/`、`kernel/Cargo.toml` |
 | 块设备 | VirtIO Block 同步 I/O、字节访问与 MBR 分区解析 | `drivers/mod.rs` |
 
@@ -631,7 +632,7 @@ exec/spawn 从设备树启动熵派生独立的 16 字节，AT_RANDOM 指向新�
 
 固定地址映射支持 MAP_FIXED_NOREPLACE（重叠返回 EEXIST，原数据保留）。MAP_LOCKED 使用与 mlockall 相同的限额，在建立映射后尽力预取，不改变未来映射的锁策略；没有交换空间预留账本，MAP_NORESERVE 不额外预留。MAP_POPULATE 在 VMA 建立后尽力预取；与 MAP_NONBLOCK 同用时不预取。未锁定的私有匿名 mremap 扩展只增加虚拟区间。MADV_DONTFORK/DOFORK 控制子进程是否继承该区间；WIPEONFORK/KEEPONFORK 控制私有匿名、堆、栈页在子进程内是否重新取零页。父进程内容不变。共享匿名扩展仅增加虚拟页描述，物理数据页按需分配；fork 时私有匿名、堆和栈驻留页按写时复制共享。ELF 页和已驻留的私有文件页仍在 fork 时复制；尚无换出。
 
-/proc/meminfo 每次打开保存一次帧分配器统计；Cached 只计文件页缓存的数据帧。MemTotal 为已登记的可分配物理内存；MemAvailable 为 MemFree 的保守估计；交换为零。sysinfo(179) 提供同口径的总量和空闲量，单位 1024 字节；尚未统计负载均值和共享内存用量。procfs 另提供根目录、`/proc/<pid>/`（stat/cmdline/status）与设备节点，枚举来自 Task 维护的独立快照表（§4.3"其他"行）；/proc/mounts 报告根卷与 FAT 挂载。
+/proc/meminfo 每次打开保存一次帧分配器统计；Cached 只计文件页缓存的数据帧。MemTotal 为已登记的可分配物理内存；MemAvailable 为 MemFree 的保守估计；交换为零。sysinfo(179) 提供同口径的总量和空闲量，单位 1024 字节；尚未统计负载均值和共享内存用量。procfs 另提供根目录、`/proc/<pid>/`（stat/cmdline/status）与设备节点，枚举来自 Task 维护的独立快照表（§4.3"其他"行）；/proc/mounts 报告根卷与辅助卷挂载。/proc/cpuinfo 以只读快照报告单核逻辑处理器编号与内核目标架构。
 
 LTP 组由启动器逐例驱动，不执行盘上的 ltp_testcode.sh：按名字排序遍历 ltp/testcases/bin 的普通文件，每例在独立会话里执行并套用 2 秒逐例时限，超时按会话逐进程 SIGKILL，回收等待上限 30 秒；用例超时或 /tmp 空闲低于 256 MiB 时清空 /tmp，单次最多两万次删除尝试。组结束后列出用例自建会话留下的进程，对它们发 SIGKILL 并等待退出，上限同样是 30 秒。截止时刻取启动器开始后 3400 秒，到点后不再启动新用例；该组只在 loongarch64 上启用，riscv64 上截止时刻已过、不启动任何用例并打印空的组标记，判分按两架构相加，所以该组分数只来自 loongarch64。glibc 组当前零分，调用位置保留但未启用。原版脚本无逐例时限，镜像中第一个不退出的用例是 cgroup_fj_proc，先 sigsuspend 等待信号，因此原版脚本在任何内核上都跑不到第 107 例之后；脚本也无超时保护，第 184 例 connect01 会 kill(0, SIGKILL) 终止同进程组的脚本 shell。
 

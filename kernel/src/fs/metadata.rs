@@ -1,6 +1,6 @@
 //! 与后端无关的文件属性与路径解析。
 #![deny(unsafe_code)]
-use super::{ext4, fat, lookup, FAT_INODE};
+use super::{ext2_mount, ext4, fat, lookup, FAT_INODE};
 use crate::syscall::Errno;
 use alloc::string::String;
 
@@ -15,6 +15,7 @@ pub(crate) struct Timestamp {
 #[derive(Default)]
 pub(crate) struct Metadata {
     pub ino: u64,
+    pub(super) handle: Option<u32>,
     pub dev: u64,
     pub rdev: u64,
     pub mode: u16,
@@ -28,6 +29,13 @@ pub(crate) struct Metadata {
     pub mtime: Option<Timestamp>,
     pub ctime: Option<Timestamp>,
     pub btime: Option<Timestamp>,
+}
+
+impl Metadata {
+    /// 返回文件系统内部使用的 inode 句柄。
+    pub(crate) fn inode_handle(&self) -> u32 {
+        self.handle.unwrap_or(self.ino as u32)
+    }
 }
 
 /// 按 inode 取得后端元数据，失败返回后端错误。
@@ -58,7 +66,10 @@ pub(super) fn metadata(ino: u32) -> Result<Metadata, Errno> {
     }
     // procfs 虚拟节点（/proc、/proc/<pid>、/dev/*）无后端 inode，按统一
     // stat 结果合成，避免 resolve 逐分量解析时把虚拟节点当 ext4 处理
-    if ino >= super::procfs::MISC_DIR || super::procfs::pid_ino_parts(ino).is_some() {
+    if ino == super::procfs::CPUINFO
+        || ino >= super::procfs::MISC_DIR
+        || super::procfs::pid_ino_parts(ino).is_some()
+    {
         let (mode, size, links, _) = super::stat(ino)?;
         return Ok(Metadata {
             ino: ino as u64,
@@ -69,7 +80,9 @@ pub(super) fn metadata(ino: u32) -> Result<Metadata, Errno> {
             ..Default::default()
         });
     }
-    if ino & FAT_INODE != 0 {
+    if ext2_mount::is_handle(ino) {
+        ext2_mount::metadata(ino)
+    } else if ino & FAT_INODE != 0 {
         fat::metadata(ino)
     } else {
         ext4::metadata(ino)
@@ -153,7 +166,7 @@ pub(super) fn resolve_entry(
                         return Ok((
                             candidate,
                             ResolvedEntry::Missing {
-                                parent: info.ino as u32,
+                                parent: info.inode_handle(),
                             },
                         ));
                     }
@@ -165,7 +178,7 @@ pub(super) fn resolve_entry(
                     if links > 40 {
                         return Err(Errno::Loop);
                     }
-                    let mut target = ext4::link_target(ino)?;
+                    let mut target = super::read_link(ino)?;
                     if target.is_empty() {
                         return Err(Errno::NoEntry);
                     }

@@ -1,4 +1,4 @@
-//! 文件系统入口，按路径和 inode 将操作转交 Ext4 或 FAT。
+//! 文件系统入口，按路径和 inode 将操作转交对应的卷。
 use crate::syscall::Errno;
 use alloc::sync::Arc;
 
@@ -9,6 +9,8 @@ pub use ext4::mounted;
 
 pub mod cache;
 pub mod context;
+mod ext2;
+mod ext2_mount;
 pub mod fat;
 pub mod mapping;
 mod metadata;
@@ -26,7 +28,7 @@ pub(crate) enum TimeUpdate {
 
 /// 按 inode 更新访问、修改时间；FAT 时间字段尚未接通。
 pub(crate) fn update_times(ino: u32, times: [TimeUpdate; 2]) -> Result<(), Errno> {
-    if ino & FAT_INODE != 0 {
+    if ino & FAT_INODE != 0 || ext2_mount::is_handle(ino) {
         Err(Errno::NotSupported)
     } else {
         ext4::update_times(ino, times)
@@ -40,7 +42,7 @@ pub(crate) fn set_owner(
     gid: Option<u32>,
     credentials: &crate::task::Credentials,
 ) -> Result<(), Errno> {
-    if ino & FAT_INODE != 0 || procfs::pid_ino_parts(ino).is_some() {
+    if ino & FAT_INODE != 0 || ext2_mount::is_handle(ino) || procfs::pid_ino_parts(ino).is_some() {
         return Err(Errno::NotSupported);
     }
     let info = ext4::metadata(ino)?;
@@ -103,7 +105,11 @@ pub(crate) fn sync_inode(ino: u32) -> Result<(), Errno> {
         return Err(Errno::NotSupported);
     }
     cache::sync_inode(ino)?;
-    ext4::sync()
+    if ext2_mount::is_handle(ino) {
+        ext2_mount::sync(Some(ino))
+    } else {
+        ext4::sync()
+    }
 }
 
 /// 同步全部已挂载可写文件系统缓存。
@@ -111,6 +117,7 @@ pub(crate) fn sync() -> Result<(), Errno> {
     #[cfg(not(feature = "rsext4-readonly"))]
     {
         ext4::sync()?;
+        ext2_mount::sync(None)?;
     }
     Ok(())
 }
@@ -118,7 +125,87 @@ pub(crate) fn sync() -> Result<(), Errno> {
 /// 在任务退出后同步并卸载可写 Ext4 根卷。
 #[cfg(not(feature = "rsext4-readonly"))]
 pub fn shutdown() -> Result<(), Errno> {
+    ext2_mount::shutdown()?;
     ext4::unmount()
+}
+
+/// 挂载辅助卷，或把已挂载的 Ext2 卷切换到只读模式。
+pub(crate) fn mount(source: &str, target: &str, kind: &str, flags: usize) -> Result<(), Errno> {
+    const MS_RDONLY: usize = 1;
+    const MS_REMOUNT: usize = 32;
+
+    match kind {
+        "ext2" => {
+            let (target, info) = metadata::resolve(target, true)?;
+            if info.mode & 0xf000 != 0x4000 {
+                return Err(Errno::NotDir);
+            }
+            if flags == (MS_REMOUNT | MS_RDONLY) {
+                return ext2_mount::remount_readonly(&target);
+            }
+            if flags & !MS_RDONLY != 0 {
+                return Err(Errno::NotSupported);
+            }
+            if target == "/"
+                || target.starts_with("/proc/")
+                || target == "/proc"
+                || target == "/dev"
+                || target.starts_with("/dev/")
+                || context::directory_busy(&target)
+                || contains_mount(&target)
+                || info.dev != 1
+            {
+                return Err(Errno::Busy);
+            }
+            let (disk, part) = fat::resolve_source(source)?;
+            if ext4::uses_disk(disk) || fat::uses_disk(disk) || ext2_mount::uses_disk(disk) {
+                return Err(Errno::Busy);
+            }
+            let (start, len) =
+                crate::drivers::partition(disk, part).map_err(|_| Errno::NoDevice)?;
+            let readonly = flags & MS_RDONLY != 0 || cfg!(feature = "rsext4-readonly");
+            ext2_mount::mount(source, &target, disk, start, len, readonly)
+        }
+        "fat" | "vfat" => {
+            if flags != 0 {
+                return Err(Errno::NotSupported);
+            }
+            let ino = lookup(target)?;
+            if stat(ino)?.0 & 0xf000 != 0x4000 {
+                return Err(Errno::NotDir);
+            }
+            let (disk, _) = fat::resolve_source(source)?;
+            if ext2_mount::is_handle(ino)
+                || ext2_mount::contains_mount(target)
+                || ext2_mount::uses_disk(disk)
+            {
+                return Err(Errno::Busy);
+            }
+            fat::mount(source, target)
+        }
+        _ => Err(Errno::NoDevice),
+    }
+}
+
+/// 卸载指定挂载点。Ext2 有存活引用时返回 EBUSY。
+pub(crate) fn unmount(target: &str, privileged: bool) -> Result<(), Errno> {
+    let resolved;
+    let ext2_target = if ext2_mount::is_mountpoint(target) {
+        Some(target)
+    } else if let Ok((path, _)) = metadata::resolve(target, true) {
+        resolved = path;
+        ext2_mount::is_mountpoint(&resolved).then_some(resolved.as_str())
+    } else {
+        None
+    };
+    if let Some(path) = ext2_target {
+        return if privileged {
+            ext2_mount::unmount(path)
+        } else {
+            Err(Errno::Perm)
+        };
+    }
+    fat::unmount(target)
 }
 
 /// 用户态 mknodat 注册的块设备节点：(节点名, 盘号, 分区号)。
@@ -204,6 +291,9 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
     if path == "/proc/meminfo" {
         return Ok(procfs::MEMINFO);
     }
+    if path == "/proc/cpuinfo" {
+        return Ok(procfs::CPUINFO);
+    }
     if path == "/proc/mounts" {
         return Ok(procfs::MOUNTS);
     }
@@ -228,6 +318,9 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
         }
         return Err(Errno::NoEntry);
     }
+    if let Some(ino) = ext2_mount::lookup(path)? {
+        return Ok(ino);
+    }
     match fat::lookup(path)? {
         Some(ino) => Ok(ino),
         None => ext4::lookup(path),
@@ -251,6 +344,9 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
     if ino == procfs::MOUNTS {
         return Ok((0o100444, procfs::mounts()?.len() as u64, 1, 0));
     }
+    if ino == procfs::CPUINFO {
+        return Ok((0o100444, procfs::cpuinfo()?.len() as u64, 1, 0));
+    }
     if let Some((pid, file)) = procfs::pid_ino_parts(ino) {
         return match file {
             0 => Ok((0o040555, 0, 2, 0)),
@@ -262,7 +358,9 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
     if ino == procfs::DIR {
         return Ok((0o040555, 0, 2, 0));
     }
-    if ino & FAT_INODE != 0 {
+    if ext2_mount::is_handle(ino) {
+        ext2_mount::stat(ino)
+    } else if ino & FAT_INODE != 0 {
         fat::stat(ino)
     } else {
         ext4::stat(ino)
@@ -271,7 +369,9 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
 
 /// 查询 inode 所属卷的容量；失败返回对应后端错误。
 pub(crate) fn filesystem_stats(ino: u32) -> Result<FileSystemStats, Errno> {
-    if ino & FAT_INODE != 0 {
+    if ext2_mount::is_handle(ino) {
+        ext2_mount::filesystem_stats(ino)
+    } else if ino & FAT_INODE != 0 {
         fat::filesystem_stats(ino)
     } else {
         ext4::filesystem_stats()
@@ -280,7 +380,9 @@ pub(crate) fn filesystem_stats(ino: u32) -> Result<FileSystemStats, Errno> {
 
 /// 读取符号链接的目标文本；非链接返回 EINVAL，FAT 不提供链接。
 pub(crate) fn read_link(ino: u32) -> Result<alloc::string::String, Errno> {
-    if ino & FAT_INODE != 0 {
+    if ext2_mount::is_handle(ino) {
+        ext2_mount::read_link(ino)
+    } else if ino & FAT_INODE != 0 {
         Err(Errno::Invalid)
     } else {
         ext4::link_target(ino)
@@ -300,11 +402,36 @@ pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
         };
         return ext4::create(dev_ino, name, mode);
     }
+    if ext2_mount::is_handle(parent) {
+        return Err(Errno::NotSupported);
+    }
     if parent & FAT_INODE != 0 {
         fat::create(parent, name, mode)
     } else {
         ext4::create(parent, name, mode)
     }
+}
+
+/// 创建普通文件，Ext2 使用调用进程的文件系统凭证。
+pub(crate) fn create_regular(
+    parent: u32,
+    name: &str,
+    mode: u16,
+    owner: (u32, u32),
+) -> Result<u32, Errno> {
+    if ext2_mount::is_handle(parent) {
+        ext2_mount::create(parent, name, mode, owner)
+    } else {
+        create(parent, name, mode)
+    }
+}
+
+/// 拒绝以可写模式打开只读辅助卷上的文件。
+pub(crate) fn check_write_open(ino: u32) -> Result<(), Errno> {
+    if ext2_mount::is_handle(ino) && ext2_mount::readonly(ino)? {
+        return Err(Errno::ReadOnly);
+    }
+    Ok(())
 }
 
 /// 在 Ext4 上创建命名管道节点，权限已由调用方应用 umask。
@@ -314,7 +441,10 @@ pub(crate) fn create_fifo(
     mode: u16,
     owner: (u32, u32),
 ) -> Result<(), Errno> {
-    if parent & FAT_INODE != 0 || procfs::pid_ino_parts(parent).is_some() {
+    if parent & FAT_INODE != 0
+        || ext2_mount::is_handle(parent)
+        || procfs::pid_ino_parts(parent).is_some()
+    {
         return Err(Errno::NotSupported);
     }
     ext4::create_fifo(parent, name, mode, owner)
@@ -325,7 +455,7 @@ pub(crate) fn check_raw_disk_write(disk: usize) -> Result<(), Errno> {
     if cfg!(feature = "rsext4-readonly") {
         return Err(Errno::ReadOnly);
     }
-    if ext4::uses_disk(disk) || fat::uses_disk(disk) {
+    if ext4::uses_disk(disk) || fat::uses_disk(disk) || ext2_mount::uses_disk(disk) {
         return Err(Errno::Busy);
     }
     Ok(())
@@ -339,7 +469,10 @@ pub(crate) fn symlink(
     uid: u32,
     gid: u32,
 ) -> Result<(), Errno> {
-    if parent & FAT_INODE != 0 || procfs::pid_ino_parts(parent).is_some() {
+    if parent & FAT_INODE != 0
+        || ext2_mount::is_handle(parent)
+        || procfs::pid_ino_parts(parent).is_some()
+    {
         return Err(Errno::Perm);
     }
     ext4::symlink(parent, name, target, uid, gid)
@@ -350,7 +483,10 @@ pub(crate) fn link(source: &Metadata, parent: u32, name: &str) -> Result<(), Err
     if source.dev != metadata::metadata(parent)?.dev {
         return Err(Errno::CrossDevice);
     }
-    let ino = source.ino as u32;
+    let ino = source.inode_handle();
+    if ext2_mount::is_handle(parent) {
+        return ext2_mount::link(ino, parent, name);
+    }
     if ino & FAT_INODE != 0
         || procfs::pid_ino_parts(ino).is_some()
         || !matches!(source.mode & 0xf000, 0x8000 | 0xa000 | 0x1000)
@@ -371,6 +507,9 @@ pub(crate) fn rename(
     if metadata::metadata(old)?.dev != metadata::metadata(new)?.dev {
         return Err(Errno::CrossDevice);
     }
+    if ext2_mount::is_handle(old) || ext2_mount::is_handle(new) {
+        return Err(Errno::NotSupported);
+    }
     if old & FAT_INODE != 0 {
         return Err(Errno::NotSupported);
     }
@@ -379,7 +518,9 @@ pub(crate) fn rename(
 
 /// 读取文件指定偏移，EOF 返回零。
 pub fn read_raw(ino: u32, offset: usize, data: &mut [u8]) -> Result<usize, Errno> {
-    if ino & FAT_INODE != 0 {
+    if ext2_mount::is_handle(ino) {
+        ext2_mount::read_raw(ino, offset, data)
+    } else if ino & FAT_INODE != 0 {
         fat::read(ino, offset, data)
     } else {
         ext4::read_raw(ino, offset, data)
@@ -402,6 +543,7 @@ pub(crate) fn read_dir(
             out.push((procfs::DIR, b"self", procfs::DIR));
             out.push((procfs::MEMINFO, b"meminfo", procfs::MEMINFO));
             out.push((procfs::MOUNTS, b"mounts", procfs::MOUNTS));
+            out.push((procfs::CPUINFO, b"cpuinfo", procfs::CPUINFO));
             for (pid, ..) in crate::task::proc_table_snapshot() {
                 let ino = procfs::pid_dir_ino(pid);
                 let name = alloc::format!("{}", pid);
@@ -444,7 +586,9 @@ pub(crate) fn read_dir(
         }
         return Ok(next);
     }
-    if ino & FAT_INODE != 0 {
+    if ext2_mount::is_handle(ino) {
+        ext2_mount::read_dir(ino, offset, visit)
+    } else if ino & FAT_INODE != 0 {
         Err(Errno::NotSupported)
     } else {
         ext4::read_dir(ino, offset, visit)
@@ -453,7 +597,9 @@ pub(crate) fn read_dir(
 
 /// 写入文件指定偏移，返回实际字节数。
 pub fn write_raw(ino: u32, offset: usize, data: &[u8]) -> Result<usize, Errno> {
-    if ino & FAT_INODE != 0 {
+    if ext2_mount::is_handle(ino) {
+        ext2_mount::write_raw(ino, offset, data)
+    } else if ino & FAT_INODE != 0 {
         fat::write(ino, offset, data)
     } else {
         ext4::write_raw(ino, offset, data)
@@ -468,6 +614,14 @@ pub fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
     }
     if mode & 0xf000 != 0x8000 {
         return Err(Errno::Invalid);
+    }
+    if ext2_mount::is_handle(ino) {
+        check_write_open(ino)?;
+        return if current == length {
+            Ok(())
+        } else {
+            Err(Errno::NotSupported)
+        };
     }
     if current != length {
         if cache::has_live(ino) && !mapping::registered() {
@@ -498,7 +652,11 @@ pub fn sync_mapping(ino: u32, offset: usize, length: usize) -> Result<(), Errno>
         return Err(Errno::NotSupported);
     }
     cache::sync_span(ino, offset, length)?;
-    ext4::sync()
+    if ext2_mount::is_handle(ino) {
+        ext2_mount::sync(Some(ino))
+    } else {
+        ext4::sync()
+    }
 }
 
 /// 只读构建没有可写回的后端。
@@ -510,10 +668,12 @@ pub fn sync_mapping(_ino: u32, _offset: usize, _length: usize) -> Result<(), Err
 /// 持有 inode 的打开引用。
 pub fn retain(ino: u32) -> Result<(), Errno> {
     // procfs 虚拟节点（/proc、/proc/<pid>、/dev/*）无后端引用计数
-    if ino >= procfs::MISC_DIR || procfs::pid_ino_parts(ino).is_some() {
+    if ino == procfs::CPUINFO || ino >= procfs::MISC_DIR || procfs::pid_ino_parts(ino).is_some() {
         return Ok(());
     }
-    if ino & FAT_INODE != 0 {
+    if ext2_mount::is_handle(ino) {
+        ext2_mount::retain(ino)
+    } else if ino & FAT_INODE != 0 {
         fat::retain(ino)
     } else {
         ext4::retain(ino)
@@ -522,10 +682,12 @@ pub fn retain(ino: u32) -> Result<(), Errno> {
 
 /// 释放 inode 的打开引用。
 pub fn release(ino: u32) {
-    if ino >= procfs::MISC_DIR || procfs::pid_ino_parts(ino).is_some() {
+    if ino == procfs::CPUINFO || ino >= procfs::MISC_DIR || procfs::pid_ino_parts(ino).is_some() {
         return;
     }
-    if ino & FAT_INODE != 0 {
+    if ext2_mount::is_handle(ino) {
+        ext2_mount::release(ino);
+    } else if ino & FAT_INODE != 0 {
         fat::release(ino);
     } else {
         ext4::release(ino);
@@ -534,7 +696,9 @@ pub fn release(ino: u32) {
 
 /// 删除目录中的文件名，已打开的 inode 仍可访问。
 pub fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
-    if ino & FAT_INODE != 0 {
+    if ext2_mount::is_handle(ino) || ext2_mount::is_handle(parent) {
+        ext2_mount::unlink(parent, ino, name)
+    } else if ino & FAT_INODE != 0 {
         fat::unlink(ino)
     } else {
         ext4::unlink(parent, ino, name)
@@ -543,6 +707,9 @@ pub fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
 
 /// procfs 只读文本文件的内容快照（open 时捕获一次）。
 pub fn procfs_text(path: &str) -> Result<alloc::string::String, Errno> {
+    if path == "/proc/cpuinfo" {
+        return procfs::cpuinfo();
+    }
     if path == "/proc/mounts" {
         return procfs::mounts();
     }
@@ -565,9 +732,9 @@ pub fn procfs_text(path: &str) -> Result<alloc::string::String, Errno> {
     Err(Errno::NoEntry)
 }
 
-/// 路径是否落在任何 FAT 挂载点之下（rmdir/rename 的 EBUSY 检查用）。
+/// 路径本身或其子目录是否存在辅助卷挂载点。
 pub fn contains_mount(path: &str) -> bool {
-    fat::contains_mount(path)
+    fat::contains_mount(path) || ext2_mount::contains_mount(path)
 }
 
 /// chmod 公共校验与执行：仅普通文件与目录，mode 保留 07777；space 仅
@@ -589,7 +756,7 @@ pub fn chmod_apply(
 /// chmod(2) 底层：按 inode 身份更新权限位（fd 与路径解析殊途同归到
 /// inode）；FAT 卷不支持（权限位为固定 0777 合成）。
 pub fn chmod_by_ino(ino: u32, path: &str, mode: u16) -> Result<(), Errno> {
-    if ino & FAT_INODE != 0 {
+    if ino & FAT_INODE != 0 || ext2_mount::is_handle(ino) {
         return Err(Errno::NotSupported);
     }
     ext4::chmod_by_ino(ino, path, mode)
@@ -597,7 +764,11 @@ pub fn chmod_by_ino(ino: u32, path: &str, mode: u16) -> Result<(), Errno> {
 
 /// 删除空目录（rmdir 语义）；FAT 未接入目录删除，返回 ENOTSUP。
 pub fn rmdir(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
-    if (parent | ino) & FAT_INODE != 0 || procfs::pid_ino_parts(ino).is_some() {
+    if (parent | ino) & FAT_INODE != 0
+        || ext2_mount::is_handle(parent)
+        || ext2_mount::is_handle(ino)
+        || procfs::pid_ino_parts(ino).is_some()
+    {
         return Err(Errno::NotSupported);
     }
     ext4::rmdir(parent, ino, name)?;

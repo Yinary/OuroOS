@@ -77,19 +77,13 @@ pub fn dispatch(
             }
         }
         sysnr::MOUNT => {
-            if a[3] != 0 {
-                return Err(Errno::NotSupported);
-            }
             let source = user_string(space, a[0])?;
             let target = ctx.path((-100isize) as usize, &user_string(space, a[1])?)?;
             let kind = user_string(space, a[2])?;
-            if kind != "vfat" && kind != "fat" {
-                return Err(Errno::NoDevice);
+            if kind == "ext2" && credentials.euid != 0 {
+                return Err(Errno::Perm);
             }
-            if fs::stat(fs::lookup(&target)?)?.0 & 0xf000 != 0x4000 {
-                return Err(Errno::NotDir);
-            }
-            fs::fat::mount(&source, &target)?;
+            fs::mount(&source, &target, &kind, a[3])?;
             Ok(0)
         }
         sysnr::FACCESSAT => faccessat(ctx, space, a),
@@ -105,7 +99,7 @@ pub fn dispatch(
                 return Err(Errno::NotSupported);
             }
             let target = ctx.path((-100isize) as usize, &user_string(space, a[0])?)?;
-            fs::fat::unmount(&target)?;
+            fs::unmount(&target, credentials.euid == 0)?;
             Ok(0)
         }
         sysnr::LINKAT => linkat(ctx, space, a),
@@ -198,17 +192,15 @@ pub fn dispatch(
             if path == "/proc/meminfo" {
                 return ctx.open_meminfo(flags, flags & 0x80000 != 0);
             }
-            if path == "/proc/mounts" {
-                let text = fs::procfs_text(&path)?;
-                return ctx.open_proc_text(text, flags, flags & 0x80000 != 0);
-            }
             if let Some(rest) = path.strip_prefix("/proc/") {
-                if rest
-                    .split_once('/')
-                    .is_some_and(|(_, f)| f == "stat" || f == "cmdline" || f == "status")
+                if matches!(rest, "cpuinfo" | "mounts")
+                    || rest
+                        .split_once('/')
+                        .is_some_and(|(_, f)| matches!(f, "stat" | "cmdline" | "status"))
                 {
+                    let ino = fs::lookup(&path)?;
                     let text = fs::procfs_text(&path)?;
-                    return ctx.open_proc_text(text, flags, flags & 0x80000 != 0);
+                    return ctx.open_proc_text(ino, text, flags, flags & 0x80000 != 0);
                 }
             }
             if path == "/dev/null" {
@@ -243,15 +235,19 @@ pub fn dispatch(
                 return Err(Errno::NoDevice);
             }
             let (ino, mode) = match entry.ok_or(Errno::NoDevice)? {
-                fs::ResolvedEntry::Existing(info) => (info.ino as u32, info.mode),
+                fs::ResolvedEntry::Existing(info) => (info.inode_handle(), info.mode),
                 fs::ResolvedEntry::Missing { parent } => {
                     let name = path.rsplit('/').next().ok_or(Errno::NoEntry)?;
                     let mode = 0x8000 | ctx.creation_mode(a[3]);
-                    (fs::create(parent, name, mode)?, mode)
+                    let owner = (credentials.fsuid, credentials.fsgid);
+                    (fs::create_regular(parent, name, mode, owner)?, mode)
                 }
             };
             if mode & 0xf000 == 0x4000 && flags & 3 != 0 {
                 return Err(Errno::IsDir);
+            }
+            if flags & 3 != 0 {
+                fs::check_write_open(ino)?;
             }
             if mode & 0xf000 == 0x1000 && !path_only {
                 return Err(Errno::NotSupported);
@@ -345,7 +341,7 @@ fn truncate(
     if nr == sysnr::TRUNCATE {
         let path = user_string(space, a[0])?;
         let info = ctx.query((-100isize) as usize, &path, false, true)?;
-        fs::truncate(info.ino as u32, length as u64)?;
+        fs::truncate(info.inode_handle(), length as u64)?;
     } else {
         ctx.get(a[0] as u32 as usize)?
             .lock()
@@ -515,7 +511,7 @@ fn utimensat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<u
         return ctx.get(dir)?.lock().update_times(times).map(|_| 0);
     }
     let info = ctx.query(dir, &path, flags & 0x1000 != 0, flags & 0x100 == 0)?;
-    fs::update_times(info.ino as u32, times)?;
+    fs::update_times(info.inode_handle(), times)?;
     Ok(0)
 }
 
@@ -559,7 +555,7 @@ fn chown(
             fd_inode(dir as usize, true)?
         } else {
             ctx.query(dir as usize, &path, empty, flags & AT_SYMLINK_NOFOLLOW == 0)?
-                .ino as u32
+                .inode_handle()
         };
         (ino, id(a[2]), id(a[3]))
     };
@@ -577,7 +573,7 @@ fn statfs(
     let stats = if nr == sysnr::STATFS {
         let path = user_string(space, a[0])?;
         let info = ctx.query((-100isize) as usize, &path, false, true)?;
-        fs::filesystem_stats(info.ino as u32)?
+        fs::filesystem_stats(info.inode_handle())?
     } else {
         ctx.get(a[0] as u32 as usize)?.lock().filesystem_stats()?
     };
@@ -620,7 +616,7 @@ fn readlinkat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<
             Errno::Invalid
         });
     }
-    let target = fs::read_link(info.ino as u32)?;
+    let target = fs::read_link(info.inode_handle())?;
     let n = target.len().min(capacity as usize);
     user_access::copy_to_user(space, a[2], &target.as_bytes()[..n]).map_err(|_| Errno::Fault)?;
     Ok(n)

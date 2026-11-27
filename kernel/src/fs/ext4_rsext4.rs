@@ -162,6 +162,10 @@ fn try_mount(id: usize, start: usize, len: usize) -> Result<(), Errno> {
     if sb[56..58] != [0x53, 0xef] || sb[24..28] != [2, 0, 0, 0] {
         return Err(Errno::Invalid);
     }
+    // 根卷盘上 inode 号不能占用辅助卷句柄范围。
+    if u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]) >= super::ext2_mount::FIRST_HANDLE {
+        return Err(Errno::NotSupported);
+    }
     // 分组几何用于分配缓存，声明的块范围必须落在卷内。
     let lo = u32::from_le_bytes([sb[4], sb[5], sb[6], sb[7]]);
     let hi = u32::from_le_bytes([sb[336], sb[337], sb[338], sb[339]]);
@@ -298,6 +302,7 @@ pub(super) fn metadata(ino: u32) -> Result<super::Metadata, Errno> {
         };
         Ok(super::Metadata {
             ino: ino as u64,
+            handle: None,
             dev: 1,
             rdev: rdev as u64,
             mode: inode.i_mode,

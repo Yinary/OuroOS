@@ -108,7 +108,10 @@ enum Kind {
         path: String,
         directory: Option<Arc<DirectoryPath>>,
     },
-    MemInfo(String),
+    ProcText {
+        ino: u32,
+        text: String,
+    },
     /// /dev/null：读 EOF、写全收（见 fs::procfs::DEVNULL）
     DevNull,
     /// /dev/zero：读返回零填充，写入丢弃。
@@ -516,7 +519,7 @@ impl Context {
         if canonical.len() >= 4096 {
             return Err(Errno::NameTooLong);
         }
-        Ok((canonical, info.ino as u32, string(name)?))
+        Ok((canonical, info.inode_handle(), string(name)?))
     }
 
     fn new_entry_path(&self, dir: usize, path: &str) -> Result<(u32, String), Errno> {
@@ -592,7 +595,7 @@ impl Context {
             return Err(Errno::NotDir);
         }
         let (_, parent, name) = self.entry_path(dir, input)?;
-        fs::unlink(parent, source.ino as u32, &name)
+        fs::unlink(parent, source.inode_handle(), &name)
     }
 
     /// 重命名文件或目录；拒绝移动仍由 cwd、目录 FD 或挂载引用的目录树。
@@ -625,7 +628,7 @@ impl Context {
         {
             return Err(Errno::Invalid);
         }
-        if fs::fat::contains_mount(&old_path) || fs::fat::contains_mount(&new_path) {
+        if fs::contains_mount(&old_path) || fs::contains_mount(&new_path) {
             return Err(Errno::Busy);
         }
         if !no_replace
@@ -704,12 +707,18 @@ impl Context {
 
     /// 打开只读 /proc/meminfo 快照。
     pub(crate) fn open_meminfo(&mut self, flags: usize, cloexec: bool) -> Result<usize, Errno> {
-        self.open_proc_text(super::procfs::meminfo()?, flags, cloexec)
+        self.open_proc_text(
+            super::procfs::MEMINFO,
+            super::procfs::meminfo()?,
+            flags,
+            cloexec,
+        )
     }
 
-    /// 打开任意 procfs 只读文本快照（meminfo/mounts/pid 文件共用）。
+    /// 打开 procfs 只读文本快照并保存对应的 inode。
     pub(crate) fn open_proc_text(
         &mut self,
+        ino: u32,
         text: String,
         flags: usize,
         cloexec: bool,
@@ -721,7 +730,7 @@ impl Context {
             return Err(Errno::NotDir);
         }
         let file = OpenFile {
-            kind: Kind::MemInfo(text),
+            kind: Kind::ProcText { ino, text },
             offset: 0,
             flags: flags & !OPEN_CREATION_FLAGS,
         };
@@ -1071,8 +1080,8 @@ impl OpenFile {
                 }
                 fs::metadata::metadata(*ino)
             }
-            Kind::MemInfo(text) => Ok(fs::Metadata {
-                ino: super::procfs::MEMINFO as u64,
+            Kind::ProcText { ino, text } => Ok(fs::Metadata {
+                ino: u64::from(*ino),
                 mode: 0o100444,
                 links: 1,
                 size: text.len() as u64,
@@ -1144,7 +1153,7 @@ impl OpenFile {
                 2 => fs::stat(*ino)?.1 as usize,
                 _ => return Err(Errno::Invalid),
             },
-            Kind::MemInfo(text) => match whence {
+            Kind::ProcText { text, .. } => match whence {
                 0 => 0,
                 1 => self.offset,
                 2 => text.len(),
@@ -1206,7 +1215,7 @@ impl OpenFile {
             }
             Kind::DevNull | Kind::Rtc => Ok(0),
             Kind::DevZero | Kind::DevRandom { .. } => self.read_at(0, data, false, deliver),
-            Kind::MemInfo(text) => {
+            Kind::ProcText { text, .. } => {
                 let bytes = text.as_bytes().get(self.offset..).unwrap_or(&[]);
                 let count = data.len().min(bytes.len());
                 let delivered = deliver(&bytes[..count])?;
@@ -1281,7 +1290,7 @@ impl OpenFile {
     pub(crate) fn check_positioned(&self) -> Result<(), Errno> {
         match self.kind {
             Kind::Inode { .. }
-            | Kind::MemInfo(_)
+            | Kind::ProcText { .. }
             | Kind::DevNull
             | Kind::DevZero
             | Kind::DevRandom { .. }
@@ -1335,7 +1344,7 @@ impl OpenFile {
             let delivered = deliver(&data[..count])?;
             return Ok(delivered);
         }
-        if let Kind::MemInfo(text) = &self.kind {
+        if let Kind::ProcText { text, .. } = &self.kind {
             let bytes = text.as_bytes().get(offset..).unwrap_or(&[]);
             let count = data.len().min(bytes.len());
             let delivered = deliver(&bytes[..count])?;
@@ -1452,7 +1461,7 @@ fn fd_poll_events(file: &OpenFile, requested: u16) -> u16 {
     match &file.kind {
         Kind::Input => 0x41 & requested,
         Kind::Output => 0x104 & requested,
-        Kind::Inode { .. } | Kind::MemInfo(_) => 0x145 & requested,
+        Kind::Inode { .. } | Kind::ProcText { .. } => 0x145 & requested,
         // /dev/null、/dev/zero、/dev/urandom 与 rtc 永远可读可写；块节点同
         Kind::DevNull
         | Kind::DevZero

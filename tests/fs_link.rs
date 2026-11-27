@@ -182,6 +182,24 @@ fn cross_mount() {
     ck!(syscall3(39, mnt, 0, 0) == 0);
 }
 
+fn check_procfs() {
+    let path = b"/proc/cpuinfo\0";
+    let fd = open(path, 0);
+    let mut text = [0; 64];
+    let count = syscall3(63, fd, text.as_mut_ptr() as usize, text.len());
+    ck!(count > 0);
+    ck!(text.starts_with(b"processor\t: 0\n"));
+    ck!(syscall3(63, fd, text.as_mut_ptr() as usize, text.len()) == 0);
+    let mut attrs = [0u8; 128];
+    ck!(syscall3(80, fd, attrs.as_mut_ptr() as usize, 0) == 0);
+    let ino = u64::from_ne_bytes(core::array::from_fn(|i| attrs[8 + i]));
+    let mode = u32::from_ne_bytes(core::array::from_fn(|i| attrs[16 + i]));
+    ck!(stat(path).0 == ino && mode == 0o100444);
+    ck!(syscall3(57, fd, 0, 0) == 0);
+    ck!(open_at(CWD, path, 1) == -30);
+    ck!(link(CWD, path, CWD, b"/cpuinfo-link\0", 0) == -18);
+}
+
 fn check_open_symlink(dir: usize) {
     let relative = b"relative\0";
     let fd = open_at(dir, relative, 0);
@@ -286,6 +304,7 @@ fn run() -> ! {
     regular();
     symbolic();
     create_symbolic();
+    check_procfs();
     let fifo = b"/meta/test-fifo\0";
     let alias = b"/fifo-alias\0";
     let args = [CWD, fifo.as_ptr() as usize, 0o010666, 0, 0, 0];
