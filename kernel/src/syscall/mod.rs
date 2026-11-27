@@ -142,7 +142,15 @@ pub mod sysnr {
     pub const CLONE: usize = 220;
     pub const EXECVE: usize = 221;
     pub const WAIT4: usize = 260;
-    // System V 共享内存
+    // System V IPC（消息队列 / 信号量 / 共享内存）
+    pub const MSGGET: usize = 186;
+    pub const MSGCTL: usize = 187;
+    pub const MSGRCV: usize = 188;
+    pub const MSGSND: usize = 189;
+    pub const SEMGET: usize = 190;
+    pub const SEMCTL: usize = 191;
+    pub const SEMTIMEDOP: usize = 192;
+    pub const SEMOP: usize = 193;
     pub const SHMGET: usize = 194;
     pub const SHMCTL: usize = 195;
     pub const SHMAT: usize = 196;
@@ -224,6 +232,10 @@ pub enum Errno {
     BadF,
     /// EFAULT: 用户缓冲区地址非法
     Fault,
+    /// ENOMSG: 消息队列无匹配消息。
+    NoMsg,
+    /// EIDRM: IPC 标识符已被移除。
+    IdRm,
     /// ENOSYS: 未实现的系统调用
     NoSys,
     /// ETIMEDOUT: 等待超过期限。
@@ -297,6 +309,8 @@ impl Errno {
             Self::ReadOnly => 30,
             Errno::BadF => 9,
             Errno::Fault => 14,
+            Errno::NoMsg => 42,
+            Errno::IdRm => 43,
             Errno::NoSys => 38,
             Errno::TimedOut => 110,
             Self::NotSock => 88,
@@ -659,7 +673,15 @@ pub fn dispatch(
         | sysnr::ACCEPT4
         | sysnr::CONNECT
         | sysnr::SENDTO
-        | sysnr::RECVFROM => Flow::Process,
+        | sysnr::RECVFROM
+        | sysnr::MSGGET
+        | sysnr::MSGCTL
+        | sysnr::MSGRCV
+        | sysnr::MSGSND
+        | sysnr::SEMGET
+        | sysnr::SEMCTL
+        | sysnr::SEMTIMEDOP
+        | sysnr::SEMOP => Flow::Process,
         sysnr::GETRANDOM => {
             // getrandom(2)：flags 只认 NONBLOCK(1)/RANDOM(2)（后者与默认
             // 等价）；无种子或熵流耗尽一律 EAGAIN（无合法阻塞唤醒来源），

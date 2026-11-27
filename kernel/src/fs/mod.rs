@@ -213,6 +213,33 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
     if path == "/proc/mounts" {
         return Ok(procfs::MOUNTS);
     }
+    if path == "/proc/sys" {
+        return Ok(procfs::SYS_DIR);
+    }
+    if path == "/proc/sys/kernel" {
+        return Ok(procfs::SYS_KERNEL_DIR);
+    }
+    if path == "/proc/sys/kernel/msgmni" {
+        return Ok(procfs::SYS_MSGMNI);
+    }
+    if path == "/proc/sys/kernel/msgmax" {
+        return Ok(procfs::SYS_MSGMAX);
+    }
+    if path == "/proc/sys/kernel/msgmnb" {
+        return Ok(procfs::SYS_MSGMNB);
+    }
+    if path == "/proc/sys/kernel/sem" {
+        return Ok(procfs::SYS_SEM);
+    }
+    if path == "/proc/sysvipc" {
+        return Ok(procfs::SYSVIPC_DIR);
+    }
+    if path == "/proc/sysvipc/msg" {
+        return Ok(procfs::SYSVIPC_MSG);
+    }
+    if path == "/proc/sysvipc/sem" {
+        return Ok(procfs::SYSVIPC_SEM);
+    }
     if let Some(rest) = path.strip_prefix("/proc/") {
         // /proc/<pid> 与 /proc/<pid>/{stat,cmdline}；只接受纯数字 pid
         let (pid, file) = match rest.split_once('/') {
@@ -256,6 +283,52 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
     }
     if ino == procfs::MOUNTS {
         return Ok((0o100444, procfs::mounts()?.len() as u64, 1, 0));
+    }
+    if ino == procfs::SYS_DIR || ino == procfs::SYS_KERNEL_DIR || ino == procfs::SYSVIPC_DIR {
+        return Ok((0o040555, 0, 2, 0));
+    }
+    if ino == procfs::SYSVIPC_MSG {
+        return Ok((
+            0o100444,
+            crate::ipc::msg::proc_sysvipc()?.len() as u64,
+            1,
+            0,
+        ));
+    }
+    if ino == procfs::SYSVIPC_SEM {
+        return Ok((
+            0o100444,
+            crate::ipc::sem::proc_sysvipc()?.len() as u64,
+            1,
+            0,
+        ));
+    }
+    if ino == procfs::SYS_MSGMNI {
+        return Ok((
+            0o100444,
+            procfs::sys_kernel_ipc("msgmni")?.len() as u64,
+            1,
+            0,
+        ));
+    }
+    if ino == procfs::SYS_MSGMAX {
+        return Ok((
+            0o100444,
+            procfs::sys_kernel_ipc("msgmax")?.len() as u64,
+            1,
+            0,
+        ));
+    }
+    if ino == procfs::SYS_MSGMNB {
+        return Ok((
+            0o100444,
+            procfs::sys_kernel_ipc("msgmnb")?.len() as u64,
+            1,
+            0,
+        ));
+    }
+    if ino == procfs::SYS_SEM {
+        return Ok((0o100444, procfs::sys_kernel_ipc("sem")?.len() as u64, 1, 0));
     }
     if let Some((pid, file)) = procfs::pid_ino_parts(ino) {
         return match file {
@@ -463,7 +536,7 @@ pub fn sync_mapping(_ino: u32, _offset: usize, _length: usize) -> Result<(), Err
 /// 持有 inode 的打开引用。
 pub fn retain(ino: u32) -> Result<(), Errno> {
     // procfs 虚拟节点（/proc、/proc/<pid>、/dev/*）无后端引用计数
-    if ino >= procfs::MISC_DIR || procfs::pid_ino_parts(ino).is_some() {
+    if ino >= procfs::VIRTUAL_MIN || procfs::pid_ino_parts(ino).is_some() {
         return Ok(());
     }
     if ino & FAT_INODE != 0 {
@@ -475,7 +548,7 @@ pub fn retain(ino: u32) -> Result<(), Errno> {
 
 /// 释放 inode 的打开引用。
 pub fn release(ino: u32) {
-    if ino >= procfs::MISC_DIR || procfs::pid_ino_parts(ino).is_some() {
+    if ino >= procfs::VIRTUAL_MIN || procfs::pid_ino_parts(ino).is_some() {
         return;
     }
     if ino & FAT_INODE != 0 {
@@ -498,6 +571,15 @@ pub fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
 pub fn procfs_text(path: &str) -> Result<alloc::string::String, Errno> {
     if path == "/proc/mounts" {
         return procfs::mounts();
+    }
+    if let Some(name) = path.strip_prefix("/proc/sys/kernel/") {
+        return procfs::sys_kernel_ipc(name);
+    }
+    if path == "/proc/sysvipc/msg" {
+        return crate::ipc::msg::proc_sysvipc();
+    }
+    if path == "/proc/sysvipc/sem" {
+        return crate::ipc::sem::proc_sysvipc();
     }
     if let Some(rest) = path.strip_prefix("/proc/") {
         if let Some((pid, file)) = rest.split_once('/') {

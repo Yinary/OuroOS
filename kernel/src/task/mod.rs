@@ -273,6 +273,16 @@ pub(crate) fn proc_table_mark_zombie(pid: Pid) {
     }
 }
 
+/// 调度器挂起/唤醒主线程时同步 procfs 进程状态（b'S' / b'R'；不覆盖已置位的 b'Z'）。
+/// 锁序：SCHED → PROC_TABLE（叶子锁，无环）。
+pub(crate) fn proc_table_set_state(pid: Pid, state: u8) {
+    if let Some(e) = PROC_TABLE.lock().iter_mut().find(|e| e.pid as Pid == pid) {
+        if e.state != b'Z' {
+            e.state = state;
+        }
+    }
+}
+
 /// 收割时移除快照（wait 收割 / 孤儿即收 / 父退出清理，均在 REGISTRY 段）。
 pub(crate) fn proc_table_remove_all<F: Fn(u32) -> bool>(pred: F) {
     PROC_TABLE.lock().retain(|e| !pred(e.pid));

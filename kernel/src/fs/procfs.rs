@@ -56,6 +56,48 @@ pub(super) const DEVBLK: u32 = u32::MAX - 7;
 pub(super) const MISC_DIR: u32 = u32::MAX - 6;
 /// /proc/mounts（df 等读取，格式见 mounts(5)）
 pub(super) const MOUNTS: u32 = u32::MAX - 4;
+/// /proc/sys 与 /proc/sys/kernel 目录及只读 IPC 限额节点。
+pub(super) const SYS_DIR: u32 = u32::MAX - 11;
+pub(super) const SYS_KERNEL_DIR: u32 = u32::MAX - 12;
+pub(super) const SYS_MSGMNI: u32 = u32::MAX - 13;
+pub(super) const SYS_MSGMAX: u32 = u32::MAX - 14;
+pub(super) const SYS_MSGMNB: u32 = u32::MAX - 15;
+pub(super) const SYS_SEM: u32 = u32::MAX - 16;
+/// /proc/sysvipc 目录及其下 msg/sem 只读快照。
+pub(super) const SYSVIPC_DIR: u32 = u32::MAX - 17;
+pub(super) const SYSVIPC_MSG: u32 = u32::MAX - 18;
+pub(super) const SYSVIPC_SEM: u32 = u32::MAX - 19;
+/// 固定 procfs/devfs 虚拟 inode 下界（[VIRTUAL_MIN..=u32::MAX] 均无磁盘后端）。
+pub(super) const VIRTUAL_MIN: u32 = u32::MAX - 31;
+
+/// /proc/sys/kernel/{msgmni,msgmax,msgmnb,sem} 只读快照（与 ipc 模块限额常量同源）。
+pub(super) fn sys_kernel_ipc(name: &str) -> Result<String, Errno> {
+    let mut out = String::new();
+    out.try_reserve(64).map_err(|_| Errno::NoMem)?;
+    match name {
+        "msgmni" => {
+            let _ = writeln!(out, "{}", crate::ipc::msg::MSGMNI);
+        }
+        "msgmax" => {
+            let _ = writeln!(out, "{}", crate::ipc::msg::MSGMAX);
+        }
+        "msgmnb" => {
+            let _ = writeln!(out, "{}", crate::ipc::msg::MSGMNB);
+        }
+        "sem" => {
+            let _ = writeln!(
+                out,
+                "{}\t{}\t{}\t{}",
+                crate::ipc::sem::SEMMSL,
+                crate::ipc::sem::SEMMNS,
+                crate::ipc::sem::SEMOPM,
+                crate::ipc::sem::SEMMNI
+            );
+        }
+        _ => return Err(Errno::NoEntry),
+    }
+    Ok(out)
+}
 
 /// /proc/<pid> 目录的 inode：pid 目录与其下文件按 16 偏移分段，
 /// 避开 FAT 的最高位与 u32::MAX 附近的固定节点。

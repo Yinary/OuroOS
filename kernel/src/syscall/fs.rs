@@ -171,7 +171,17 @@ pub fn dispatch(
             if path == "/proc/meminfo" {
                 return ctx.open_meminfo(a[2], a[2] & 0x80000 != 0);
             }
-            if path == "/proc/mounts" {
+            if path == "/proc/mounts"
+                || matches!(
+                    path.as_str(),
+                    "/proc/sys/kernel/msgmni"
+                        | "/proc/sys/kernel/msgmax"
+                        | "/proc/sys/kernel/msgmnb"
+                        | "/proc/sys/kernel/sem"
+                        | "/proc/sysvipc/msg"
+                        | "/proc/sysvipc/sem"
+                )
+            {
                 let text = fs::procfs_text(&path)?;
                 return ctx.open_proc_text(text, a[2], a[2] & 0x80000 != 0);
             }
