@@ -38,7 +38,7 @@ RUSTFLAGS_LA := RUSTFLAGS="-Zunstable-options -C target-feature=-lsx,-lasx"
 MEM ?= 1G
 # 仅面向单核，默认 -smp 1
 SMP ?= 1
-LOG ?= warn         # 编译期日志级别: error|warn|info|debug|trace（boot 报告块由 polyhal 固定打印，不受此控）
+LOG ?= error        # 编译期日志级别: error|warn|info|debug|trace（boot 报告块由 polyhal 固定打印，不受此控）
 FEATURES ?=         # 附加内核 feature，例如 rsext4-readonly
 KERNEL_FEATURES = $(if $(strip $(FEATURES)),--features "$(strip $(FEATURES))")
 
