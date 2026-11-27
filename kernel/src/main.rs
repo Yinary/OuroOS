@@ -14,6 +14,7 @@ mod elf;
 mod entropy;
 mod fs;
 mod hal;
+mod ipc;
 mod lang_items;
 mod mm;
 mod net;

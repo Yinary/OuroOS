@@ -48,6 +48,33 @@ static WAKE_SIGNALS: AtomicBool = AtomicBool::new(false);
 const PIPE_WAKE_SLOTS: usize = 64;
 static WAKE_PIPE_IDS: [AtomicU64; PIPE_WAKE_SLOTS] = [const { AtomicU64::new(0) }; PIPE_WAKE_SLOTS];
 
+/// 定向 System V IPC 唤醒槽位；槽满或键无效时退回全局 WAKE_IPC_ALL 广播。
+static WAKE_IPC_ALL: AtomicBool = AtomicBool::new(false);
+const IPC_WAKE_SLOTS: usize = 32;
+static WAKE_IPC_KEYS: [AtomicU64; IPC_WAKE_SLOTS] = [const { AtomicU64::new(0) }; IPC_WAKE_SLOTS];
+
+/// 请求唤醒等待指定 System V IPC 对象（消息队列或信号量集）的任务。
+pub fn request_ipc_wake(key: u64) {
+    if key == 0 {
+        WAKE_IPC_ALL.store(true, Ordering::Release);
+        return;
+    }
+    for slot in &WAKE_IPC_KEYS {
+        let cur = slot.load(Ordering::Acquire);
+        if cur == key {
+            return;
+        }
+        if cur == 0
+            && slot
+                .compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return;
+        }
+    }
+    WAKE_IPC_ALL.store(true, Ordering::Release);
+}
+
 /// 请求唤醒等待子进程的任务（子进程退出时调用）。
 pub fn request_children_wake() {
     WAKE_CHILDREN.store(true, Ordering::Release);
@@ -85,7 +112,11 @@ fn has_pending_wake() -> bool {
     WAKE_CHILDREN.load(Ordering::Acquire)
         || WAKE_PIPES.load(Ordering::Acquire)
         || WAKE_SIGNALS.load(Ordering::Acquire)
+        || WAKE_IPC_ALL.load(Ordering::Acquire)
         || WAKE_PIPE_IDS
+            .iter()
+            .any(|slot| slot.load(Ordering::Acquire) != 0)
+        || WAKE_IPC_KEYS
             .iter()
             .any(|slot| slot.load(Ordering::Acquire) != 0)
 }
@@ -283,6 +314,28 @@ impl Scheduler {
                 });
             }
         }
+        if WAKE_IPC_ALL.swap(false, Ordering::AcqRel) {
+            for slot in &WAKE_IPC_KEYS {
+                slot.store(0, Ordering::Release);
+            }
+            self.move_waiting(|_, r| matches!(r, WaitReason::Ipc { .. }));
+        } else {
+            let mut keys = [0u64; IPC_WAKE_SLOTS];
+            let mut count = 0usize;
+            for slot in &WAKE_IPC_KEYS {
+                let key = slot.swap(0, Ordering::AcqRel);
+                if key != 0 {
+                    keys[count] = key;
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                let active = &keys[..count];
+                self.move_waiting(
+                    |_, r| matches!(r, WaitReason::Ipc { key, .. } if active.contains(key)),
+                );
+            }
+        }
         if WAKE_SIGNALS.swap(false, Ordering::AcqRel) {
             // 信号唤醒：持 REGISTRY 锁按可投递性搬回等待者（锁序
             // SCHED→REGISTRY，见 docs/ostd-contracts.md §5）。
@@ -313,6 +366,9 @@ impl Scheduler {
             WaitReason::Deadline(d)
             | WaitReason::PollUntil(d)
             | WaitReason::SigTimedWait { deadline: d, .. } => now >= *d,
+            WaitReason::Ipc {
+                deadline: Some(d), ..
+            } => now >= *d,
             WaitReason::Futex {
                 deadline: Some(d), ..
             } if now >= *d => {
@@ -335,7 +391,11 @@ impl Scheduler {
         while i < self.waiting.len() {
             let (task, reason) = &mut self.waiting[i];
             if f(task, reason) {
-                let (task, _) = self.waiting.swap_remove(i);
+                let (mut task, _) = self.waiting.swap_remove(i);
+                task.state = TaskState::Ready;
+                if task.pid == task.tgid {
+                    super::proc_table_set_state(task.tgid, b'R');
+                }
                 self.ready.push_back(task);
             } else {
                 i += 1;
@@ -521,6 +581,9 @@ pub(super) fn park(reason: WaitReason) -> Option<FutexEnd> {
         s.wake_expired();
         if s.waiting.len() < s.waiting.capacity() {
             cur.state = TaskState::Waiting;
+            if cur.pid == cur.tgid {
+                super::proc_table_set_state(cur.tgid, b'S');
+            }
             s.waiting.push((cur, reason));
         } else {
             cur.state = TaskState::Ready;
@@ -569,6 +632,10 @@ pub(super) fn wake_futex(
                 if woken < nr_wake {
                     removed_deadline |= deadline.is_some();
                     let (mut task, _) = s.waiting.swap_remove(i);
+                    task.state = TaskState::Ready;
+                    if task.pid == task.tgid {
+                        super::proc_table_set_state(task.tgid, b'R');
+                    }
                     task.futex_end = Some(FutexEnd::Notified);
                     s.ready.push_back(task);
                     woken += 1;
@@ -635,6 +702,7 @@ pub(super) fn exit_group_current(exit: ExitInfo) -> ! {
     for key in robust_wakes {
         wake_futex(key, 1, u32::MAX, None);
     }
+    crate::ipc::sem::on_process_exit(tgid);
     registry::record_exit(tgid, exit);
     request_children_wake();
     wake_vfork(pid);
@@ -730,10 +798,12 @@ pub(super) fn exit_current(exit: ExitInfo) -> ! {
     if let Some(key) = clear_key {
         wake_futex(key, 1, u32::MAX, None);
     }
+    crate::ipc::sem::clear_waiter(pid);
     if let Some(info) = registry::record_thread_exit(pid, exit) {
         // 登记退出信息并释放地址空间：UserAddressSpace 的 Drop 会先切回
         // 内核根（若仍活动）再释放数据页/页表页。此刻仍在自己的内核栈上；
         // 窗口映射在内核根与全部用户根中共享，切页表不影响栈访问。锁序 REGISTRY → FRAME。
+        crate::ipc::sem::on_process_exit(tgid);
         registry::record_exit(tgid, info);
         request_children_wake();
     }

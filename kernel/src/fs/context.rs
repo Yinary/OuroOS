@@ -102,7 +102,21 @@ struct Pipe {
     readers: usize,
     writers: usize,
     event_gen: u64,
+    fifo_ino: Option<u32>,
+    opening_readers: Vec<u32>,
+    opening_writers: Vec<u32>,
 }
+
+struct FifoEntry {
+    ino: u32,
+    id: u64,
+    pipe: Arc<Mutex<Pipe>>,
+}
+
+/// 命名管道（FIFO）运行期注册表，按 Ext4 inode 编号关联共享管道缓冲。
+/// 锁序约定：始终先锁 FIFOS 再锁单条 Pipe，严禁反向加锁。
+static FIFOS: Mutex<Vec<FifoEntry>> = Mutex::new(Vec::new());
+
 const PIPE_MAX_SIZE: usize = 1024 * 1024;
 enum Kind {
     Input,
@@ -111,6 +125,8 @@ enum Kind {
         id: u64,
         pipe: Arc<Mutex<Pipe>>,
         reading: bool,
+        writing: bool,
+        ino: Option<u32>,
     },
     Inode {
         ino: u32,
@@ -167,14 +183,45 @@ impl Drop for OpenFile {
                 directory: None,
                 ..
             } => fs::release(*ino),
-            Kind::Pipe { id, pipe, reading } => {
-                let mut p = pipe.lock();
-                if *reading {
-                    p.readers -= 1;
-                } else {
-                    p.writers -= 1;
+            Kind::Pipe {
+                id,
+                pipe,
+                reading,
+                writing,
+                ino,
+            } => {
+                let maybe_cleanup = {
+                    let mut p = pipe.lock();
+                    if *reading {
+                        p.readers = p.readers.saturating_sub(1);
+                    }
+                    if *writing {
+                        p.writers = p.writers.saturating_sub(1);
+                    }
+                    p.event_gen = p.event_gen.wrapping_add(1);
+                    if p.readers == 0 && p.writers == 0 {
+                        p.fifo_ino
+                    } else {
+                        None
+                    }
+                };
+                if let Some(fifo_ino) = maybe_cleanup {
+                    let mut fifos = FIFOS.lock();
+                    fifos.retain(|e| {
+                        if e.ino != fifo_ino {
+                            return true;
+                        }
+                        let p = e.pipe.lock();
+                        p.readers > 0
+                            || p.writers > 0
+                            || !p.opening_readers.is_empty()
+                            || !p.opening_writers.is_empty()
+                    });
                 }
-                p.event_gen = p.event_gen.wrapping_add(1);
+                if let Some(fifo_ino) = *ino {
+                    fs::release(fifo_ino);
+                    crate::task::sched::request_pipe_wake();
+                }
                 // 对端计数变化可能使等待者可读（EOF）或写失败（EPIPE），
                 // 按管道实例定向唤醒；无锁原子槽位，可在任意持锁环境下调用。
                 crate::task::sched::request_pipe_id_wake(*id);
@@ -474,6 +521,40 @@ impl Context {
         let retained = (path != "/" && ino & fs::FAT_INODE == 0).then_some(ino);
         self.cwd = directory_path(path, retained)?;
         Ok(())
+    }
+
+    /// fchdir(2)：将工作目录切换到已打开的目录 FD（允许 O_PATH 目录 FD）；非特权进程校验搜索权限。
+    pub(crate) fn fchdir(
+        &mut self,
+        fd: usize,
+        credentials: &crate::task::Credentials,
+    ) -> Result<(), Errno> {
+        let handle = self.get(fd)?;
+        let (path, ino) = {
+            let f = handle.lock();
+            match &f.kind {
+                Kind::Inode {
+                    ino,
+                    directory: Some(dir),
+                    ..
+                } => (string(dir.path()?)?, *ino),
+                _ => return Err(Errno::NotDir),
+            }
+        };
+        if credentials.euid != 0 {
+            let meta = fs::metadata::metadata(ino)?;
+            let bit = if credentials.euid == meta.uid {
+                0o100
+            } else if credentials.egid == meta.gid {
+                0o010
+            } else {
+                0o001
+            };
+            if meta.mode & bit == 0 {
+                return Err(Errno::Access);
+            }
+        }
+        self.set_cwd(path, ino)
     }
 
     fn rename_path(&self, dir: usize, input: &str) -> Result<(String, u32, String), Errno> {
@@ -880,13 +961,16 @@ impl Context {
         let handle = self.get(fd)?;
         let (ino, path) = {
             let f = handle.lock();
-            let Kind::Inode { ino, path, .. } = &f.kind else {
-                return Err(Errno::NoEntry);
-            };
-            if f.detached_directory() {
-                return Err(Errno::NoEntry);
+            match &f.kind {
+                Kind::Inode { ino, path, .. } => {
+                    if f.detached_directory() {
+                        return Err(Errno::NoEntry);
+                    }
+                    (*ino, path.clone())
+                }
+                Kind::Pipe { ino: Some(ino), .. } => (*ino, String::new()),
+                _ => return Err(Errno::NoEntry),
             }
-            (*ino, path.clone())
         };
         super::chmod_apply(path.as_str(), ino, mode, space)
     }
@@ -1016,6 +1100,9 @@ impl Context {
             readers: 1,
             writers: 1,
             event_gen: 1,
+            fifo_ino: None,
+            opening_readers: Vec::new(),
+            opening_writers: Vec::new(),
         }))?;
         let r = fs::try_arc(Mutex::new(OpenFile {
             ofd_id: next_ofd_id(),
@@ -1023,6 +1110,8 @@ impl Context {
                 id,
                 pipe: pipe.clone(),
                 reading: true,
+                writing: false,
+                ino: None,
             },
             offset: 0,
             flags: flags & 0x800,
@@ -1033,6 +1122,8 @@ impl Context {
                 id,
                 pipe,
                 reading: false,
+                writing: true,
+                ino: None,
             },
             offset: 0,
             flags: (flags & 0x800) | 1,
@@ -1046,6 +1137,145 @@ impl Context {
             }
         };
         Ok((rfd, wfd))
+    }
+
+    /// 打开命名管道（FIFO，fifo(7) 语义）：支持 O_RDONLY、O_WRONLY、O_RDWR 与 O_NONBLOCK。
+    pub(crate) fn open_fifo(
+        &mut self,
+        ino: u32,
+        flags: usize,
+        cloexec: bool,
+        tgid: u32,
+    ) -> Result<usize, Errno> {
+        let acc = flags & 3;
+        let nonblock = flags & 0x800 != 0;
+        let (id, pipe) = {
+            let mut fifos = FIFOS.lock();
+            if let Some(entry) = fifos.iter().find(|e| e.ino == ino) {
+                (entry.id, entry.pipe.clone())
+            } else {
+                let mut data = VecDeque::new();
+                data.try_reserve(4096).map_err(|_| Errno::NoMem)?;
+                let id = NEXT_PIPE_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                let pipe = fs::try_arc(Mutex::new(Pipe {
+                    data,
+                    capacity: PIPE_CAPACITY,
+                    readers: 0,
+                    writers: 0,
+                    event_gen: 1,
+                    fifo_ino: Some(ino),
+                    opening_readers: Vec::new(),
+                    opening_writers: Vec::new(),
+                }))?;
+                fifos.try_reserve(1).map_err(|_| Errno::NoMem)?;
+                fifos.push(FifoEntry {
+                    ino,
+                    id,
+                    pipe: pipe.clone(),
+                });
+                (id, pipe)
+            }
+        };
+
+        let (reading, writing) = {
+            let mut p = pipe.lock();
+            match acc {
+                2 => {
+                    p.opening_readers.retain(|&x| x != tgid);
+                    p.opening_writers.retain(|&x| x != tgid);
+                    p.readers += 1;
+                    p.writers += 1;
+                    (true, true)
+                }
+                0 => {
+                    if nonblock || p.writers > 0 || !p.opening_writers.is_empty() {
+                        p.opening_readers.retain(|&x| x != tgid);
+                        p.readers += 1;
+                        (true, false)
+                    } else {
+                        if !p.opening_readers.contains(&tgid) {
+                            p.opening_readers.try_reserve(1).map_err(|_| Errno::NoMem)?;
+                            p.opening_readers.push(tgid);
+                        }
+                        return Err(Errno::WouldBlock);
+                    }
+                }
+                1 => {
+                    if p.readers == 0 && p.opening_readers.is_empty() {
+                        if nonblock {
+                            let empty = p.writers == 0 && p.opening_writers.is_empty();
+                            drop(p);
+                            if empty {
+                                let mut fifos = FIFOS.lock();
+                                fifos.retain(|e| {
+                                    if e.ino != ino {
+                                        return true;
+                                    }
+                                    let q = e.pipe.lock();
+                                    q.readers > 0
+                                        || q.writers > 0
+                                        || !q.opening_readers.is_empty()
+                                        || !q.opening_writers.is_empty()
+                                });
+                            }
+                            return Err(Errno::NxIo);
+                        }
+                        if !p.opening_writers.contains(&tgid) {
+                            p.opening_writers.try_reserve(1).map_err(|_| Errno::NoMem)?;
+                            p.opening_writers.push(tgid);
+                        }
+                        return Err(Errno::WouldBlock);
+                    }
+                    p.opening_writers.retain(|&x| x != tgid);
+                    p.writers += 1;
+                    p.event_gen = p.event_gen.wrapping_add(1);
+                    (false, true)
+                }
+                _ => return Err(Errno::Invalid),
+            }
+        };
+
+        crate::task::sched::request_pipe_wake();
+        crate::task::sched::request_pipe_id_wake(id);
+        if let Err(e) = fs::retain(ino) {
+            let mut p = pipe.lock();
+            if reading {
+                p.readers = p.readers.saturating_sub(1);
+            }
+            if writing {
+                p.writers = p.writers.saturating_sub(1);
+            }
+            return Err(e);
+        }
+        let file = fs::try_arc(Mutex::new(OpenFile {
+            ofd_id: next_ofd_id(),
+            kind: Kind::Pipe {
+                id,
+                pipe,
+                reading,
+                writing,
+                ino: Some(ino),
+            },
+            offset: 0,
+            flags: flags & !OPEN_CREATION_FLAGS,
+        }))?;
+        self.install(file, cloexec)
+    }
+
+    /// 若 `fd` 指向管道或套接字，返回当前是否有可读数据（供 splice/tee 选择精确等待目标）。
+    pub(crate) fn has_readable_data(&self, fd: usize) -> bool {
+        let Ok(handle) = self.get(fd) else {
+            return false;
+        };
+        let f = handle.lock();
+        match &f.kind {
+            Kind::Pipe { pipe, .. } => {
+                let p = pipe.lock();
+                !p.data.is_empty() || p.writers == 0
+            }
+            Kind::Socket(id) => crate::net::poll_events(*id, 0x01) != 0,
+            _ => true,
+        }
     }
 
     /// 将新创建的套接字句柄安装到 FD 表（默认 O_RDWR，按需置 O_NONBLOCK/FD_CLOEXEC）。
@@ -1348,7 +1578,7 @@ impl OpenFile {
     /// 获取 inode；没有后端 inode 的对象返回 EINVAL。
     pub(crate) fn inode(&self) -> Result<u32, Errno> {
         match self.kind {
-            Kind::Inode { ino, .. } => Ok(ino),
+            Kind::Inode { ino, .. } | Kind::Pipe { ino: Some(ino), .. } => Ok(ino),
             _ => Err(Errno::Invalid),
         }
     }
@@ -1377,10 +1607,12 @@ impl OpenFile {
         }
     }
 
-    /// 更新打开 inode 的访问和修改时间；管道与控制台返回 EOPNOTSUPP。
+    /// 更新打开 inode 的访问和修改时间；匿名管道与控制台返回 EOPNOTSUPP。
     pub(crate) fn update_times(&self, times: [fs::TimeUpdate; 2]) -> Result<(), Errno> {
         match self.kind {
-            Kind::Inode { ino, .. } => fs::update_times(ino, times),
+            Kind::Inode { ino, .. } | Kind::Pipe { ino: Some(ino), .. } => {
+                fs::update_times(ino, times)
+            }
             _ => Err(Errno::NotSupported),
         }
     }
@@ -1415,6 +1647,7 @@ impl OpenFile {
                 }
                 fs::metadata::metadata(*ino)
             }
+            Kind::Pipe { ino: Some(ino), .. } => fs::metadata::metadata(*ino),
             Kind::ProcFdDir(_) => Ok(fs::Metadata {
                 ino: super::procfs::SELF_FD_DIR as u64,
                 mode: 0o040555,
@@ -1589,6 +1822,155 @@ impl OpenFile {
         }
     }
 
+    /// 若为管道或命名管道，返回其管道实例号。
+    pub(crate) fn pipe_id(&self) -> Option<u64> {
+        match &self.kind {
+            Kind::Pipe { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// 是否为套接字打开对象。
+    pub(crate) fn is_socket(&self) -> bool {
+        matches!(self.kind, Kind::Socket(_))
+    }
+
+    /// 是否为已连接的套接字打开对象（供 splice 校验）。
+    pub(crate) fn is_connected_socket(&self) -> bool {
+        match &self.kind {
+            Kind::Socket(id) => crate::net::is_connected(*id),
+            _ => false,
+        }
+    }
+
+    /// 是否为普通文件 inode（非目录、非管道、非套接字、非设备）。
+    pub(crate) fn is_regular_file(&self) -> Result<bool, Errno> {
+        match &self.kind {
+            Kind::Inode {
+                ino,
+                directory: None,
+                ..
+            } => Ok(fs::stat(*ino)?.0 & 0xf000 == 0x8000),
+            _ => Ok(false),
+        }
+    }
+
+    /// 返回管道剩余可写空间；无读端返回 EPIPE，无空间返回 EAGAIN/WouldBlock。
+    pub(crate) fn pipe_writable_space(&self, nonblock: bool) -> Result<usize, Errno> {
+        let Kind::Pipe { pipe, .. } = &self.kind else {
+            return Err(Errno::Invalid);
+        };
+        let p = pipe.lock();
+        if p.readers == 0 {
+            return Err(Errno::Pipe);
+        }
+        let avail = p.capacity.saturating_sub(p.data.len());
+        if avail == 0 {
+            return if nonblock || self.flags & 0x800 != 0 {
+                Err(Errno::Again)
+            } else {
+                Err(Errno::WouldBlock)
+            };
+        }
+        Ok(avail)
+    }
+
+    /// 按显式 nonblock 标志从套接字读入内核缓冲区（供 splice 使用）。
+    pub(crate) fn read_socket_into(&self, dst: &mut [u8], nonblock: bool) -> Result<usize, Errno> {
+        let Kind::Socket(id) = &self.kind else {
+            return Err(Errno::Invalid);
+        };
+        let nb = nonblock || self.flags & 0x800 != 0;
+        crate::net::recvfrom(*id, dst, 0, nb, |bytes, _| Ok(bytes.len()))
+    }
+
+    /// 按显式 nonblock 标志向套接字写入内核缓冲区（供 splice 使用）。
+    pub(crate) fn write_socket_from(&self, data: &[u8], nonblock: bool) -> Result<usize, Errno> {
+        let Kind::Socket(id) = &self.kind else {
+            return Err(Errno::Invalid);
+        };
+        let nb = nonblock || self.flags & 0x800 != 0;
+        crate::net::sendto(*id, data, 0, None, nb)
+    }
+
+    /// 按显式 nonblock 标志从指定偏移只看不消费地读取管道内容（供 splice/tee 使用）。
+    pub(crate) fn peek_pipe_into(
+        &self,
+        skip: usize,
+        dst: &mut [u8],
+        nonblock: bool,
+    ) -> Result<usize, Errno> {
+        let Kind::Pipe { pipe, .. } = &self.kind else {
+            return Err(Errno::Invalid);
+        };
+        let p = pipe.lock();
+        if p.data.len() <= skip {
+            return if skip > 0 || p.writers == 0 {
+                Ok(0)
+            } else if nonblock || self.flags & 0x800 != 0 {
+                Err(Errno::Again)
+            } else {
+                Err(Errno::WouldBlock)
+            };
+        }
+        let avail = p.data.len() - skip;
+        let count = dst.len().min(avail);
+        let (first, second) = p.data.as_slices();
+        if skip < first.len() {
+            let take_first = count.min(first.len() - skip);
+            dst[..take_first].copy_from_slice(&first[skip..skip + take_first]);
+            if take_first < count {
+                dst[take_first..count].copy_from_slice(&second[..count - take_first]);
+            }
+        } else {
+            let s = skip - first.len();
+            dst[..count].copy_from_slice(&second[s..s + count]);
+        }
+        Ok(count)
+    }
+
+    /// 消费管道前端已成功搬运的字节并唤醒写端（供 pipe->pipe splice 使用）。
+    pub(crate) fn consume_pipe(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Kind::Pipe { id, pipe, .. } = &self.kind {
+            let mut p = pipe.lock();
+            let take = count.min(p.data.len());
+            p.data.drain(..take);
+            if take > 0 {
+                p.event_gen = p.event_gen.wrapping_add(1);
+            }
+            crate::task::sched::request_pipe_id_wake(*id);
+        }
+    }
+
+    /// 按显式 nonblock 标志向管道写入字节（供 splice/tee 使用）。
+    pub(crate) fn write_pipe_from(&self, data: &[u8], nonblock: bool) -> Result<usize, Errno> {
+        let Kind::Pipe { id, pipe, .. } = &self.kind else {
+            return Err(Errno::Invalid);
+        };
+        let mut p = pipe.lock();
+        if p.readers == 0 {
+            return Err(Errno::Pipe);
+        }
+        let avail = p.capacity.saturating_sub(p.data.len());
+        let need = if data.len() <= 4096 { data.len() } else { 1 };
+        if avail < need {
+            return if nonblock || self.flags & 0x800 != 0 {
+                Err(Errno::Again)
+            } else {
+                Err(Errno::WouldBlock)
+            };
+        }
+        let n = data.len().min(avail);
+        p.data.extend(&data[..n]);
+        if n > 0 {
+            p.event_gen = p.event_gen.wrapping_add(1);
+        }
+        crate::task::sched::request_pipe_id_wake(*id);
+        Ok(n)
+    }
     /// 将一段内容直接读入调用方提供的内核缓冲区（供 sendfile 等内核态搬运使用）。
     pub(crate) fn read_into_buf(
         &mut self,
@@ -1919,21 +2301,31 @@ pub(super) fn fd_poll_events(file: &mut OpenFile, requested: u16, depth: usize) 
                 0
             }
         }
-        Kind::Pipe { pipe, reading, .. } => {
+        Kind::Pipe {
+            pipe,
+            reading,
+            writing,
+            ..
+        } => {
             let p = pipe.lock();
+            let mut ev = 0u16;
             if *reading {
-                (if p.data.is_empty() {
-                    0
-                } else {
-                    0x41 & requested
-                }) | (if p.writers == 0 { 16 } else { 0 })
-            } else {
-                (if p.data.len() < p.capacity {
-                    0x104 & requested
-                } else {
-                    0
-                }) | (if p.readers == 0 { 8 } else { 0 })
+                if !p.data.is_empty() {
+                    ev |= 0x41 & requested;
+                }
+                if p.writers == 0 {
+                    ev |= 16;
+                }
             }
+            if *writing {
+                if p.data.len() < p.capacity {
+                    ev |= 0x104 & requested;
+                }
+                if p.readers == 0 {
+                    ev |= 8;
+                }
+            }
+            ev
         }
     }
 }

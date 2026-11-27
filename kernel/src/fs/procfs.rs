@@ -76,10 +76,47 @@ pub(super) const TAINTED: u32 = u32::MAX - 18;
 pub(super) const SYS_FS_DIR: u32 = u32::MAX - 19;
 /// /proc/sys/fs/pipe-max-size 文件
 pub(super) const PIPE_MAX_SIZE_NODE: u32 = u32::MAX - 20;
+/// /proc/sys/kernel/{msgmni,msgmax,msgmnb,sem} 与 /proc/sysvipc/{msg,sem} 只读节点。
+pub(super) const SYS_MSGMNI: u32 = u32::MAX - 21;
+pub(super) const SYS_MSGMAX: u32 = u32::MAX - 22;
+pub(super) const SYS_MSGMNB: u32 = u32::MAX - 23;
+pub(super) const SYS_SEM: u32 = u32::MAX - 24;
+pub(super) const SYSVIPC_DIR: u32 = u32::MAX - 25;
+pub(super) const SYSVIPC_MSG: u32 = u32::MAX - 26;
+pub(super) const SYSVIPC_SEM: u32 = u32::MAX - 27;
 
 /// 判断 inode 是否属于虚拟节点区间（固定虚拟节点或 /proc/<pid> 派生节点）。
 pub(super) fn is_virtual_ino(ino: u32) -> bool {
-    ino >= PIPE_MAX_SIZE_NODE || pid_ino_parts(ino).is_some()
+    ino >= SYSVIPC_SEM || pid_ino_parts(ino).is_some()
+}
+
+/// /proc/sys/kernel/{msgmni,msgmax,msgmnb,sem} 只读快照（与 ipc 模块限额常量同源）。
+pub(super) fn sys_kernel_ipc(name: &str) -> Result<String, Errno> {
+    let mut out = String::new();
+    out.try_reserve(64).map_err(|_| Errno::NoMem)?;
+    match name {
+        "msgmni" => {
+            let _ = writeln!(out, "{}", crate::ipc::msg::MSGMNI);
+        }
+        "msgmax" => {
+            let _ = writeln!(out, "{}", crate::ipc::msg::MSGMAX);
+        }
+        "msgmnb" => {
+            let _ = writeln!(out, "{}", crate::ipc::msg::MSGMNB);
+        }
+        "sem" => {
+            let _ = writeln!(
+                out,
+                "{}\t{}\t{}\t{}",
+                crate::ipc::sem::SEMMSL,
+                crate::ipc::sem::SEMMNS,
+                crate::ipc::sem::SEMOPM,
+                crate::ipc::sem::SEMMNI
+            );
+        }
+        _ => return Err(Errno::NoEntry),
+    }
+    Ok(out)
 }
 
 /// /proc/sys/kernel/pid_max 内容。

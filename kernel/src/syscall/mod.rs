@@ -46,6 +46,7 @@ pub mod sysnr {
     pub const TRUNCATE: usize = 45;
     pub const FTRUNCATE: usize = 46;
     pub const CHDIR: usize = 49;
+    pub const FCHDIR: usize = 50;
     pub const OPENAT: usize = 56;
     pub const CLOSE: usize = 57;
     pub const PIPE2: usize = 59;
@@ -60,6 +61,8 @@ pub mod sysnr {
     pub const PREADV: usize = 69;
     pub const PWRITEV: usize = 70;
     pub const SENDFILE: usize = 71;
+    pub const SPLICE: usize = 76;
+    pub const TEE: usize = 77;
     pub const READLINKAT: usize = 78;
     pub const FSTATAT: usize = 79;
     pub const FSTAT: usize = 80;
@@ -71,6 +74,8 @@ pub mod sysnr {
     pub const UTIMENSAT: usize = 88;
     pub const UMASK: usize = 166;
     pub const RENAMEAT2: usize = 276;
+    pub const FADVISE64: usize = 223;
+    pub const COPY_FILE_RANGE: usize = 285;
     pub const STATX: usize = 291;
     pub const EPOLL_PWAIT2: usize = 441;
     // 进程
@@ -164,7 +169,15 @@ pub mod sysnr {
     pub const CLONE: usize = 220;
     pub const EXECVE: usize = 221;
     pub const WAIT4: usize = 260;
-    // System V 共享内存
+    // System V IPC（消息队列 / 信号量 / 共享内存）
+    pub const MSGGET: usize = 186;
+    pub const MSGCTL: usize = 187;
+    pub const MSGRCV: usize = 188;
+    pub const MSGSND: usize = 189;
+    pub const SEMGET: usize = 190;
+    pub const SEMCTL: usize = 191;
+    pub const SEMTIMEDOP: usize = 192;
+    pub const SEMOP: usize = 193;
     pub const SHMGET: usize = 194;
     pub const SHMCTL: usize = 195;
     pub const SHMAT: usize = 196;
@@ -227,6 +240,8 @@ pub enum Errno {
     Exists,
     NotDir,
     IsDir,
+    /// ENXIO: 无对应设备或无读端非阻塞打开 FIFO。
+    NxIo,
     NoDevice,
     TooManyFiles,
     Range,
@@ -247,6 +262,10 @@ pub enum Errno {
     BadF,
     /// EFAULT: 用户缓冲区地址非法
     Fault,
+    /// ENOMSG: 消息队列无匹配消息。
+    NoMsg,
+    /// EIDRM: IPC 标识符已被移除。
+    IdRm,
     /// ENOSYS: 未实现的系统调用
     NoSys,
     /// ETIMEDOUT: 等待超过期限。
@@ -306,6 +325,7 @@ impl Errno {
             Self::Exists => 17,
             Self::NotDir => 20,
             Self::IsDir => 21,
+            Self::NxIo => 6,
             Self::NoDevice => 19,
             Self::TooManyFiles => 24,
             Self::Range => 34,
@@ -320,6 +340,8 @@ impl Errno {
             Self::ReadOnly => 30,
             Errno::BadF => 9,
             Errno::Fault => 14,
+            Errno::NoMsg => 42,
+            Errno::IdRm => 43,
             Errno::NoSys => 38,
             Errno::TimedOut => 110,
             Self::NotSock => 88,
@@ -402,6 +424,7 @@ pub fn dispatch(
         | sysnr::TRUNCATE
         | sysnr::FTRUNCATE
         | sysnr::CHDIR
+        | sysnr::FCHDIR
         | sysnr::OPENAT
         | sysnr::CLOSE
         | sysnr::PIPE2
@@ -416,6 +439,10 @@ pub fn dispatch(
         | sysnr::PREADV
         | sysnr::PWRITEV
         | sysnr::SENDFILE
+        | sysnr::SPLICE
+        | sysnr::TEE
+        | sysnr::FADVISE64
+        | sysnr::COPY_FILE_RANGE
         | sysnr::READLINKAT
         | sysnr::FSTAT
         | sysnr::FSTATAT
@@ -440,16 +467,35 @@ pub fn dispatch(
                 credentials,
                 thread.tgid as u32,
             );
-            // pipe/eventfd/timerfd/套接字/文件锁无数据或锁冲突且阻塞：等待唤醒。
+            // pipe/FIFO/eventfd/timerfd/套接字/文件锁无数据或锁冲突且阻塞：等待唤醒。
             if ret == Err(Errno::WouldBlock) {
-                if matches!(nr, sysnr::FCNTL | sysnr::FLOCK) {
+                if matches!(nr, sysnr::FCNTL | sysnr::FLOCK | sysnr::OPENAT) {
                     return Flow::Wait(WaitReason::Pipe);
+                }
+                if nr == sysnr::SPLICE || nr == sysnr::TEE {
+                    let out_fd = if nr == sysnr::SPLICE {
+                        args[2]
+                    } else {
+                        args[1]
+                    };
+                    let in_reason = fs.wait_reason_for_fd(args[0]);
+                    if !matches!(in_reason, WaitReason::Pipe) && !fs.has_readable_data(args[0]) {
+                        return Flow::Wait(in_reason);
+                    }
+                    let out_reason = fs.wait_reason_for_fd(out_fd);
+                    if !matches!(out_reason, WaitReason::Pipe) {
+                        return Flow::Wait(out_reason);
+                    }
+                    return Flow::Wait(in_reason);
                 }
                 return Flow::Wait(fs.wait_reason_for_fd(args[0]));
             }
             // 向无读者的管道写入：SIGPIPE 入队并与 -EPIPE 返回并行。
             if ret == Err(Errno::Pipe)
-                && (nr == sysnr::WRITE || nr == sysnr::WRITEV || nr == sysnr::SENDFILE)
+                && matches!(
+                    nr,
+                    sysnr::WRITE | sysnr::WRITEV | sysnr::SENDFILE | sysnr::SPLICE | sysnr::TEE
+                )
             {
                 signal.generate(
                     SIGPIPE,
@@ -689,7 +735,15 @@ pub fn dispatch(
         | sysnr::ACCEPT4
         | sysnr::CONNECT
         | sysnr::SENDTO
-        | sysnr::RECVFROM => Flow::Process,
+        | sysnr::RECVFROM
+        | sysnr::MSGGET
+        | sysnr::MSGCTL
+        | sysnr::MSGRCV
+        | sysnr::MSGSND
+        | sysnr::SEMGET
+        | sysnr::SEMCTL
+        | sysnr::SEMTIMEDOP
+        | sysnr::SEMOP => Flow::Process,
         sysnr::GETRANDOM => {
             // getrandom(2)：flags 只认 NONBLOCK(1)/RANDOM(2)（后者与默认
             // 等价）；无种子或熵流耗尽一律 EAGAIN（无合法阻塞唤醒来源），

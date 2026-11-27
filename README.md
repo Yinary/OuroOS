@@ -61,6 +61,7 @@ hello, OuroOS user world (riscv64)
 [user] hello: exited with status 0
 check: write ok
 check: mm syscall paths ok
+check: clock syscall paths ok
 check: all syscall paths ok, faulting now
 [user] check: killed by LoadPageFault @ 0x5000
 ```

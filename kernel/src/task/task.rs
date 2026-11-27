@@ -70,6 +70,11 @@ pub enum WaitReason {
     },
     /// vfork 的父进程等待子进程 exec 或退出。
     Vfork(Pid),
+    /// 等待指定 System V IPC 对象（消息队列或信号量集）状态变化，可选单调截止时刻。
+    Ipc {
+        key: u64,
+        deadline: Option<core::time::Duration>,
+    },
 }
 
 impl WaitReason {
@@ -79,7 +84,7 @@ impl WaitReason {
             WaitReason::Deadline(d)
             | WaitReason::PollUntil(d)
             | WaitReason::SigTimedWait { deadline: d, .. } => Some(*d),
-            WaitReason::Futex { deadline, .. } => *deadline,
+            WaitReason::Futex { deadline, .. } | WaitReason::Ipc { deadline, .. } => *deadline,
             _ => None,
         }
     }
