@@ -199,21 +199,10 @@ pub struct Context {
     cwd: Arc<DirectoryPath>,
     fds: Vec<Option<Descriptor>>,
     nofile_limit: [usize; 2],
-    extra_limits: [[usize; 2]; 16],
     umask: u16,
     /// 本进程最近一次 execve 的绝对路径（/proc/self/exe 的目标，proc(5)）。
     /// 内核内嵌启动的程序没有盘上路径，保持为空串。
     exe_path: String,
-}
-fn default_extra_limits() -> [[usize; 2]; 16] {
-    let mut lim = [[usize::MAX, usize::MAX]; 16];
-    lim[4] = [0, usize::MAX]; // RLIMIT_CORE
-    lim[6] = [4096, 4096]; // RLIMIT_NPROC
-    lim[11] = [1024, 1024]; // RLIMIT_SIGPENDING
-    lim[12] = [819_200, 819_200]; // RLIMIT_MSGQUEUE
-    lim[13] = [0, 0]; // RLIMIT_NICE
-    lim[14] = [0, 0]; // RLIMIT_RTPRIO
-    lim
 }
 fn string(s: &str) -> Result<String, Errno> {
     let mut result = String::new();
@@ -241,7 +230,6 @@ impl Context {
             cwd: directory_path(string("/")?, None)?,
             fds,
             nofile_limit: [FD_DEFAULT_SOFT, FD_DEFAULT_HARD],
-            extra_limits: default_extra_limits(),
             umask: 0o022,
             exe_path: String::new(),
         })
@@ -255,31 +243,9 @@ impl Context {
             cwd: self.cwd.clone(),
             fds,
             nofile_limit: self.nofile_limit,
-            extra_limits: self.extra_limits,
             umask: self.umask,
             exe_path: self.exe_path.clone(),
         })
-    }
-    /// 查询本进程其余非内存/非 NOFILE 的标准 RLIMIT_* 软硬限额（资源号 0..16）。
-    pub(crate) fn extra_limit(&self, resource: usize) -> Option<[usize; 2]> {
-        self.extra_limits.get(resource).copied()
-    }
-    /// 修改标准 RLIMIT_* 限额；非特权进程不得抬高硬限额。
-    pub(crate) fn set_extra_limit(
-        &mut self,
-        resource: usize,
-        limit: [usize; 2],
-        privileged: bool,
-    ) -> Result<(), Errno> {
-        let cur = self.extra_limits.get_mut(resource).ok_or(Errno::Invalid)?;
-        if limit[0] > limit[1] {
-            return Err(Errno::Invalid);
-        }
-        if !privileged && limit[1] > cur[1] {
-            return Err(Errno::Perm);
-        }
-        *cur = limit;
-        Ok(())
     }
     /// 查询本进程 RLIMIT_NOFILE 的软硬限额。
     pub(crate) fn nofile_limit(&self) -> [usize; 2] {
