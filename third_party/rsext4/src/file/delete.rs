@@ -65,8 +65,8 @@ pub fn free_inode<B: BlockDevice>(
 }
 
 // OuroOS patch: leave inode reclamation to the caller that owns open references.
-/// Removes a regular file's directory entry and returns its remaining link count.
-pub fn unlink_regular_entry<B: BlockDevice>(
+/// 移除普通文件或符号链接 的目录项，返回剩余链接数。
+pub fn unlink_file_entry<B: BlockDevice>(
     fs: &mut Ext4FileSystem,
     device: &mut Jbd2Dev<B>,
     parent: InodeNumber,
@@ -88,21 +88,33 @@ pub fn unlink_regular_entry<B: BlockDevice>(
     if inode.is_dir() {
         return Err(Ext4Error::is_dir());
     }
-    // OuroOS patch: allow unlinking symlinks in addition to regular files.
     if !inode.is_file() && !inode.is_symlink() {
         return Err(Ext4Error::unsupported());
     }
-    let links = inode.i_links_count.checked_sub(1).ok_or_else(Ext4Error::corrupted)?;
+    let links = inode
+        .i_links_count
+        .checked_sub(1)
+        .ok_or_else(Ext4Error::corrupted)?;
     if links == 0
         && (inode.file_acl() != 0
             || (inode.blocks_count() != 0 && !inode.have_extend_header_and_use_extend()))
     {
         return Err(Ext4Error::unsupported());
     }
-    remove_named_entry_at(fs, device, parent, &dir, entry.phys, name.as_bytes())?;
-    fs.set_inode_links_count(device, ino, links)?;
-    fs.touch_parent_dir_for_entry_change(device, parent)?;
-    Ok(links)
+    let mut undo = super::rename::Undo::new()?;
+    undo.block(fs, device, entry.phys)?;
+    undo.inode(fs, device, ino)?;
+    undo.inode(fs, device, parent)?;
+    let result = (|| {
+        remove_named_entry_at(fs, device, parent, &dir, entry.phys, name.as_bytes())?;
+        fs.set_inode_links_count(device, ino, links)?;
+        fs.touch_parent_dir_for_entry_change(device, parent)?;
+        Ok(links)
+    })();
+    if result.is_err() {
+        undo.restore(fs, device).map_err(|_| Ext4Error::io())?;
+    }
+    result
 }
 
 /// Remove a non-directory link from its parent directory.
@@ -322,7 +334,7 @@ pub(crate) fn find_named_entry_in_parent<B: BlockDevice>(
     parent_inode: &Ext4Inode,
     name_bytes: &[u8],
 ) -> Ext4Result<ParentDirEntry> {
-    use crate::hashtree::{Ext4InodeHashTreeExt, lookup_directory_entry};
+    use crate::hashtree::{lookup_directory_entry, Ext4InodeHashTreeExt};
 
     if !parent_inode.is_dir() {
         return Err(Ext4Error::not_dir());
@@ -341,12 +353,10 @@ pub(crate) fn find_named_entry_in_parent<B: BlockDevice>(
 
     let mut parent_inode = *parent_inode;
     for phys in parent_dir_data_blocks(fs, block_dev, &mut parent_inode)? {
-        let cached = match fs.datablock_cache.get_or_load(block_dev, phys) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let data = &cached.data[..BLOCK_SIZE];
-        if let Some((inode, file_type)) = find_dentry_in_dir_block(data, name_bytes) {
+        let cached = fs.datablock_cache.get_or_load(block_dev, phys)?;
+        if let Some((inode, file_type)) =
+            find_dentry_in_dir_block(&cached.data[..BLOCK_SIZE], name_bytes)
+        {
             let ino = InodeNumber::new(inode).map_err(|_| Ext4Error::corrupted())?;
             return Ok(ParentDirEntry {
                 ino,
@@ -373,6 +383,38 @@ pub(crate) fn remove_named_entry_at<B: BlockDevice>(
     } else {
         Err(Ext4Error::not_found())
     }
+}
+
+// OuroOS patch: 撤销插入，保留已初始化的目录扩容块。
+pub(super) fn rollback_entry_insert<B: BlockDevice>(
+    fs: &mut Ext4FileSystem,
+    dev: &mut Jbd2Dev<B>,
+    parent: InodeNumber,
+    child: InodeNumber,
+    name: &str,
+    original: &Ext4Inode,
+    attempted: &Ext4Inode,
+) -> Ext4Result<()> {
+    let current = fs.get_inode_by_num(dev, parent)?;
+    let grown = attempted.size() != current.size();
+    let dir = if grown { attempted } else { &current };
+    match find_named_entry_in_parent(fs, dev, parent, dir, name.as_bytes()) {
+        Ok(entry) if entry.ino == child => {
+            remove_named_entry_at(fs, dev, parent, dir, entry.phys, name.as_bytes())?;
+        }
+        Ok(_) => return Err(Ext4Error::corrupted()),
+        Err(e) if e.code == Errno::ENOENT && !grown => {}
+        Err(e) => return Err(e),
+    }
+    fs.modify_inode(dev, parent, |out| {
+        if grown {
+            *out = *attempted;
+        }
+        out.i_ctime = original.i_ctime;
+        out.i_ctime_extra = original.i_ctime_extra;
+        out.i_mtime = original.i_mtime;
+        out.i_mtime_extra = original.i_mtime_extra;
+    })
 }
 
 pub fn remove_inodeentry_from_parentdir<B: BlockDevice>(

@@ -1,4 +1,4 @@
-//! 与后端无关的文件属性，以及保留符号链接语义的状态查询路径解析。
+//! 与后端无关的文件属性与路径解析。
 #![deny(unsafe_code)]
 use super::{ext4, fat, lookup, FAT_INODE};
 use crate::syscall::Errno;
@@ -28,6 +28,13 @@ pub(crate) struct Metadata {
     pub mtime: Option<Timestamp>,
     pub ctime: Option<Timestamp>,
     pub btime: Option<Timestamp>,
+}
+
+impl Metadata {
+    /// 返回文件系统内部使用的 inode 句柄。
+    pub(crate) fn inode_handle(&self) -> u32 {
+        self.ino as u32
+    }
 }
 
 /// 按 inode 取得后端元数据，失败返回后端错误。
@@ -100,14 +107,37 @@ pub(crate) fn query(path: &str, follow: bool) -> Result<Metadata, Errno> {
 
 /// 解析绝对路径并返回规范路径及属性；保留与 query 相同的链接规则。
 pub(crate) fn resolve(path: &str, follow: bool) -> Result<(String, Metadata), Errno> {
-    if is_clean_ext4_path(path) && !fat::has_mounts() {
-        if let Ok(Some(info)) = ext4::fast_metadata(path) {
-            return Ok((string(path)?, info));
-        }
+    let (path, target) = resolve_entry(path, follow, false)?;
+    match target {
+        ResolvedEntry::Existing(info) => Ok((path, info)),
+        ResolvedEntry::Missing { .. } => Err(Errno::NoEntry),
     }
+}
+
+/// 路径末项存在，或可在已确认的父目录下新建。
+pub(crate) enum ResolvedEntry {
+    Existing(Metadata),
+    Missing { parent: u32 },
+}
+
+/// 解析路径并保留规范名称；allow_create 只允许末项不存在。
+pub(super) fn resolve_entry(
+    path: &str,
+    follow: bool,
+    allow_create: bool,
+) -> Result<(String, ResolvedEntry), Errno> {
+    resolve_entry_from("/", path, follow, allow_create)
+}
+
+fn resolve_entry_from(
+    base: &str,
+    path: &str,
+    follow: bool,
+    allow_create: bool,
+) -> Result<(String, ResolvedEntry), Errno> {
     let mut pending = string(path)?;
-    let mut current = string("/")?;
-    let mut info = metadata(lookup("/")?)?;
+    let mut current = string(if path.starts_with('/') { "/" } else { base })?;
+    let mut info = metadata(lookup(&current)?)?;
     let mut cursor = 0;
     let mut links = 0;
     let mut saw_symlink = false;
@@ -144,7 +174,18 @@ pub(crate) fn resolve(path: &str, follow: bool) -> Result<(String, Metadata), Er
                 if candidate.len() >= 4096 {
                     return Err(Errno::NameTooLong);
                 }
-                let ino = lookup(&candidate)?;
+                let ino = match lookup(&candidate) {
+                    Ok(ino) => ino,
+                    Err(Errno::NoEntry) if allow_create && suffix.is_empty() => {
+                        return Ok((
+                            candidate,
+                            ResolvedEntry::Missing {
+                                parent: info.inode_handle(),
+                            },
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                };
                 let child = metadata(ino)?;
                 if child.mode & 0xf000 == 0xa000 && (follow || !suffix.is_empty()) {
                     saw_symlink = true;
@@ -152,7 +193,7 @@ pub(crate) fn resolve(path: &str, follow: bool) -> Result<(String, Metadata), Er
                     if links > 40 {
                         return Err(Errno::Loop);
                     }
-                    let mut target = ext4::link_target(ino)?;
+                    let mut target = super::read_link(ino)?;
                     if target.is_empty() {
                         return Err(Errno::NoEntry);
                     }
@@ -183,10 +224,9 @@ pub(crate) fn resolve(path: &str, follow: bool) -> Result<(String, Metadata), Er
     if !saw_symlink
         && info.mode & 0xf000 != 0xa000
         && is_clean_ext4_path(&current)
-        && (info.ino as u32) & FAT_INODE == 0
         && !fat::has_mounts()
     {
-        ext4::mark_direct_stat(&current, info.ino as u32);
+        ext4::mark_direct_stat(&current, info.inode_handle());
     }
-    Ok((current, info))
+    Ok((current, ResolvedEntry::Existing(info)))
 }

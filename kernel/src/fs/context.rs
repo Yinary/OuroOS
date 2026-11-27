@@ -437,17 +437,40 @@ impl Context {
         if input.starts_with('/') {
             return fs::query(input, follow);
         }
-        let base = if dir as isize == -100 {
+        fs::query(&self.absolute_path(dir, input)?, follow)
+    }
+
+    fn absolute_path(&self, dir: usize, input: &str) -> Result<String, Errno> {
+        let mut path = if dir as isize == -100 {
             string(self.cwd()?)?
         } else {
             string(self.get(dir)?.lock().directory_path()?)?
         };
-        let mut path = base;
         path.try_reserve(input.len() + 1)
             .map_err(|_| Errno::NoMem)?;
-        path.push('/');
+        if path != "/" {
+            path.push('/');
+        }
         path.push_str(input);
-        fs::query(&path, follow)
+        Ok(path)
+    }
+
+    /// 解析打开路径，允许在已确认的父目录中创建末项。
+    pub(crate) fn open_path(
+        &self,
+        dir: usize,
+        input: &str,
+        follow: bool,
+        allow_create: bool,
+    ) -> Result<(String, fs::ResolvedEntry), Errno> {
+        if input.is_empty() {
+            return Err(Errno::NoEntry);
+        }
+        if input.starts_with('/') {
+            fs::metadata::resolve_entry(input, follow, allow_create)
+        } else {
+            fs::metadata::resolve_entry(&self.absolute_path(dir, input)?, follow, allow_create)
+        }
     }
 
     /// 返回当前工作目录路径。已删名的目录返回 ENOENT。
@@ -462,7 +485,7 @@ impl Context {
         Ok(())
     }
 
-    fn rename_path(&self, dir: usize, input: &str) -> Result<(String, u32, String), Errno> {
+    fn entry_path(&self, dir: usize, input: &str) -> Result<(String, u32, String), Errno> {
         if input.is_empty() {
             return Err(Errno::NoEntry);
         }
@@ -505,7 +528,37 @@ impl Context {
         if canonical.len() >= 4096 {
             return Err(Errno::NameTooLong);
         }
-        Ok((canonical, info.ino as u32, string(name)?))
+        Ok((canonical, info.inode_handle(), string(name)?))
+    }
+
+    fn new_entry_path(&self, dir: usize, path: &str) -> Result<(u32, String), Errno> {
+        if path.ends_with('/') || matches!(path.rsplit('/').next(), Some("." | "..")) {
+            let trimmed = path.trim_end_matches('/');
+            let target = if trimmed.is_empty() { "/" } else { trimmed };
+            self.query(dir, target, false, false)?;
+            return Err(Errno::Exists);
+        }
+        let (_, parent, name) = self.entry_path(dir, path)?;
+        Ok((parent, name))
+    }
+
+    /// 删除末项名称，符号链接按自身的 inode 处理。
+    pub(crate) fn unlink(&self, dir: usize, input: &str) -> Result<(), Errno> {
+        let path = input.trim_end_matches('/');
+        let path = if path.is_empty() && !input.is_empty() {
+            "/"
+        } else {
+            path
+        };
+        let source = self.query(dir, path, false, false)?;
+        if source.mode & 0xf000 == 0x4000 {
+            return Err(Errno::IsDir);
+        }
+        if input.ends_with('/') {
+            return Err(Errno::NotDir);
+        }
+        let (_, parent, name) = self.entry_path(dir, input)?;
+        fs::unlink(parent, source.inode_handle(), &name)
     }
 
     /// 构造带基准目录的未词法折叠路径，供保留符号链接顺序的逐分量解析使用。
@@ -586,73 +639,40 @@ impl Context {
     }
 
     /// 创建符号链接（symlinkat 语义）；目标允许相对或悬空，不得为空。
-    pub(crate) fn symlink(&self, dir: usize, linkpath: &str, target: &str) -> Result<(), Errno> {
-        if target.is_empty() || linkpath.is_empty() {
+    pub(crate) fn symlink(
+        &self,
+        dir: usize,
+        path: &str,
+        target: &str,
+        credentials: &crate::task::Credentials,
+    ) -> Result<(), Errno> {
+        if target.is_empty() {
             return Err(Errno::NoEntry);
         }
-        if target.len() >= 4096 {
-            return Err(Errno::NameTooLong);
-        }
-        if linkpath.ends_with('/') {
-            let (canonical, _, _) = self.resolve_parent_entry(dir, linkpath, Errno::Exists)?;
-            return match fs::query(&canonical, false) {
-                Ok(_) => Err(Errno::Exists),
-                Err(Errno::NoEntry) => Err(Errno::NoEntry),
-                Err(e) => Err(e),
-            };
-        }
-        let (_canonical, parent, name) = self.resolve_parent_entry(dir, linkpath, Errno::Exists)?;
-        fs::symlink(parent, &name, target)?;
-        Ok(())
+        let (parent, name) = self.new_entry_path(dir, path)?;
+        fs::symlink(parent, &name, target, credentials.fsuid, credentials.fsgid)
     }
 
     /// 创建硬链接（linkat 语义）；拒绝目录，默认不跟随旧路径末项符号链接。
     pub(crate) fn link(
         &self,
         old_dir: usize,
-        old_path: &str,
+        old: &str,
         new_dir: usize,
-        new_path: &str,
-        follow: bool,
-        empty_path: bool,
+        new: &str,
+        flags: u32,
+        _credentials: &crate::task::Credentials,
     ) -> Result<(), Errno> {
-        let (ino, mode) = if old_path.is_empty() {
-            if !empty_path {
-                return Err(Errno::NoEntry);
-            }
-            if old_dir as isize == -100 {
-                let ino = fs::lookup(self.cwd()?)?;
-                (ino, fs::stat(ino)?.0)
-            } else {
-                let handle = self.get(old_dir)?;
-                let f = handle.lock();
-                let ino = f.inode()?;
-                (ino, fs::stat(ino)?.0)
-            }
+        let source = if old.is_empty() && flags & 0x1000 != 0 {
+            self.query(old_dir, old, true, false)?
         } else {
-            let info = self.query(old_dir, old_path, false, follow)?;
-            if old_path.ends_with('/') && info.mode & 0xf000 != 0x4000 {
-                return Err(Errno::NotDir);
-            }
-            (info.ino as u32, info.mode)
+            self.query(old_dir, old, false, flags & 0x400 != 0)?
         };
-        if mode & 0xf000 == 0x4000 {
-            return Err(Errno::Perm);
-        }
-        if new_path.is_empty() {
+        if source.links == 0 {
             return Err(Errno::NoEntry);
         }
-        if new_path.ends_with('/') {
-            let (canonical, _, _) = self.resolve_parent_entry(new_dir, new_path, Errno::Exists)?;
-            return match fs::query(&canonical, false) {
-                Ok(_) => Err(Errno::Exists),
-                Err(Errno::NoEntry) => Err(Errno::NoEntry),
-                Err(e) => Err(e),
-            };
-        }
-        let (_canonical, new_parent, new_name) =
-            self.resolve_parent_entry(new_dir, new_path, Errno::Exists)?;
-        fs::link(ino, new_parent, &new_name)
+        let (parent, name) = self.new_entry_path(new_dir, new)?;
+        fs::link(&source, parent, &name)
     }
 
     /// 重命名文件或目录；拒绝移动仍由 cwd、目录 FD 或挂载引用的目录树。
@@ -664,8 +684,8 @@ impl Context {
         new: &str,
         no_replace: bool,
     ) -> Result<(), Errno> {
-        let (old_path, old_parent, old_name) = self.rename_path(old_dir, old)?;
-        let (new_path, new_parent, new_name) = self.rename_path(new_dir, new)?;
+        let (old_path, old_parent, old_name) = self.entry_path(old_dir, old)?;
+        let (new_path, new_parent, new_name) = self.entry_path(new_dir, new)?;
         let source = fs::query(&old_path, false)?;
         let target = match fs::query(&new_path, false) {
             Ok(info) => Some(info),

@@ -15,12 +15,12 @@ fn valid_name(name: &str) -> Ext4Result<()> {
     Ok(())
 }
 
-struct Undo {
+pub(super) struct Undo {
     blocks: Vec<(AbsoluteBN, Vec<u8>)>,
     inodes: Vec<(InodeNumber, Ext4Inode)>,
 }
 impl Undo {
-    fn new() -> Ext4Result<Self> {
+    pub(super) fn new() -> Ext4Result<Self> {
         let mut blocks = Vec::new();
         let mut inodes = Vec::new();
         blocks
@@ -31,7 +31,7 @@ impl Undo {
             .map_err(|_| Ext4Error::new(Errno::ENOMEM))?;
         Ok(Self { blocks, inodes })
     }
-    fn block<B: BlockDevice>(
+    pub(super) fn block<B: BlockDevice>(
         &mut self,
         fs: &mut Ext4FileSystem,
         dev: &mut Jbd2Dev<B>,
@@ -43,7 +43,7 @@ impl Undo {
         }
         Ok(())
     }
-    fn inode<B: BlockDevice>(
+    pub(super) fn inode<B: BlockDevice>(
         &mut self,
         fs: &mut Ext4FileSystem,
         dev: &mut Jbd2Dev<B>,
@@ -54,7 +54,7 @@ impl Undo {
         }
         Ok(())
     }
-    fn restore<B: BlockDevice>(
+    pub(super) fn restore<B: BlockDevice>(
         &self,
         fs: &mut Ext4FileSystem,
         dev: &mut Jbd2Dev<B>,

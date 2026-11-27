@@ -563,38 +563,56 @@ pub(super) fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
 }
 
 /// 在指定父目录创建符号链接，允许相对或悬空目标。
-pub(super) fn symlink(parent: u32, name: &str, target: &str) -> Result<u32, Errno> {
+pub(super) fn symlink(
+    parent: u32,
+    name: &str,
+    target: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<(), Errno> {
     if !WRITABLE {
         return Err(Errno::ReadOnly);
     }
     access(|v| {
-        let ino = rsext4::file::create_symlink_inode(
-            &mut v.device,
+        v.invalidate_dcache();
+        rsext4::file::create_symlink_inode(
             &mut v.fs,
+            &mut v.device,
             InodeNumber::new(parent)?,
             name,
             target,
-        )?;
-        v.invalidate_dcache();
-        Ok(ino.raw())
+            uid,
+            gid,
+        )
+        .inspect_err(|e| {
+            use rsext4::Errno as Ext4Errno;
+            if matches!(e.code, Ext4Errno::EIO | Ext4Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })
     })
 }
 
 /// 在指定父目录为已有非目录 inode 创建硬链接。
-pub(super) fn link(target_ino: u32, parent: u32, name: &str) -> Result<(), Errno> {
+pub(super) fn link(ino: u32, parent: u32, name: &str) -> Result<(), Errno> {
     if !WRITABLE {
         return Err(Errno::ReadOnly);
     }
     access(|v| {
-        rsext4::file::link_inode(
-            &mut v.device,
-            &mut v.fs,
-            InodeNumber::new(target_ino)?,
-            InodeNumber::new(parent)?,
-            name,
-        )?;
         v.invalidate_dcache();
-        Ok(())
+        rsext4::file::link_entry(
+            &mut v.fs,
+            &mut v.device,
+            InodeNumber::new(parent)?,
+            InodeNumber::new(ino)?,
+            name,
+        )
+        .inspect_err(|e| {
+            use rsext4::Errno as Ext4Errno;
+            if matches!(e.code, Ext4Errno::EIO | Ext4Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })
     })
 }
 
@@ -793,7 +811,7 @@ pub(super) fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
     }
     access(|v| {
         let inode = InodeNumber::new(ino)?;
-        let links = rsext4::file::unlink_regular_entry(
+        let links = rsext4::file::unlink_file_entry(
             &mut v.fs,
             &mut v.device,
             InodeNumber::new(parent)?,
