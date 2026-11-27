@@ -70,6 +70,7 @@ pub const SOCKADDR_IN_LEN: usize = 16;
 const EPHEMERAL_START: u16 = 49152;
 const EPHEMERAL_END: u16 = 65535;
 const STREAM_BUF_DEFAULT: usize = 131_072;
+const UNIX_BUF_DEFAULT: usize = 16_384;
 const TCP_DEFAULT_MSS: i32 = 1460;
 const MAX_UDP_PAYLOAD: usize = 65507;
 const MAX_UDP_QUEUE_BYTES: usize = 2 * 1024 * 1024;
@@ -508,7 +509,11 @@ pub fn create_unix_pair(sock_type: SockType) -> Result<(SocketId, SocketId), Err
                 peer_closed: false,
             },
         },
-        opts: SocketOptions::default(),
+        opts: SocketOptions {
+            snd_buf: UNIX_BUF_DEFAULT,
+            rcv_buf: UNIX_BUF_DEFAULT,
+            ..SocketOptions::default()
+        },
         shut_rd: false,
         shut_wr: false,
     };
