@@ -71,19 +71,13 @@ pub fn dispatch(
             }
         }
         sysnr::MOUNT => {
-            if a[3] != 0 {
-                return Err(Errno::NotSupported);
-            }
             let source = user_string(space, a[0])?;
             let target = ctx.path((-100isize) as usize, &user_string(space, a[1])?)?;
             let kind = user_string(space, a[2])?;
-            if kind != "vfat" && kind != "fat" {
-                return Err(Errno::NoDevice);
+            if kind == "ext2" && credentials.euid != 0 {
+                return Err(Errno::Perm);
             }
-            if fs::stat(fs::lookup(&target)?)?.0 & 0xf000 != 0x4000 {
-                return Err(Errno::NotDir);
-            }
-            fs::fat::mount(&source, &target)?;
+            fs::mount(&source, &target, &kind, a[3])?;
             Ok(0)
         }
         sysnr::FACCESSAT => faccessat(ctx, space, a),
@@ -99,11 +93,11 @@ pub fn dispatch(
                 return Err(Errno::NotSupported);
             }
             let target = ctx.path((-100isize) as usize, &user_string(space, a[0])?)?;
-            fs::fat::unmount(&target)?;
+            fs::unmount(&target, credentials.euid == 0)?;
             Ok(0)
         }
-        sysnr::SYMLINKAT => symlinkat(ctx, space, a, credentials),
         sysnr::LINKAT => linkat(ctx, space, a, credentials),
+        sysnr::SYMLINKAT => symlinkat(ctx, space, a, credentials),
         sysnr::SENDFILE => sendfile(ctx, space, a),
         sysnr::UNLINKAT => {
             if a[2] & !0x200 != 0 {
@@ -154,7 +148,7 @@ pub fn dispatch(
             if info.mode & 0xf000 != 0x4000 {
                 return Err(Errno::NotDir);
             }
-            ctx.set_cwd(resolved, info.ino as u32)?;
+            ctx.set_cwd(resolved, info.inode_handle())?;
             Ok(0)
         }
         sysnr::OPENAT => {
@@ -197,12 +191,25 @@ pub fn dispatch(
                 return ctx.open_proc_fd_dir(flags, flags & 0x80000 != 0);
             }
             if path == "/proc/self/maps" {
+                let ino = fs::lookup(&path)?;
                 let text = fs::procfs_maps(space)?;
-                return ctx.open_proc_text(text, flags, flags & 0x80000 != 0);
+                return ctx.open_proc_text(ino, text, flags, flags & 0x80000 != 0);
             }
             if fs::is_procfs_text(&path) {
+                let ino = fs::lookup(&path)?;
                 let text = fs::procfs_text(&path)?;
-                return ctx.open_proc_text(text, flags, flags & 0x80000 != 0);
+                return ctx.open_proc_text(ino, text, flags, flags & 0x80000 != 0);
+            }
+            if let Some(rest) = path.strip_prefix("/proc/") {
+                if matches!(rest, "cpuinfo" | "mounts")
+                    || rest
+                        .split_once('/')
+                        .is_some_and(|(_, f)| matches!(f, "stat" | "cmdline" | "status"))
+                {
+                    let ino = fs::lookup(&path)?;
+                    let text = fs::procfs_text(&path)?;
+                    return ctx.open_proc_text(ino, text, flags, flags & 0x80000 != 0);
+                }
             }
             if path == "/dev/null" {
                 return ctx.open_devnull(flags, flags & 0x80000 != 0);
@@ -220,8 +227,18 @@ pub fn dispatch(
                 return ctx.open_rtc(flags, flags & 0x80000 != 0);
             }
             if let Some((disk, part)) = fs::lookup_blk_node(&path) {
+                if credentials.euid != 0 && !path_only {
+                    return Err(Errno::Access);
+                }
                 if let Ok((start, len)) = crate::drivers::partition(disk, part) {
-                    return ctx.open_devblk(disk, start, len as u64, flags, flags & 0x80000 != 0);
+                    return ctx.open_devblk(
+                        disk,
+                        part,
+                        start,
+                        len as u64,
+                        flags,
+                        flags & 0x80000 != 0,
+                    );
                 }
                 return Err(Errno::NoDevice);
             }
@@ -230,11 +247,15 @@ pub fn dispatch(
                 fs::ResolvedEntry::Missing { parent } => {
                     let name = path.rsplit('/').next().ok_or(Errno::NoEntry)?;
                     let mode = 0x8000 | ctx.creation_mode(a[3]);
-                    (fs::create(parent, name, mode)?, mode)
+                    let owner = (credentials.fsuid, credentials.fsgid);
+                    (fs::create_regular(parent, name, mode, owner)?, mode)
                 }
             };
             if mode & 0xf000 == 0x4000 && flags & 3 != 0 {
                 return Err(Errno::IsDir);
+            }
+            if flags & 3 != 0 {
+                fs::check_write_open(ino)?;
             }
             if mode & 0xf000 == 0x1000 && !path_only {
                 return Err(Errno::NotSupported);
@@ -328,7 +349,7 @@ fn truncate(
     if nr == sysnr::TRUNCATE {
         let path = user_string(space, a[0])?;
         let info = ctx.query((-100isize) as usize, &path, false, true)?;
-        fs::truncate(info.ino as u32, length as u64)?;
+        fs::truncate(info.inode_handle(), length as u64)?;
     } else {
         ctx.get(a[0] as u32 as usize)?
             .lock()
@@ -439,7 +460,7 @@ fn getdents64(
     Ok(used)
 }
 
-/// Linux symlinkat：创建保存 UTF-8 目标的符号链接。
+/// Linux symlinkat：在指定目录下创建保存 UTF-8 目标的符号链接。
 fn symlinkat(
     ctx: &Context,
     space: &UserAddressSpace,
@@ -457,7 +478,7 @@ fn symlinkat(
     Ok(0)
 }
 
-/// Linux linkat：创建硬链接，支持跟随源路径末项及空路径 FD。
+/// Linux linkat：检查目录访问权限后创建硬链接，可跟随源路径末项的符号链接。
 fn linkat(
     ctx: &Context,
     space: &UserAddressSpace,
@@ -552,7 +573,7 @@ fn utimensat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<u
         return ctx.get(dir)?.lock().update_times(times).map(|_| 0);
     }
     let info = ctx.query(dir, &path, flags & 0x1000 != 0, flags & 0x100 == 0)?;
-    fs::update_times(info.ino as u32, times)?;
+    fs::update_times(info.inode_handle(), times)?;
     Ok(0)
 }
 
@@ -596,7 +617,7 @@ fn chown(
             fd_inode(dir as usize, true)?
         } else {
             ctx.query(dir as usize, &path, empty, flags & AT_SYMLINK_NOFOLLOW == 0)?
-                .ino as u32
+                .inode_handle()
         };
         (ino, id(a[2]), id(a[3]))
     };
@@ -614,7 +635,7 @@ fn statfs(
     let stats = if nr == sysnr::STATFS {
         let path = user_string(space, a[0])?;
         let info = ctx.query((-100isize) as usize, &path, false, true)?;
-        fs::filesystem_stats(info.ino as u32)?
+        fs::filesystem_stats(info.inode_handle())?
     } else {
         ctx.get(a[0] as u32 as usize)?.lock().filesystem_stats()?
     };
@@ -657,7 +678,7 @@ fn readlinkat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<
             Errno::Invalid
         });
     }
-    let target = fs::read_link(info.ino as u32)?;
+    let target = fs::read_link(info.inode_handle())?;
     let n = target.len().min(capacity as usize);
     user_access::copy_to_user(space, a[2], &target.as_bytes()[..n]).map_err(|_| Errno::Fault)?;
     Ok(n)
@@ -1123,20 +1144,15 @@ fn encode_statx(m: &fs::Metadata) -> [u8; 256] {
     }
     out
 }
-/// faccessat(2)（dirfd, path, mode, 无 flags）：glibc 在某些版本会把
-/// 第 4 寄存器残留为任意值，raw 入口不得读取第 4 参数（否则非零残留
-/// 被误判为非法 flags，RV glibc which 即因此失败）。
+/// Linux faccessat/faccessat2：按身份检查路径权限；原始 faccessat 不读取第 4 参数。
 fn faccessat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
     access_check_common(ctx, space, a, true)
 }
 
-/// faccessat2(2)（dirfd, path, mode, flags）：flags 接受 AT_EACCESS(0x200)/
-/// AT_SYMLINK_NOFOLLOW(0x100)；AT_EACCESS 在无凭证模型下与默认等价。
 fn faccessat2(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
     access_check_common(ctx, space, a, false)
 }
 
-/// access 系列共用主体；`raw` 为 true 时忽略第 4 参数（faccessat 的 ABI）。
 fn access_check_common(
     ctx: &Context,
     space: &UserAddressSpace,

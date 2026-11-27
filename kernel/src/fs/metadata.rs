@@ -1,6 +1,6 @@
 //! 与后端无关的文件属性与路径解析。
 #![deny(unsafe_code)]
-use super::{ext4, fat, lookup, FAT_INODE};
+use super::{ext2_mount, ext4, fat, lookup, FAT_INODE};
 use crate::syscall::Errno;
 use alloc::string::String;
 
@@ -15,6 +15,7 @@ pub(crate) struct Timestamp {
 #[derive(Default)]
 pub(crate) struct Metadata {
     pub ino: u64,
+    pub(super) handle: Option<u32>,
     pub dev: u64,
     pub rdev: u64,
     pub mode: u16,
@@ -33,7 +34,7 @@ pub(crate) struct Metadata {
 impl Metadata {
     /// 返回文件系统内部使用的 inode 句柄。
     pub(crate) fn inode_handle(&self) -> u32 {
-        self.ino as u32
+        self.handle.unwrap_or(self.ino as u32)
     }
 }
 
@@ -51,6 +52,18 @@ pub(super) fn metadata(ino: u32) -> Result<Metadata, Errno> {
     if ino == super::procfs::DEVRANDOM {
         return Ok(super::procfs::random_metadata(false));
     }
+    if ino == super::procfs::MEMINFO {
+        return super::procfs::metadata();
+    }
+    if ino == super::procfs::DEVBLK {
+        return Ok(Metadata {
+            ino: ino.into(),
+            mode: 0o060600,
+            links: 1,
+            block_size: 4096,
+            ..Default::default()
+        });
+    }
     // procfs 虚拟节点（/proc、/proc/<pid>、/dev/*）无后端 inode，按统一
     // stat 结果合成，避免 resolve 逐分量解析时把虚拟节点当 ext4 处理
     if super::procfs::is_virtual_ino(ino) {
@@ -64,7 +77,9 @@ pub(super) fn metadata(ino: u32) -> Result<Metadata, Errno> {
             ..Default::default()
         });
     }
-    if ino & FAT_INODE != 0 {
+    if ext2_mount::is_handle(ino) {
+        ext2_mount::metadata(ino)
+    } else if ino & FAT_INODE != 0 {
         fat::metadata(ino)
     } else {
         ext4::metadata(ino)
@@ -97,7 +112,7 @@ fn is_clean_ext4_path(path: &str) -> bool {
 
 /// 查询绝对路径；follow 只控制末项链接，最多跟随 40 个链接。
 pub(crate) fn query(path: &str, follow: bool) -> Result<Metadata, Errno> {
-    if is_clean_ext4_path(path) && !fat::has_mounts() {
+    if is_clean_ext4_path(path) && !fat::has_mounts() && !ext2_mount::has_mounts() {
         if let Ok(Some(info)) = ext4::fast_metadata(path) {
             return Ok(info);
         }
@@ -225,6 +240,7 @@ fn resolve_entry_from(
         && info.mode & 0xf000 != 0xa000
         && is_clean_ext4_path(&current)
         && !fat::has_mounts()
+        && !ext2_mount::has_mounts()
     {
         ext4::mark_direct_stat(&current, info.inode_handle());
     }

@@ -204,6 +204,11 @@ pub(super) fn root_disk_name() -> char {
     (b'a' + ROOT_DISK_ID.load(core::sync::atomic::Ordering::Relaxed) as u8) as char
 }
 
+/// 检查根卷是否占用该块设备。
+pub(super) fn uses_disk(disk: usize) -> bool {
+    mounted() && ROOT_DISK_ID.load(core::sync::atomic::Ordering::Relaxed) == disk
+}
+
 fn try_mount(id: usize, start: usize, len: usize) -> Result<(), Errno> {
     if len < BLOCK_SIZE {
         return Err(Errno::Invalid);
@@ -213,6 +218,10 @@ fn try_mount(id: usize, start: usize, len: usize) -> Result<(), Errno> {
     // 超级块中的 magic 和 log_block_size。
     if sb[56..58] != [0x53, 0xef] || sb[24..28] != [2, 0, 0, 0] {
         return Err(Errno::Invalid);
+    }
+    // 根卷盘上 inode 号不能占用辅助卷句柄范围。
+    if u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]) >= super::ext2_mount::FIRST_HANDLE {
+        return Err(Errno::NotSupported);
     }
     // 分组几何用于分配缓存，声明的块范围必须落在卷内。
     let lo = u32::from_le_bytes([sb[4], sb[5], sb[6], sb[7]]);
@@ -290,8 +299,8 @@ fn access<T>(f: impl FnOnce(&mut Volume) -> Ext4Result<T>) -> Result<T, Errno> {
 fn error(err: Ext4Error) -> Errno {
     use rsext4::Errno as Ext4Errno;
     match err.code {
-        Ext4Errno::ENOENT => Errno::NoEntry,
         Ext4Errno::EPERM => Errno::Perm,
+        Ext4Errno::ENOENT => Errno::NoEntry,
         Ext4Errno::EACCES => Errno::Access,
         Ext4Errno::ENOTDIR => Errno::NotDir,
         Ext4Errno::EISDIR => Errno::IsDir,
@@ -384,6 +393,7 @@ fn build_metadata(v: &mut Volume, ino: u32) -> Ext4Result<super::Metadata> {
     };
     Ok(super::Metadata {
         ino: ino as u64,
+        handle: None,
         dev: 1,
         rdev: rdev as u64,
         mode: inode.i_mode,
@@ -562,7 +572,7 @@ pub(super) fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
     })
 }
 
-/// 创建命名管道节点并保存权限和属主信息。
+/// 创建不分配数据块的 FIFO 节点。
 pub(super) fn create_fifo(
     parent: u32,
     name: &str,
@@ -585,60 +595,6 @@ pub(super) fn create_fifo(
         .map(|_| ())
         .inspect_err(|e| {
             if matches!(e.code, rsext4::Errno::EIO | rsext4::Errno::EUCLEAN) {
-                v.failed = true;
-            }
-        })
-    })
-}
-
-/// 在指定父目录创建符号链接，允许相对或悬空目标。
-pub(super) fn symlink(
-    parent: u32,
-    name: &str,
-    target: &str,
-    uid: u32,
-    gid: u32,
-) -> Result<(), Errno> {
-    if !WRITABLE {
-        return Err(Errno::ReadOnly);
-    }
-    access(|v| {
-        v.invalidate_dcache();
-        rsext4::file::create_symlink_inode(
-            &mut v.fs,
-            &mut v.device,
-            InodeNumber::new(parent)?,
-            name,
-            target,
-            uid,
-            gid,
-        )
-        .inspect_err(|e| {
-            use rsext4::Errno as Ext4Errno;
-            if matches!(e.code, Ext4Errno::EIO | Ext4Errno::EUCLEAN) {
-                v.failed = true;
-            }
-        })
-    })
-}
-
-/// 在指定父目录为已有非目录 inode 创建硬链接。
-pub(super) fn link(ino: u32, parent: u32, name: &str) -> Result<(), Errno> {
-    if !WRITABLE {
-        return Err(Errno::ReadOnly);
-    }
-    access(|v| {
-        v.invalidate_dcache();
-        rsext4::file::link_entry(
-            &mut v.fs,
-            &mut v.device,
-            InodeNumber::new(parent)?,
-            InodeNumber::new(ino)?,
-            name,
-        )
-        .inspect_err(|e| {
-            use rsext4::Errno as Ext4Errno;
-            if matches!(e.code, Ext4Errno::EIO | Ext4Errno::EUCLEAN) {
                 v.failed = true;
             }
         })
@@ -833,7 +789,61 @@ pub(super) fn rmdir(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
     })
 }
 
-/// 移除普通文件名；没有链接和打开引用时回收 inode。
+/// 创建符号链接并保存目标文本。
+pub(super) fn symlink(
+    parent: u32,
+    name: &str,
+    target: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        v.invalidate_dcache();
+        rsext4::file::create_symlink_inode(
+            &mut v.fs,
+            &mut v.device,
+            InodeNumber::new(parent)?,
+            name,
+            target,
+            uid,
+            gid,
+        )
+        .inspect_err(|e| {
+            use rsext4::Errno as Ext4Errno;
+            if matches!(e.code, Ext4Errno::EIO | Ext4Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })
+    })
+}
+
+/// 在父目录中添加指向已有 inode 的名称。
+pub(super) fn link(ino: u32, parent: u32, name: &str) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        v.invalidate_dcache();
+        rsext4::file::link_entry(
+            &mut v.fs,
+            &mut v.device,
+            InodeNumber::new(parent)?,
+            InodeNumber::new(ino)?,
+            name,
+        )
+        .inspect_err(|e| {
+            use rsext4::Errno as Ext4Errno;
+            if matches!(e.code, Ext4Errno::EIO | Ext4Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })
+    })
+}
+
+/// 移除普通文件或符号链接的名称；无链接和打开引用时回收 inode。
 pub(super) fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
     if !WRITABLE {
         return Err(Errno::ReadOnly);
