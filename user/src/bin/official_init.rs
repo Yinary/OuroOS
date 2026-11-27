@@ -54,6 +54,7 @@ const LTP_DIR_BYTES: usize = 512 * 1024;
 const LTP_INDEX_BYTES: usize = 128 * 1024;
 const LTP_TEST_TIMEOUT_SECS: u64 = 2;
 const LTP_MUSL_BUDGET_SECS: u64 = 3400;
+const LTP_DEFAULT_GROUP_BUDGET_SECS: u64 = 1200;
 const LTP_REAP_TIMEOUT_SECS: u64 = 30;
 
 fn sys_openat(path: &[u8], flags: usize, mode: usize) -> isize {
@@ -1304,17 +1305,20 @@ extern "C" fn ouro_main() -> ! {
     run_selected_group(b"iozone-glibc", started);
     run_selected_group(b"cyclictest-musl", started);
     run_selected_group(b"cyclictest-glibc", started);
+    // 双架构全量启用双库 LTP（每组 1200 秒通用预算），置于 lmbench 之前以免单机总时限被 lmbench 耗尽。
+    run_ltp(
+        b"/musl\0",
+        b"musl\0",
+        now_secs() + LTP_DEFAULT_GROUP_BUDGET_SECS,
+    );
+    run_ltp(
+        b"/glibc\0",
+        b"glibc\0",
+        now_secs() + LTP_DEFAULT_GROUP_BUDGET_SECS,
+    );
     run_selected_group(b"lmbench-musl", started);
     run_selected_group(b"lmbench-glibc", started);
-    // LTP 与其余尚未完成全量验收的测试组暂不在默认送测中启用，按需取消注释：
-    // let budget: u64 = if cfg!(target_arch = "loongarch64") {
-    //     LTP_MUSL_BUDGET_SECS
-    // } else {
-    //     0
-    // };
-    // run_ltp(b"/musl\0", b"musl\0", started + budget);
-    // run_ltp(b"/glibc\0", b"glibc\0", now_secs() + 550);
-    // run_script(b"/musl\0", 5, b"./cyclictest_testcode.sh\0");
+    // 其余尚未完成验收的测试组暂不在默认送测中启用：
     // run_script(b"/musl\0", 5, b"./unixbench_testcode.sh\0");
     note(b"[official-init] all groups finished\n");
     sys_exit(0)
