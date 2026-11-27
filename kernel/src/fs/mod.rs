@@ -10,6 +10,7 @@ pub use ext4::mounted;
 pub mod block_cache;
 pub mod cache;
 pub mod context;
+pub mod event;
 pub mod fat;
 pub mod mapping;
 mod metadata;
@@ -213,6 +214,15 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
     if path == "/proc/mounts" {
         return Ok(procfs::MOUNTS);
     }
+    if path == "/proc/sys" {
+        return Ok(procfs::SYS_DIR);
+    }
+    if path == "/proc/sys/kernel" {
+        return Ok(procfs::SYS_KERNEL_DIR);
+    }
+    if path == "/proc/sys/kernel/tainted" {
+        return Ok(procfs::SYS_TAINTED);
+    }
     if let Some(rest) = path.strip_prefix("/proc/") {
         // /proc/<pid> 与 /proc/<pid>/{stat,cmdline}；只接受纯数字 pid
         let (pid, file) = match rest.split_once('/') {
@@ -256,6 +266,12 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
     }
     if ino == procfs::MOUNTS {
         return Ok((0o100444, procfs::mounts()?.len() as u64, 1, 0));
+    }
+    if ino == procfs::SYS_DIR || ino == procfs::SYS_KERNEL_DIR {
+        return Ok((0o040555, 0, 2, 0));
+    }
+    if ino == procfs::SYS_TAINTED {
+        return Ok((0o100444, 2, 1, 0));
     }
     if let Some((pid, file)) = procfs::pid_ino_parts(ino) {
         return match file {
@@ -463,7 +479,7 @@ pub fn sync_mapping(_ino: u32, _offset: usize, _length: usize) -> Result<(), Err
 /// 持有 inode 的打开引用。
 pub fn retain(ino: u32) -> Result<(), Errno> {
     // procfs 虚拟节点（/proc、/proc/<pid>、/dev/*）无后端引用计数
-    if ino >= procfs::MISC_DIR || procfs::pid_ino_parts(ino).is_some() {
+    if ino >= procfs::VIRTUAL_MIN || procfs::pid_ino_parts(ino).is_some() {
         return Ok(());
     }
     if ino & FAT_INODE != 0 {
@@ -475,7 +491,7 @@ pub fn retain(ino: u32) -> Result<(), Errno> {
 
 /// 释放 inode 的打开引用。
 pub fn release(ino: u32) {
-    if ino >= procfs::MISC_DIR || procfs::pid_ino_parts(ino).is_some() {
+    if ino >= procfs::VIRTUAL_MIN || procfs::pid_ino_parts(ino).is_some() {
         return;
     }
     if ino & FAT_INODE != 0 {
@@ -498,6 +514,12 @@ pub fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
 pub fn procfs_text(path: &str) -> Result<alloc::string::String, Errno> {
     if path == "/proc/mounts" {
         return procfs::mounts();
+    }
+    if path == "/proc/sys/kernel/tainted" {
+        let mut s = alloc::string::String::new();
+        s.try_reserve(2).map_err(|_| Errno::NoMem)?;
+        s.push_str("0\n");
+        return Ok(s);
     }
     if let Some(rest) = path.strip_prefix("/proc/") {
         if let Some((pid, file)) = rest.split_once('/') {

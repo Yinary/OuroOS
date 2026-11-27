@@ -56,6 +56,11 @@ pub(super) const DEVBLK: u32 = u32::MAX - 7;
 pub(super) const MISC_DIR: u32 = u32::MAX - 6;
 /// /proc/mounts（df 等读取，格式见 mounts(5)）
 pub(super) const MOUNTS: u32 = u32::MAX - 4;
+/// /proc/sys、/proc/sys/kernel 与 /proc/sys/kernel/tainted 只读节点。
+pub(super) const SYS_DIR: u32 = u32::MAX - 11;
+pub(super) const SYS_KERNEL_DIR: u32 = u32::MAX - 12;
+pub(super) const SYS_TAINTED: u32 = u32::MAX - 13;
+pub(super) const VIRTUAL_MIN: u32 = u32::MAX - 31;
 
 /// /proc/<pid> 目录的 inode：pid 目录与其下文件按 16 偏移分段，
 /// 避开 FAT 的最高位与 u32::MAX 附近的固定节点。

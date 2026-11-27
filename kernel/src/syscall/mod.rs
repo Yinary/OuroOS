@@ -25,6 +25,10 @@ use crate::task::WaitReason;
 pub mod sysnr {
     // 文件
     pub const GETCWD: usize = 17;
+    pub const EVENTFD2: usize = 19;
+    pub const EPOLL_CREATE1: usize = 20;
+    pub const EPOLL_CTL: usize = 21;
+    pub const EPOLL_PWAIT: usize = 22;
     pub const DUP: usize = 23;
     pub const DUP3: usize = 24;
     pub const IOCTL: usize = 29;
@@ -57,10 +61,14 @@ pub mod sysnr {
     pub const FSTAT: usize = 80;
     pub const SYNC: usize = 81;
     pub const FSYNC: usize = 82;
+    pub const TIMERFD_CREATE: usize = 85;
+    pub const TIMERFD_SETTIME: usize = 86;
+    pub const TIMERFD_GETTIME: usize = 87;
     pub const UTIMENSAT: usize = 88;
     pub const UMASK: usize = 166;
     pub const RENAMEAT2: usize = 276;
     pub const STATX: usize = 291;
+    pub const EPOLL_PWAIT2: usize = 441;
     // 进程
     pub const EXIT: usize = 93;
     pub const EXIT_GROUP: usize = 94;
@@ -356,6 +364,12 @@ pub fn dispatch(
     let (a0, a1, a2) = (args[0], args[1], args[2]);
     match nr {
         sysnr::GETCWD
+        | sysnr::EVENTFD2
+        | sysnr::EPOLL_CREATE1
+        | sysnr::EPOLL_CTL
+        | sysnr::TIMERFD_CREATE
+        | sysnr::TIMERFD_SETTIME
+        | sysnr::TIMERFD_GETTIME
         | sysnr::DUP
         | sysnr::DUP3
         | sysnr::FCNTL
@@ -406,12 +420,9 @@ pub fn dispatch(
                 fs,
                 credentials,
             );
-            // pipe/套接字无数据或无空间且非 O_NONBLOCK：转为阻塞等待；单管道按实例定向等待。
+            // pipe/eventfd/timerfd/套接字无数据或无空间且非 O_NONBLOCK：转为阻塞等待。
             if ret == Err(Errno::WouldBlock) {
-                if let Some(id) = fs.pipe_id(args[0]) {
-                    return Flow::Wait(WaitReason::PipeId(id));
-                }
-                return Flow::Wait(WaitReason::Pipe);
+                return Flow::Wait(fs.wait_reason_for_fd(args[0]));
             }
             // 向无读者的管道写入：SIGPIPE 入队并与 -EPIPE 返回并行。
             if ret == Err(Errno::Pipe) && (nr == sysnr::WRITE || nr == sysnr::WRITEV) {
@@ -607,6 +618,8 @@ pub fn dispatch(
         | sysnr::SYSINFO
         | sysnr::PSELECT6
         | sysnr::PPOLL
+        | sysnr::EPOLL_PWAIT
+        | sysnr::EPOLL_PWAIT2
         | sysnr::NANOSLEEP
         | sysnr::GETITIMER
         | sysnr::SETITIMER
