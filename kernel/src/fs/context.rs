@@ -476,7 +476,12 @@ impl Context {
         Ok(())
     }
 
-    fn entry_path(&self, dir: usize, input: &str) -> Result<(String, u32, String), Errno> {
+    fn entry_path(
+        &self,
+        dir: usize,
+        input: &str,
+        credentials: Option<&crate::task::Credentials>,
+    ) -> Result<(String, u32, String), Errno> {
         if input.is_empty() {
             return Err(Errno::NoEntry);
         }
@@ -492,20 +497,24 @@ impl Context {
         if name.len() > 255 {
             return Err(Errno::NameTooLong);
         }
-        let mut base = if input.starts_with('/') {
-            string("")?
-        } else if dir as isize == -100 {
-            string(self.cwd()?)?
+        let (mut canonical, info) = if let Some(credentials) = credentials {
+            self.link_path(dir, parent, true, credentials)?
         } else {
-            string(self.get(dir)?.lock().directory_path()?)?
+            let mut base = if input.starts_with('/') {
+                string("")?
+            } else if dir as isize == -100 {
+                string(self.cwd()?)?
+            } else {
+                string(self.get(dir)?.lock().directory_path()?)?
+            };
+            base.try_reserve(parent.len() + 1)
+                .map_err(|_| Errno::NoMem)?;
+            if !base.is_empty() {
+                base.push('/');
+            }
+            base.push_str(parent);
+            fs::metadata::resolve(&base, true)?
         };
-        base.try_reserve(parent.len() + 1)
-            .map_err(|_| Errno::NoMem)?;
-        if !base.is_empty() {
-            base.push('/');
-        }
-        base.push_str(parent);
-        let (mut canonical, info) = fs::metadata::resolve(&base, true)?;
         if info.mode & 0xf000 != 0x4000 {
             return Err(Errno::NotDir);
         }
@@ -522,14 +531,23 @@ impl Context {
         Ok((canonical, info.inode_handle(), string(name)?))
     }
 
-    fn new_entry_path(&self, dir: usize, path: &str) -> Result<(u32, String), Errno> {
+    fn new_entry_path(
+        &self,
+        dir: usize,
+        path: &str,
+        credentials: Option<&crate::task::Credentials>,
+    ) -> Result<(u32, String), Errno> {
         if path.ends_with('/') || matches!(path.rsplit('/').next(), Some("." | "..")) {
             let trimmed = path.trim_end_matches('/');
             let target = if trimmed.is_empty() { "/" } else { trimmed };
-            self.query(dir, target, false, false)?;
+            if let Some(credentials) = credentials {
+                self.link_path(dir, target, false, credentials)?;
+            } else {
+                self.query(dir, target, false, false)?;
+            }
             return Err(Errno::Exists);
         }
-        let (_, parent, name) = self.entry_path(dir, path)?;
+        let (_, parent, name) = self.entry_path(dir, path, credentials)?;
         Ok((parent, name))
     }
 
@@ -541,7 +559,7 @@ impl Context {
         mode: usize,
         credentials: &crate::task::Credentials,
     ) -> Result<(), Errno> {
-        let (parent, name) = self.new_entry_path(dir, path)?;
+        let (parent, name) = self.new_entry_path(dir, path, None)?;
         fs::create_fifo(
             parent,
             &name,
@@ -561,11 +579,11 @@ impl Context {
         if target.is_empty() {
             return Err(Errno::NoEntry);
         }
-        let (parent, name) = self.new_entry_path(dir, path)?;
+        let (parent, name) = self.new_entry_path(dir, path, None)?;
         fs::symlink(parent, &name, target, credentials.fsuid, credentials.fsgid)
     }
 
-    /// 将源 inode 添加到目标父目录，按 follow 决定是否跟随源路径末项。
+    /// 检查路径搜索与目标父目录写权限后，为源 inode 增加名称。
     pub(crate) fn link(
         &self,
         old_dir: usize,
@@ -573,10 +591,61 @@ impl Context {
         new_dir: usize,
         new: &str,
         follow: bool,
+        credentials: &crate::task::Credentials,
     ) -> Result<(), Errno> {
-        let source = self.query(old_dir, old, false, follow)?;
-        let (parent, name) = self.new_entry_path(new_dir, new)?;
+        let (_, source) = self.link_path(old_dir, old, follow, credentials)?;
+        let (parent, name) = self.new_entry_path(new_dir, new, Some(credentials))?;
+        fs::metadata::metadata(parent)?.check_directory_access(credentials, 3)?;
         fs::link(&source, parent, &name)
+    }
+
+    fn link_path(
+        &self,
+        dir: usize,
+        path: &str,
+        follow: bool,
+        credentials: &crate::task::Credentials,
+    ) -> Result<(String, fs::Metadata), Errno> {
+        if path.is_empty() {
+            return Err(Errno::NoEntry);
+        }
+        let base = if path.starts_with('/') {
+            string("/")?
+        } else if dir as isize == -100 {
+            string(self.cwd()?)?
+        } else {
+            string(self.get(dir)?.lock().directory_path()?)?
+        };
+        fs::metadata::resolve_with_credentials(&base, path, follow, credentials)
+    }
+
+    /// 查询 access 权限；flags 控制身份、末项链接与空路径 FD 查询。
+    pub(crate) fn access(
+        &self,
+        dir: usize,
+        path: &str,
+        mode: u16,
+        flags: u32,
+        credentials: &crate::task::Credentials,
+    ) -> Result<(), Errno> {
+        let identity = fs::metadata::AccessIdentity::for_access(credentials, flags & 0x200 != 0);
+        let info = if path.is_empty() {
+            self.query(dir, path, flags & 0x1000 != 0, false)?
+        } else {
+            let base = if path.starts_with('/') {
+                string("/")?
+            } else if dir as isize == -100 {
+                string(self.cwd()?)?
+            } else {
+                string(self.get(dir)?.lock().directory_path()?)?
+            };
+            fs::metadata::resolve_with_identity(&base, path, flags & 0x100 == 0, identity)?.1
+        };
+        if mode & 2 != 0 && matches!(info.mode & 0xf000, 0x4000 | 0x8000 | 0xa000) {
+            fs::check_write_access(info.inode_handle())?;
+        }
+        info.check_access(identity, mode)?;
+        Ok(())
     }
 
     /// 删除末项名称，符号链接按其自身的 inode 处理。
@@ -594,7 +663,7 @@ impl Context {
         if input.ends_with('/') {
             return Err(Errno::NotDir);
         }
-        let (_, parent, name) = self.entry_path(dir, input)?;
+        let (_, parent, name) = self.entry_path(dir, input, None)?;
         fs::unlink(parent, source.inode_handle(), &name)
     }
 
@@ -607,8 +676,8 @@ impl Context {
         new: &str,
         no_replace: bool,
     ) -> Result<(), Errno> {
-        let (old_path, old_parent, old_name) = self.entry_path(old_dir, old)?;
-        let (new_path, new_parent, new_name) = self.entry_path(new_dir, new)?;
+        let (old_path, old_parent, old_name) = self.entry_path(old_dir, old, None)?;
+        let (new_path, new_parent, new_name) = self.entry_path(new_dir, new, None)?;
         let source = fs::query(&old_path, false)?;
         let target = match fs::query(&new_path, false) {
             Ok(info) => Some(info),

@@ -434,6 +434,20 @@ pub(crate) fn check_write_open(ino: u32) -> Result<(), Errno> {
     Ok(())
 }
 
+/// 查询普通文件、目录或链接的写访问是否受只读卷限制。
+pub(crate) fn check_write_access(ino: u32) -> Result<(), Errno> {
+    if ext2_mount::is_handle(ino) {
+        check_write_open(ino)
+    } else if procfs::pid_ino_parts(ino).is_some()
+        || ino >= procfs::CPUINFO
+        || ino & FAT_INODE == 0 && cfg!(feature = "rsext4-readonly")
+    {
+        Err(Errno::ReadOnly)
+    } else {
+        Ok(())
+    }
+}
+
 /// 在 Ext4 上创建命名管道节点，权限已由调用方应用 umask。
 pub(crate) fn create_fifo(
     parent: u32,
