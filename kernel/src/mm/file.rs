@@ -255,18 +255,38 @@ impl FilePage {
         *self.data.borrow_mut() = Some(Resident::register(self.file.ino, self.offset, data)?);
         Ok(pa)
     }
+    /// 私有文件驻留页正由多个地址空间共享，写入前须执行写时复制。
+    pub(super) fn is_cow_shared(&self) -> bool {
+        self.mode == Mode::Private
+            && self
+                .data
+                .borrow()
+                .as_ref()
+                .is_some_and(|r| Arc::strong_count(r) > 1)
+    }
+    /// 为写时复制分配独占私有页副本并替换当前驻留项，返回新物理页地址。
+    pub(super) fn split_private(&self) -> Result<PhysAddr, MapError> {
+        let copy = {
+            let cur = self.data.borrow();
+            let Some(resident) = cur.as_ref() else {
+                return Err(MapError::NotMapped);
+            };
+            let Data::Private(src) = &resident.data else {
+                return Err(MapError::PermissionDenied);
+            };
+            let frame = OwnedFrame::new()?;
+            frame.copy_from(src);
+            Resident::register(self.file.ino, self.offset, Data::Private(frame))?
+        };
+        let pa = copy.data.addr();
+        *self.data.borrow_mut() = Some(copy);
+        Ok(pa)
+    }
     pub(super) fn fork(&self) -> Result<Self, MapError> {
         let child = Self::new(self.file.clone(), self.offset, self.mode);
         if let Some(parent) = self.data.borrow().as_ref() {
-            let copied = match &parent.data {
-                Data::Private(src) => {
-                    let frame = OwnedFrame::new()?;
-                    frame.copy_from(src);
-                    Resident::register(self.file.ino, self.offset, Data::Private(frame))?
-                }
-                Data::Shared(_) => parent.clone(),
-            };
-            *child.data.borrow_mut() = Some(copied);
+            // 私有与共享驻留页均直接共享 Arc；私有页在首次写入时由 split_private 拆分。
+            *child.data.borrow_mut() = Some(parent.clone());
         }
         Ok(child)
     }
