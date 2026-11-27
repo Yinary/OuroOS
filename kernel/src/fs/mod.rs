@@ -11,6 +11,7 @@ pub mod block_cache;
 pub mod cache;
 pub mod context;
 pub mod fat;
+pub mod locks;
 pub mod mapping;
 mod metadata;
 pub mod procfs;
@@ -228,6 +229,12 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
     if path == "/proc/sys/kernel/tainted" {
         return Ok(procfs::TAINTED);
     }
+    if path == "/proc/sys/fs" {
+        return Ok(procfs::SYS_FS_DIR);
+    }
+    if path == "/proc/sys/fs/pipe-max-size" {
+        return Ok(procfs::PIPE_MAX_SIZE_NODE);
+    }
     if path == "/proc/self" {
         return Ok(procfs::SELF_DIR);
     }
@@ -287,6 +294,9 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
     if ino == procfs::TAINTED {
         return Ok((0o100444, procfs::tainted().len() as u64, 1, 0));
     }
+    if ino == procfs::PIPE_MAX_SIZE_NODE {
+        return Ok((0o100444, procfs::pipe_max_size().len() as u64, 1, 0));
+    }
     if ino == procfs::VERSION {
         return Ok((0o100444, procfs::version().len() as u64, 1, 0));
     }
@@ -298,6 +308,7 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
         procfs::DIR
             | procfs::SYS_DIR
             | procfs::SYS_KERNEL_DIR
+            | procfs::SYS_FS_DIR
             | procfs::SELF_DIR
             | procfs::SELF_FD_DIR
     ) {
@@ -577,6 +588,13 @@ pub fn procfs_text(path: &str) -> Result<alloc::string::String, Errno> {
     if path == "/proc/sys/kernel/tainted" {
         let mut s = alloc::string::String::new();
         let src = procfs::tainted();
+        s.try_reserve_exact(src.len()).map_err(|_| Errno::NoMem)?;
+        s.push_str(src);
+        return Ok(s);
+    }
+    if path == "/proc/sys/fs/pipe-max-size" {
+        let mut s = alloc::string::String::new();
+        let src = procfs::pipe_max_size();
         s.try_reserve_exact(src.len()).map_err(|_| Errno::NoMem)?;
         s.push_str(src);
         return Ok(s);

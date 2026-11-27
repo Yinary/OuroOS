@@ -89,6 +89,12 @@ pub(super) fn detach_directory(ino: u32) {
 
 /// 下一个新建管道的唯一实例号；单调递增，0 保留表示槽位空闲。
 static NEXT_PIPE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+/// 下一个打开文件描述（OFD）的唯一标识号，供 flock 与 OFD 记录锁区分归属。
+static NEXT_OFD_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+fn next_ofd_id() -> u64 {
+    NEXT_OFD_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 struct Pipe {
     data: VecDeque<u8>,
@@ -134,12 +140,14 @@ enum Kind {
 }
 /// 共享偏移、打开标志和文件资源的持有者。
 pub(crate) struct OpenFile {
+    ofd_id: u64,
     kind: Kind,
     offset: usize,
     flags: usize,
 }
 impl Drop for OpenFile {
     fn drop(&mut self) {
+        fs::locks::release_ofd(self.ofd_id);
         match &self.kind {
             Kind::Inode {
                 ino,
@@ -207,6 +215,7 @@ impl Context {
         for kind in [Kind::Input, Kind::Output, Kind::Output] {
             fds.push(Some(Descriptor {
                 handle: crate::fs::try_arc(Mutex::new(OpenFile {
+                    ofd_id: next_ofd_id(),
                     flags: if matches!(kind, Kind::Input) { 0 } else { 1 },
                     kind,
                     offset: 0,
@@ -729,8 +738,14 @@ impl Context {
         fs::rename(old_parent, &old_name, new_parent, &new_name, no_replace)
     }
 
-    /// 将打开文件复制到指定 FD，替换原描述符。
-    pub(crate) fn dup_to(&mut self, from: usize, to: usize, cloexec: bool) -> Result<usize, Errno> {
+    /// 将打开文件复制到指定 FD，替换原描述符；若目标槽原有 FD 则按 POSIX 释放该进程对应锁。
+    pub(crate) fn dup_to(
+        &mut self,
+        from: usize,
+        to: usize,
+        cloexec: bool,
+        tgid: u32,
+    ) -> Result<usize, Errno> {
         let file = self.get(from)?;
         if to >= self.fd_limit() {
             return Err(Errno::BadF);
@@ -741,20 +756,32 @@ impl Context {
                 .map_err(|_| Errno::NoMem)?;
             self.fds.resize_with(to + 1, || None);
         }
-        self.fds[to] = Some(Descriptor {
+        let replaced = self.fds[to].replace(Descriptor {
             handle: file,
             cloexec,
         });
+        if let Some(old) = replaced {
+            let key = old.handle.lock().lock_key();
+            if tgid != 0 {
+                fs::locks::release_posix_for_key(tgid, key);
+            }
+        }
         Ok(to)
     }
 
-    /// 关闭 FD 并释放引用，无效 FD 返回 EBADF。
-    pub(crate) fn close(&mut self, fd: usize) -> Result<(), Errno> {
-        self.fds
+    /// 关闭 FD 并释放引用，按 POSIX fcntl(2) 释放该进程在该文件上的全部 POSIX 记录锁。
+    pub(crate) fn close(&mut self, fd: usize, tgid: u32) -> Result<(), Errno> {
+        let desc = self
+            .fds
             .get_mut(fd)
             .ok_or(Errno::BadF)?
             .take()
             .ok_or(Errno::BadF)?;
+        if tgid != 0 {
+            let key = desc.handle.lock().lock_key();
+            fs::locks::release_posix_for_key(tgid, key);
+        }
+        drop(desc);
         Ok(())
     }
 
@@ -775,6 +802,7 @@ impl Context {
         };
         self.install(
             fs::try_arc(Mutex::new(OpenFile {
+                ofd_id: next_ofd_id(),
                 kind: Kind::Inode {
                     ino,
                     path,
@@ -806,6 +834,7 @@ impl Context {
             return Err(Errno::NotDir);
         }
         let file = OpenFile {
+            ofd_id: next_ofd_id(),
             kind: Kind::MemInfo(text),
             offset: 0,
             flags: flags & !OPEN_CREATION_FLAGS,
@@ -826,6 +855,7 @@ impl Context {
             }
         }
         let file = OpenFile {
+            ofd_id: next_ofd_id(),
             kind: Kind::ProcFdDir(entries),
             offset: 0,
             flags: flags & !OPEN_CREATION_FLAGS,
@@ -954,6 +984,7 @@ impl Context {
             return Err(Errno::Invalid);
         }
         let file = OpenFile {
+            ofd_id: next_ofd_id(),
             kind: Kind::DevBlk { disk, start, len },
             offset: 0,
             flags: flags & !OPEN_CREATION_FLAGS,
@@ -967,6 +998,7 @@ impl Context {
             return Err(Errno::NotDir);
         }
         let file = OpenFile {
+            ofd_id: next_ofd_id(),
             kind,
             offset: 0,
             flags: flags & !OPEN_CREATION_FLAGS,
@@ -997,6 +1029,7 @@ impl Context {
             writers: 1,
         }))?;
         let r = fs::try_arc(Mutex::new(OpenFile {
+            ofd_id: next_ofd_id(),
             kind: Kind::Pipe {
                 id,
                 pipe: pipe.clone(),
@@ -1006,6 +1039,7 @@ impl Context {
             flags: flags & 0x800,
         }))?;
         let w = fs::try_arc(Mutex::new(OpenFile {
+            ofd_id: next_ofd_id(),
             kind: Kind::Pipe {
                 id,
                 pipe,
@@ -1035,6 +1069,7 @@ impl Context {
     ) -> Result<usize, Errno> {
         let flags = 2 | if nonblock { 0x800 } else { 0 };
         let file = match fs::try_arc(Mutex::new(OpenFile {
+            ofd_id: next_ofd_id(),
             kind: Kind::Socket(id),
             offset: 0,
             flags,
@@ -1088,6 +1123,38 @@ impl OpenFile {
     /// 查询共享的访问模式和文件状态标志。
     pub(crate) fn status_flags(&self) -> usize {
         self.flags
+    }
+
+    /// 返回本打开文件描述（OFD）的全局唯一标识号。
+    pub(crate) fn ofd_id(&self) -> u64 {
+        self.ofd_id
+    }
+
+    /// 返回本打开文件对应的文件锁对象键。
+    pub(crate) fn lock_key(&self) -> u64 {
+        match &self.kind {
+            Kind::Inode { ino, .. } => u64::from(*ino),
+            Kind::Pipe { id, .. } => (1u64 << 62) | *id,
+            Kind::Socket(id) => (2u64 << 62) | id.wake_id(),
+            Kind::DevNull => (3u64 << 62) | 1,
+            Kind::DevZero => (3u64 << 62) | 2,
+            Kind::DevRandom { urandom } => (3u64 << 62) | if *urandom { 3 } else { 4 },
+            Kind::Rtc => (3u64 << 62) | 5,
+            Kind::DevBlk { disk, start, .. } => {
+                (4u64 << 62) | ((*disk as u64) << 40) | ((*start as u64) & 0xffff_ffff)
+            }
+            _ => (3u64 << 62) | self.ofd_id,
+        }
+    }
+
+    /// 返回用于 fcntl 锁 SEEK_END 计算的文件长度。
+    pub(crate) fn lock_file_size(&self) -> Result<u64, Errno> {
+        match &self.kind {
+            Kind::Inode { ino, .. } => Ok(fs::stat(*ino)?.1),
+            Kind::MemInfo(text) => Ok(text.len() as u64),
+            Kind::DevBlk { len, .. } => Ok(*len),
+            _ => Ok(0),
+        }
     }
 
     /// 查询管道当前容量（fcntl F_GETPIPE_SZ）；非管道返回 EINVAL。

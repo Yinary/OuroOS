@@ -72,10 +72,14 @@ pub(super) const SELF_MAPS: u32 = u32::MAX - 16;
 pub(super) const SELF_FD_DIR: u32 = u32::MAX - 17;
 /// /proc/sys/kernel/tainted 文件
 pub(super) const TAINTED: u32 = u32::MAX - 18;
+/// /proc/sys/fs 目录
+pub(super) const SYS_FS_DIR: u32 = u32::MAX - 19;
+/// /proc/sys/fs/pipe-max-size 文件
+pub(super) const PIPE_MAX_SIZE_NODE: u32 = u32::MAX - 20;
 
 /// 判断 inode 是否属于虚拟节点区间（固定虚拟节点或 /proc/<pid> 派生节点）。
 pub(super) fn is_virtual_ino(ino: u32) -> bool {
-    ino >= TAINTED || pid_ino_parts(ino).is_some()
+    ino >= PIPE_MAX_SIZE_NODE || pid_ino_parts(ino).is_some()
 }
 
 /// /proc/sys/kernel/pid_max 内容。
@@ -86,6 +90,11 @@ pub(super) fn pid_max() -> &'static str {
 /// /proc/sys/kernel/tainted 内容（0 表示无内核污染）。
 pub(super) fn tainted() -> &'static str {
     "0\n"
+}
+
+/// /proc/sys/fs/pipe-max-size 内容（与 context::PIPE_MAX_SIZE = 1 MiB 一致）。
+pub(super) fn pipe_max_size() -> &'static str {
+    "1048576\n"
 }
 
 /// /proc/version 内容。
