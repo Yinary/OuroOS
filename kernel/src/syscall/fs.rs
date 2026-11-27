@@ -165,9 +165,20 @@ pub fn dispatch(
             if path == "/proc/meminfo" {
                 return ctx.open_meminfo(a[2], a[2] & 0x80000 != 0);
             }
-            if path == "/proc/mounts" {
+            if path == "/proc/mounts"
+                || path == "/proc/sys/kernel/pid_max"
+                || path == "/proc/sys/kernel/tainted"
+                || path == "/proc/version"
+            {
                 let text = fs::procfs_text(&path)?;
                 return ctx.open_proc_text(text, a[2], a[2] & 0x80000 != 0);
+            }
+            if path == "/proc/self/maps" {
+                let text = fs::procfs_maps(space)?;
+                return ctx.open_proc_text(text, a[2], a[2] & 0x80000 != 0);
+            }
+            if path == "/proc/self/fd" {
+                return ctx.open_proc_fd_dir(a[2], a[2] & 0x80000 != 0);
             }
             if let Some(rest) = path.strip_prefix("/proc/") {
                 if rest
@@ -328,6 +339,55 @@ fn getdents64(
 ) -> Result<usize, Errno> {
     let handle = ctx.get(fd)?;
     let mut f = handle.lock();
+    if let Some(entries) = f.proc_fd_entries() {
+        let mut out = [0u8; 4096];
+        let cap = count.min(out.len());
+        let mut used = 0;
+        let mut full = false;
+        let mut pos = f.offset();
+        let total = 2 + entries.len();
+        while pos < total {
+            let mut num_buf = [0u8; 20];
+            let (ino_val, dtype, name): (u64, u8, &[u8]) = if pos == 0 {
+                (u64::from(u32::MAX - 17), 4, b".")
+            } else if pos == 1 {
+                (u64::from(u32::MAX - 15), 4, b"..")
+            } else {
+                let mut v = entries[pos - 2];
+                let mut i = num_buf.len();
+                if v == 0 {
+                    i -= 1;
+                    num_buf[i] = b'0';
+                } else {
+                    while v > 0 {
+                        i -= 1;
+                        num_buf[i] = b'0' + (v % 10) as u8;
+                        v /= 10;
+                    }
+                }
+                (u64::from(u32::MAX - 17) + (pos as u64), 10, &num_buf[i..])
+            };
+            let len = (19 + name.len() + 1 + 7) & !7;
+            if used + len > cap {
+                full = true;
+                break;
+            }
+            let d = &mut out[used..used + len];
+            d[..8].copy_from_slice(&ino_val.to_ne_bytes());
+            d[8..16].copy_from_slice(&((pos + 1) as u64).to_ne_bytes());
+            d[16..18].copy_from_slice(&(len as u16).to_ne_bytes());
+            d[18] = dtype;
+            d[19..19 + name.len()].copy_from_slice(name);
+            used += len;
+            pos += 1;
+        }
+        if full && used == 0 {
+            return Err(Errno::Invalid);
+        }
+        user_access::copy_to_user(space, output, &out[..used]).map_err(|_| Errno::Fault)?;
+        f.set_offset(pos);
+        return Ok(used);
+    }
     let ino = f.directory()?;
     if f.detached_directory() {
         return Ok(0);
@@ -560,6 +620,8 @@ fn fcntl(ctx: &mut Context, fd: usize, command: u32, argument: u32) -> Result<us
         2 => ctx.set_descriptor_flags(fd, argument as usize),
         3 => Ok(handle.lock().status_flags()),
         4 => handle.lock().set_status_flags(argument as usize),
+        1031 => handle.lock().set_pipe_size(argument as usize),
+        1032 => handle.lock().pipe_size(),
         _ => Err(Errno::Invalid),
     }
 }

@@ -46,7 +46,7 @@ pub(super) fn metadata(ino: u32) -> Result<Metadata, Errno> {
     }
     // procfs 虚拟节点（/proc、/proc/<pid>、/dev/*）无后端 inode，按统一
     // stat 结果合成，避免 resolve 逐分量解析时把虚拟节点当 ext4 处理
-    if ino >= super::procfs::MISC_DIR || super::procfs::pid_ino_parts(ino).is_some() {
+    if super::procfs::is_virtual_ino(ino) {
         let (mode, size, links, _) = super::stat(ino)?;
         return Ok(Metadata {
             ino: ino as u64,

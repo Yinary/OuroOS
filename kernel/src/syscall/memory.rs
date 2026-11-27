@@ -79,11 +79,15 @@ fn mmap_region(
     ctx: &crate::fs::context::Context,
 ) -> Result<usize, Errno> {
     let [addr, len, prot, map_flags, _fd, offset] = a;
-    let n = pages(len)?;
-    let f = flags(prot)?;
     if offset % PAGE_SIZE != 0 {
         return Err(Errno::Invalid);
     }
+    // 对齐 Linux ksys_mmap_pgoff：非匿名映射先校验 FD 有效性（EBADF），再校验长度
+    if map_flags & 0x20 == 0 {
+        ctx.get(_fd)?;
+    }
+    let n = pages(len)?;
+    let f = flags(prot)?;
     if map_flags & 3 == 0 || (map_flags & 3 == 3 && map_flags & 0x20 != 0) {
         return Err(Errno::Invalid);
     }
@@ -392,7 +396,7 @@ pub(super) fn msync(
     Ok(0)
 }
 
-/// getrlimit/setrlimit/prlimit64：支持内存限额（DATA/STACK/MEMLOCK/AS）与 RLIMIT_NOFILE(7)。
+/// getrlimit/setrlimit/prlimit64：支持全部 16 项 Linux RLIMIT_* 资源（含内存限额、NOFILE 与 CORE/CPU/FSIZE/NPROC 等）。
 pub(super) fn limit(
     space: &mut UserAddressSpace,
     fs: &mut crate::fs::context::Context,
@@ -404,8 +408,10 @@ pub(super) fn limit(
     const RLIMIT_NOFILE: usize = 7;
     let old = if resource == RLIMIT_NOFILE {
         fs.nofile_limit()
+    } else if let Some(v) = space.memory_limit(resource) {
+        v
     } else {
-        space.memory_limit(resource).ok_or(Errno::Invalid)?
+        fs.extra_limit(resource).ok_or(Errno::Invalid)?
     };
     let mut next = None;
     if new_ptr != 0 {
@@ -428,8 +434,10 @@ pub(super) fn limit(
     if let Some(next) = next {
         if resource == RLIMIT_NOFILE {
             fs.set_nofile_limit(next, credentials.euid == 0)?;
-        } else {
+        } else if space.memory_limit(resource).is_some() {
             space.set_memory_limit(resource, next).map_err(error)?;
+        } else {
+            fs.set_extra_limit(resource, next, credentials.euid == 0)?;
         }
     }
     Ok(0)

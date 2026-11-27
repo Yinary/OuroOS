@@ -213,6 +213,30 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
     if path == "/proc/mounts" {
         return Ok(procfs::MOUNTS);
     }
+    if path == "/proc/version" {
+        return Ok(procfs::VERSION);
+    }
+    if path == "/proc/sys" {
+        return Ok(procfs::SYS_DIR);
+    }
+    if path == "/proc/sys/kernel" {
+        return Ok(procfs::SYS_KERNEL_DIR);
+    }
+    if path == "/proc/sys/kernel/pid_max" {
+        return Ok(procfs::PID_MAX);
+    }
+    if path == "/proc/sys/kernel/tainted" {
+        return Ok(procfs::TAINTED);
+    }
+    if path == "/proc/self" {
+        return Ok(procfs::SELF_DIR);
+    }
+    if path == "/proc/self/maps" {
+        return Ok(procfs::SELF_MAPS);
+    }
+    if path == "/proc/self/fd" {
+        return Ok(procfs::SELF_FD_DIR);
+    }
     if let Some(rest) = path.strip_prefix("/proc/") {
         // /proc/<pid> 与 /proc/<pid>/{stat,cmdline}；只接受纯数字 pid
         let (pid, file) = match rest.split_once('/') {
@@ -257,6 +281,28 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
     if ino == procfs::MOUNTS {
         return Ok((0o100444, procfs::mounts()?.len() as u64, 1, 0));
     }
+    if ino == procfs::PID_MAX {
+        return Ok((0o100444, procfs::pid_max().len() as u64, 1, 0));
+    }
+    if ino == procfs::TAINTED {
+        return Ok((0o100444, procfs::tainted().len() as u64, 1, 0));
+    }
+    if ino == procfs::VERSION {
+        return Ok((0o100444, procfs::version().len() as u64, 1, 0));
+    }
+    if ino == procfs::SELF_MAPS {
+        return Ok((0o100444, 0, 1, 0));
+    }
+    if matches!(
+        ino,
+        procfs::DIR
+            | procfs::SYS_DIR
+            | procfs::SYS_KERNEL_DIR
+            | procfs::SELF_DIR
+            | procfs::SELF_FD_DIR
+    ) {
+        return Ok((0o040555, 0, 2, 0));
+    }
     if let Some((pid, file)) = procfs::pid_ino_parts(ino) {
         return match file {
             0 => Ok((0o040555, 0, 2, 0)),
@@ -264,9 +310,6 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
             2 => Ok((0o100444, procfs::pid_cmdline(pid)?.len() as u64, 1, 0)),
             _ => Ok((0o100444, procfs::pid_status(pid)?.len() as u64, 1, 0)),
         };
-    }
-    if ino == procfs::DIR {
-        return Ok((0o040555, 0, 2, 0));
     }
     if ino & FAT_INODE != 0 {
         fat::stat(ino)
@@ -463,7 +506,7 @@ pub fn sync_mapping(_ino: u32, _offset: usize, _length: usize) -> Result<(), Err
 /// 持有 inode 的打开引用。
 pub fn retain(ino: u32) -> Result<(), Errno> {
     // procfs 虚拟节点（/proc、/proc/<pid>、/dev/*）无后端引用计数
-    if ino >= procfs::MISC_DIR || procfs::pid_ino_parts(ino).is_some() {
+    if procfs::is_virtual_ino(ino) {
         return Ok(());
     }
     if ino & FAT_INODE != 0 {
@@ -475,7 +518,7 @@ pub fn retain(ino: u32) -> Result<(), Errno> {
 
 /// 释放 inode 的打开引用。
 pub fn release(ino: u32) {
-    if ino >= procfs::MISC_DIR || procfs::pid_ino_parts(ino).is_some() {
+    if procfs::is_virtual_ino(ino) {
         return;
     }
     if ino & FAT_INODE != 0 {
@@ -499,6 +542,27 @@ pub fn procfs_text(path: &str) -> Result<alloc::string::String, Errno> {
     if path == "/proc/mounts" {
         return procfs::mounts();
     }
+    if path == "/proc/sys/kernel/pid_max" {
+        let mut s = alloc::string::String::new();
+        let src = procfs::pid_max();
+        s.try_reserve_exact(src.len()).map_err(|_| Errno::NoMem)?;
+        s.push_str(src);
+        return Ok(s);
+    }
+    if path == "/proc/sys/kernel/tainted" {
+        let mut s = alloc::string::String::new();
+        let src = procfs::tainted();
+        s.try_reserve_exact(src.len()).map_err(|_| Errno::NoMem)?;
+        s.push_str(src);
+        return Ok(s);
+    }
+    if path == "/proc/version" {
+        let mut s = alloc::string::String::new();
+        let src = procfs::version();
+        s.try_reserve_exact(src.len()).map_err(|_| Errno::NoMem)?;
+        s.push_str(src);
+        return Ok(s);
+    }
     if let Some(rest) = path.strip_prefix("/proc/") {
         if let Some((pid, file)) = rest.split_once('/') {
             if !pid.bytes().all(|b| b.is_ascii_digit()) || pid.is_empty() {
@@ -516,6 +580,13 @@ pub fn procfs_text(path: &str) -> Result<alloc::string::String, Errno> {
         }
     }
     Err(Errno::NoEntry)
+}
+
+/// 生成当前进程的 /proc/self/maps 只读文本快照。
+pub fn procfs_maps(
+    space: &crate::mm::address_space::UserAddressSpace,
+) -> Result<alloc::string::String, Errno> {
+    procfs::format_maps(space)
 }
 
 /// 路径是否落在任何 FAT 挂载点之下（rmdir/rename 的 EBUSY 检查用）。
