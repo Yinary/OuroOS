@@ -139,7 +139,7 @@ pub fn pid_dir_ino(pid: u32) -> u32 {
 }
 
 /// pid 派生 inode 的反解：Some((pid, file))，file 0=目录 1=stat 2=cmdline
-/// 3=status
+/// 3=status 4=comm 5=timerslack_ns
 pub fn pid_ino_parts(ino: u32) -> Option<(u32, u8)> {
     if !(0x4000_0000..0x7FFF_0000).contains(&ino) {
         return None;
@@ -147,7 +147,7 @@ pub fn pid_ino_parts(ino: u32) -> Option<(u32, u8)> {
     let rel = ino - 0x4000_0000;
     let pid = rel / 16;
     let file = rel % 16;
-    if pid == 0 || file > 3 {
+    if pid == 0 || file > 5 {
         return None;
     }
     Some((pid, file as u8))
@@ -197,15 +197,23 @@ pub(super) fn pid_stat(pid: u32) -> Result<String, Errno> {
     let Some((pgid, sid, _)) = crate::task::proc_table_identity(pid) else {
         return Err(Errno::NoEntry);
     };
+    let comm_buf = crate::task::proc_table_comm(pid);
+    let comm = comm_buf
+        .as_ref()
+        .and_then(|raw| {
+            let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            core::str::from_utf8(&raw[..len]).ok()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or(name);
     let mut out = String::new();
     out.try_reserve(256).map_err(|_| Errno::NoMem)?;
     let _ = write!(
         out,
         "{} ({}) {} {} {} {}",
-        pid, name, state as char, ppid, pgid, sid
+        pid, comm, state as char, ppid, pgid, sid
     );
-    // 字段 7..53 全部补零；comm 含空格的场景按 proc(5) 无需转义（任务名
-    // 来自登记的 &'static str，不含括号）
+    // 字段 7..53 全部补零；comm 含空格的场景按 proc(5) 无需转义
     for _ in 7..=53 {
         out.push_str(" 0");
     }
@@ -213,7 +221,7 @@ pub(super) fn pid_stat(pid: u32) -> Result<String, Errno> {
     Ok(out)
 }
 
-/// /proc/<pid>/status 快照（proc(5) 关键行；Uid 与 Gid 取进程凭证）。
+/// /proc/<pid>/status 快照（proc(5) 关键行；Uid、Gid、Name 与 NoNewPrivs 取自进程快照）。
 pub(super) fn pid_status(pid: u32) -> Result<String, Errno> {
     let Some((name, state, ppid, _)) = crate::task::proc_table_lookup(pid) else {
         return Err(Errno::NoEntry);
@@ -221,8 +229,18 @@ pub(super) fn pid_status(pid: u32) -> Result<String, Errno> {
     let Some((_, _, ids)) = crate::task::proc_table_identity(pid) else {
         return Err(Errno::NoEntry);
     };
+    let comm_buf = crate::task::proc_table_comm(pid);
+    let comm = comm_buf
+        .as_ref()
+        .and_then(|raw| {
+            let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            core::str::from_utf8(&raw[..len]).ok()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or(name);
+    let nnp = u8::from(crate::task::proc_table_no_new_privs(pid));
     let mut out = String::new();
-    out.try_reserve(192).map_err(|_| Errno::NoMem)?;
+    out.try_reserve(224).map_err(|_| Errno::NoMem)?;
     let state_text = match state {
         b'R' => "R (running)",
         b'Z' => "Z (zombie)",
@@ -230,8 +248,8 @@ pub(super) fn pid_status(pid: u32) -> Result<String, Errno> {
     };
     let _ = write!(
         out,
-        "Name:\t{}\nState:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n",
-        name, state_text, pid, ppid, ids[0], ids[1], ids[2], ids[3], ids[4], ids[5], ids[6], ids[7]
+        "Name:\t{}\nState:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nNoNewPrivs:\t{}\n",
+        comm, state_text, pid, ppid, ids[0], ids[1], ids[2], ids[3], ids[4], ids[5], ids[6], ids[7], nnp
     );
     Ok(out)
 }
@@ -254,6 +272,38 @@ pub(super) fn pid_cmdline(pid: u32) -> Result<String, Errno> {
             out.push('\0');
         }
     }
+    Ok(out)
+}
+
+/// /proc/<pid>/comm 快照（含末尾换行，见 proc(5)）。
+pub(super) fn pid_comm(pid: u32) -> Result<String, Errno> {
+    let Some((name, ..)) = crate::task::proc_table_lookup(pid) else {
+        return Err(Errno::NoEntry);
+    };
+    let comm_buf = crate::task::proc_table_comm(pid);
+    let comm = comm_buf
+        .as_ref()
+        .and_then(|raw| {
+            let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            core::str::from_utf8(&raw[..len]).ok()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or(name);
+    let mut out = String::new();
+    out.try_reserve(comm.len() + 1).map_err(|_| Errno::NoMem)?;
+    out.push_str(comm);
+    out.push('\n');
+    Ok(out)
+}
+
+/// /proc/<pid>/timerslack_ns 快照（十进制纳秒加换行）。
+pub(super) fn pid_timerslack(pid: u32) -> Result<String, Errno> {
+    let Some(slack) = crate::task::proc_table_timer_slack(pid) else {
+        return Err(Errno::NoEntry);
+    };
+    let mut out = String::new();
+    out.try_reserve(24).map_err(|_| Errno::NoMem)?;
+    let _ = writeln!(out, "{}", slack);
     Ok(out)
 }
 

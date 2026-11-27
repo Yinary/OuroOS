@@ -1,13 +1,16 @@
 //! 时钟源：单调时钟取开机时间，墙钟在启动时与 RTC 的秒边界对齐，之后随单调时钟推进。
 //! 系统调用按 clockid 经本模块取时间。
 
-use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 
 use crate::syscall::Errno;
 
 /// 各时钟的分辨率。
 pub const RESOLUTION: Duration = Duration::from_nanos(1);
+
+/// settimeofday/clock_settime 允许的最大秒数，防止与纳秒换算溢出 i64。
+pub const MAX_SETTOD_SEC: i64 = (i64::MAX / 1_000_000_000) - 1;
 
 /// 单调时钟：开机以来经过的时间。
 #[inline]
@@ -17,6 +20,8 @@ pub fn monotonic() -> Duration {
 
 /// 墙钟基准的整秒；取 i64::MIN 表示尚未对齐，此时墙钟退化为开机时间。
 static BASE_SEC: AtomicI64 = AtomicI64::new(i64::MIN);
+/// 墙钟基准的亚秒纳秒部分（0..1_000_000_000）。
+static BASE_NSEC: AtomicU32 = AtomicU32::new(0);
 /// 墙钟基准对应的单调时刻，单位纳秒。
 static BASE_MONO_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -44,7 +49,19 @@ pub fn align_realtime() {
         }
     }
     BASE_MONO_NS.store(sample.as_nanos() as u64, Ordering::Relaxed);
+    BASE_NSEC.store(0, Ordering::Relaxed);
     BASE_SEC.store(sec.max(0), Ordering::Relaxed);
+}
+
+/// 设置墙钟时间；不影响单调时钟，之后墙钟从此基准继续随单调时钟推进。
+pub fn set_realtime(target: Duration) {
+    let now_mono = monotonic().as_nanos().min(u64::MAX as u128) as u64;
+    BASE_MONO_NS.store(now_mono, Ordering::Relaxed);
+    BASE_NSEC.store(target.subsec_nanos(), Ordering::Relaxed);
+    BASE_SEC.store(
+        target.as_secs().min(i64::MAX as u64) as i64,
+        Ordering::Relaxed,
+    );
 }
 
 /// 墙钟，即 UTC 纪元以来的时间。
@@ -53,8 +70,9 @@ pub fn realtime() -> Duration {
     if sec == i64::MIN {
         return monotonic();
     }
+    let nsec = BASE_NSEC.load(Ordering::Relaxed);
     let base = Duration::from_nanos(BASE_MONO_NS.load(Ordering::Relaxed));
-    Duration::new(sec as u64, 0) + monotonic().saturating_sub(base)
+    Duration::new(sec as u64, nsec).saturating_add(monotonic().saturating_sub(base))
 }
 
 /// 时钟按取时间的方式分成三类。

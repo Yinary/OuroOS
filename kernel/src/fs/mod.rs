@@ -176,6 +176,33 @@ pub fn lookup_blk_node(name: &str) -> Option<(usize, usize)> {
         .map(|&(_, d, p)| (d, p))
 }
 
+/// 解析 `/proc/` 之后的进程子路径，支持 `<pid|self>[/task/<tid>][/<file>]`。
+fn parse_proc_pid_path(rest: &str) -> Result<(u32, &str), Errno> {
+    let (pid_part, tail) = match rest.split_once('/') {
+        Some((p, f)) => (p, f),
+        None => (rest, ""),
+    };
+    let pid = if pid_part == "self" {
+        crate::task::sched::current_tgid().ok_or(Errno::NoEntry)?
+    } else if !pid_part.is_empty() && pid_part.bytes().all(|b| b.is_ascii_digit()) {
+        pid_part.parse::<u32>().map_err(|_| Errno::NoEntry)?
+    } else {
+        return Err(Errno::NoEntry);
+    };
+    if let Some(after_task) = tail.strip_prefix("task/") {
+        let (tid_part, file) = match after_task.split_once('/') {
+            Some((t, f)) => (t, f),
+            None => (after_task, ""),
+        };
+        if tid_part.is_empty() || !tid_part.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Errno::NoEntry);
+        }
+        let _tid = tid_part.parse::<u32>().map_err(|_| Errno::NoEntry)?;
+        return Ok((pid, file));
+    }
+    Ok((pid, tail))
+}
+
 /// 按绝对路径查找 inode。
 pub fn lookup(path: &str) -> Result<u32, Errno> {
     if path == "/dev/null" {
@@ -245,25 +272,17 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
         return Ok(procfs::SELF_FD_DIR);
     }
     if let Some(rest) = path.strip_prefix("/proc/") {
-        // /proc/<pid> 与 /proc/<pid>/{stat,cmdline}；只接受纯数字 pid
-        let (pid, file) = match rest.split_once('/') {
-            Some((p, f)) => (p, f),
-            None => (rest, ""),
+        let (pid, file) = parse_proc_pid_path(rest)?;
+        let base = procfs::pid_dir_ino(pid);
+        return match file {
+            "" => Ok(base),
+            "stat" => Ok(base + 1),
+            "cmdline" => Ok(base + 2),
+            "status" => Ok(base + 3),
+            "comm" => Ok(base + 4),
+            "timerslack_ns" => Ok(base + 5),
+            _ => Err(Errno::NoEntry),
         };
-        if !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) {
-            let Ok(pid) = pid.parse::<u32>() else {
-                return Err(Errno::NoEntry);
-            };
-            let base = procfs::pid_dir_ino(pid);
-            return match file {
-                "" => Ok(base),
-                "stat" => Ok(base + 1),
-                "cmdline" => Ok(base + 2),
-                "status" => Ok(base + 3),
-                _ => Err(Errno::NoEntry),
-            };
-        }
-        return Err(Errno::NoEntry);
     }
     match fat::lookup(path)? {
         Some(ino) => Ok(ino),
@@ -319,7 +338,9 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
             0 => Ok((0o040555, 0, 2, 0)),
             1 => Ok((0o100444, procfs::pid_stat(pid)?.len() as u64, 1, 0)),
             2 => Ok((0o100444, procfs::pid_cmdline(pid)?.len() as u64, 1, 0)),
-            _ => Ok((0o100444, procfs::pid_status(pid)?.len() as u64, 1, 0)),
+            3 => Ok((0o100444, procfs::pid_status(pid)?.len() as u64, 1, 0)),
+            4 => Ok((0o100444, procfs::pid_comm(pid)?.len() as u64, 1, 0)),
+            _ => Ok((0o100444, procfs::pid_timerslack(pid)?.len() as u64, 1, 0)),
         };
     }
     if ino & FAT_INODE != 0 {
@@ -573,6 +594,27 @@ pub fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
     }
 }
 
+/// 判断路径是否属于按需生成快照的 procfs 只读文本文件。
+pub fn is_procfs_text(path: &str) -> bool {
+    if matches!(
+        path,
+        "/proc/mounts"
+            | "/proc/sys/kernel/pid_max"
+            | "/proc/sys/kernel/tainted"
+            | "/proc/sys/fs/pipe-max-size"
+            | "/proc/version"
+    ) {
+        return true;
+    }
+    let Some(rest) = path.strip_prefix("/proc/") else {
+        return false;
+    };
+    matches!(
+        parse_proc_pid_path(rest),
+        Ok((_, "stat" | "cmdline" | "status" | "comm" | "timerslack_ns"))
+    )
+}
+
 /// procfs 只读文本文件的内容快照（open 时捕获一次）。
 pub fn procfs_text(path: &str) -> Result<alloc::string::String, Errno> {
     if path == "/proc/mounts" {
@@ -607,20 +649,15 @@ pub fn procfs_text(path: &str) -> Result<alloc::string::String, Errno> {
         return Ok(s);
     }
     if let Some(rest) = path.strip_prefix("/proc/") {
-        if let Some((pid, file)) = rest.split_once('/') {
-            if !pid.bytes().all(|b| b.is_ascii_digit()) || pid.is_empty() {
-                return Err(Errno::NoEntry);
-            }
-            let Ok(pid) = pid.parse::<u32>() else {
-                return Err(Errno::NoEntry);
-            };
-            return match file {
-                "stat" => procfs::pid_stat(pid),
-                "cmdline" => procfs::pid_cmdline(pid),
-                "status" => procfs::pid_status(pid),
-                _ => Err(Errno::NoEntry),
-            };
-        }
+        let (pid, file) = parse_proc_pid_path(rest)?;
+        return match file {
+            "stat" => procfs::pid_stat(pid),
+            "cmdline" => procfs::pid_cmdline(pid),
+            "status" => procfs::pid_status(pid),
+            "comm" => procfs::pid_comm(pid),
+            "timerslack_ns" => procfs::pid_timerslack(pid),
+            _ => Err(Errno::NoEntry),
+        };
     }
     Err(Errno::NoEntry)
 }

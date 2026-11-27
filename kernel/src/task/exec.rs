@@ -288,24 +288,19 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
     // —— 提交段：发布备齐对象，无分配、无失败路径 ——
     rec.space = Some(LocalSpace(space));
     rec.signal.reset_for_exec();
+    rec.dumpable = 1;
+    rec.keepcaps = false;
+    let new_comm = crate::task::comm_from_path(&path);
+    let tgid = rec.pid;
     if let Some(thread) = reg.threads.iter_mut().find(|t| t.tid == pid) {
         thread.signal.reset_for_exec();
         thread.clear_child_tid = 0;
         thread.robust_list = 0;
+        thread.comm = new_comm;
     }
     rec.did_exec = true;
-    rec.keep_caps = false;
-    {
-        let base = exe_value
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("exec");
-        rec.comm = [0u8; 16];
-        let n = base.len().min(15);
-        rec.comm[..n].copy_from_slice(&base.as_bytes()[..n]);
-    }
-    crate::task::proc_table_set_cmdline(pid, cmdline);
+    crate::task::proc_table_set_cmdline(tgid, cmdline);
+    crate::task::proc_table_set_comm(tgid, new_comm);
     if let Some(ctx) = rec.fs.as_mut() {
         context::close_exec(ctx);
         // /proc/self/exe 记录（proc(5)）；值为空串时退化为 ENOENT
