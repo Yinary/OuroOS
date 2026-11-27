@@ -490,6 +490,39 @@ pub fn create(sock_type: SockType) -> Result<SocketId, Errno> {
     Ok(id)
 }
 
+/// 创建未连接的 AF_UNIX 套接字（支持 SOCK_STREAM 与 SOCK_DGRAM）。
+pub fn create_unix(sock_type: SockType) -> Result<SocketId, Errno> {
+    let mut net = NET.lock();
+    let id = net.alloc_id();
+    let kind = match sock_type {
+        SockType::Stream => SockKind::UnixStream {
+            peer_id: None,
+            rx: VecDeque::new(),
+            peer_closed: false,
+        },
+        SockType::Dgram => SockKind::UnixDgram {
+            peer_id: None,
+            rx: VecDeque::new(),
+            rx_bytes: 0,
+            peer_closed: false,
+        },
+    };
+    net.sockets.insert(
+        id,
+        SocketEntry {
+            kind,
+            opts: SocketOptions {
+                snd_buf: UNIX_BUF_DEFAULT,
+                rcv_buf: UNIX_BUF_DEFAULT,
+                ..SocketOptions::default()
+            },
+            shut_rd: false,
+            shut_wr: false,
+        },
+    );
+    Ok(id)
+}
+
 /// 创建一对已互连的匿名 AF_UNIX 套接字（支持 SOCK_STREAM 与 SOCK_DGRAM）。
 pub fn create_unix_pair(sock_type: SockType) -> Result<(SocketId, SocketId), Errno> {
     let mut net = NET.lock();

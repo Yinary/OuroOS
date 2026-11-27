@@ -1337,7 +1337,7 @@ fn process_call(
             } else {
                 let wanted = args[0] as i32;
                 if wanted == i32::MIN {
-                    Err(Errno::NoChild)
+                    Err(Errno::NoProcess)
                 } else {
                     let caller_pgid = REGISTRY.lock().group(parent).map_or(0, |r| r.pgid);
                     let wanted_pgid = (-(wanted as i64)) as usize;

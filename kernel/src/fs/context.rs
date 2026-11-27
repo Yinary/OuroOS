@@ -92,9 +92,11 @@ static NEXT_PIPE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 
 struct Pipe {
     data: VecDeque<u8>,
+    capacity: usize,
     readers: usize,
     writers: usize,
 }
+const PIPE_MAX_SIZE: usize = 1024 * 1024;
 enum Kind {
     Input,
     Output,
@@ -109,6 +111,8 @@ enum Kind {
         directory: Option<Arc<DirectoryPath>>,
     },
     MemInfo(String),
+    /// /proc/self/fd 目录快照，记录打开时刻存活的 FD 编号列表。
+    ProcFdDir(Vec<usize>),
     /// /dev/null：读 EOF、写全收（见 fs::procfs::DEVNULL）
     DevNull,
     /// /dev/zero：读返回零填充，写入丢弃。
@@ -173,10 +177,21 @@ pub struct Context {
     cwd: Arc<DirectoryPath>,
     fds: Vec<Option<Descriptor>>,
     nofile_limit: [usize; 2],
+    extra_limits: [[usize; 2]; 16],
     umask: u16,
     /// 本进程最近一次 execve 的绝对路径（/proc/self/exe 的目标，proc(5)）。
     /// 内核内嵌启动的程序没有盘上路径，保持为空串。
     exe_path: String,
+}
+fn default_extra_limits() -> [[usize; 2]; 16] {
+    let mut lim = [[usize::MAX, usize::MAX]; 16];
+    lim[4] = [0, usize::MAX]; // RLIMIT_CORE
+    lim[6] = [4096, 4096]; // RLIMIT_NPROC
+    lim[11] = [1024, 1024]; // RLIMIT_SIGPENDING
+    lim[12] = [819_200, 819_200]; // RLIMIT_MSGQUEUE
+    lim[13] = [0, 0]; // RLIMIT_NICE
+    lim[14] = [0, 0]; // RLIMIT_RTPRIO
+    lim
 }
 fn string(s: &str) -> Result<String, Errno> {
     let mut result = String::new();
@@ -203,6 +218,7 @@ impl Context {
             cwd: directory_path(string("/")?, None)?,
             fds,
             nofile_limit: [FD_DEFAULT_SOFT, FD_DEFAULT_HARD],
+            extra_limits: default_extra_limits(),
             umask: 0o022,
             exe_path: String::new(),
         })
@@ -216,9 +232,31 @@ impl Context {
             cwd: self.cwd.clone(),
             fds,
             nofile_limit: self.nofile_limit,
+            extra_limits: self.extra_limits,
             umask: self.umask,
             exe_path: self.exe_path.clone(),
         })
+    }
+    /// 查询本进程其余非内存/非 NOFILE 的标准 RLIMIT_* 软硬限额（资源号 0..16）。
+    pub(crate) fn extra_limit(&self, resource: usize) -> Option<[usize; 2]> {
+        self.extra_limits.get(resource).copied()
+    }
+    /// 修改标准 RLIMIT_* 限额；非特权进程不得抬高硬限额。
+    pub(crate) fn set_extra_limit(
+        &mut self,
+        resource: usize,
+        limit: [usize; 2],
+        privileged: bool,
+    ) -> Result<(), Errno> {
+        let cur = self.extra_limits.get_mut(resource).ok_or(Errno::Invalid)?;
+        if limit[0] > limit[1] {
+            return Err(Errno::Invalid);
+        }
+        if !privileged && limit[1] > cur[1] {
+            return Err(Errno::Perm);
+        }
+        *cur = limit;
+        Ok(())
     }
     /// 查询本进程 RLIMIT_NOFILE 的软硬限额。
     pub(crate) fn nofile_limit(&self) -> [usize; 2] {
@@ -257,9 +295,9 @@ impl Context {
         previous as usize
     }
 
-    /// 对新建文件和目录的请求权限应用当前进程掩码。
+    /// 对新建文件和目录的请求权限应用当前进程掩码（保留特殊权限位 0o7000）。
     pub(crate) fn creation_mode(&self, mode: usize) -> u16 {
-        mode as u16 & 0o777 & !self.umask
+        mode as u16 & 0o7777 & !self.umask
     }
 
     /// 取得打开文件引用，无效 FD 返回 EBADF。
@@ -628,6 +666,26 @@ impl Context {
         self.install(fs::try_arc(Mutex::new(file))?, cloexec)
     }
 
+    /// 打开 /proc/self/fd 目录快照，供 opendir/getdents64 枚举当前打开的 FD 编号。
+    pub(crate) fn open_proc_fd_dir(&mut self, flags: usize, cloexec: bool) -> Result<usize, Errno> {
+        if flags & (3 | 0x200) != 0 {
+            return Err(Errno::IsDir);
+        }
+        let mut entries = Vec::new();
+        for (idx, slot) in self.fds.iter().enumerate() {
+            if slot.is_some() {
+                entries.try_reserve(1).map_err(|_| Errno::NoMem)?;
+                entries.push(idx);
+            }
+        }
+        let file = OpenFile {
+            kind: Kind::ProcFdDir(entries),
+            offset: 0,
+            flags: flags & !OPEN_CREATION_FLAGS,
+        };
+        self.install(fs::try_arc(Mutex::new(file))?, cloexec)
+    }
+
     /// 打开 /dev/null：读恒 EOF、写全部接收并丢弃。
     pub(crate) fn open_devnull(&mut self, flags: usize, cloexec: bool) -> Result<usize, Errno> {
         self.open_special(Kind::DevNull, flags, cloexec)
@@ -688,11 +746,31 @@ impl Context {
     ) -> Result<usize, Errno> {
         // _IOR('p', 0x09, struct rtc_time)：32 位方向/大小/类型/序号编码
         const RTC_RD_TIME: usize = 0x8024_7009;
+        // FIONREAD：返回管道或普通文件当前可读字节数（i32）
+        const FIONREAD: usize = 0x541B;
         let file = self.get(fd)?;
         let f = file.lock();
         // ioctl(2) 的 cmd 是 unsigned int：部分 libc（如 musl）把负的 int
         // 常量符号扩展到 64 位寄存器，比较前统一截断为 32 位
-        if !matches!(f.kind, Kind::Rtc) || (cmd as u32) as usize != RTC_RD_TIME {
+        let cmd32 = (cmd as u32) as usize;
+        if cmd32 == FIONREAD {
+            let avail: i32 = match &f.kind {
+                Kind::Pipe { pipe, .. } => pipe.lock().data.len().min(i32::MAX as usize) as i32,
+                Kind::Inode {
+                    ino,
+                    directory: None,
+                    ..
+                } => {
+                    let size = fs::stat(*ino)?.1 as usize;
+                    size.saturating_sub(f.offset).min(i32::MAX as usize) as i32
+                }
+                _ => return Err(Errno::InappropriateIoctl),
+            };
+            crate::mm::user_access::copy_to_user(space, arg, &avail.to_ne_bytes())
+                .map_err(|_| Errno::Fault)?;
+            return Ok(0);
+        }
+        if !matches!(f.kind, Kind::Rtc) || cmd32 != RTC_RD_TIME {
             return Err(Errno::InappropriateIoctl);
         }
         let Some(secs) = crate::drivers::rtc::read_utc_seconds() else {
@@ -767,6 +845,7 @@ impl Context {
         let id = NEXT_PIPE_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let pipe = fs::try_arc(Mutex::new(Pipe {
             data,
+            capacity: PIPE_CAPACITY,
             readers: 1,
             writers: 1,
         }))?;
@@ -864,6 +943,45 @@ impl OpenFile {
         self.flags
     }
 
+    /// 查询管道当前容量（fcntl F_GETPIPE_SZ）；非管道返回 EINVAL。
+    pub(crate) fn pipe_size(&self) -> Result<usize, Errno> {
+        match &self.kind {
+            Kind::Pipe { pipe, .. } => Ok(pipe.lock().capacity),
+            _ => Err(Errno::Invalid),
+        }
+    }
+
+    /// 调整管道容量（fcntl F_SETPIPE_SZ）；按页向上取整，小于当前积压字节数返回 EBUSY。
+    pub(crate) fn set_pipe_size(&self, requested: usize) -> Result<usize, Errno> {
+        let Kind::Pipe { id, pipe, .. } = &self.kind else {
+            return Err(Errno::Invalid);
+        };
+        let req_i32 = requested as u32 as i32;
+        if req_i32 < 0 {
+            return Err(Errno::Invalid);
+        }
+        let req = (req_i32 as usize).max(4096);
+        let rounded = req.next_power_of_two().max(4096);
+        if rounded > PIPE_MAX_SIZE {
+            return Err(Errno::Perm);
+        }
+        let mut p = pipe.lock();
+        if rounded < p.data.len() {
+            return Err(Errno::Busy);
+        }
+        p.capacity = rounded;
+        crate::task::sched::request_pipe_id_wake(*id);
+        Ok(rounded)
+    }
+
+    /// 若本打开对象是 `/proc/self/fd` 目录快照，返回其 FD 列表。
+    pub(crate) fn proc_fd_entries(&self) -> Option<&[usize]> {
+        match &self.kind {
+            Kind::ProcFdDir(entries) => Some(entries),
+            _ => None,
+        }
+    }
+
     /// 更新共享的追加、非阻塞标志；未实现的可变标志返回 EOPNOTSUPP。
     pub(crate) fn set_status_flags(&mut self, flags: usize) -> Result<usize, Errno> {
         if flags & (0x2000 | 0x4000 | 0x40000) != 0 {
@@ -931,7 +1049,7 @@ impl OpenFile {
             Kind::Inode { ino, .. } => {
                 // procfs 虚拟节点（/proc、/dev/*、pid 派生）无后端 inode
                 // 元数据，直接按统一 stat 结果合成
-                if *ino >= super::procfs::MISC_DIR || super::procfs::pid_ino_parts(*ino).is_some() {
+                if super::procfs::is_virtual_ino(*ino) {
                     let (mode, size, links, _) = fs::stat(*ino)?;
                     return Ok(fs::Metadata {
                         ino: *ino as u64,
@@ -944,6 +1062,13 @@ impl OpenFile {
                 }
                 fs::metadata::metadata(*ino)
             }
+            Kind::ProcFdDir(_) => Ok(fs::Metadata {
+                ino: super::procfs::SELF_FD_DIR as u64,
+                mode: 0o040555,
+                links: 2,
+                block_size: 4096,
+                ..Default::default()
+            }),
             Kind::MemInfo(text) => Ok(fs::Metadata {
                 ino: super::procfs::MEMINFO as u64,
                 mode: 0o100444,
@@ -1000,7 +1125,7 @@ impl OpenFile {
                 Kind::Inode {
                     directory: Some(_),
                     ..
-                }
+                } | Kind::ProcFdDir(_)
             )
         {
             return Err(Errno::IsDir);
@@ -1129,9 +1254,13 @@ impl OpenFile {
                 if p.readers == 0 {
                     return Err(Errno::Pipe);
                 }
-                let avail = PIPE_CAPACITY - p.data.len();
+                let avail = p.capacity.saturating_sub(p.data.len());
                 // 遵循 POSIX PIPE_BUF(4096) 原子写语义；更大请求允许部分写入以提升大块管道吞吐。
-                let need = if data.len() <= 4096 { data.len() } else { 1 };
+                let need = if data.len() <= 4096.min(p.capacity) {
+                    data.len()
+                } else {
+                    1
+                };
                 if avail < need {
                     return Err(nonblock_or_wait(self.flags));
                 }
@@ -1324,7 +1453,7 @@ fn fd_poll_events(file: &OpenFile, requested: u16) -> u16 {
     match &file.kind {
         Kind::Input => 0x41 & requested,
         Kind::Output => 0x104 & requested,
-        Kind::Inode { .. } | Kind::MemInfo(_) => 0x145 & requested,
+        Kind::Inode { .. } | Kind::MemInfo(_) | Kind::ProcFdDir(_) => 0x145 & requested,
         // /dev/null、/dev/zero、/dev/urandom 与 rtc 永远可读可写；块节点同
         Kind::DevNull
         | Kind::DevZero
@@ -1341,7 +1470,7 @@ fn fd_poll_events(file: &OpenFile, requested: u16) -> u16 {
                     0x41 & requested
                 }) | (if p.writers == 0 { 16 } else { 0 })
             } else {
-                (if p.data.len() < PIPE_CAPACITY {
+                (if p.data.len() < p.capacity {
                     0x104 & requested
                 } else {
                     0
@@ -1490,6 +1619,9 @@ pub(crate) fn select_write_back(
 pub fn mapping(ctx: &Context, fd: usize, write: bool) -> Result<(u32, bool), Errno> {
     let handle = ctx.get(fd)?;
     let f = handle.lock();
+    if f.flags & 0x200000 != 0 {
+        return Err(Errno::BadF);
+    }
     if f.flags & 3 == 1 || (write && f.flags & 3 != 2) {
         return Err(Errno::Access);
     }

@@ -56,6 +56,72 @@ pub(super) const DEVBLK: u32 = u32::MAX - 7;
 pub(super) const MISC_DIR: u32 = u32::MAX - 6;
 /// /proc/mounts（df 等读取，格式见 mounts(5)）
 pub(super) const MOUNTS: u32 = u32::MAX - 4;
+/// /proc/sys 目录
+pub(super) const SYS_DIR: u32 = u32::MAX - 11;
+/// /proc/sys/kernel 目录
+pub(super) const SYS_KERNEL_DIR: u32 = u32::MAX - 12;
+/// /proc/sys/kernel/pid_max
+pub(super) const PID_MAX: u32 = u32::MAX - 13;
+/// /proc/version
+pub(super) const VERSION: u32 = u32::MAX - 14;
+/// /proc/self 目录
+pub(super) const SELF_DIR: u32 = u32::MAX - 15;
+/// /proc/self/maps
+pub(super) const SELF_MAPS: u32 = u32::MAX - 16;
+/// /proc/self/fd 目录
+pub(super) const SELF_FD_DIR: u32 = u32::MAX - 17;
+/// /proc/sys/kernel/tainted 文件
+pub(super) const TAINTED: u32 = u32::MAX - 18;
+
+/// 判断 inode 是否属于虚拟节点区间（固定虚拟节点或 /proc/<pid> 派生节点）。
+pub(super) fn is_virtual_ino(ino: u32) -> bool {
+    ino >= TAINTED || pid_ino_parts(ino).is_some()
+}
+
+/// /proc/sys/kernel/pid_max 内容。
+pub(super) fn pid_max() -> &'static str {
+    "32768\n"
+}
+
+/// /proc/sys/kernel/tainted 内容（0 表示无内核污染）。
+pub(super) fn tainted() -> &'static str {
+    "0\n"
+}
+
+/// /proc/version 内容。
+pub(super) fn version() -> &'static str {
+    "Linux version 6.1.0-OuroOS (ouroos@build) (rustc) #1 SMP\n"
+}
+
+/// 生成当前进程的 /proc/self/maps 快照（proc(5) 标准行格式，地址按 Linux %08lx 排版）。
+pub(crate) fn format_maps(
+    space: &crate::mm::address_space::UserAddressSpace,
+) -> Result<String, Errno> {
+    use polyhal::pagetable::MappingFlags as F;
+    let areas = space.areas();
+    let mut out = String::new();
+    out.try_reserve(areas.len().saturating_mul(64))
+        .map_err(|_| Errno::NoMem)?;
+    for area in areas {
+        let r = if area.flags.contains(F::R) { 'r' } else { '-' };
+        let w = if area.flags.contains(F::W) { 'w' } else { '-' };
+        let x = if area.flags.contains(F::X) { 'x' } else { '-' };
+        let s = if matches!(
+            area.kind,
+            crate::mm::address_space::AreaKind::SharedAnonymous
+        ) {
+            's'
+        } else {
+            'p'
+        };
+        let _ = writeln!(
+            out,
+            "{:08x}-{:08x} {}{}{}{} 00000000 00:00 0",
+            area.start, area.end, r, w, x, s
+        );
+    }
+    Ok(out)
+}
 
 /// /proc/<pid> 目录的 inode：pid 目录与其下文件按 16 偏移分段，
 /// 避开 FAT 的最高位与 u32::MAX 附近的固定节点。
