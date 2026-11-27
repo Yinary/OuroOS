@@ -2,7 +2,7 @@
 //! 使用 rsext4 0.8.1（Apache-2.0），来源见 docs/third-party.md。
 use super::block_cache::BlockCache;
 use crate::{drivers, syscall::Errno};
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use rsext4::{
     bmalloc::{AbsoluteBN, InodeNumber},
     superblock::Ext4Superblock,
@@ -22,10 +22,29 @@ struct Partition {
     time_base: i64,
 }
 
+const DCACHE_SLOTS: usize = 256;
+
+struct DentrySlot {
+    path: String,
+    ino: u32,
+    /// 整条路径（含末项）已确认无符号链接，允许 stat/query 直接读 inode。
+    direct_stat: bool,
+}
+
+fn dcache_slot(path: &str) -> usize {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in path.as_bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    (hash as usize) & (DCACHE_SLOTS - 1)
+}
+
 struct Volume {
     fs: Ext4FileSystem,
     device: Jbd2Dev<BlockCache<Partition>>,
     opens: Vec<(u32, usize)>,
+    dcache: Vec<Option<DentrySlot>>,
     failed: bool,
 }
 
@@ -36,6 +55,43 @@ impl Volume {
         } else {
             Ok(())
         }
+    }
+
+    fn invalidate_dcache(&mut self) {
+        for slot in &mut self.dcache {
+            *slot = None;
+        }
+    }
+
+    fn dcache_get(&self, path: &str) -> Option<&DentrySlot> {
+        let idx = dcache_slot(path);
+        self.dcache
+            .get(idx)
+            .and_then(|s| s.as_ref())
+            .filter(|s| s.path == path)
+    }
+
+    fn dcache_insert(&mut self, path: &str, ino: u32, direct_stat: bool) {
+        if path.len() > 256 || self.dcache.len() != DCACHE_SLOTS {
+            return;
+        }
+        let idx = dcache_slot(path);
+        if let Some(existing) = self.dcache[idx].as_mut() {
+            if existing.path == path && existing.ino == ino {
+                existing.direct_stat |= direct_stat;
+                return;
+            }
+        }
+        let mut owned = String::new();
+        if owned.try_reserve_exact(path.len()).is_err() {
+            return;
+        }
+        owned.push_str(path);
+        self.dcache[idx] = Some(DentrySlot {
+            path: owned,
+            ino,
+            direct_stat,
+        });
     }
 }
 
@@ -208,10 +264,16 @@ fn try_mount(id: usize, start: usize, len: usize) -> Result<(), Errno> {
     if !fs.get_root(&mut device).map_err(error)?.is_dir() {
         return Err(Errno::Invalid);
     }
+    let mut dcache = Vec::new();
+    dcache
+        .try_reserve_exact(DCACHE_SLOTS)
+        .map_err(|_| Errno::NoMem)?;
+    dcache.resize_with(DCACHE_SLOTS, || None);
     *ROOT.lock() = Some(Volume {
         fs,
         device,
         opens: Vec::new(),
+        dcache,
         failed: false,
     });
     log::info!("EXT4 root mounted (rsext4, writable={WRITABLE})");
@@ -245,17 +307,46 @@ fn error(err: Ext4Error) -> Errno {
     }
 }
 
-/// 查找路径并返回 Ext4 inode 编号。
+/// 查找路径并返回 Ext4 inode 编号；命中路径目录项缓存时直接返回。
 pub(super) fn lookup(path: &str) -> Result<u32, Errno> {
     access(|v| {
+        if let Some(slot) = v.dcache_get(path) {
+            return Ok(slot.ino);
+        }
         let (ino, _) = rsext4::loopfile::get_file_inode(&mut v.fs, &mut v.device, path)?
             .ok_or_else(Ext4Error::not_found)?;
         // 高位由上层用于区分 FAT inode。
         if ino.raw() & 0x8000_0000 != 0 {
             return Err(Ext4Error::unsupported());
         }
-        Ok(ino.raw())
+        let raw = ino.raw();
+        v.dcache_insert(path, raw, false);
+        Ok(raw)
     })
+}
+
+/// 若规范绝对路径命中无符号链接标记的目录项缓存，在单次锁内直接读取最新 inode 元数据。
+pub(super) fn fast_metadata(path: &str) -> Result<Option<super::Metadata>, Errno> {
+    access(|v| {
+        let Some(ino) = v
+            .dcache_get(path)
+            .filter(|slot| slot.direct_stat)
+            .map(|slot| slot.ino)
+        else {
+            return Ok(None);
+        };
+        build_metadata(v, ino).map(Some)
+    })
+}
+
+/// 标记规范绝对路径（整条路径及末项均无符号链接）允许走 `fast_metadata` 快路径。
+pub(super) fn mark_direct_stat(path: &str, ino: u32) {
+    let mut root = ROOT.lock();
+    if let Some(v) = root.as_mut() {
+        if v.check_io().is_ok() {
+            v.dcache_insert(path, ino, true);
+        }
+    }
 }
 
 /// 返回 inode 类型、长度、链接数和磁盘占用。
@@ -272,50 +363,52 @@ pub(super) fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
     })
 }
 
+fn build_metadata(v: &mut Volume, ino: u32) -> Ext4Result<super::Metadata> {
+    let inode =
+        v.fs.get_inode_by_num(&mut v.device, InodeNumber::new(ino)?)?;
+    let size = v.fs.superblock.s_inode_size;
+    let time = |t: Ext4Timestamp| super::Timestamp {
+        sec: t.sec,
+        nsec: t.nsec,
+    };
+    let rdev = if matches!(inode.i_mode & 0xf000, 0x2000 | 0x6000) {
+        if inode.i_block[0] != 0 {
+            inode.i_block[0]
+        } else {
+            inode.i_block[1]
+        }
+    } else {
+        0
+    };
+    Ok(super::Metadata {
+        ino: ino as u64,
+        dev: 1,
+        rdev: rdev as u64,
+        mode: inode.i_mode,
+        links: inode.i_links_count as u32,
+        uid: inode.uid(),
+        gid: inode.gid(),
+        size: inode.size(),
+        blocks: inode
+            .blocks_count()
+            // HUGE_FILE 将 i_blocks 的单位从扇区切换为文件系统块。
+            .checked_mul(if inode.i_flags & 0x40000 != 0 {
+                (BLOCK_SIZE / 512) as u64
+            } else {
+                1
+            })
+            .ok_or_else(Ext4Error::io)?,
+        block_size: BLOCK_SIZE as u32,
+        atime: Some(time(inode.atime_ts(size))),
+        mtime: Some(time(inode.mtime_ts(size))),
+        ctime: Some(time(inode.ctime_ts(size))),
+        btime: inode.crtime_ts(size).map(time),
+    })
+}
+
 /// 读取 inode 的所有者、精确时间及基本属性。
 pub(super) fn metadata(ino: u32) -> Result<super::Metadata, Errno> {
-    access(|v| {
-        let inode =
-            v.fs.get_inode_by_num(&mut v.device, InodeNumber::new(ino)?)?;
-        let size = v.fs.superblock.s_inode_size;
-        let time = |t: Ext4Timestamp| super::Timestamp {
-            sec: t.sec,
-            nsec: t.nsec,
-        };
-        let rdev = if matches!(inode.i_mode & 0xf000, 0x2000 | 0x6000) {
-            if inode.i_block[0] != 0 {
-                inode.i_block[0]
-            } else {
-                inode.i_block[1]
-            }
-        } else {
-            0
-        };
-        Ok(super::Metadata {
-            ino: ino as u64,
-            dev: 1,
-            rdev: rdev as u64,
-            mode: inode.i_mode,
-            links: inode.i_links_count as u32,
-            uid: inode.uid(),
-            gid: inode.gid(),
-            size: inode.size(),
-            blocks: inode
-                .blocks_count()
-                // HUGE_FILE 将 i_blocks 的单位从扇区切换为文件系统块。
-                .checked_mul(if inode.i_flags & 0x40000 != 0 {
-                    (BLOCK_SIZE / 512) as u64
-                } else {
-                    1
-                })
-                .ok_or_else(Ext4Error::io)?,
-            block_size: BLOCK_SIZE as u32,
-            atime: Some(time(inode.atime_ts(size))),
-            mtime: Some(time(inode.mtime_ts(size))),
-            ctime: Some(time(inode.ctime_ts(size))),
-            btime: inode.crtime_ts(size).map(time),
-        })
-    })
+    access(|v| build_metadata(v, ino))
 }
 
 /// 更新 inode 时间，保留后端的时间编码、校验和与日志写回流程。
@@ -647,6 +740,7 @@ pub(super) fn rmdir(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
                 v.failed = true;
             }
         })?;
+        v.invalidate_dcache();
         if !v.opens.iter().any(|&(id, _)| id == ino) {
             reclaim_unlinked(v, ino)?;
         }
@@ -674,6 +768,7 @@ pub(super) fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
                 v.failed = true;
             }
         })?;
+        v.invalidate_dcache();
         if links == 0 && !v.opens.iter().any(|&(id, _)| id == ino) {
             reclaim_unlinked(v, ino)?;
         }
@@ -707,6 +802,7 @@ pub(super) fn rename(
                 v.failed = true;
             }
         })?;
+        v.invalidate_dcache();
         if let Some(ino) = replaced {
             if !v.opens.iter().any(|&(id, _)| id == ino.raw()) {
                 reclaim_unlinked(v, ino.raw())?;
