@@ -88,7 +88,7 @@
 |---|---|
 | brk 字节级记账 | `address_space::brk` |
 | mmap 空洞 / MAP_FIXED | `find_free`、`replace_region` 事务替换 |
-| fork | `deep_copy` 完成子地址空间后，将父子共享的私有匿名、堆和栈物理页设为只读。首次写入时分配私有副本；只剩一个引用时恢复写权限。 |
+| fork | `deep_copy` 完成子地址空间后，将父子共享的私有匿名、堆、栈、ELF 段与私有文件映射驻留页统一设为只读。首次写入时分配私有副本；只剩一个引用时恢复写权限。 |
 | exec 先建后切 | 新空间含 argv/envp/auxv，成功才替换 |
 | 页字节访问收口 | 拥有页复制及 ELF 初始页写入由 mm 封装；`elf.rs`、`fs/cache.rs`、`syscall/memory.rs`、`task/user_task.rs`、`task/exec.rs`、`task/task.rs` 拒绝 `unsafe` |
 | MAP_SHARED 文件页缓存 | `fs/cache.rs`；索引独立持有页，比较有效字节和上次写回基线，失败后可重试 |

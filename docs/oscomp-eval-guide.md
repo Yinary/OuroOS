@@ -218,3 +218,13 @@ python3 tests/run_official.py la --groups ltp-musl --ltp-filter chown,statx --lt
   - `la`：`cyclictest-glibc` **5.46/4**（4/4 通过 + `kill hackbench: success`，`NO_STRESS` 最大延迟 281–549 µs，`STRESS` 最大延迟约 40–44 ms）；`cyclictest-musl` **0.00/4**（同组 `hackbench` 400 任务压测与 `SIGINT` 回收已正常通过）。经 `llvm-objdump` 反汇编核验，官方 `sdcard-la.img` 内的 `/musl/lib/libc.so` 为未打补丁的上游 musl，其 `sched_getparam` 与 `sched_setscheduler` 在用户态直接返回 `-38`（`-ENOSYS`）而不执行 `syscall` 指令，属于官方 `pre-20250615` LoongArch 盘面自带的用户态库限制；内核侧 `sched_getparam(121)`/`sched_setscheduler(119)` 均已双架构实现。
   - **双架构 6 组核心回归（零回退）**：`rv` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9、`iperf-musl` **8.16/6**（较前值 7.23 提升 +0.93）、`netperf-musl` 8.74/5、`iozone-musl` 36.90/20；`la` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9、`iperf-musl` **8.84/6**（较前值 7.96 提升 +0.88）、`netperf-musl` 9.30/5、`iozone-musl` 38.18/20。
   - **默认送测启用状态**：`official_init.rs` 已在默认送测流程中启用 `cyclictest-musl` 与 `cyclictest-glibc`，顺序排在 `iozone` 之后、`lmbench` 之前。
+
+### 5.7 `fork` 全私有页写时复制优化验证结果（`mm/fork-cow`）
+
+- **优化范围**：
+  1. **ELF 段与私有文件映射 COW（`kernel/src/mm/address_space.rs`、`kernel/src/mm/file.rs`）**：`deep_copy()` 将全部 `Backing::Private`（含 `AreaKind::Elf`）与 `FilePage`（`Mode::Private`，含 `libc.so.6` 等动态库只读/数据页）统一共享引用并在子空间安装后对父页表写保护；写入缺页时通过 `FrameRef::duplicate` 或 `FilePage::split_private` 懒拆分，仅剩单引用时原地恢复写权限；`Page::leaf_flags` 与 `populate_locked` 同步纳入私有文件页，`mprotect` 不会绕过 COW 写保护。
+  2. **高并发 `AF_UNIX` 缓冲默认上限（`kernel/src/net/mod.rs`）**：将匿名 `AF_UNIX` 套接字默认收发缓冲设为 16 KiB（200 对满队列上限 3.2 MiB，仍允许 `SO_SNDBUF`/`SO_RCVBUF` 显式调大），避免 400 个 `hackbench` 进程高速 `fork` 后并发打满 32 MiB 固定内核堆。
+- **双架构实测对比（QEMU 10.0.2 + QCOW2 覆盖层，零 OOM、零回归）**：
+  - `la` `cyclictest-glibc`：`STRESS_P1` 最大延迟由 **40,010 µs → 4,427 µs**（降 **9.0×**），`STRESS_P8` 8 线程平均最大延迟由 **43,619 µs → 1,839 µs**（降 **23.7×**），总分由 `5.46/4` 升至 **5.84/4**；
+  - `rv` `cyclictest-musl` `STRESS_P1` 最大延迟由 **4,996 µs → 1,226 µs**（降 **4.1×**，总分 5.61/4），`cyclictest-glibc` `STRESS_P1` 由 **5,424 µs → 944 µs**（降 **5.7×**，总分 5.19/4）；
+  - 双架构回归与专项：`rv` 与 `la` 上 `basic-glibc` 102/102、`busybox-glibc` 54/55、`libctest-musl` 217/220 全部零回退；主机 `tests/file_mapping.rs` 6/6 通过。
