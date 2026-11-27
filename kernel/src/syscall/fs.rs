@@ -4,10 +4,7 @@
 
 use super::{sysnr, Errno};
 use crate::{
-    fs::{
-        self,
-        context::{parent, Context},
-    },
+    fs::{self, context::Context},
     mm::{address_space::UserAddressSpace, user_access},
     task::Credentials,
 };
@@ -59,12 +56,13 @@ pub fn dispatch(
             ctx.dup_to(a[0], a[1], a[2] & 0x80000 != 0)
         }
         sysnr::MKDIRAT => {
-            let path = ctx.path(a[0], &user_string(space, a[1])?)?;
-            match fs::lookup(&path) {
+            let input = user_string(space, a[1])?;
+            let dirfd = a[0] as u32 as i32 as isize as usize;
+            let (canonical, p, name) = ctx.resolve_parent_entry(dirfd, &input, Errno::Exists)?;
+            match fs::query(&canonical, false) {
                 Ok(_) => Err(Errno::Exists),
                 Err(Errno::NoEntry) => {
-                    let (p, name) = parent(&path)?;
-                    fs::create(p, name, 0x4000 | ctx.creation_mode(a[2]))?;
+                    fs::create(p, &name, 0x4000 | ctx.creation_mode(a[2]))?;
                     Ok(0)
                 }
                 Err(e) => Err(e),
@@ -102,31 +100,70 @@ pub fn dispatch(
             fs::fat::unmount(&target)?;
             Ok(0)
         }
+        sysnr::SYMLINKAT => {
+            let target = user_string(space, a[0])?;
+            let linkpath = user_string(space, a[2])?;
+            let dirfd = a[1] as u32 as i32 as isize as usize;
+            ctx.symlink(dirfd, &linkpath, &target)?;
+            Ok(0)
+        }
+        sysnr::LINKAT => {
+            const AT_SYMLINK_FOLLOW: u32 = 0x400;
+            const AT_EMPTY_PATH: u32 = 0x1000;
+            let flags = a[4] as u32;
+            if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+                return Err(Errno::Invalid);
+            }
+            let old = user_string(space, a[1])?;
+            let new = user_string(space, a[3])?;
+            let old_dir = a[0] as u32 as i32 as isize as usize;
+            let new_dir = a[2] as u32 as i32 as isize as usize;
+            ctx.link(
+                old_dir,
+                &old,
+                new_dir,
+                &new,
+                flags & AT_SYMLINK_FOLLOW != 0,
+                flags & AT_EMPTY_PATH != 0,
+            )?;
+            Ok(0)
+        }
+        sysnr::SENDFILE => sendfile(ctx, space, a),
         sysnr::UNLINKAT => {
             if a[2] & !0x200 != 0 {
-                return Err(Errno::NotSupported);
+                return Err(Errno::Invalid);
             }
             let input = user_string(space, a[1])?;
-            let path = ctx.path(a[0], &input)?;
-            let ino = fs::lookup(&path)?;
+            let dirfd = a[0] as u32 as i32 as isize as usize;
             if a[2] & 0x200 != 0 {
                 match input.trim_end_matches('/').rsplit('/').next() {
                     Some(".") => return Err(Errno::Invalid),
                     Some("..") => return Err(Errno::NotEmpty),
                     _ => {}
                 }
-                if fs::stat(ino)?.0 & 0xf000 != 0x4000 {
+                let (path, p, name) = ctx.resolve_parent_entry(dirfd, &input, Errno::Busy)?;
+                let info = fs::query(&path, false)?;
+                if info.mode & 0xf000 != 0x4000 {
                     return Err(Errno::NotDir);
                 }
                 if path == "/" || fs::contains_mount(&path) {
                     return Err(Errno::Busy);
                 }
-                let (p, name) = parent(&path)?;
-                fs::rmdir(p, ino, name)?;
+                fs::rmdir(p, info.ino as u32, &name)?;
                 return Ok(0);
             }
-            let (p, name) = parent(&path)?;
-            fs::unlink(p, ino, name)?;
+            if input.ends_with('/') {
+                let (path, _, _) = ctx.resolve_parent_entry(dirfd, &input, Errno::IsDir)?;
+                let info = fs::query(&path, false)?;
+                return Err(if info.mode & 0xf000 == 0x4000 {
+                    Errno::IsDir
+                } else {
+                    Errno::NotDir
+                });
+            }
+            let (path, p, name) = ctx.resolve_parent_entry(dirfd, &input, Errno::IsDir)?;
+            let info = fs::query(&path, false)?;
+            fs::unlink(p, info.ino as u32, &name)?;
             Ok(0)
         }
         sysnr::PIPE2 => {
@@ -146,98 +183,187 @@ pub fn dispatch(
         }
         sysnr::GETDENTS64 => getdents64(ctx, space, a[0], a[1], a[2]),
         sysnr::CHDIR => {
-            let path = ctx.path((-100isize) as usize, &user_string(space, a[0])?)?;
-            let ino = fs::lookup(&path)?;
-            if fs::stat(ino)?.0 & 0xf000 != 0x4000 {
+            let joined = ctx.join_raw((-100isize) as usize, &user_string(space, a[0])?)?;
+            let (resolved, info) = fs::resolve(&joined, true)?;
+            if info.mode & 0xf000 != 0x4000 {
                 return Err(Errno::NotDir);
             }
-            ctx.set_cwd(path, ino)?;
+            ctx.set_cwd(resolved, info.ino as u32)?;
             Ok(0)
         }
         sysnr::OPENAT => {
+            const O_CREAT: usize = 0x40;
+            const O_EXCL: usize = 0x80;
+            const O_TRUNC: usize = 0x200;
+            const O_DIRECTORY: usize = 0x10000;
+            const O_NOFOLLOW: usize = 0x20000;
+            const O_CLOEXEC: usize = 0x80000;
+            const O_PATH: usize = 0x200000;
             if a[2] & 3 == 3 {
                 return Err(Errno::Invalid);
             }
-            if a[2] & 0x10000 != 0 && a[2] & 64 != 0 {
+            if a[2] & O_DIRECTORY != 0 && a[2] & O_CREAT != 0 {
                 return Err(Errno::Invalid);
             }
-            let path = ctx.path(a[0], &user_string(space, a[1])?)?;
-            if path == "/proc/meminfo" {
-                return ctx.open_meminfo(a[2], a[2] & 0x80000 != 0);
-            }
-            if path == "/proc/mounts"
-                || path == "/proc/sys/kernel/pid_max"
-                || path == "/proc/sys/kernel/tainted"
-                || path == "/proc/version"
-            {
-                let text = fs::procfs_text(&path)?;
-                return ctx.open_proc_text(text, a[2], a[2] & 0x80000 != 0);
-            }
-            if path == "/proc/self/maps" {
-                let text = fs::procfs_maps(space)?;
-                return ctx.open_proc_text(text, a[2], a[2] & 0x80000 != 0);
-            }
-            if path == "/proc/self/fd" {
-                return ctx.open_proc_fd_dir(a[2], a[2] & 0x80000 != 0);
-            }
-            if let Some(rest) = path.strip_prefix("/proc/") {
-                if rest
-                    .split_once('/')
-                    .is_some_and(|(_, f)| f == "stat" || f == "cmdline" || f == "status")
-                {
-                    let text = fs::procfs_text(&path)?;
-                    return ctx.open_proc_text(text, a[2], a[2] & 0x80000 != 0);
-                }
-            }
-            if path == "/dev/null" {
-                return ctx.open_devnull(a[2], a[2] & 0x80000 != 0);
-            }
-            if path == "/dev/zero" {
-                return ctx.open_devzero(a[2], a[2] & 0x80000 != 0);
-            }
-            if path == "/dev/urandom" {
-                return ctx.open_devrandom(true, a[2], a[2] & 0x80000 != 0);
-            }
-            if path == "/dev/random" {
-                return ctx.open_devrandom(false, a[2], a[2] & 0x80000 != 0);
-            }
-            if path == "/dev/misc/rtc" {
-                return ctx.open_rtc(a[2], a[2] & 0x80000 != 0);
-            }
-            if let Some((disk, part)) = fs::lookup_blk_node(&path) {
-                if let Ok((start, len)) = crate::drivers::partition(disk, part) {
-                    return ctx.open_devblk(disk, start, len as u64, a[2], a[2] & 0x80000 != 0);
-                }
-                return Err(Errno::NoDevice);
-            }
-            let ino = match fs::lookup(&path) {
-                Ok(ino) => {
-                    if a[2] & 0xc0 == 0xc0 {
-                        return Err(Errno::Exists);
+            let raw_input = user_string(space, a[1])?;
+            let dirfd = a[0] as u32 as i32 as isize as usize;
+            let joined = ctx.join_raw(dirfd, &raw_input)?;
+            if joined.starts_with("/proc") || joined.starts_with("/dev") {
+                if let Ok(path) = ctx.path(dirfd, &raw_input) {
+                    if path == "/proc/meminfo" {
+                        return ctx.open_meminfo(a[2], a[2] & O_CLOEXEC != 0);
                     }
-                    ino
+                    if path == "/proc/mounts"
+                        || path == "/proc/sys/kernel/pid_max"
+                        || path == "/proc/sys/kernel/tainted"
+                        || path == "/proc/version"
+                    {
+                        let text = fs::procfs_text(&path)?;
+                        return ctx.open_proc_text(text, a[2], a[2] & O_CLOEXEC != 0);
+                    }
+                    if path == "/proc/self/maps" {
+                        let text = fs::procfs_maps(space)?;
+                        return ctx.open_proc_text(text, a[2], a[2] & O_CLOEXEC != 0);
+                    }
+                    if path == "/proc/self/fd" {
+                        return ctx.open_proc_fd_dir(a[2], a[2] & O_CLOEXEC != 0);
+                    }
+                    if let Some(rest) = path.strip_prefix("/proc/") {
+                        if rest
+                            .split_once('/')
+                            .is_some_and(|(_, f)| f == "stat" || f == "cmdline" || f == "status")
+                        {
+                            let text = fs::procfs_text(&path)?;
+                            return ctx.open_proc_text(text, a[2], a[2] & O_CLOEXEC != 0);
+                        }
+                    }
+                    if path == "/dev/null" {
+                        return ctx.open_devnull(a[2], a[2] & O_CLOEXEC != 0);
+                    }
+                    if path == "/dev/zero" {
+                        return ctx.open_devzero(a[2], a[2] & O_CLOEXEC != 0);
+                    }
+                    if path == "/dev/urandom" {
+                        return ctx.open_devrandom(true, a[2], a[2] & O_CLOEXEC != 0);
+                    }
+                    if path == "/dev/random" {
+                        return ctx.open_devrandom(false, a[2], a[2] & O_CLOEXEC != 0);
+                    }
+                    if path == "/dev/misc/rtc" {
+                        return ctx.open_rtc(a[2], a[2] & O_CLOEXEC != 0);
+                    }
+                    if let Some((disk, part)) = fs::lookup_blk_node(&path) {
+                        if let Ok((start, len)) = crate::drivers::partition(disk, part) {
+                            return ctx.open_devblk(
+                                disk,
+                                start,
+                                len as u64,
+                                a[2],
+                                a[2] & O_CLOEXEC != 0,
+                            );
+                        }
+                        return Err(Errno::NoDevice);
+                    }
                 }
-                Err(Errno::NoEntry) if a[2] & 64 != 0 => {
-                    let (p, name) = parent(&path)?;
-                    fs::create(p, name, 0x8000 | ctx.creation_mode(a[3]))?
+            }
+            let creat = a[2] & O_CREAT != 0;
+            let excl = a[2] & O_EXCL != 0;
+            let nofollow = a[2] & O_NOFOLLOW != 0;
+            let o_path = a[2] & O_PATH != 0;
+            let trailing_slash = raw_input.ends_with('/');
+            let (ino, mode, open_path) = if creat && excl {
+                if trailing_slash {
+                    return Err(Errno::IsDir);
                 }
-                Err(e) => return Err(e),
+                let (canonical, p, name) =
+                    ctx.resolve_parent_entry(dirfd, &raw_input, Errno::Exists)?;
+                match fs::query(&canonical, false) {
+                    Ok(_) => return Err(Errno::Exists),
+                    Err(Errno::NoEntry) => {
+                        let new_mode = 0x8000 | ctx.creation_mode(a[3]);
+                        let ino = fs::create(p, &name, new_mode)?;
+                        (ino, new_mode, canonical)
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else {
+                let follow = !nofollow || trailing_slash;
+                match fs::resolve(&joined, follow) {
+                    Ok((resolved, info)) => {
+                        if info.mode & 0xf000 == 0xa000 && !o_path {
+                            return Err(Errno::Loop);
+                        }
+                        if trailing_slash && info.mode & 0xf000 != 0x4000 {
+                            return Err(Errno::NotDir);
+                        }
+                        (info.ino as u32, info.mode, resolved)
+                    }
+                    Err(Errno::NoEntry) if creat => {
+                        if trailing_slash {
+                            return Err(Errno::IsDir);
+                        }
+                        let new_mode = 0x8000 | ctx.creation_mode(a[3]);
+                        // 悬空符号链接 + O_CREAT（无 O_EXCL）：按 Linux open(2) 跟随链接并创建目标文件。
+                        if let Ok((sym_path, sym_info)) = fs::resolve(&joined, false) {
+                            if sym_info.mode & 0xf000 == 0xa000 {
+                                if nofollow {
+                                    return Err(Errno::Loop);
+                                }
+                                let target = fs::read_link(sym_info.ino as u32)?;
+                                let target_joined = if target.starts_with('/') {
+                                    target
+                                } else {
+                                    let sym_parent = match sym_path.rfind('/') {
+                                        Some(0) | None => "/",
+                                        Some(i) => &sym_path[..i],
+                                    };
+                                    let mut full = String::new();
+                                    full.try_reserve(sym_parent.len() + target.len() + 1)
+                                        .map_err(|_| Errno::NoMem)?;
+                                    full.push_str(sym_parent);
+                                    if sym_parent != "/" {
+                                        full.push('/');
+                                    }
+                                    full.push_str(&target);
+                                    full
+                                };
+                                let (canonical, p, name) = ctx.resolve_parent_entry(
+                                    (-100isize) as usize,
+                                    &target_joined,
+                                    Errno::Exists,
+                                )?;
+                                let ino = fs::create(p, &name, new_mode)?;
+                                (ino, new_mode, canonical)
+                            } else {
+                                let (canonical, p, name) =
+                                    ctx.resolve_parent_entry(dirfd, &raw_input, Errno::Exists)?;
+                                let ino = fs::create(p, &name, new_mode)?;
+                                (ino, new_mode, canonical)
+                            }
+                        } else {
+                            let (canonical, p, name) =
+                                ctx.resolve_parent_entry(dirfd, &raw_input, Errno::Exists)?;
+                            let ino = fs::create(p, &name, new_mode)?;
+                            (ino, new_mode, canonical)
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
             };
-            let mode = fs::stat(ino)?.0;
-            if a[2] & 0x10000 != 0 && mode & 0xf000 != 0x4000 {
+            if a[2] & O_DIRECTORY != 0 && mode & 0xf000 != 0x4000 {
                 return Err(Errno::NotDir);
             }
-            if mode & 0xf000 == 0x4000 && a[2] & 3 != 0 {
+            if mode & 0xf000 == 0x4000 && a[2] & 3 != 0 && !o_path {
                 return Err(Errno::IsDir);
             }
-            if a[2] & 0x200 != 0 && a[2] & 3 != 0 {
+            if a[2] & O_TRUNC != 0 && a[2] & 3 != 0 && !o_path {
                 fs::truncate(ino, 0)?;
             }
             ctx.open_inode(
                 ino,
-                path,
+                open_path,
                 a[2],
-                a[2] & 0x80000 != 0,
+                a[2] & O_CLOEXEC != 0,
                 mode & 0xf000 == 0x4000,
             )
         }
@@ -1019,4 +1145,121 @@ fn mknodat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usi
 /// ioctl(2)：转发到 FD 层按设备类型分派（见 Context::ioctl）。
 fn ioctl(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
     ctx.ioctl(a[0], a[1], a[2], space)
+}
+
+/// Linux sendfile(2)：在两个文件描述符间直接搬运字节，支持可选 offset 指针与阻塞写端。
+fn sendfile(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
+    const MAX_RW_COUNT: usize = 0x7fff_f000;
+    const O_APPEND: usize = 0x400;
+    let out_fd = a[0];
+    let in_fd = a[1];
+    let offset_ptr = a[2];
+    let count = a[3].min(MAX_RW_COUNT);
+
+    let out_handle = ctx.get(out_fd)?;
+    let in_handle = ctx.get(in_fd)?;
+    let same_file = alloc::sync::Arc::ptr_eq(&out_handle, &in_handle);
+
+    // 校验输入/输出描述符读写模式与类型（避免对同一句柄重复加锁死锁）。
+    {
+        let in_f = in_handle.lock();
+        in_f.check_access(true)?;
+        if in_f.is_directory() {
+            return Err(Errno::Invalid);
+        }
+        in_f.check_positioned().map_err(|e| match e {
+            Errno::SeekPipe => Errno::Invalid,
+            other => other,
+        })?;
+        if same_file {
+            in_f.check_access(false)?;
+            if in_f.status_flags() & O_APPEND != 0 {
+                return Err(Errno::Invalid);
+            }
+        }
+    }
+    if !same_file {
+        let out_f = out_handle.lock();
+        out_f.check_access(false)?;
+        if out_f.is_directory() || out_f.status_flags() & O_APPEND != 0 {
+            return Err(Errno::Invalid);
+        }
+    }
+
+    let mut cur_offset = if offset_ptr != 0 {
+        let mut raw = [0u8; 8];
+        user_access::copy_from_user(space, offset_ptr, &mut raw).map_err(|_| Errno::Fault)?;
+        let off = i64::from_ne_bytes(raw);
+        if off < 0 {
+            return Err(Errno::Invalid);
+        }
+        Some(off as usize)
+    } else {
+        None
+    };
+
+    if count == 0 {
+        if let Some(off) = cur_offset {
+            user_access::copy_to_user(space, offset_ptr, &(off as i64).to_ne_bytes())
+                .map_err(|_| Errno::Fault)?;
+        }
+        return Ok(0);
+    }
+
+    let mut scratch = ScratchBuf::acquire(count.min(POOL_IO_BUF))?;
+    let mut done = 0usize;
+    while done < count {
+        let chunk = (count - done).min(scratch.0.len());
+        let read_n = {
+            let mut in_f = in_handle.lock();
+            in_f.read_into_buf(cur_offset, &mut scratch.0[..chunk], done == 0)
+        };
+        let n = match read_n {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if done > 0 => {
+                let _ = e;
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+        let written = {
+            let mut out_f = out_handle.lock();
+            out_f.write_chunk(&scratch.0[..n], done == 0)
+        };
+        match written {
+            Ok(w) => {
+                done += w;
+                if let Some(off) = cur_offset.as_mut() {
+                    *off = off.saturating_add(w);
+                }
+                if w < n {
+                    // 短写回退输入偏移，避免丢失未写入目标的字节。
+                    if cur_offset.is_none() {
+                        let mut in_f = in_handle.lock();
+                        let pos = in_f.offset().saturating_sub(n - w);
+                        in_f.set_offset(pos);
+                    }
+                    break;
+                }
+            }
+            Err(e) => {
+                if cur_offset.is_none() {
+                    let mut in_f = in_handle.lock();
+                    let pos = in_f.offset().saturating_sub(n);
+                    in_f.set_offset(pos);
+                }
+                if done > 0 {
+                    break;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    if let Some(off) = cur_offset {
+        user_access::copy_to_user(space, offset_ptr, &(off as i64).to_ne_bytes())
+            .map_err(|_| Errno::Fault)?;
+    }
+    Ok(done)
 }

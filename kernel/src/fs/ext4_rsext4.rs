@@ -291,6 +291,8 @@ fn error(err: Ext4Error) -> Errno {
     use rsext4::Errno as Ext4Errno;
     match err.code {
         Ext4Errno::ENOENT => Errno::NoEntry,
+        Ext4Errno::EPERM => Errno::Perm,
+        Ext4Errno::EACCES => Errno::Access,
         Ext4Errno::ENOTDIR => Errno::NotDir,
         Ext4Errno::EISDIR => Errno::IsDir,
         Ext4Errno::EINVAL => Errno::Invalid,
@@ -557,6 +559,42 @@ pub(super) fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
             rsext4::file::create_regular_inode
         };
         create(&mut v.device, &mut v.fs, parent, name, mode).map(|ino| ino.raw())
+    })
+}
+
+/// 在指定父目录创建符号链接，允许相对或悬空目标。
+pub(super) fn symlink(parent: u32, name: &str, target: &str) -> Result<u32, Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        let ino = rsext4::file::create_symlink_inode(
+            &mut v.device,
+            &mut v.fs,
+            InodeNumber::new(parent)?,
+            name,
+            target,
+        )?;
+        v.invalidate_dcache();
+        Ok(ino.raw())
+    })
+}
+
+/// 在指定父目录为已有非目录 inode 创建硬链接。
+pub(super) fn link(target_ino: u32, parent: u32, name: &str) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        rsext4::file::link_inode(
+            &mut v.device,
+            &mut v.fs,
+            InodeNumber::new(target_ino)?,
+            InodeNumber::new(parent)?,
+            name,
+        )?;
+        v.invalidate_dcache();
+        Ok(())
     })
 }
 
