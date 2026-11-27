@@ -205,3 +205,16 @@ python3 tests/run_official.py la --groups ltp-musl --ltp-filter chown,statx --lt
   - `la` 9 组回归：`basic` 102/102、`busybox` 54/55、`lua` 9/9、`libctest-musl` 217/220 零回退，`iperf-musl` 由 `6.91` 升至 **7.96/6**、`netperf-musl` 由 `8.57` 升至 **9.25/5**；
   - `rv` `lmbench-musl` 前 7 项抽测（300 秒内）：`Simple syscall` 降至 **1.84 µs**、`Simple read` **3.41 µs**、`Simple write` **3.21 µs**、`Select on 100 fd's` **7.94 µs**（7 项得 12.91/14）；
   - 文件系统一致性专项：`fs_rename_backend.py`（15/15 故障注入回滚 + `e2fsck`）、`fs_stat.py`（默认及 `--metadata` 双架构 128/256 字节 inode + `e2fsck`）、`fs_fcntl.py`（双架构 + `e2fsck`）、`file_mapping.rs`（6/6）全部通过。
+
+### 5.6 `cyclictest` 摸底与 `AF_UNIX socketpair` 验证结果（`net/unix-socketpair`）
+
+- **首轮基线（`dev` `03de5e3`）**：`riscv64` 上 `cyclictest` 主体（`NO_STRESS_P1`/`NO_STRESS_P8`/`STRESS_P1`/`STRESS_P8`）在双 libc 下均可正常测量（最大延迟 539–967 µs），但压测进程 `hackbench` 因缺少 `socketpair(199)` 报 `Creating fdpair (error: Function not implemented)` 立即退出，导致 `kill -2 $hackbench_pid` 失败并输出 `kill hackbench: fail, ignore STRESS result`，判分归零；此外，16 MiB 内核栈窗口最多仅容 455 个并发任务（紧贴 `hackbench` 400 任务上限），套接字阻塞采用全局广播唤醒在 400 任务下存在惊群，且 `sched_setaffinity`/`sched_getaffinity`/`sched_rr_get_interval` 按进程主线程号查找导致工作线程报 `WARN: Could not set CPU affinity to CPU #0`。
+- **通用内核补齐（`net/unix-socketpair` 分支）**：
+  1. **匿名 UNIX 域套接字对（`kernel/src/net/mod.rs`、`kernel/src/syscall/net.rs`、`kernel/src/syscall/mod.rs`）**：实现 `socketpair(199)`，支持 `AF_UNIX` 下的 `SOCK_STREAM` 与 `SOCK_DGRAM`、`SOCK_NONBLOCK`/`SOCK_CLOEXEC` 及安装或拷贝失败时的文件描述符回滚；打通 `sendto`/`recvfrom`/`read`/`write`/`poll_events`/`shutdown`/`close`/`getsockname`/`getpeername`/`setsockopt`/`getsockopt` 全路径，并用 `VecDeque::as_slices` 批量切片拷贝替换逐字节复制。
+  2. **400 任务栈窗口扩容与套接字定向唤醒（`kernel/src/mm/kstack.rs`、`kernel/src/task/sched.rs`、`kernel/src/fs/context.rs`）**：内核栈虚拟窗口由 16 MiB 扩至 32 MiB（可容纳 910 个并发任务）；为套接字分配最高位置 1 的独立定向唤醒键 `SocketId::wake_id`，经 `Context::wait_id` 与 `WaitReason::PipeId` 精准唤醒对端，并将 `PIPE_WAKE_SLOTS` 由 16 扩至 64。
+  3. **线程级调度亲和与时间片查询（`kernel/src/task/user_task.rs`）**：`sched_setaffinity`、`sched_getaffinity` 与 `sched_rr_get_interval` 改为按 `REGISTRY.thread(target)` 校验目标线程存在性，并通过调用方地址空间读写用户缓冲区，消除工作线程亲和性告警。
+- **双架构实测结果（QEMU 10.0.2 + QCOW2 覆盖层，`sdcard-rv.img`/`sdcard-la.img` `pre-20250615`）**：
+  - `rv`：`cyclictest-musl` **5.65/4**（4/4 通过 + `kill hackbench: success`）、`cyclictest-glibc` **6.04/4**（4/4 通过 + `kill hackbench: success`），两配置合计用时约 26 秒；
+  - `la`：`cyclictest-glibc` **5.46/4**（4/4 通过 + `kill hackbench: success`，`NO_STRESS` 最大延迟 281–549 µs，`STRESS` 最大延迟约 40–44 ms）；`cyclictest-musl` **0.00/4**（同组 `hackbench` 400 任务压测与 `SIGINT` 回收已正常通过）。经 `llvm-objdump` 反汇编核验，官方 `sdcard-la.img` 内的 `/musl/lib/libc.so` 为未打补丁的上游 musl，其 `sched_getparam` 与 `sched_setscheduler` 在用户态直接返回 `-38`（`-ENOSYS`）而不执行 `syscall` 指令，属于官方 `pre-20250615` LoongArch 盘面自带的用户态库限制；内核侧 `sched_getparam(121)`/`sched_setscheduler(119)` 均已双架构实现。
+  - **双架构 6 组核心回归（零回退）**：`rv` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9、`iperf-musl` **8.16/6**（较前值 7.23 提升 +0.93）、`netperf-musl` 8.74/5、`iozone-musl` 36.90/20；`la` 上 `basic-musl` 102/102、`busybox-musl` 54/55、`lua-musl` 9/9、`iperf-musl` **8.84/6**（较前值 7.96 提升 +0.88）、`netperf-musl` 9.30/5、`iozone-musl` 38.18/20。
+  - **默认送测启用状态**：`official_init.rs` 已在默认送测流程中启用 `cyclictest-musl` 与 `cyclictest-glibc`，顺序排在 `iozone` 之后、`lmbench` 之前。

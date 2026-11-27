@@ -2515,12 +2515,14 @@ fn sched_rr_get_interval(parent: Pid, pid_arg: usize, tp: usize) -> Result<usize
     }
     let target = sched_target(parent, pid_arg)?;
     let reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter()
-        .find(|r| r.pid == target)
-        .ok_or(Errno::NoProcess)?;
-    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    if reg.thread(target).is_none() {
+        return Err(Errno::NoProcess);
+    }
+    let space = reg
+        .group(parent)
+        .and_then(|r| r.space.as_ref())
+        .ok_or(Errno::NoProcess)?
+        .as_space();
     let mut data = [0u8; 16];
     data[8..16].copy_from_slice(&(crate::config::TICK_MS * 1_000_000).to_ne_bytes());
     crate::mm::user_access::copy_to_user(space, tp, &data).map_err(|_| Errno::Fault)?;
@@ -2530,12 +2532,14 @@ fn sched_rr_get_interval(parent: Pid, pid_arg: usize, tp: usize) -> Result<usize
 fn sched_getaffinity(parent: Pid, pid_arg: usize, len: usize, mask: usize) -> Result<usize, Errno> {
     let target = sched_target(parent, pid_arg)?;
     let reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter()
-        .find(|r| r.pid == target)
-        .ok_or(Errno::NoProcess)?;
-    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    if reg.thread(target).is_none() {
+        return Err(Errno::NoProcess);
+    }
+    let space = reg
+        .group(parent)
+        .and_then(|r| r.space.as_ref())
+        .ok_or(Errno::NoProcess)?
+        .as_space();
     let n = len.min(8);
     let bits = 1u64.to_ne_bytes();
     if n > 0 {
@@ -2547,15 +2551,17 @@ fn sched_getaffinity(parent: Pid, pid_arg: usize, len: usize, mask: usize) -> Re
 fn sched_setaffinity(parent: Pid, pid_arg: usize, len: usize, mask: usize) -> Result<usize, Errno> {
     let target = sched_target(parent, pid_arg)?;
     let reg = REGISTRY.lock();
-    let rec = reg
-        .records
-        .iter()
-        .find(|r| r.pid == target)
-        .ok_or(Errno::NoProcess)?;
+    if reg.thread(target).is_none() {
+        return Err(Errno::NoProcess);
+    }
     if len == 0 {
         return Err(Errno::Invalid);
     }
-    let space = rec.space.as_ref().ok_or(Errno::NoProcess)?.as_space();
+    let space = reg
+        .group(parent)
+        .and_then(|r| r.space.as_ref())
+        .ok_or(Errno::NoProcess)?
+        .as_space();
     let n = len.min(8);
     let mut data = [0u8; 8];
     crate::mm::user_access::copy_from_user(space, mask, &mut data[..n])
