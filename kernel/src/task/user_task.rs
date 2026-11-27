@@ -132,6 +132,7 @@ pub fn user_task_entry() -> ! {
     };
     let mut sleep_deadline = None;
     let mut vfork_child: Option<Pid> = None;
+    let mut ipc_wait: Option<crate::ipc::IpcWaitState> = None;
     // 循环局部等待状态：sigsuspend 的旧屏蔽集合、sigtimedwait 的等待集与截止。
     let mut sigsuspend_saved: Option<SignalSet> = None;
     let mut timedwait: Option<(SignalSet, core::time::Duration)> = None;
@@ -269,6 +270,7 @@ pub fn user_task_entry() -> ! {
                                     &mut sigsuspend_saved,
                                     &mut timedwait,
                                     &mut vfork_child,
+                                    &mut ipc_wait,
                                     &mut wait_uncompleted,
                                 ),
                                 Flow::Wait(reason) => ProcessResult::Wait(reason),
@@ -457,6 +459,7 @@ pub fn user_task_entry() -> ! {
                         &mut frame,
                         &mut sleep_deadline,
                         &mut timedwait,
+                        &mut ipc_wait,
                         allow_park,
                     );
                     match outcome {
@@ -548,6 +551,7 @@ fn park_check_signals(
     frame: &mut TrapFrame,
     sleep_deadline: &mut Option<core::time::Duration>,
     timedwait: &mut Option<(SignalSet, core::time::Duration)>,
+    ipc_wait: &mut Option<crate::ipc::IpcWaitState>,
     allow_park: bool,
 ) -> ParkOutcome {
     // sigtimedwait 的等待集；Some 即本次挂起属于 rt_sigtimedwait。
@@ -674,6 +678,9 @@ fn park_check_signals(
             // 其余：完成 syscall 返回 -EINTR；信号留给循环顶检查点。
             _ => {
                 *sleep_deadline = None;
+                if ipc_wait.take().is_some_and(|w| w.is_sem) {
+                    crate::ipc::sem::clear_waiter(pid);
+                }
                 frame.syscall_ok();
                 frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
                 ParkOutcome::Completed
@@ -705,6 +712,7 @@ fn process_call(
     sigsuspend_saved: &mut Option<SignalSet>,
     timedwait: &mut Option<(SignalSet, core::time::Duration)>,
     vfork_child: &mut Option<Pid>,
+    ipc_wait: &mut Option<crate::ipc::IpcWaitState>,
     wait_uncompleted: &mut bool,
 ) -> ProcessResult {
     let args = frame.args();
@@ -1473,6 +1481,126 @@ fn process_call(
             match flow {
                 crate::syscall::net::NetFlow::Done(res) => res,
                 crate::syscall::net::NetFlow::Wait(reason) => return ProcessResult::Wait(reason),
+            }
+        }
+        sysnr::MSGGET | sysnr::SEMGET => {
+            let reg = REGISTRY.lock();
+            match reg.group(parent) {
+                Some(rec) => {
+                    let key = args[0] as u32 as i32;
+                    if nr == sysnr::MSGGET {
+                        crate::ipc::msg::get(key, args[1] as u32 as i32, &rec.creds)
+                    } else {
+                        crate::ipc::sem::get(
+                            key,
+                            args[1] as u32 as i32,
+                            args[2] as u32 as i32,
+                            &rec.creds,
+                        )
+                    }
+                }
+                None => Err(Errno::NoProcess),
+            }
+        }
+        sysnr::MSGCTL | sysnr::SEMCTL => {
+            let reg = REGISTRY.lock();
+            match reg
+                .group(parent)
+                .and_then(|r| Some((r.pid, &r.creds, r.space.as_ref()?.as_space())))
+            {
+                Some((tgid, creds, space)) => {
+                    if nr == sysnr::MSGCTL {
+                        crate::ipc::msg::ctl(
+                            space,
+                            args[0] as u32 as i32,
+                            args[1] as u32 as i32,
+                            args[2],
+                            creds,
+                        )
+                    } else {
+                        crate::ipc::sem::ctl(
+                            space,
+                            args[0] as u32 as i32,
+                            args[1] as u32 as i32,
+                            args[2] as u32 as i32,
+                            args[3],
+                            tgid,
+                            creds,
+                        )
+                    }
+                }
+                None => Err(Errno::NoProcess),
+            }
+        }
+        sysnr::MSGSND | sysnr::MSGRCV | sysnr::SEMOP | sysnr::SEMTIMEDOP => {
+            let cur_wait = *ipc_wait;
+            let flow = {
+                let reg = REGISTRY.lock();
+                match reg
+                    .group(parent)
+                    .and_then(|r| Some((r.pid, &r.creds, r.space.as_ref()?.as_space())))
+                {
+                    Some((tgid, creds, space)) => match nr {
+                        sysnr::MSGSND => crate::ipc::msg::snd(
+                            space,
+                            args[0] as u32 as i32,
+                            args[1],
+                            args[2],
+                            args[3] as u32 as i32,
+                            tgid,
+                            creds,
+                            cur_wait,
+                        ),
+                        sysnr::MSGRCV => crate::ipc::msg::rcv(
+                            space,
+                            args[0] as u32 as i32,
+                            args[1],
+                            args[2],
+                            args[3] as i64,
+                            args[4] as u32 as i32,
+                            tgid,
+                            creds,
+                            cur_wait,
+                        ),
+                        sysnr::SEMOP => crate::ipc::sem::timedop(
+                            space,
+                            args[0] as u32 as i32,
+                            args[1],
+                            args[2],
+                            0,
+                            parent,
+                            tgid,
+                            creds,
+                            cur_wait,
+                        ),
+                        _ => crate::ipc::sem::timedop(
+                            space,
+                            args[0] as u32 as i32,
+                            args[1],
+                            args[2],
+                            args[3],
+                            parent,
+                            tgid,
+                            creds,
+                            cur_wait,
+                        ),
+                    },
+                    None => crate::ipc::IpcFlow::Done(Err(Errno::NoProcess)),
+                }
+            };
+            match flow {
+                crate::ipc::IpcFlow::Done(res) => {
+                    *ipc_wait = None;
+                    res
+                }
+                crate::ipc::IpcFlow::Wait {
+                    key,
+                    deadline,
+                    state,
+                } => {
+                    *ipc_wait = Some(state);
+                    return ProcessResult::Wait(WaitReason::Ipc { key, deadline });
+                }
             }
         }
         _ => Err(Errno::NoSys),

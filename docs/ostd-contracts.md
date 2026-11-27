@@ -208,11 +208,11 @@ CURRENT 记录当前任务地址；调度器的 `current` Box 持有实体，切
 
 ### 3.5 等待与唤醒
 
-- `Flow::Wait(WaitReason::Deadline/Children/Pipe/Signal/PollUntil/Futex/Vfork)`：
+- `Flow::Wait(WaitReason::Deadline/Children/Pipe/PipeId/Signal/PollUntil/Futex/Vfork/Ipc)`：
   park 进等待
   表并切走，保留 syscall PC；醒来重执行重查条件（Mesa 风格）。
-- Deadline 由调度边界按硬件时钟扫描；Children/Pipe/Signal 由事件方置
-  无锁原子标志，在调度边界统一消费，避免 fs 在 REGISTRY 内反向取
+- Deadline 由调度边界按硬件时钟扫描；Children/Pipe/Signal/Ipc 由事件方置
+  无锁原子标志（Pipe 与 Ipc 均含定向槽队列，槽满退回广播），在调度边界统一消费，避免在 REGISTRY 内反向取
   SCHED。Signal 标志在信号实际入队后置位；drain 持 REGISTRY 一次按
   "pending & !blocked 非空"精确判定等待者（SCHED→REGISTRY 唯一嵌套点，
   见 §5），集合外信号假唤醒由唤醒点重查消化，无害。
@@ -284,6 +284,7 @@ try_lock 失败即报告“持锁跨调度”。
 | 信号 | kill、tkill、tgkill、rt_sigaction、rt_sigprocmask、rt_sigpending、rt_sigsuspend、rt_sigtimedwait、rt_sigqueueinfo、sigaltstack、rt_sigreturn | `syscall/signal.rs`、`task/signal.rs`、`sigframe/`（契约与偏差见 §4.5） |
 | 网络 | socket、socketpair、bind、listen、accept、accept4、connect、getsockname、getpeername、sendto、recvfrom、setsockopt、getsockopt、shutdown | `syscall/net.rs`、`net/mod.rs`（AF_INET 本地回环 UDP/TCP、AF_UNIX 匿名套接字对与未连接 AF_UNIX 套接字） |
 | 内存 | brk、mmap、munmap、mprotect、mremap、mincore、madvise、msync、锁页系列、shmget、shmctl、shmat、shmdt | `syscall/memory.rs`、`mm/shm.rs` |
+| System V IPC | msgget、msgctl、msgrcv、msgsnd、semget、semctl、semop、semtimedop | `ipc/msg.rs`、`ipc/sem.rs`、`task::process_call` |
 | 其他 | uname、sethostname、setdomainname、getcpu、gettimeofday、set_tid_address(96) | `syscall/mod.rs` |
 | 其余 | 未列出的调用号 | ENOSYS |
 
@@ -347,6 +348,7 @@ try_lock 失败即报告“持锁跨调度”。
 | 套接字（AF_INET 回环与 AF_UNIX） | 支持 AF_INET 的 SOCK_STREAM（TCP）与 SOCK_DGRAM（UDP），`socket(AF_UNIX, SOCK_STREAM\|SOCK_DGRAM, 0)` 未连接套接字，以及 `socketpair(199)` 创建的 AF_UNIX 匿名 SOCK_STREAM/SOCK_DGRAM 互连对（对齐 Linux 类型与协议错误码顺序：非法 type 返回 EINVAL，协议不匹配返回 EPROTONOSUPPORT）；支持 SOCK_NONBLOCK/SOCK_CLOEXEC、bind（含端口 0 临时端口分配与 UDP SO_REUSEADDR 共享端口）、listen、accept/accept4、connect（非阻塞 TCP 返回 EINPROGRESS 且立即入监听队列；UDP 按精确对端优先解复用）、getsockname/getpeername（AF_UNIX 写回 2 字节地址族）、sendto/recvfrom（含 MSG_PEEK/MSG_DONTWAIT/MSG_NOSIGNAL 与 SIGPIPE；阻塞流式小包整块写入防短写）、read/write/ppoll/pselect6/close/fstat（S_IFSOCK）、shutdown，以及 SOL_SOCKET（SO_REUSEADDR/SO_REUSEPORT/SO_KEEPALIVE/SO_DONTROUTE/SO_LINGER/SO_RCVLOWAT/SO_SNDLOWAT/SO_TYPE/SO_ERROR/SO_SNDBUF/SO_RCVBUF/SO_RCVTIMEO/SO_SNDTIMEO）、IPPROTO_IP（IP_TOS/IP_TTL/IP_MTU_DISCOVER/IP_RECVERR）与 IPPROTO_TCP（TCP_NODELAY/TCP_MAXSEG/TCP_CORK/TCP_KEEPIDLE/TCP_KEEPINTVL/TCP_KEEPCNT/TCP_INFO/TCP_CONGESTION）；单 FD 套接字阻塞等待按套接字唯一唤醒键走调度器定向唤醒（64 槽位，满时退回广播） | AF_INET 仅支持本地回环（0.0.0.0 与 127.x.x.x）；AF_UNIX 仅支持匿名 socketpair 与基础未连接创建，不支持命名路径/抽象名绑定、listen/accept/connect 与 SCM_RIGHTS 辅助消息；无外部物理网卡、AF_INET6、sendmsg/recvmsg 与完整 TCP 拥塞/重传状态机 | 未实现：外部网卡、命名 AF_UNIX、AF_INET6、sendmsg/recvmsg |
 | pselect6 / getitimer / setitimer | pselect6 支持最多 1024 个 FD 的 read/write/except 位图、可选相对超时与临时信号掩码（被打断返回 EINTR，不走 SA_RESTART）；getitimer/setitimer 支持 ITIMER_REAL 单次与周期触发 SIGALRM（fork 清零、exec 保留、退出清理） | ITIMER_VIRTUAL 与 ITIMER_PROF 返回 EOPNOTSUPP；超过 1024 FD 的位图返回 EINVAL | 未实现：ITIMER_VIRTUAL、ITIMER_PROF |
 | System V 共享内存（shmget/shmctl/shmat/shmdt） | 全局段表复用 `mm::shared::SharedPage` 与 `AreaKind::SharedAnonymous`；支持 `IPC_PRIVATE` 与具名 key（`IPC_CREAT`/`IPC_EXCL`）、`shmat`（含 `SHM_RDONLY`/`SHM_RND`/`SHM_REMAP`/`SHM_EXEC`）、`shmdt` 与 `shmctl`（`IPC_RMID`/`IPC_STAT`/`IPC_SET`，兼容剥离 `IPC_64` 标志）；`IPC_RMID` 立即解绑 key 并在 `nattch` 归零后回收，已挂接映射与 `fork` 继承映射持续有效直到解除或进程退出；`shmid64_ds` 按 asm-generic 64 位 112 字节编码 | 单段上限 256 MiB，总段数上限 1024；未实现 `IPC_INFO`/`SHM_INFO`/`SHM_STAT`/`SHM_LOCK`/`SHM_UNLOCK` 与按 uid/gid 的 IPC 权限校验 | 未实现：IPC_INFO、SHM_LOCK 与凭证权限校验 |
+| System V 消息队列与信号量（msgget/msgctl/msgrcv/msgsnd、semget/semctl/semop/semtimedop） | 全局叶子锁表 `MSG_TABLE`/`SEM_TABLE`（循环槽与序号编码），按 `ipcperms()` 做 uid/gid/groups 权限检查（euid==0 特权放行）；消息队列支持 `msgtyp`（`0`/`>0`/`<0`）、`IPC_NOWAIT`/`MSG_NOERROR`/`MSG_EXCEPT`/`MSG_COPY`、`IPC_STAT`/`IPC_SET`/`IPC_RMID`/`IPC_INFO`/`MSG_INFO`/`MSG_STAT`/`MSG_STAT_ANY`；信号量集支持多操作原子执行、相对超时 `semtimedop`、精确 `GETNCNT`/`GETZCNT` 计数、`GETVAL`/`SETVAL`/`GETALL`/`SETALL`/`GETPID`/`IPC_STAT`/`IPC_SET`/`IPC_RMID`/`IPC_INFO`/`SEM_INFO`/`SEM_STAT`/`SEM_STAT_ANY` 与线程组退出 `SEM_UNDO` 自动回滚（`fork` 不继承、`exec` 保留、`SETVAL`/`SETALL` 清除）；阻塞调用走 `WaitReason::Ipc` 定向唤醒键，`IPC_RMID` 唤醒阻塞者返回 `EIDRM`，信号打断一律返回 `EINTR`（不走 `SA_RESTART`）；提供 `/proc/sysvipc/{msg,sem}` 与 `/proc/sys/kernel/{msgmni,msgmax,msgmnb,sem}` 只读快照，并同步 `/proc/<pid>/{stat,status}` 阻塞态 `'S'` | 默认上限 `MSGMAX=8192`、`MSGMNB=16384`、`MSGMNI=128`、`SEMMSL=512`、`SEMMNI=128`、`SEMMNS=32000`、`SEMOPM=500`、`SEMVMX=32767`（与 `IPC_INFO` 及 `/proc/sys/kernel/*` 一致）；暂不支持写入修改 `/proc/sys/kernel/*`、`/proc/sysvipc/shm` 与非同线程组 `CLONE_SYSVSEM` | 未实现：动态调参 `/proc/sys/kernel/*`、`/proc/sysvipc/shm` 与非同线程组 `CLONE_SYSVSEM` |
 | sync | 同步已挂载可写 Ext4 根卷缓存并返回 0 | 语义兼容（无独立写回线程，同步落盘） | 无偏差 |
 | 路径 | 必须是合法 UTF-8；总长 4096 字节，单分量 255 | 非 UTF-8 文件名不可访问 | 取舍，理由待补 |
 | 其他 | stdin 读恒 EOF；fd=1/2 直通控制台；/dev/null（rdev 1:3）读与 pread 恒返回 EOF、写与 pwrite 丢弃并返回请求长度（null(4)）；/dev/urandom（1:9）与 /dev/random（1:8）读返回熵流、写丢弃；/dev/misc/rtc 提供墙上时钟查询（RV Goldfish RTC@0x101000 纳秒计数，LA LS7A TOY 双读一致法；ioctl RTC_RD_TIME 按 linux/rtc.h 拆 tm 字段，cmd 按 unsigned int 截断比较以兼容部分 libc 的符号扩展）；/proc/self/exe 在 exec/open 时重写为该进程最近一次 execve 的绝对路径（内嵌程序无路径时 ENOENT）；/proc/self 与 /proc/<pid>（及 `/proc/<pid>/task/<tid>`）支持 stat/cmdline/status/comm/timerslack_ns；sched_yield 轮转后可能立即再次调度；getpid 总成功，getppid 返回注册表 parent | 孤儿过继最近存活的 child_subreaper 祖先或 init；/proc 枚举来自 Task 维护的独立快照表（注册/退出/收割同步更新；FS 读路径经专用锁消费，锁序 REGISTRY→PROC_TABLE 单向）；cmdline 为 execve 提交后的真实 argv，未 exec 的任务以登记名近似；/proc/<pid>/stat 提供 proc(5) 全部 53 字段（CPU 记账与内存尺寸字段为 0，记账未导出为欠账）；/proc/<pid>/status 输出 Name/State/Pid/PPid/Uid/Gid/NoNewPrivs；RTC 不支持设置时间（RTC_SET_TIME ENOTTY） | 取舍，理由待补：stdin 恒 EOF、fd 1 与 2 直通控制台；未实现：RTC 设置时间、CPU 记账字段 |
@@ -462,7 +464,7 @@ signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综�
 |---|---|
 | 前提 | 任务时代内核态关中断；单核无合法持锁等待；lock_debug 下 try_lock 失败即报告 bug |
 | 检查 | DebugMutex 的 percpu 持锁深度及切换入口零深度检查始终启用；lock_debug 额外跟踪锁名/获取点（`#[track_caller]`） |
-| 锁序 | SCHED→FRAME；REGISTRY→{FRAME, EXIT_REPORTS, PROC_TABLE, UTS_NAMES, SHM_TABLE, 打开文件 Handle, ROOT/MOUNTS/PAGES, NET}；Handle→{ROOT, MOUNTS, PAGES, NET}；PAGES→{ROOT, MOUNTS}；ROOT/MOUNTS→DISKS；SCHED→REGISTRY（信号唤醒 drain 与到期 ITIMER_REAL 触发的唯一嵌套方向，反向路径已核查不存在） |
+| 锁序 | SCHED→FRAME；REGISTRY→{FRAME, EXIT_REPORTS, PROC_TABLE, UTS_NAMES, SHM_TABLE, MSG_TABLE, SEM_TABLE, 打开文件 Handle, ROOT/MOUNTS/PAGES, NET}；Handle→{ROOT, MOUNTS, PAGES, NET}；PAGES→{ROOT, MOUNTS}；ROOT/MOUNTS→DISKS；SCHED→REGISTRY（信号唤醒 drain 与到期 ITIMER_REAL 触发的唯一嵌套方向，反向路径已核查不存在） |
 | 反向 | 任何路径不得反向持有；fs/drivers 的 `spin::Mutex` 不受 DebugMutex 深度检查保护 |
 | 唤醒 | 事件方不直接取 SCHED；用无锁原子标志，在调度边界消费。futex 的唤醒与重排队在注册表锁外按锁内算好的键执行 |
 | 锁外析构 | 退出路径的 space/fs Drop 在 REGISTRY 锁外完成；exec 目前是例外 |

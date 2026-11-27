@@ -256,6 +256,27 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
     if path == "/proc/sys/kernel/tainted" {
         return Ok(procfs::TAINTED);
     }
+    if path == "/proc/sys/kernel/msgmni" {
+        return Ok(procfs::SYS_MSGMNI);
+    }
+    if path == "/proc/sys/kernel/msgmax" {
+        return Ok(procfs::SYS_MSGMAX);
+    }
+    if path == "/proc/sys/kernel/msgmnb" {
+        return Ok(procfs::SYS_MSGMNB);
+    }
+    if path == "/proc/sys/kernel/sem" {
+        return Ok(procfs::SYS_SEM);
+    }
+    if path == "/proc/sysvipc" {
+        return Ok(procfs::SYSVIPC_DIR);
+    }
+    if path == "/proc/sysvipc/msg" {
+        return Ok(procfs::SYSVIPC_MSG);
+    }
+    if path == "/proc/sysvipc/sem" {
+        return Ok(procfs::SYSVIPC_SEM);
+    }
     if path == "/proc/sys/fs" {
         return Ok(procfs::SYS_FS_DIR);
     }
@@ -307,6 +328,49 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
     if ino == procfs::MOUNTS {
         return Ok((0o100444, procfs::mounts()?.len() as u64, 1, 0));
     }
+    if ino == procfs::SYSVIPC_MSG {
+        return Ok((
+            0o100444,
+            crate::ipc::msg::proc_sysvipc()?.len() as u64,
+            1,
+            0,
+        ));
+    }
+    if ino == procfs::SYSVIPC_SEM {
+        return Ok((
+            0o100444,
+            crate::ipc::sem::proc_sysvipc()?.len() as u64,
+            1,
+            0,
+        ));
+    }
+    if ino == procfs::SYS_MSGMNI {
+        return Ok((
+            0o100444,
+            procfs::sys_kernel_ipc("msgmni")?.len() as u64,
+            1,
+            0,
+        ));
+    }
+    if ino == procfs::SYS_MSGMAX {
+        return Ok((
+            0o100444,
+            procfs::sys_kernel_ipc("msgmax")?.len() as u64,
+            1,
+            0,
+        ));
+    }
+    if ino == procfs::SYS_MSGMNB {
+        return Ok((
+            0o100444,
+            procfs::sys_kernel_ipc("msgmnb")?.len() as u64,
+            1,
+            0,
+        ));
+    }
+    if ino == procfs::SYS_SEM {
+        return Ok((0o100444, procfs::sys_kernel_ipc("sem")?.len() as u64, 1, 0));
+    }
     if ino == procfs::PID_MAX {
         return Ok((0o100444, procfs::pid_max().len() as u64, 1, 0));
     }
@@ -328,6 +392,7 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
             | procfs::SYS_DIR
             | procfs::SYS_KERNEL_DIR
             | procfs::SYS_FS_DIR
+            | procfs::SYSVIPC_DIR
             | procfs::SELF_DIR
             | procfs::SELF_FD_DIR
     ) {
@@ -630,6 +695,12 @@ pub fn is_procfs_text(path: &str) -> bool {
         "/proc/mounts"
             | "/proc/sys/kernel/pid_max"
             | "/proc/sys/kernel/tainted"
+            | "/proc/sys/kernel/msgmni"
+            | "/proc/sys/kernel/msgmax"
+            | "/proc/sys/kernel/msgmnb"
+            | "/proc/sys/kernel/sem"
+            | "/proc/sysvipc/msg"
+            | "/proc/sysvipc/sem"
             | "/proc/sys/fs/pipe-max-size"
             | "/proc/version"
     ) {
@@ -662,6 +733,15 @@ pub fn procfs_text(path: &str) -> Result<alloc::string::String, Errno> {
         s.try_reserve_exact(src.len()).map_err(|_| Errno::NoMem)?;
         s.push_str(src);
         return Ok(s);
+    }
+    if let Some(name) = path.strip_prefix("/proc/sys/kernel/") {
+        return procfs::sys_kernel_ipc(name);
+    }
+    if path == "/proc/sysvipc/msg" {
+        return crate::ipc::msg::proc_sysvipc();
+    }
+    if path == "/proc/sysvipc/sem" {
+        return crate::ipc::sem::proc_sysvipc();
     }
     if path == "/proc/sys/fs/pipe-max-size" {
         let mut s = alloc::string::String::new();
