@@ -68,15 +68,21 @@ pub mod sysnr {
     pub const FSTAT: usize = 80;
     pub const SYNC: usize = 81;
     pub const FSYNC: usize = 82;
+    pub const FDATASYNC: usize = 83;
+    pub const SYNC_FILE_RANGE: usize = 84;
     pub const TIMERFD_CREATE: usize = 85;
     pub const TIMERFD_SETTIME: usize = 86;
     pub const TIMERFD_GETTIME: usize = 87;
     pub const UTIMENSAT: usize = 88;
     pub const UMASK: usize = 166;
+    pub const SYNCFS: usize = 267;
     pub const RENAMEAT2: usize = 276;
     pub const FADVISE64: usize = 223;
     pub const COPY_FILE_RANGE: usize = 285;
+    pub const PREADV2: usize = 286;
+    pub const PWRITEV2: usize = 287;
     pub const STATX: usize = 291;
+    pub const CLOSE_RANGE: usize = 436;
     pub const EPOLL_PWAIT2: usize = 441;
     // 进程
     pub const EXIT: usize = 93;
@@ -427,6 +433,7 @@ pub fn dispatch(
         | sysnr::FCHDIR
         | sysnr::OPENAT
         | sysnr::CLOSE
+        | sysnr::CLOSE_RANGE
         | sysnr::PIPE2
         | sysnr::GETDENTS64
         | sysnr::LSEEK
@@ -438,6 +445,8 @@ pub fn dispatch(
         | sysnr::PWRITE64
         | sysnr::PREADV
         | sysnr::PWRITEV
+        | sysnr::PREADV2
+        | sysnr::PWRITEV2
         | sysnr::SENDFILE
         | sysnr::SPLICE
         | sysnr::TEE
@@ -448,6 +457,9 @@ pub fn dispatch(
         | sysnr::FSTATAT
         | sysnr::SYNC
         | sysnr::FSYNC
+        | sysnr::FDATASYNC
+        | sysnr::SYNC_FILE_RANGE
+        | sysnr::SYNCFS
         | sysnr::UTIMENSAT
         | sysnr::UMASK
         | sysnr::FACCESSAT
@@ -494,7 +506,12 @@ pub fn dispatch(
             if ret == Err(Errno::Pipe)
                 && matches!(
                     nr,
-                    sysnr::WRITE | sysnr::WRITEV | sysnr::SENDFILE | sysnr::SPLICE | sysnr::TEE
+                    sysnr::WRITE
+                        | sysnr::WRITEV
+                        | sysnr::PWRITEV2
+                        | sysnr::SENDFILE
+                        | sysnr::SPLICE
+                        | sysnr::TEE
                 )
             {
                 signal.generate(
