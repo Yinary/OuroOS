@@ -157,6 +157,10 @@ pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
 /// siginfo si_code：SI_QUEUE，sigqueue 类发送。
 pub const SI_QUEUE: i32 = -1;
+/// siginfo si_code：SI_TIMER，POSIX 定时器到期发送。
+pub const SI_TIMER: i32 = -2;
+/// siginfo si_code：SI_MESGQ，POSIX 消息队列异步通知发送。
+pub const SI_MESGQ: i32 = -3;
 /// siginfo si_code：SI_TKILL，tkill/tgkill 发送。
 pub const SI_TKILL: i32 = -6;
 
@@ -172,12 +176,16 @@ pub struct SigInfoSlot {
     pub code: i32,
     /// si_errno。
     pub errno: i32,
-    /// 出错地址（SIGSEGV/SIGBUS 等填充）。
+    /// 出错地址（SIGSEGV/SIGBUS 等填充）或 sigev_value（SI_TIMER/SI_QUEUE）。
     pub addr: usize,
     /// 发送方 pid。
     pub pid: u32,
     /// 子进程退出状态（SIGCHLD 用）。
     pub status: i32,
+    /// POSIX 定时器 ID（SI_TIMER 用）。
+    pub timer_id: i32,
+    /// POSIX 定时器溢出次数（SI_TIMER 用）。
+    pub overrun: i32,
     /// 硬件异常细节（force 投递填写）。
     pub fault: Option<UserFault>,
 }
@@ -294,6 +302,7 @@ impl SignalGroup {
         }
         self.queue(sig, slot);
         super::sched::request_signal_wake();
+        super::sched::request_pipe_wake();
     }
 
     /// 设置信号 sig 的处置；sig 不在 1..=64 时不修改任何状态。
@@ -540,6 +549,7 @@ pub fn generate_thread(group: &SignalGroup, thread: &mut ThreadSig, sig: u8, slo
     }
     thread.queue(sig, slot);
     super::sched::request_signal_wake();
+    super::sched::request_pipe_wake();
 }
 
 /// 锁外信号产生入口（kill/tgkill）：取 REGISTRY 锁并调用 generate。

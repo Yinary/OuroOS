@@ -82,12 +82,22 @@ pub(super) fn install_hooks() {
 
 /// 清理目标 inode 的空登记组，避免每次解除映射都扫描全部 inode。
 pub(crate) fn compact_ino(ino: u32) {
+    compact_inos(&[ino]);
+}
+
+/// 批量清理一组 inode 在 `RESIDENT` 中的失效弱引用。
+pub(crate) fn compact_inos(inos: &[u32]) {
+    if inos.is_empty() {
+        return;
+    }
     let mut groups = RESIDENT.lock();
-    if let Ok(index) = groups.binary_search_by_key(&ino, |group| group.ino) {
-        let group = &mut groups[index];
-        group.pages.retain(|p| p.strong_count() != 0);
-        if group.pages.is_empty() {
-            groups.remove(index);
+    for &ino in inos {
+        if let Ok(index) = groups.binary_search_by_key(&ino, |group| group.ino) {
+            let group = &mut groups[index];
+            group.pages.retain(|p| p.strong_count() != 0);
+            if group.pages.is_empty() {
+                groups.remove(index);
+            }
         }
     }
 }
@@ -95,15 +105,34 @@ pub(crate) fn compact_ino(ino: u32) {
 /// 与打开描述符无关的 inode 引用。
 pub(crate) struct MappingFile {
     ino: u32,
+    writable_shared: bool,
 }
 impl MappingFile {
-    pub(crate) fn new(ino: u32) -> Result<Arc<Self>, Errno> {
+    pub(crate) fn new_for_map(ino: u32, writable_shared: bool) -> Result<Arc<Self>, Errno> {
         fs::retain(ino)?;
-        fs::try_arc(Self { ino })
+        if writable_shared && fs::memfd::is_memfd_ino(ino) {
+            fs::memfd::inc_writable_map(ino);
+        }
+        match fs::try_arc(Self {
+            ino,
+            writable_shared,
+        }) {
+            Ok(arc) => Ok(arc),
+            Err(e) => {
+                if writable_shared && fs::memfd::is_memfd_ino(ino) {
+                    fs::memfd::dec_writable_map(ino);
+                }
+                fs::release(ino);
+                Err(e)
+            }
+        }
     }
 }
 impl Drop for MappingFile {
     fn drop(&mut self) {
+        if self.writable_shared && fs::memfd::is_memfd_ino(self.ino) {
+            fs::memfd::dec_writable_map(self.ino);
+        }
         fs::release(self.ino);
     }
 }
@@ -211,11 +240,21 @@ impl FilePage {
                 || matches!(&p.data, Data::Shared(page) if !page.is_valid())
         })
     }
-    pub(super) fn discard(&self) {
+    /// 释放驻留页引用并回收空闲共享页，返回待压缩的 inode 号。
+    pub(super) fn release_deferred(&self) -> Option<u32> {
+        if self.data.borrow_mut().take().is_none() {
+            return None;
+        }
         let ino = self.file.ino;
-        self.data.borrow_mut().take();
-        crate::fs::cache::release_idle(ino, self.offset);
-        compact_ino(ino);
+        if matches!(self.mode, Mode::Shared { .. }) {
+            crate::fs::cache::release_idle(ino, self.offset);
+        }
+        Some(ino)
+    }
+    pub(super) fn discard(&self) {
+        if let Some(ino) = self.release_deferred() {
+            compact_ino(ino);
+        }
     }
     pub(super) fn addr(&self) -> Option<PhysAddr> {
         self.data.borrow().as_ref().map(|p| p.data.addr())
@@ -297,6 +336,12 @@ impl FilePage {
             }
             _ => None,
         }
+    }
+}
+impl Drop for FilePage {
+    fn drop(&mut self) {
+        // 释放残留共享页并清理 RESIDENT 登记。
+        self.discard();
     }
 }
 fn map_io(error: Errno) -> MapError {

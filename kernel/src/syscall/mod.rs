@@ -31,6 +31,18 @@ pub mod sysnr {
     pub const IO_GETEVENTS: usize = 4;
     pub const IO_PGETEVENTS: usize = 292;
     // 文件
+    pub const SETXATTR: usize = 5;
+    pub const LSETXATTR: usize = 6;
+    pub const FSETXATTR: usize = 7;
+    pub const GETXATTR: usize = 8;
+    pub const LGETXATTR: usize = 9;
+    pub const FGETXATTR: usize = 10;
+    pub const LISTXATTR: usize = 11;
+    pub const LLISTXATTR: usize = 12;
+    pub const FLISTXATTR: usize = 13;
+    pub const REMOVEXATTR: usize = 14;
+    pub const LREMOVEXATTR: usize = 15;
+    pub const FREMOVEXATTR: usize = 16;
     pub const GETCWD: usize = 17;
     pub const EVENTFD2: usize = 19;
     pub const EPOLL_CREATE1: usize = 20;
@@ -38,8 +50,11 @@ pub mod sysnr {
     pub const EPOLL_PWAIT: usize = 22;
     pub const DUP: usize = 23;
     pub const DUP3: usize = 24;
-    pub const IOCTL: usize = 29;
     pub const FCNTL: usize = 25;
+    pub const INOTIFY_INIT1: usize = 26;
+    pub const INOTIFY_ADD_WATCH: usize = 27;
+    pub const INOTIFY_RM_WATCH: usize = 28;
+    pub const IOCTL: usize = 29;
     pub const FLOCK: usize = 32;
     pub const MKDIRAT: usize = 34;
     pub const UNLINKAT: usize = 35;
@@ -52,6 +67,7 @@ pub mod sysnr {
     pub const FSTATFS: usize = 44;
     pub const TRUNCATE: usize = 45;
     pub const FTRUNCATE: usize = 46;
+    pub const FALLOCATE: usize = 47;
     pub const CHDIR: usize = 49;
     pub const FCHDIR: usize = 50;
     pub const OPENAT: usize = 56;
@@ -68,6 +84,8 @@ pub mod sysnr {
     pub const PREADV: usize = 69;
     pub const PWRITEV: usize = 70;
     pub const SENDFILE: usize = 71;
+    pub const SIGNALFD4: usize = 74;
+    pub const VMSPLICE: usize = 75;
     pub const SPLICE: usize = 76;
     pub const TEE: usize = 77;
     pub const READLINKAT: usize = 78;
@@ -75,15 +93,22 @@ pub mod sysnr {
     pub const FSTAT: usize = 80;
     pub const SYNC: usize = 81;
     pub const FSYNC: usize = 82;
+    pub const FDATASYNC: usize = 83;
+    pub const SYNC_FILE_RANGE: usize = 84;
     pub const TIMERFD_CREATE: usize = 85;
     pub const TIMERFD_SETTIME: usize = 86;
     pub const TIMERFD_GETTIME: usize = 87;
     pub const UTIMENSAT: usize = 88;
     pub const UMASK: usize = 166;
+    pub const SYNCFS: usize = 267;
     pub const RENAMEAT2: usize = 276;
+    pub const MEMFD_CREATE: usize = 279;
     pub const FADVISE64: usize = 223;
     pub const COPY_FILE_RANGE: usize = 285;
+    pub const PREADV2: usize = 286;
+    pub const PWRITEV2: usize = 287;
     pub const STATX: usize = 291;
+    pub const CLOSE_RANGE: usize = 436;
     pub const EPOLL_PWAIT2: usize = 441;
     // 进程
     pub const EXIT: usize = 93;
@@ -97,6 +122,11 @@ pub mod sysnr {
     pub const NANOSLEEP: usize = 101;
     pub const GETITIMER: usize = 102;
     pub const SETITIMER: usize = 103;
+    pub const TIMER_CREATE: usize = 107;
+    pub const TIMER_GETTIME: usize = 108;
+    pub const TIMER_GETOVERRUN: usize = 109;
+    pub const TIMER_SETTIME: usize = 110;
+    pub const TIMER_DELETE: usize = 111;
     pub const CLOCK_SETTIME: usize = 112;
     pub const CLOCK_GETTIME: usize = 113;
     pub const CLOCK_GETRES: usize = 114;
@@ -168,6 +198,14 @@ pub mod sysnr {
     pub const FCHOWN: usize = 55;
     pub const CAPGET: usize = 90;
     pub const CAPSET: usize = 91;
+    pub const PERSONALITY: usize = 92;
+    pub const IOPRIO_SET: usize = 30;
+    pub const IOPRIO_GET: usize = 31;
+    pub const RT_TGSIGQUEUEINFO: usize = 240;
+    pub const PROCESS_VM_READV: usize = 270;
+    pub const PROCESS_VM_WRITEV: usize = 271;
+    pub const SCHED_SETATTR: usize = 274;
+    pub const SCHED_GETATTR: usize = 275;
     pub const MKNODAT: usize = 33;
     pub const FCHMOD: usize = 52;
     pub const SYSLOG: usize = 116;
@@ -176,6 +214,17 @@ pub mod sysnr {
     pub const CLONE: usize = 220;
     pub const EXECVE: usize = 221;
     pub const WAIT4: usize = 260;
+    pub const KCMP: usize = 272;
+    pub const PIDFD_SEND_SIGNAL: usize = 424;
+    pub const PIDFD_OPEN: usize = 434;
+    pub const PIDFD_GETFD: usize = 438;
+    // POSIX 消息队列
+    pub const MQ_OPEN: usize = 180;
+    pub const MQ_UNLINK: usize = 181;
+    pub const MQ_TIMEDSEND: usize = 182;
+    pub const MQ_TIMEDRECEIVE: usize = 183;
+    pub const MQ_NOTIFY: usize = 184;
+    pub const MQ_GETSETATTR: usize = 185;
     // System V IPC（消息队列 / 信号量 / 共享内存）
     pub const MSGGET: usize = 186;
     pub const MSGCTL: usize = 187;
@@ -203,7 +252,11 @@ pub mod sysnr {
     pub const SETSOCKOPT: usize = 208;
     pub const GETSOCKOPT: usize = 209;
     pub const SHUTDOWN: usize = 210;
+    pub const SENDMSG: usize = 211;
+    pub const RECVMSG: usize = 212;
     pub const ACCEPT4: usize = 242;
+    pub const RECVMMSG: usize = 243;
+    pub const SENDMMSG: usize = 269;
     // 内存
     pub const READAHEAD: usize = 213;
     pub const BRK: usize = 214;
@@ -273,6 +326,8 @@ pub enum Errno {
     NoMsg,
     /// EIDRM: IPC 标识符已被移除。
     IdRm,
+    /// ENODATA: 扩展属性不存在或无可用数据。
+    NoData,
     /// ENOSYS: 未实现的系统调用
     NoSys,
     /// ETIMEDOUT: 等待超过期限。
@@ -349,6 +404,7 @@ impl Errno {
             Errno::Fault => 14,
             Errno::NoMsg => 42,
             Errno::IdRm => 43,
+            Errno::NoData => 61,
             Errno::NoSys => 38,
             Errno::TimedOut => 110,
             Self::NotSock => 88,
@@ -427,6 +483,9 @@ pub fn dispatch(
         | sysnr::DUP
         | sysnr::DUP3
         | sysnr::FCNTL
+        | sysnr::INOTIFY_INIT1
+        | sysnr::INOTIFY_ADD_WATCH
+        | sysnr::INOTIFY_RM_WATCH
         | sysnr::FLOCK
         | sysnr::MKDIRAT
         | sysnr::UNLINKAT
@@ -440,10 +499,13 @@ pub fn dispatch(
         | sysnr::FSTATFS
         | sysnr::TRUNCATE
         | sysnr::FTRUNCATE
+        | sysnr::FALLOCATE
         | sysnr::CHDIR
         | sysnr::FCHDIR
         | sysnr::OPENAT
+        | sysnr::MEMFD_CREATE
         | sysnr::CLOSE
+        | sysnr::CLOSE_RANGE
         | sysnr::PIPE2
         | sysnr::GETDENTS64
         | sysnr::LSEEK
@@ -455,7 +517,10 @@ pub fn dispatch(
         | sysnr::PWRITE64
         | sysnr::PREADV
         | sysnr::PWRITEV
+        | sysnr::PREADV2
+        | sysnr::PWRITEV2
         | sysnr::SENDFILE
+        | sysnr::VMSPLICE
         | sysnr::SPLICE
         | sysnr::TEE
         | sysnr::FADVISE64
@@ -465,6 +530,9 @@ pub fn dispatch(
         | sysnr::FSTATAT
         | sysnr::SYNC
         | sysnr::FSYNC
+        | sysnr::FDATASYNC
+        | sysnr::SYNC_FILE_RANGE
+        | sysnr::SYNCFS
         | sysnr::UTIMENSAT
         | sysnr::UMASK
         | sysnr::FACCESSAT
@@ -475,7 +543,31 @@ pub fn dispatch(
         | sysnr::FCHMOD
         | sysnr::MKNODAT
         | sysnr::IOCTL
+        | sysnr::SETXATTR
+        | sysnr::LSETXATTR
+        | sysnr::FSETXATTR
+        | sysnr::GETXATTR
+        | sysnr::LGETXATTR
+        | sysnr::FGETXATTR
+        | sysnr::LISTXATTR
+        | sysnr::LLISTXATTR
+        | sysnr::FLISTXATTR
+        | sysnr::REMOVEXATTR
+        | sysnr::LREMOVEXATTR
+        | sysnr::FREMOVEXATTR
         | sysnr::STATX => {
+            if nr == sysnr::READ {
+                if let Some((sfd_mask, nonblock)) = fs.signalfd_info(args[0]) {
+                    let ret = read_signalfd(
+                        space, fs, signal, thread, args[0], args[1], args[2], sfd_mask, nonblock,
+                    );
+                    if ret == Err(Errno::WouldBlock) {
+                        return Flow::Wait(WaitReason::Pipe);
+                    }
+                    cx[TrapFrameArgs::RET] = to_abi(ret);
+                    return Flow::Continue;
+                }
+            }
             let ret = self::fs::dispatch(
                 nr,
                 [args[0], args[1], args[2], args[3], args[4], args[5]],
@@ -511,7 +603,13 @@ pub fn dispatch(
             if ret == Err(Errno::Pipe)
                 && matches!(
                     nr,
-                    sysnr::WRITE | sysnr::WRITEV | sysnr::SENDFILE | sysnr::SPLICE | sysnr::TEE
+                    sysnr::WRITE
+                        | sysnr::WRITEV
+                        | sysnr::PWRITEV2
+                        | sysnr::SENDFILE
+                        | sysnr::VMSPLICE
+                        | sysnr::SPLICE
+                        | sysnr::TEE
                 )
             {
                 signal.generate(
@@ -524,6 +622,11 @@ pub fn dispatch(
                     thread.signal.blocked(),
                 );
             }
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        sysnr::SIGNALFD4 => {
+            let ret = signalfd4(space, fs, args);
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
@@ -698,6 +801,11 @@ pub fn dispatch(
         | sysnr::NANOSLEEP
         | sysnr::GETITIMER
         | sysnr::SETITIMER
+        | sysnr::TIMER_CREATE
+        | sysnr::TIMER_GETTIME
+        | sysnr::TIMER_GETOVERRUN
+        | sysnr::TIMER_SETTIME
+        | sysnr::TIMER_DELETE
         | sysnr::CLOCK_SETTIME
         | sysnr::CLOCK_GETTIME
         | sysnr::CLOCK_GETRES
@@ -734,13 +842,25 @@ pub fn dispatch(
         | sysnr::EXECVE
         | sysnr::WAIT4
         | sysnr::WAITID
+        | sysnr::KCMP
+        | sysnr::PIDFD_OPEN
+        | sysnr::PIDFD_SEND_SIGNAL
+        | sysnr::PIDFD_GETFD
         | sysnr::GETRUSAGE
         | sysnr::SCHED_SETPARAM
         | sysnr::SCHED_SETSCHEDULER
         | sysnr::SCHED_GETSCHEDULER
         | sysnr::SCHED_GETPARAM
+        | sysnr::SCHED_SETATTR
+        | sysnr::SCHED_GETATTR
         | sysnr::SETPRIORITY
         | sysnr::GETPRIORITY
+        | sysnr::IOPRIO_SET
+        | sysnr::IOPRIO_GET
+        | sysnr::PERSONALITY
+        | sysnr::RT_TGSIGQUEUEINFO
+        | sysnr::PROCESS_VM_READV
+        | sysnr::PROCESS_VM_WRITEV
         | sysnr::SCHED_SETAFFINITY
         | sysnr::SCHED_GETAFFINITY
         | sysnr::SCHED_GET_PRIORITY_MAX
@@ -755,6 +875,16 @@ pub fn dispatch(
         | sysnr::CONNECT
         | sysnr::SENDTO
         | sysnr::RECVFROM
+        | sysnr::SENDMSG
+        | sysnr::RECVMSG
+        | sysnr::SENDMMSG
+        | sysnr::RECVMMSG
+        | sysnr::MQ_OPEN
+        | sysnr::MQ_UNLINK
+        | sysnr::MQ_TIMEDSEND
+        | sysnr::MQ_TIMEDRECEIVE
+        | sysnr::MQ_NOTIFY
+        | sysnr::MQ_GETSETATTR
         | sysnr::MSGGET
         | sysnr::MSGCTL
         | sysnr::MSGRCV
@@ -981,6 +1111,91 @@ impl UtsNames {
 
 static UTS_NAMES: crate::sync::DebugMutex<UtsNames> =
     crate::sync::DebugMutex::new("UTS_NAMES", UtsNames::new());
+
+/// signalfd4(2)：创建或更新信号文件描述符的监听信号集，屏蔽不可捕获的 SIGKILL/SIGSTOP。
+fn signalfd4(
+    space: &UserAddressSpace,
+    fs: &mut crate::fs::context::Context,
+    args: [usize; 6],
+) -> Result<usize, Errno> {
+    const SFD_NONBLOCK: u32 = 0x800;
+    const SFD_CLOEXEC: u32 = 0x80000;
+    let ufd = args[0] as u32 as i32;
+    let mask_ptr = args[1];
+    let sizemask = args[2];
+    let flags = args[3] as u32;
+    if flags & !(SFD_NONBLOCK | SFD_CLOEXEC) != 0 {
+        return Err(Errno::Invalid);
+    }
+    if sizemask != 8 {
+        return Err(Errno::Invalid);
+    }
+    let mut raw = [0u8; 8];
+    user_access::copy_from_user(space, mask_ptr, &mut raw).map_err(|_| Errno::Fault)?;
+    let mut mask = u64::from_ne_bytes(raw);
+    mask &= !((1u64 << (crate::task::signal::SIGKILL - 1))
+        | (1u64 << (crate::task::signal::SIGSTOP - 1)));
+    fs.open_or_update_signalfd(
+        ufd,
+        mask,
+        flags & SFD_NONBLOCK != 0,
+        flags & SFD_CLOEXEC != 0,
+    )
+}
+
+/// read(2) 读取 signalfd：按 128 字节 struct signalfd_siginfo 逐条出队匹配的待决信号。
+#[allow(clippy::too_many_arguments)]
+fn read_signalfd(
+    space: &UserAddressSpace,
+    fs: &crate::fs::context::Context,
+    signal: &mut crate::task::signal::SignalGroup,
+    thread: &mut crate::task::ThreadRecord,
+    fd: usize,
+    buf: usize,
+    count: usize,
+    mask: u64,
+    nonblock: bool,
+) -> Result<usize, Errno> {
+    const SIGINFO_SIZE: usize = 128;
+    if count < SIGINFO_SIZE {
+        return Err(Errno::Invalid);
+    }
+    let mut done = 0usize;
+    while done + SIGINFO_SIZE <= count {
+        let Some((sig, slot)) = crate::task::signal::peek_any(signal, &thread.signal, !mask) else {
+            if done == 0 {
+                return Err(if nonblock {
+                    Errno::Again
+                } else {
+                    Errno::WouldBlock
+                });
+            }
+            break;
+        };
+        let mut raw = [0u8; SIGINFO_SIZE];
+        raw[0..4].copy_from_slice(&(sig as u32).to_ne_bytes());
+        raw[4..8].copy_from_slice(&slot.errno.to_ne_bytes());
+        raw[8..12].copy_from_slice(&slot.code.to_ne_bytes());
+        raw[12..16].copy_from_slice(&slot.pid.to_ne_bytes());
+        raw[40..44].copy_from_slice(&slot.status.to_ne_bytes());
+        raw[72..80].copy_from_slice(&(slot.addr as u64).to_ne_bytes());
+        let dst = buf.checked_add(done).ok_or(Errno::Fault)?;
+        if user_access::copy_to_user(space, dst, &raw).is_err() {
+            return if done > 0 {
+                fs.bump_signalfd_gen(fd);
+                Ok(done)
+            } else {
+                Err(Errno::Fault)
+            };
+        }
+        let _ = crate::task::signal::take_any(signal, &mut thread.signal, !mask);
+        done += SIGINFO_SIZE;
+    }
+    if done > 0 {
+        fs.bump_signalfd_gen(fd);
+    }
+    Ok(done)
+}
 
 /// Result → Linux ABI 返回值：Ok(n) → n；Err(e) → -errno
 pub(crate) fn to_abi(ret: Result<usize, Errno>) -> usize {
