@@ -110,6 +110,10 @@ pub struct Task {
     pub(super) priority: i32,
     /// 普通策略的谦让值，-20 到 19，越小越优先。
     pub(super) nice: i32,
+    /// sched_setattr(2) 标志位（如 SCHED_FLAG_RESET_ON_FORK 等）。
+    pub(super) sched_flags: u64,
+    /// SCHED_DEADLINE 参数（runtime / deadline / period，纳秒）。
+    pub(super) sched_dl: [u64; 3],
     /// 内核栈（纯所有权字段，仅 Drop 生效，无读取方；下划线豁免
     /// dead_code 检查）。任务回收时最终释放。
     _kstack: KernelStack,
@@ -145,6 +149,8 @@ impl Task {
             policy: 0,
             priority: 0,
             nice: 0,
+            sched_flags: 0,
+            sched_dl: [0; 3],
             _kstack: kstack,
         })
     }
@@ -173,6 +179,8 @@ impl Task {
             policy: 0,
             priority: 0,
             nice: 0,
+            sched_flags: 0,
+            sched_dl: [0; 3],
             _kstack: kstack,
         })
     }

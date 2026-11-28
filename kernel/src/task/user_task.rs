@@ -1626,8 +1626,16 @@ fn process_call(
         sysnr::SCHED_SETPARAM => sched_setparam(parent, args),
         sysnr::SCHED_GETSCHEDULER => sched_getscheduler(parent, args[0]),
         sysnr::SCHED_GETPARAM => sched_getparam(parent, args[0], args[1]),
+        sysnr::SCHED_SETATTR => sched_setattr(parent, args),
+        sysnr::SCHED_GETATTR => sched_getattr(parent, args),
         sysnr::SETPRIORITY => setpriority(parent, args),
         sysnr::GETPRIORITY => getpriority(parent, args),
+        sysnr::IOPRIO_SET => ioprio_set(parent, args),
+        sysnr::IOPRIO_GET => ioprio_get(parent, args),
+        sysnr::PERSONALITY => personality_call(parent, args),
+        sysnr::RT_TGSIGQUEUEINFO => tgsigqueueinfo(parent, args),
+        sysnr::PROCESS_VM_READV => process_vm_rw(parent, args, false),
+        sysnr::PROCESS_VM_WRITEV => process_vm_rw(parent, args, true),
         sysnr::SCHED_GET_PRIORITY_MAX => sched_priority_limit(args[0], true),
         sysnr::SCHED_GET_PRIORITY_MIN => sched_priority_limit(args[0], false),
         sysnr::SCHED_RR_GET_INTERVAL => sched_rr_get_interval(parent, args[0], args[1]),
@@ -3951,7 +3959,8 @@ fn fork_user(
         child_frame[TrapFrameArgs::SP] = stack;
     }
     let pid = super::registry::alloc_pid();
-    let (policy, priority, nice) = super::sched::attrs_of(parent).ok_or(Errno::NoProcess)?;
+    let (policy, priority, nice, sched_flags, sched_dl) =
+        super::sched::attrs_ext_of(parent).ok_or(Errno::NoProcess)?;
     // CLONE_CHILD_SETTID：在子进程地址空间写入其 tid。
     if flags & CLONE_CHILD_SETTID != 0 && child_tid != 0 {
         // 写入经 user_access 完成，目标是子进程自身的用户内存；地址来自
@@ -3960,9 +3969,20 @@ fn fork_user(
             crate::mm::user_access::copy_to_user(&space, child_tid, &(pid as u32).to_ne_bytes());
     }
     let mut task = Task::new_user(pid, pid, "child", child_frame).map_err(|_| Errno::NoMem)?;
-    task.policy = policy;
-    task.priority = priority;
-    task.nice = nice;
+    if sched_flags & 1 != 0 {
+        // SCHED_FLAG_RESET_ON_FORK：子进程重置为 SCHED_OTHER 并清零标志。
+        task.policy = 0;
+        task.priority = 0;
+        task.nice = nice.max(0);
+        task.sched_flags = 0;
+        task.sched_dl = [0; 3];
+    } else {
+        task.policy = policy;
+        task.priority = priority;
+        task.nice = nice;
+        task.sched_flags = sched_flags;
+        task.sched_dl = sched_dl;
+    }
     let task = Box::try_new(task).map_err(|_| Errno::NoMem)?;
     super::registry::reserve().map_err(|_| Errno::NoMem)?;
     sched::reserve_task().map_err(|_| Errno::NoMem)?;
@@ -3991,7 +4011,18 @@ fn fork_user(
                 }
                 core::cmp::Ordering::Equal => {}
             }
-            let (pgid, sid, rlimits, dumpable, keepcaps, thp_disable, cap_bset, securebits) = {
+            let (
+                pgid,
+                sid,
+                rlimits,
+                dumpable,
+                keepcaps,
+                thp_disable,
+                cap_bset,
+                securebits,
+                ioprio,
+                personality,
+            ) = {
                 let p = &reg.records[pi];
                 (
                     p.pgid,
@@ -4002,6 +4033,8 @@ fn fork_user(
                     p.thp_disable,
                     p.cap_bset,
                     p.securebits,
+                    p.ioprio,
+                    p.personality,
                 )
             };
             // 子进程继承备用栈，pending/info 清零；child_subreaper 按 prctl(2) 在 fork 时清零。
@@ -4018,6 +4051,8 @@ fn fork_user(
             child.thp_disable = thp_disable;
             child.cap_bset = cap_bset;
             child.securebits = securebits;
+            child.ioprio = ioprio;
+            child.personality = personality;
         }
         let parent_thread = reg.threads.iter().position(|t| t.tid == parent);
         let child_thread = reg.threads.iter().position(|t| t.tid == pid);
@@ -4189,4 +4224,564 @@ fn fork_thread(
     }
     sched::enqueue(task);
     Ok(tid)
+}
+
+/// process_vm_readv(2) / process_vm_writev(2)：在调用者与目标进程地址空间间逐页搬运 iovec 数据。
+fn process_vm_rw(parent: Pid, args: [usize; 6], is_write: bool) -> Result<usize, Errno> {
+    const MAX_IOV: usize = 1024;
+    let raw_pid = args[0] as u32 as i32;
+    let local_iov_ptr = args[1];
+    let liovcnt = args[2];
+    let remote_iov_ptr = args[3];
+    let riovcnt = args[4];
+    let flags = args[5];
+
+    if flags != 0 || liovcnt > MAX_IOV || riovcnt > MAX_IOV {
+        return Err(Errno::Invalid);
+    }
+
+    let reg = REGISTRY.lock();
+    let caller_idx = reg.group_index(parent).ok_or(Errno::NoProcess)?;
+    let caller_space = reg.records[caller_idx]
+        .space
+        .as_ref()
+        .ok_or(Errno::NoProcess)?
+        .as_space();
+
+    let import_iov =
+        |ptr: usize, count: usize| -> Result<(alloc::vec::Vec<(usize, usize)>, usize), Errno> {
+            if count == 0 {
+                return Ok((alloc::vec::Vec::new(), 0));
+            }
+            if ptr == 0 {
+                return Err(Errno::Fault);
+            }
+            let mut out = alloc::vec::Vec::new();
+            out.try_reserve_exact(count).map_err(|_| Errno::NoMem)?;
+            let mut total = 0usize;
+            for i in 0..count {
+                let mut raw = [0u8; 16];
+                let p = ptr.checked_add(i * 16).ok_or(Errno::Fault)?;
+                user_access::copy_from_user(caller_space, p, &mut raw).map_err(|_| Errno::Fault)?;
+                let base = usize::from_ne_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
+                let len = usize::from_ne_bytes(raw[8..16].try_into().unwrap_or([0; 8]));
+                total = total
+                    .checked_add(len)
+                    .filter(|n| *n <= isize::MAX as usize)
+                    .ok_or(Errno::Invalid)?;
+                out.push((base, len));
+            }
+            Ok((out, total))
+        };
+
+    let (local_iovs, local_total) = import_iov(local_iov_ptr, liovcnt)?;
+    let (remote_iovs, remote_total) = import_iov(remote_iov_ptr, riovcnt)?;
+
+    if raw_pid <= 0 {
+        return Err(Errno::NoProcess);
+    }
+    let target_idx = reg
+        .group_index(raw_pid as usize)
+        .filter(|&i| reg.records[i].exit.is_none() && reg.records[i].space.is_some())
+        .ok_or(Errno::NoProcess)?;
+
+    if target_idx != caller_idx {
+        let c = &reg.records[caller_idx].creds;
+        let t = &reg.records[target_idx].creds;
+        let allowed = c.euid == 0
+            || (reg.records[target_idx].dumpable != 0
+                && c.ruid == t.ruid
+                && c.ruid == t.euid
+                && c.ruid == t.suid
+                && c.rgid == t.rgid
+                && c.rgid == t.egid
+                && c.rgid == t.sgid);
+        if !allowed {
+            return Err(Errno::Perm);
+        }
+    }
+
+    if local_total == 0 || remote_total == 0 {
+        return Ok(0);
+    }
+
+    let target_space = reg.records[target_idx]
+        .space
+        .as_ref()
+        .ok_or(Errno::NoProcess)?
+        .as_space();
+
+    let mut scratch = [0u8; 4096];
+    let mut li = 0usize;
+    let mut loff = 0usize;
+    let mut ri = 0usize;
+    let mut roff = 0usize;
+    let mut done = 0usize;
+
+    while li < local_iovs.len() && ri < remote_iovs.len() {
+        let (lbase, llen) = local_iovs[li];
+        if loff >= llen {
+            li += 1;
+            loff = 0;
+            continue;
+        }
+        let (rbase, rlen) = remote_iovs[ri];
+        if roff >= rlen {
+            ri += 1;
+            roff = 0;
+            continue;
+        }
+        let Some(laddr) = lbase.checked_add(loff) else {
+            return if done > 0 {
+                Ok(done)
+            } else {
+                Err(Errno::Fault)
+            };
+        };
+        let Some(raddr) = rbase.checked_add(roff) else {
+            return if done > 0 {
+                Ok(done)
+            } else {
+                Err(Errno::Fault)
+            };
+        };
+        if laddr == 0 || raddr == 0 {
+            return if done > 0 {
+                Ok(done)
+            } else {
+                Err(Errno::Fault)
+            };
+        }
+        let lpage = 4096 - (laddr % 4096);
+        let rpage = 4096 - (raddr % 4096);
+        let chunk = (llen - loff)
+            .min(rlen - roff)
+            .min(lpage)
+            .min(rpage)
+            .min(scratch.len());
+        let step_ok = if is_write {
+            user_access::copy_from_user(caller_space, laddr, &mut scratch[..chunk]).is_ok()
+                && user_access::copy_to_user(target_space, raddr, &scratch[..chunk]).is_ok()
+        } else {
+            user_access::copy_from_user(target_space, raddr, &mut scratch[..chunk]).is_ok()
+                && user_access::copy_to_user(caller_space, laddr, &scratch[..chunk]).is_ok()
+        };
+        if !step_ok {
+            return if done > 0 {
+                Ok(done)
+            } else {
+                Err(Errno::Fault)
+            };
+        }
+        loff += chunk;
+        roff += chunk;
+        done += chunk;
+    }
+    Ok(done)
+}
+
+/// sched_getattr(2)：读取目标任务的扩展调度属性（支持 VER0 48 字节与 VER1 56 字节布局）。
+fn sched_getattr(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    const SCHED_ATTR_SIZE_VER0: u32 = 48;
+    const SCHED_ATTR_SIZE_VER1: usize = 56;
+    let pid = args[0] as u32 as i32;
+    let attr_ptr = args[1];
+    let size = args[2] as u32;
+    let flags = args[3] as u32;
+    if attr_ptr == 0 || pid < 0 || size < SCHED_ATTR_SIZE_VER0 || size > 4096 || flags != 0 {
+        return Err(Errno::Invalid);
+    }
+    let target = if pid == 0 { parent } else { pid as usize };
+    let (policy, priority, nice, sched_flags, dl) =
+        super::sched::attrs_ext_of(target).ok_or(Errno::NoProcess)?;
+    let copy_len = (size as usize).min(SCHED_ATTR_SIZE_VER1);
+    let mut out = [0u8; SCHED_ATTR_SIZE_VER1];
+    out[0..4].copy_from_slice(&(copy_len as u32).to_ne_bytes());
+    out[4..8].copy_from_slice(&(policy as u32).to_ne_bytes());
+    out[8..16].copy_from_slice(&sched_flags.to_ne_bytes());
+    out[16..20].copy_from_slice(&nice.to_ne_bytes());
+    out[20..24].copy_from_slice(&(priority as u32).to_ne_bytes());
+    out[24..32].copy_from_slice(&dl[0].to_ne_bytes());
+    out[32..40].copy_from_slice(&dl[1].to_ne_bytes());
+    out[40..48].copy_from_slice(&dl[2].to_ne_bytes());
+    let reg = REGISTRY.lock();
+    let space = reg
+        .group(parent)
+        .and_then(|r| r.space.as_ref())
+        .ok_or(Errno::NoProcess)?
+        .as_space();
+    user_access::copy_to_user(space, attr_ptr, &out[..copy_len]).map_err(|_| Errno::Fault)?;
+    Ok(0)
+}
+
+/// sched_setattr(2)：设置目标任务的调度策略、优先级、谦让值与标志位（含 SCHED_DEADLINE 参数校验）。
+fn sched_setattr(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    const SCHED_ATTR_SIZE_VER0: usize = 48;
+    const SCHED_ATTR_SIZE_VER1: usize = 56;
+    const SCHED_FLAG_KEEP_POLICY: u64 = 0x08;
+    const SCHED_FLAG_KEEP_PARAMS: u64 = 0x10;
+    const SCHED_FLAG_ALL: u64 = 0x7f;
+
+    let pid = args[0] as u32 as i32;
+    let attr_ptr = args[1];
+    let flags = args[2] as u32;
+    if attr_ptr == 0 || pid < 0 || flags != 0 {
+        return Err(Errno::Invalid);
+    }
+
+    let mut raw = [0u8; SCHED_ATTR_SIZE_VER1];
+    {
+        let reg = REGISTRY.lock();
+        let space = reg
+            .group(parent)
+            .and_then(|r| r.space.as_ref())
+            .ok_or(Errno::NoProcess)?
+            .as_space();
+        let mut size_raw = [0u8; 4];
+        user_access::copy_from_user(space, attr_ptr, &mut size_raw).map_err(|_| Errno::Fault)?;
+        let declared = u32::from_ne_bytes(size_raw) as usize;
+        let eff_size = if declared == 0 {
+            SCHED_ATTR_SIZE_VER0
+        } else {
+            declared
+        };
+        if !(SCHED_ATTR_SIZE_VER0..=4096).contains(&eff_size) {
+            return Err(Errno::Invalid);
+        }
+        let read_len = eff_size.min(SCHED_ATTR_SIZE_VER1);
+        user_access::copy_from_user(space, attr_ptr, &mut raw[..read_len])
+            .map_err(|_| Errno::Fault)?;
+        if eff_size > SCHED_ATTR_SIZE_VER1 {
+            let mut tail = [0u8; 64];
+            let mut off = SCHED_ATTR_SIZE_VER1;
+            while off < eff_size {
+                let n = (eff_size - off).min(tail.len());
+                user_access::copy_from_user(space, attr_ptr + off, &mut tail[..n])
+                    .map_err(|_| Errno::Fault)?;
+                if tail[..n].iter().any(|&b| b != 0) {
+                    let _ = user_access::copy_to_user(
+                        space,
+                        attr_ptr,
+                        &(SCHED_ATTR_SIZE_VER1 as u32).to_ne_bytes(),
+                    );
+                    return Err(Errno::TooBig);
+                }
+                off += n;
+            }
+        }
+    }
+
+    let target = if pid == 0 { parent } else { pid as usize };
+    let (cur_policy, cur_prio, cur_nice, _, cur_dl) =
+        super::sched::attrs_ext_of(target).ok_or(Errno::NoProcess)?;
+
+    let mut policy = u32::from_ne_bytes(raw[4..8].try_into().unwrap_or([0; 4])) as i32;
+    let sched_flags = u64::from_ne_bytes(raw[8..16].try_into().unwrap_or([0; 8]));
+    let mut nice = i32::from_ne_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
+    let mut priority = u32::from_ne_bytes(raw[20..24].try_into().unwrap_or([0; 4])) as i32;
+    let mut runtime = u64::from_ne_bytes(raw[24..32].try_into().unwrap_or([0; 8]));
+    let mut deadline = u64::from_ne_bytes(raw[32..40].try_into().unwrap_or([0; 8]));
+    let mut period = u64::from_ne_bytes(raw[40..48].try_into().unwrap_or([0; 8]));
+
+    if sched_flags & !SCHED_FLAG_ALL != 0 {
+        return Err(Errno::Invalid);
+    }
+    if sched_flags & SCHED_FLAG_KEEP_POLICY != 0 {
+        policy = cur_policy as i32;
+    }
+    if sched_flags & SCHED_FLAG_KEEP_PARAMS != 0 {
+        nice = cur_nice;
+        priority = cur_prio;
+        runtime = cur_dl[0];
+        deadline = cur_dl[1];
+        period = cur_dl[2];
+    }
+
+    match policy {
+        0 | 3 => {
+            if priority != 0 || !(-20..=19).contains(&nice) {
+                return Err(Errno::Invalid);
+            }
+            runtime = 0;
+            deadline = 0;
+            period = 0;
+        }
+        5 => {
+            if priority != 0 {
+                return Err(Errno::Invalid);
+            }
+            nice = cur_nice;
+            runtime = 0;
+            deadline = 0;
+            period = 0;
+        }
+        1 | 2 => {
+            if !(1..=99).contains(&priority) {
+                return Err(Errno::Invalid);
+            }
+            nice = cur_nice;
+            runtime = 0;
+            deadline = 0;
+            period = 0;
+        }
+        6 => {
+            if priority != 0 {
+                return Err(Errno::Invalid);
+            }
+            if period == 0 {
+                period = deadline;
+            }
+            if runtime == 0 || deadline == 0 || runtime > deadline || deadline > period {
+                return Err(Errno::Invalid);
+            }
+            nice = cur_nice;
+        }
+        _ => return Err(Errno::Invalid),
+    }
+
+    let stored_flags = sched_flags & !(SCHED_FLAG_KEEP_POLICY | SCHED_FLAG_KEEP_PARAMS);
+    if super::sched::set_sched_attr(
+        target,
+        policy as u8,
+        priority,
+        nice,
+        stored_flags,
+        [runtime, deadline, period],
+    ) {
+        Ok(0)
+    } else {
+        Err(Errno::NoProcess)
+    }
+}
+
+/// rt_tgsigqueueinfo(2)：向指定线程组内的指定线程投递携带 siginfo 的信号。
+fn tgsigqueueinfo(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let tgid = args[0] as u32 as i32;
+    let tid = args[1] as u32 as i32;
+    let sig = args[2] as u32;
+    let uinfo_ptr = args[3];
+    if tgid <= 0 || tid <= 0 {
+        return Err(Errno::Invalid);
+    }
+    let mut raw = [0u8; 128];
+    let (sender_tgid, copied) = {
+        let reg = REGISTRY.lock();
+        let stgid = reg.group(parent).map_or(parent, |r| r.pid);
+        let ok = reg
+            .group(parent)
+            .and_then(|r| r.space.as_ref())
+            .is_some_and(|s| {
+                user_access::copy_from_user(s.as_space(), uinfo_ptr, &mut raw).is_ok()
+            });
+        (stgid, ok)
+    };
+    if !copied {
+        return Err(Errno::Fault);
+    }
+    if sig > 64 {
+        return Err(Errno::Invalid);
+    }
+    let code = i32::from_ne_bytes(raw[8..12].try_into().unwrap_or([0; 4]));
+    if (code >= 0 || code == SI_TKILL) && tgid != sender_tgid as i32 {
+        return Err(Errno::Perm);
+    }
+    let mut locked = REGISTRY.lock();
+    let reg = &mut *locked;
+    let Some(t_idx) = reg
+        .threads
+        .iter()
+        .position(|t| t.tid == tid as usize && t.tgid == tgid as usize)
+    else {
+        return Err(Errno::NoProcess);
+    };
+    let Some(g_idx) = reg
+        .records
+        .iter()
+        .position(|r| r.pid == tgid as usize && r.exit.is_none())
+    else {
+        return Err(Errno::NoProcess);
+    };
+    if sig == 0 {
+        return Ok(0);
+    }
+    let slot = SigInfoSlot {
+        code,
+        errno: i32::from_ne_bytes(raw[4..8].try_into().unwrap_or([0; 4])),
+        pid: u32::from_ne_bytes(raw[16..20].try_into().unwrap_or([0; 4])),
+        addr: usize::from_ne_bytes(raw[24..32].try_into().unwrap_or([0; 8])),
+        ..Default::default()
+    };
+    let group = &reg.records[g_idx];
+    let thread = &mut reg.threads[t_idx];
+    super::signal::generate_thread(&group.signal, &mut thread.signal, sig as u8, slot);
+    Ok(0)
+}
+
+/// ioprio_set(2)：按 PROCESS / PGRP / USER 设置进程 I/O 优先级。
+fn ioprio_set(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    const IOPRIO_WHO_PROCESS: i32 = 1;
+    const IOPRIO_WHO_PGRP: i32 = 2;
+    const IOPRIO_WHO_USER: i32 = 3;
+    let which = args[0] as u32 as i32;
+    let who = args[1] as u32 as i32;
+    let raw_prio = args[2] as u32 as i32;
+    if !(0..=0xffff).contains(&raw_prio) {
+        return Err(Errno::Invalid);
+    }
+    let prio = raw_prio as u16;
+    let class = prio >> 13;
+    let data = prio & 0x1fff;
+    let mut reg = REGISTRY.lock();
+    let caller_idx = reg.group_index(parent).ok_or(Errno::NoProcess)?;
+    let caller_tgid = reg.records[caller_idx].pid;
+    let caller_pgid = reg.records[caller_idx].pgid;
+    let caller_ruid = reg.records[caller_idx].creds.ruid;
+    let has_admin = reg.records[caller_idx].creds.has_cap(super::CAP_SYS_ADMIN)
+        || reg.records[caller_idx].creds.euid == 0;
+    match class {
+        0 => {
+            if data != 0 {
+                return Err(Errno::Invalid);
+            }
+        }
+        1 => {
+            if data >= 8 {
+                return Err(Errno::Invalid);
+            }
+            if !has_admin {
+                return Err(Errno::Perm);
+            }
+        }
+        2 | 3 => {
+            if data >= 8 {
+                return Err(Errno::Invalid);
+            }
+        }
+        _ => return Err(Errno::Invalid),
+    }
+
+    let mut hits = 0usize;
+    match which {
+        IOPRIO_WHO_PROCESS => {
+            if who < 0 {
+                return Err(Errno::NoProcess);
+            }
+            let target = if who == 0 { caller_tgid } else { who as usize };
+            let Some(t_idx) = reg
+                .group_index(target)
+                .filter(|&i| reg.records[i].exit.is_none())
+            else {
+                return Err(Errno::NoProcess);
+            };
+            if t_idx != caller_idx && !has_admin && reg.records[t_idx].creds.ruid != caller_ruid {
+                return Err(Errno::Perm);
+            }
+            reg.records[t_idx].ioprio = prio;
+            hits = 1;
+        }
+        IOPRIO_WHO_PGRP => {
+            if who < 0 {
+                return Err(Errno::NoProcess);
+            }
+            let target_pgid = if who == 0 { caller_pgid } else { who as usize };
+            for rec in reg.records.iter_mut().filter(|r| r.exit.is_none()) {
+                if rec.pgid == target_pgid {
+                    if rec.pid != caller_tgid && !has_admin && rec.creds.ruid != caller_ruid {
+                        return Err(Errno::Perm);
+                    }
+                    rec.ioprio = prio;
+                    hits += 1;
+                }
+            }
+        }
+        IOPRIO_WHO_USER => {
+            let target_uid = if who == 0 { caller_ruid } else { who as u32 };
+            for rec in reg.records.iter_mut().filter(|r| r.exit.is_none()) {
+                if rec.creds.ruid == target_uid {
+                    if rec.pid != caller_tgid && !has_admin && rec.creds.ruid != caller_ruid {
+                        return Err(Errno::Perm);
+                    }
+                    rec.ioprio = prio;
+                    hits += 1;
+                }
+            }
+        }
+        _ => return Err(Errno::Invalid),
+    }
+    if hits == 0 {
+        Err(Errno::NoProcess)
+    } else {
+        Ok(0)
+    }
+}
+
+/// ioprio_get(2)：按 PROCESS / PGRP / USER 查询匹配进程的最高 I/O 优先级。
+fn ioprio_get(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    const IOPRIO_WHO_PROCESS: i32 = 1;
+    const IOPRIO_WHO_PGRP: i32 = 2;
+    const IOPRIO_WHO_USER: i32 = 3;
+    let which = args[0] as u32 as i32;
+    let who = args[1] as u32 as i32;
+    let reg = REGISTRY.lock();
+    let caller_idx = reg.group_index(parent).ok_or(Errno::NoProcess)?;
+    let caller_tgid = reg.records[caller_idx].pid;
+    let caller_pgid = reg.records[caller_idx].pgid;
+    let caller_ruid = reg.records[caller_idx].creds.ruid;
+
+    let best_of = |cur: Option<u16>, next: u16| -> Option<u16> {
+        match cur {
+            None => Some(next),
+            Some(0) => Some(next),
+            Some(c) if next == 0 => Some(c),
+            Some(c) => Some(c.min(next)),
+        }
+    };
+
+    let mut best: Option<u16> = None;
+    match which {
+        IOPRIO_WHO_PROCESS => {
+            if who < 0 {
+                return Err(Errno::NoProcess);
+            }
+            let target = if who == 0 { caller_tgid } else { who as usize };
+            let idx = reg
+                .group_index(target)
+                .filter(|&i| reg.records[i].exit.is_none())
+                .ok_or(Errno::NoProcess)?;
+            best = Some(reg.records[idx].ioprio);
+        }
+        IOPRIO_WHO_PGRP => {
+            if who < 0 {
+                return Err(Errno::NoProcess);
+            }
+            let target_pgid = if who == 0 { caller_pgid } else { who as usize };
+            for rec in reg.records.iter().filter(|r| r.exit.is_none()) {
+                if rec.pgid == target_pgid {
+                    best = best_of(best, rec.ioprio);
+                }
+            }
+        }
+        IOPRIO_WHO_USER => {
+            let target_uid = if who == 0 { caller_ruid } else { who as u32 };
+            for rec in reg.records.iter().filter(|r| r.exit.is_none()) {
+                if rec.creds.ruid == target_uid {
+                    best = best_of(best, rec.ioprio);
+                }
+            }
+        }
+        _ => return Err(Errno::Invalid),
+    }
+    best.map(|p| p as usize).ok_or(Errno::NoProcess)
+}
+
+/// personality(2)：查询（0xffffffff）或设置当前进程执行域并返回旧值。
+fn personality_call(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
+    let persona = args[0] as u32;
+    let mut reg = REGISTRY.lock();
+    let rec = reg.group_mut(parent).ok_or(Errno::NoProcess)?;
+    let old = rec.personality;
+    if persona != u32::MAX {
+        rec.personality = persona;
+    }
+    Ok(old as usize)
 }

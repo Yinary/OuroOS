@@ -268,6 +268,10 @@ pub struct ProcessRecord {
     pub cap_bset: u64,
     /// PR_SET_SECUREBITS / PR_GET_SECUREBITS（fork 继承，exec 保留）。
     pub securebits: u32,
+    /// ioprio_set(2) / ioprio_get(2) I/O 调度优先级（默认 0 即 IOPRIO_CLASS_NONE；fork 继承）。
+    pub ioprio: u16,
+    /// personality(2) 执行域标志（默认 0 即 PER_LINUX；fork 继承，exec 保留）。
+    pub personality: u32,
     /// pidfd_open(2) 按需创建的进程实例句柄，退出时置位并唤醒 poll/epoll。
     pub pidfd_state: Option<Arc<PidFdState>>,
 }
@@ -687,6 +691,8 @@ mod registry {
             thp_disable: false,
             cap_bset: CAP_FULL_SET,
             securebits: 0,
+            ioprio: 0,
+            personality: 0,
             pidfd_state: None,
             user_ns: 0,
             system_ns: 0,

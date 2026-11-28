@@ -176,6 +176,14 @@ pub mod sysnr {
     pub const FCHOWN: usize = 55;
     pub const CAPGET: usize = 90;
     pub const CAPSET: usize = 91;
+    pub const PERSONALITY: usize = 92;
+    pub const IOPRIO_SET: usize = 30;
+    pub const IOPRIO_GET: usize = 31;
+    pub const RT_TGSIGQUEUEINFO: usize = 240;
+    pub const PROCESS_VM_READV: usize = 270;
+    pub const PROCESS_VM_WRITEV: usize = 271;
+    pub const SCHED_SETATTR: usize = 274;
+    pub const SCHED_GETATTR: usize = 275;
     pub const MKNODAT: usize = 33;
     pub const FCHMOD: usize = 52;
     pub const SYSLOG: usize = 116;
@@ -791,8 +799,16 @@ pub fn dispatch(
         | sysnr::SCHED_SETSCHEDULER
         | sysnr::SCHED_GETSCHEDULER
         | sysnr::SCHED_GETPARAM
+        | sysnr::SCHED_SETATTR
+        | sysnr::SCHED_GETATTR
         | sysnr::SETPRIORITY
         | sysnr::GETPRIORITY
+        | sysnr::IOPRIO_SET
+        | sysnr::IOPRIO_GET
+        | sysnr::PERSONALITY
+        | sysnr::RT_TGSIGQUEUEINFO
+        | sysnr::PROCESS_VM_READV
+        | sysnr::PROCESS_VM_WRITEV
         | sysnr::SCHED_SETAFFINITY
         | sysnr::SCHED_GETAFFINITY
         | sysnr::SCHED_GET_PRIORITY_MAX
