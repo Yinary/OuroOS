@@ -16,6 +16,7 @@ pub mod locks;
 pub mod mapping;
 mod metadata;
 pub mod procfs;
+pub mod xattr;
 
 /// 仍被文件系统页缓存与块缓存持有的物理页帧总数（任务退出帧守恒自检用）。
 pub(crate) fn retained_frames() -> usize {
@@ -436,7 +437,7 @@ pub(crate) fn read_link(ino: u32) -> Result<alloc::string::String, Errno> {
 
 /// 在指定父目录下创建新对象。
 pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
-    if parent == procfs::DEVDIR {
+    let ino = if parent == procfs::DEVDIR {
         let dev_ino = match ext4::lookup("/dev") {
             Ok(ino) => ino,
             Err(Errno::NoEntry) => {
@@ -445,18 +446,19 @@ pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
             }
             Err(e) => return Err(e),
         };
-        return ext4::create(dev_ino, name, mode);
-    }
-    if parent & FAT_INODE != 0 {
-        fat::create(parent, name, mode)
+        ext4::create(dev_ino, name, mode)?
+    } else if parent & FAT_INODE != 0 {
+        fat::create(parent, name, mode)?
     } else {
-        ext4::create(parent, name, mode)
-    }
+        ext4::create(parent, name, mode)?
+    };
+    xattr::purge_inode(ino);
+    Ok(ino)
 }
 
 /// 在指定父目录下创建普通或特殊节点（含设备号 rdev）；FAT 仅支持普通文件。
 pub fn create_node(parent: u32, name: &str, mode: u16, rdev: u64) -> Result<u32, Errno> {
-    if parent == procfs::DEVDIR {
+    let ino = if parent == procfs::DEVDIR {
         let dev_ino = match ext4::lookup("/dev") {
             Ok(ino) => ino,
             Err(Errno::NoEntry) => {
@@ -465,17 +467,18 @@ pub fn create_node(parent: u32, name: &str, mode: u16, rdev: u64) -> Result<u32,
             }
             Err(e) => return Err(e),
         };
-        return ext4::create_node(dev_ino, name, mode, rdev);
-    }
-    if parent & FAT_INODE != 0 {
+        ext4::create_node(dev_ino, name, mode, rdev)?
+    } else if parent & FAT_INODE != 0 {
         if mode & 0xf000 == 0x8000 {
-            fat::create(parent, name, mode)
+            fat::create(parent, name, mode)?
         } else {
-            Err(Errno::NotSupported)
+            return Err(Errno::NotSupported);
         }
     } else {
-        ext4::create_node(parent, name, mode, rdev)
-    }
+        ext4::create_node(parent, name, mode, rdev)?
+    };
+    xattr::purge_inode(ino);
+    Ok(ino)
 }
 
 /// 在指定父目录下创建符号链接；FAT 与虚拟目录不支持。
@@ -486,7 +489,9 @@ pub(crate) fn symlink(parent: u32, name: &str, target: &str) -> Result<u32, Errn
     if parent & FAT_INODE != 0 {
         return Err(Errno::NotSupported);
     }
-    ext4::symlink(parent, name, target)
+    let ino = ext4::symlink(parent, name, target)?;
+    xattr::purge_inode(ino);
+    Ok(ino)
 }
 
 /// 在指定父目录下为已有 inode 建立硬链接；跨挂载返回 EXDEV，FAT 与虚拟节点不支持。
@@ -815,6 +820,7 @@ pub fn rmdir(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
         return Err(Errno::NotSupported);
     }
     ext4::rmdir(parent, ino, name)?;
+    xattr::purge_inode(ino);
     context::detach_directory(ino);
     Ok(())
 }

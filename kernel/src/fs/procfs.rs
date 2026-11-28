@@ -86,7 +86,7 @@ pub(super) const SYSVIPC_MSG: u32 = u32::MAX - 26;
 pub(super) const SYSVIPC_SEM: u32 = u32::MAX - 27;
 
 /// 判断 inode 是否属于虚拟节点区间（固定虚拟节点或 /proc/<pid> 派生节点）。
-pub(super) fn is_virtual_ino(ino: u32) -> bool {
+pub(crate) fn is_virtual_ino(ino: u32) -> bool {
     ino >= SYSVIPC_SEM || pid_ino_parts(ino).is_some()
 }
 
