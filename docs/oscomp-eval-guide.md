@@ -289,3 +289,27 @@ python3 tests/run_official.py la --groups ltp-musl --ltp-filter chown,statx --lt
     - `rv` `ltp-musl` **`159/324`**、`rv` `ltp-glibc` **`159/324`**、`la` `ltp-musl` **`159/324`**、`la` `ltp-glibc` **`159/324`**，四配置完全一致，**零 `TFAIL`、零 panic**；其中 `dup05`（1/1）、`fchdir01`–`03`（3/3）、`mknod01`（7/7）、`mknod02`（2/2）、`mknod09`（1/1）、`open06`（1/1）、`open11`（28/28）、`posix_fadvise02/04` 含 `_64`（24/24）、`read03`（1/1）、`write04`（1/1）、`unlink05`（2/2）、`splice01`–`05`（11/11）、`splice07`（73/73 有效断言，160 项因未实现 fd 类型 `TCONF`）、`tee01`（1/1）、`tee02`（3/3）全部 100% 通过。
   - `copy_file_range03`（两变体各自调用 1 秒 `usleep`，需 `--ltp-timeout 6`）：四配置（`rv`/`la` × `ltp-musl`/`ltp-glibc`）均 **`2/2`（100% 通过）**。
   - 双架构核心回归与文件系统一致性：`rv` 与 `la` 上 `basic-musl` **102/102**、`busybox-musl` **54/55**、`lua-musl` **9/9** 零回退；`tests/fs_stat.py`（双架构 128/256 字节 inode + `e2fsck`）与 `tests/fs_fcntl.py`（双架构 + `e2fsck`）全部通过。
+
+### 5.13 全套评测根因修复：Ext4 哈希树、内核堆泄漏与流式 ELF 加载
+
+- **问题根因（对应首轮全套线上评测 `glibc-la` LTP 仅 396、`lmbench-la` 为 0.0）**：
+  1. **Ext4 哈希树目录 `ENOENT` 双重全盘线性扫描（`third_party/rsext4/src/{hashtree/lookup,loopfile}.rs`）**：每次在哈希树目录中查询不存在的文件都会触发两轮整目录线性扫描与 `warn!` 刷屏；`glibc` 动态链接器搜索路径频繁产生 `ENOENT`，前 402 例即产生 8,872 条 `[WARN]`。
+  2. **多块连续分配误报与位图误标脏（`third_party/rsext4/src/{bmalloc/block,ext4/alloc}.rs`）**：连续块探测在 `bitmap_cache.modify` 内执行，碎片未命中时将未修改的位图块标脏并输出误导性 `warn!`。
+  3. **长跑内核堆泄漏与不可失败 1 MiB 堆分配（`third_party/rsext4/src/{file/io,cache/data_block}.rs`、`kernel/src/{mm/file,task/mod,fs/context}.rs`）**：每次 `execve` 加载 `ld-linux-loongarch-lp64d.so.1`（1.38 MiB）都会在 `rsext4::file::io::read_inode_data_into` 中触发不可失败的 1 MiB 堆分配；同时 `FilePage` 缺少 `Drop` 导致未 `munmap` 退出进程遗留 `RESIDENT` 与 `fs::cache::PAGES`，`EXIT_REPORTS` 无界翻倍及 `REGISTRY`/`PROC_TABLE` 在 fork 风暴后不回缩，在累计约 2,500–3,000 例 LTP 后耗尽 32 MiB 伙伴堆触发 OOM panic。
+  4. **8.45 MiB `/glibc/lmbench_all` 触发 16 MiB 连续伙伴块碎片失败（`kernel/src/{elf,task/exec,fs/context}.rs`）**：`execve` 先将整文件读入连续 `Vec<u8>`，在 `loongarch64` 上 `/glibc/lmbench_all` 为 8,453,456 字节需申请 16 MiB 连续伙伴块，LTP 之后必然返回 `ENOMEM`；改为 64 KiB 分块流式按页加载 ELF 后单次 `execve` 堆峰值降至 64 KiB 且跳过未映射的调试段。
+  5. **关机帧守恒与残留 System V 共享内存（`kernel/src/{mm/shm,task/mod}.rs`）**：LTP 超时被杀进程遗留未 `IPC_RMID` 的共享内存段，在 `task::run` 全部任务退出后统一回收再执行帧守恒断言。
+- **验证结果（QEMU 10.0.2 + QCOW2 覆盖层，`sdcard-rv.img`/`sdcard-la.img` `pre-20250615`）**：
+  - `la` 全量 `ltp-glibc`：由修复前 402 例/120 秒、8,872 条 `[WARN]`（线上 396）提升至全部 **2,840 例**完整跑完、**`[WARN] = 0`**、零 OOM panic，得分 **`3,197 / 4,342`**；
+  - `rv` 回归：`basic-musl` **102/102**、`busybox-musl` **54/55**、`lua-musl` **9/9**、`cyclictest-musl` **6.04/4**、`cyclictest-glibc` **6.10/4**；`ltp-musl` 15 分钟跑完 1,305 例 **`1,465 / 1,891`**、**`[WARN] = 0`**、零 panic；
+  - 文件系统一致性：`tests/fs_stat.py`（4/4）与 `tests/fs_fcntl.py`（2/2）双架构 + `e2fsck` 全部通过。
+
+### 5.14 LTP 批量超时根因修复与内核热路径提速
+
+- **优化与修复范围（均为通用 Linux 语义与性能修复，无测例特判）**：
+  1. **补齐 `fallocate(47)` 系统调用并修正 `mount` 参数校验顺序（`kernel/src/syscall/{mod,fs}.rs`、`kernel/src/fs/context.rs`）**：实现默认模式与 `FALLOC_FL_KEEP_SIZE` 的稀疏预留与空闲块 `ENOSPC` 检查；消除约 130–220 个需要临时块设备镜像的 LTP 测例因 `fallocate` 返回 `ENOSYS` 回退写 300 MiB 零数据导致每例卡死超时 2–6 秒并冲刷 16 MiB 块缓存的问题；`mount` 改为先校验文件系统类型再读 `source`，使 `tmpfs` 返回准确 `ENODEV` 而非 `EFAULT`。
+  2. **`UserAddressSpace::drop` 按唯一 inode 批量压缩 `RESIDENT`（`kernel/src/mm/{file,address_space}.rs`）**：将进程退出时逐页加锁扫描的 $O(N^2)$ 清理改为单次锁内按去重 inode 批量压缩，显著降低 `glibc` 进程退出开销。
+  3. **`rsext4` 块对齐整段读零拷贝直写（`third_party/rsext4/src/file/io.rs`、`kernel/src/elf.rs`）**：`read_inode_data_into` 对块对齐整段读取直接经 `read_run` 写入调用方缓冲 `dst`，免去每 64 KiB 的临时堆分配、清零与二次拷贝，并让流式 ELF 加载块按页对齐命中直读路径。
+- **双架构实测对比（QEMU 10.0.2 + QCOW2 覆盖层，`sdcard-rv.img`/`sdcard-la.img` `pre-20250615`）**：
+  - `rv` `ltp-musl` 吞吐对比：修复前 900 秒跑 1,305 例（**87 例/分**，超时 162 例，得分 `1,465/1,891`）；修复后仅 **180 秒** 即跑完 **1,099 例**（**366 例/分，提速 4.2×**），超时降至 51 例、零 panic，3 分钟得分已达 **`1,320 / 1,746`**；
+  - 10 项原 100% 超时挂载/设备测例 + `fallocate01`–`06`（双库共 32 项）：`la` 仅用约 5.5 秒全部跑完，超时 **0**、遗留 `/tmp` 为 **0**，且 `fallocate01`（4/4）、`fallocate02`（8/8）、`fallocate03`（8/8）双架构全部 **100% 通过**；
+  - 回归与一致性：`la` 上 `basic-glibc` **102/102**、`busybox-glibc` **54/55**、`lua-glibc` **9/9**、`libcbench-musl` **35.46/27**；`tests/fs_stat.py`（4/4）与 `tests/fs_fcntl.py`（2/2）双架构 + `e2fsck` 全部通过。

@@ -15,12 +15,12 @@ fn valid_name(name: &str) -> Ext4Result<()> {
     Ok(())
 }
 
-struct Undo {
+pub(super) struct Undo {
     blocks: Vec<(AbsoluteBN, Vec<u8>)>,
     inodes: Vec<(InodeNumber, Ext4Inode)>,
 }
 impl Undo {
-    fn new() -> Ext4Result<Self> {
+    pub(super) fn new() -> Ext4Result<Self> {
         let mut blocks = Vec::new();
         let mut inodes = Vec::new();
         blocks
@@ -31,7 +31,7 @@ impl Undo {
             .map_err(|_| Ext4Error::new(Errno::ENOMEM))?;
         Ok(Self { blocks, inodes })
     }
-    fn block<B: BlockDevice>(
+    pub(super) fn block<B: BlockDevice>(
         &mut self,
         fs: &mut Ext4FileSystem,
         dev: &mut Jbd2Dev<B>,
@@ -43,7 +43,7 @@ impl Undo {
         }
         Ok(())
     }
-    fn inode<B: BlockDevice>(
+    pub(super) fn inode<B: BlockDevice>(
         &mut self,
         fs: &mut Ext4FileSystem,
         dev: &mut Jbd2Dev<B>,
@@ -54,11 +54,12 @@ impl Undo {
         }
         Ok(())
     }
-    fn restore<B: BlockDevice>(
+    pub(super) fn restore<B: BlockDevice>(
         &self,
         fs: &mut Ext4FileSystem,
         dev: &mut Jbd2Dev<B>,
     ) -> Ext4Result<()> {
+        fs.directory_index = None;
         for (block, data) in &self.blocks {
             fs.datablock_cache
                 .modify_via_journal(dev, *block, |out| out.copy_from_slice(data))?;
@@ -96,6 +97,7 @@ fn replace_entry<B: BlockDevice>(
     ino: InodeNumber,
     kind: u8,
 ) -> Ext4Result<()> {
+    fs.directory_index = None;
     let inode = fs.get_inode_by_num(dev, parent)?;
     let data = fs.datablock_cache.get_or_load(dev, block)?;
     let offset = entry_offset(&data.data, name.as_bytes())?;
@@ -118,6 +120,7 @@ pub fn rename_entry<B: BlockDevice>(
     target: &str,
     no_replace: bool,
 ) -> Ext4Result<Option<InodeNumber>> {
+    fs.directory_index = None;
     if fs.readonly {
         return Err(Ext4Error::read_only());
     }
