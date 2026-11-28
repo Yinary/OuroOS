@@ -54,3 +54,7 @@ Cargo 清单移除了随上游测试程序提供的目标。内核默认启用�
   1. `file/create.rs` 新增 `create_special_inode`（`create_regular_inode` 复用该实现），按父 inode 在线性目录创建普通文件（`S_IFREG`）、命名管道（`S_IFIFO`）、字符设备（`S_IFCHR`）、块设备（`S_IFBLK`）与套接字节点（`S_IFSOCK`），非普通节点不置 `EXT4_EXTENTS_FL`，字符/块设备按 Ext4 `old_encode_dev`/`new_encode_dev` 约定将设备号写入 `i_block[0]`/`i_block[1]` 并写入对应 `EXT4_FT_*` 目录项类型；
   2. `file/delete.rs` 扩展 `unlink_regular_entry` 放行命名管道、字符/块设备与套接字节点，并在 `free_inode` 中为无数据块的特殊节点跳过 `extent_block_map` 遍历；
   3. `file/link.rs` 扩展 `link_inode` 按目标 inode 类型写入对应 `EXT4_FT_*` 目录项类型。
+- 哈希树目录查找、位图连续分配与大块缓冲补丁：
+  1. `hashtree/lookup.rs` 与 `loopfile.rs` 在有效单层哈希树目录（`EXT4_INDEX_FL`、`indirect_levels == 0` 且受支持哈希版本）下直接处理 `"."`/`".."` 与哈希冲突续链块（`hash & 1 != 0`），把权威未命中（`HashTreeError::EntryNotFound`）直接返回 `Ok(None)`，消除每次 `ENOENT` 的两次全目录线性扫描、冗余 CRC32C 校验与 `warn!` 刷屏；
+  2. `bmalloc/block.rs` 与 `ext4/alloc.rs` 新增字节级快跳只读探查 `find_contiguous_in_slice`，连续块分配先只读探查再修改位图，避免碎片探测把未修改位图块标脏并仅在单块分配失败时记 `warn!`；
+  3. `file/io.rs` 与 `cache/data_block.rs` 将连续块读写暂存缓冲上限收紧至 64 KiB（16 块）并改用可失败 `try_reserve_exact`（返回 `ENOMEM`），块对齐整段读取直接经 `read_run` 写入调用方缓冲免去临时分配、清零与二次拷贝，并修复 `write_dirty_runs` 块数上限单位误用问题。

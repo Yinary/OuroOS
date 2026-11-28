@@ -32,6 +32,12 @@ pub fn dispatch(
         sysnr::UMASK => Ok(ctx.set_umask(a[0])),
         sysnr::UTIMENSAT => utimensat(ctx, space, a),
         sysnr::TRUNCATE | sysnr::FTRUNCATE => truncate(nr, ctx, space, a),
+        sysnr::FALLOCATE => {
+            let file = ctx.get(a[0])?;
+            let file = file.lock();
+            file.fallocate(a[1] as u32 as i32, a[2] as i64, a[3] as i64)?;
+            Ok(0)
+        }
         sysnr::RENAMEAT | sysnr::RENAMEAT2 => renameat(nr, ctx, space, a),
         sysnr::GETCWD => {
             let cwd = ctx.cwd()?;
@@ -71,12 +77,15 @@ pub fn dispatch(
             }
         }
         sysnr::MOUNT => {
-            let source = user_string(space, a[0])?;
             let target = ctx.path((-100isize) as usize, &user_string(space, a[1])?)?;
             let kind = user_string(space, a[2])?;
+            if !matches!(kind.as_str(), "ext2" | "vfat" | "fat") {
+                return Err(Errno::NoDevice);
+            }
             if kind == "ext2" && credentials.euid != 0 {
                 return Err(Errno::Perm);
             }
+            let source = user_string(space, a[0])?;
             fs::mount(&source, &target, &kind, a[3])?;
             Ok(0)
         }

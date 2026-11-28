@@ -10,7 +10,7 @@ pub mod signal;
 mod task;
 pub mod user_task;
 
-use alloc::vec::Vec;
+use alloc::{collections::VecDeque, vec::Vec};
 
 use polyhal::{irq::IRQ, println};
 
@@ -311,10 +311,25 @@ impl Registry {
     }
 }
 
+/// `EXIT_REPORTS` 环形缓冲容量上限。
+const MAX_EXIT_REPORTS: usize = 512;
+
 /// 终态行积攒表：收割即删后注册表不留历史，输出推迟到时代结束，
 /// 避免混入用户程序的测试输出块（官方 oracle 按 START/END 判定）。
-static EXIT_REPORTS: DebugMutex<Vec<(Pid, &'static str, ExitInfo)>> =
-    DebugMutex::new("EXIT_REPORTS", Vec::new());
+static EXIT_REPORTS: DebugMutex<VecDeque<(Pid, &'static str, ExitInfo)>> =
+    DebugMutex::new("EXIT_REPORTS", VecDeque::new());
+
+/// 元素数远小于容量时缩容，分配失败则保留原缓冲。
+fn maybe_shrink_vec<T>(v: &mut Vec<T>, min_cap: usize) {
+    if v.capacity() > min_cap * 2 && v.len() * 4 <= v.capacity() {
+        let target = v.len().max(min_cap);
+        let mut compact = Vec::new();
+        if compact.try_reserve_exact(target).is_ok() {
+            compact.append(v);
+            *v = compact;
+        }
+    }
+}
 
 /// procfs 的独立进程快照表：Task 在注册/退出/收割的提交点同步维护，
 /// FS 读路径只取本表（不回调 REGISTRY——syscall 分发已持有该锁，
@@ -470,7 +485,9 @@ pub(crate) fn proc_table_set_state(pid: Pid, state: u8) {
 
 /// 收割时移除快照（wait 收割 / 孤儿即收 / 父退出清理，均在 REGISTRY 段）。
 pub(crate) fn proc_table_remove_all<F: Fn(u32) -> bool>(pred: F) {
-    PROC_TABLE.lock().retain(|e| !pred(e.pid));
+    let mut table = PROC_TABLE.lock();
+    table.retain(|e| !pred(e.pid));
+    maybe_shrink_vec(&mut table, 32);
 }
 
 /// procfs 快照条目：(pid, 登记名, 状态字符, 父 pid, exec 后 argv)
@@ -690,11 +707,14 @@ mod registry {
             let had_itimer = rec.itimer_real.take().is_some();
             // 快照置僵尸（procfs 可见的存活规则与注册表一致）
             proc_table_mark_zombie(pid);
-            // 积攒终态行；容量不足时丢弃（打印非关键路径）
+            // 积攒终态行；满容淘汰最旧条目，分配失败则丢弃。
             {
                 let mut reports = EXIT_REPORTS.lock();
-                if reports.try_reserve(1).is_ok() {
-                    reports.push((pid, rec.name, exit));
+                if reports.len() >= MAX_EXIT_REPORTS {
+                    reports.pop_front();
+                }
+                if reports.len() < MAX_EXIT_REPORTS && reports.try_reserve(1).is_ok() {
+                    reports.push_back((pid, rec.name, exit));
                 }
             }
             if let Some(local) = rec.space.as_ref() {
@@ -830,6 +850,8 @@ mod registry {
             for pid in &removed {
                 reg.remove_thread(*pid as Pid);
             }
+            maybe_shrink_vec(&mut reg.records, 32);
+            maybe_shrink_vec(&mut reg.threads, 32);
             proc_table_remove_all(|p| removed.contains(&p));
             let mut adopted_zombie: Option<(Pid, ExitInfo)> = None;
             for child in reg.records.iter_mut().filter(|r| r.parent == pid) {
@@ -894,6 +916,8 @@ mod registry {
             .position(|r| r.pid == target && r.parent == parent && r.exit.is_some())?;
         let rec = reg.records.remove(i);
         reg.remove_thread(target);
+        maybe_shrink_vec(&mut reg.records, 32);
+        maybe_shrink_vec(&mut reg.threads, 32);
         proc_table_remove_all(|p| p == target as u32);
         Some((
             rec.user_ns.saturating_add(rec.child_user_ns),
@@ -1042,6 +1066,8 @@ pub fn run(baseline: (usize, usize)) {
     if let Err(e) = crate::fs::cache::flush(None) {
         log::error!("shared page writeback pending at task exit: {:?}", e);
     }
+    // 回收关机时仍驻留的 System V 共享内存段。
+    mm::shm::clear_all();
     let (total, free) = mm::frame::stats();
     assert_eq!(
         (total, free + crate::fs::retained_frames()),

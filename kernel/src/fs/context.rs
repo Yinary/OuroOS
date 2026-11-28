@@ -1625,6 +1625,47 @@ impl OpenFile {
         }
     }
 
+    /// 对应 Linux `fallocate(2)`，支持默认模式与 `FALLOC_FL_KEEP_SIZE`；参数非法或类型不符返回对应 errno。
+    pub(crate) fn fallocate(&self, mode: i32, offset: i64, len: i64) -> Result<(), Errno> {
+        const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
+        if self.flags & 0x200000 != 0 || self.flags & 3 == 0 {
+            return Err(Errno::BadF);
+        }
+        if offset < 0 || len <= 0 {
+            return Err(Errno::Invalid);
+        }
+        let end = offset.checked_add(len).ok_or(Errno::FileTooBig)?;
+        if mode & !FALLOC_FL_KEEP_SIZE != 0 {
+            return Err(Errno::NotSupported);
+        }
+        match self.kind {
+            Kind::Pipe { .. } => Err(Errno::SeekPipe),
+            Kind::Inode { ino, .. } => {
+                let (file_mode, old_size, _, _) = fs::stat(ino)?;
+                if file_mode & 0xf000 != 0x8000 {
+                    return Err(Errno::NoDevice);
+                }
+                let stats = fs::filesystem_stats(ino)?;
+                let bs = u64::from(stats.block_size).max(4096);
+                let end_u64 = end as u64;
+                let extra_bytes = if end_u64 > old_size {
+                    end_u64 - old_size
+                } else {
+                    0
+                };
+                let needed_blocks = extra_bytes.div_ceil(bs);
+                if needed_blocks > stats.available_blocks {
+                    return Err(Errno::NoSpace);
+                }
+                if mode & FALLOC_FL_KEEP_SIZE == 0 && end_u64 > old_size {
+                    fs::truncate(ino, end_u64)?;
+                }
+                Ok(())
+            }
+            _ => Err(Errno::NoDevice),
+        }
+    }
+
     /// 查询共享的访问模式和文件状态标志。
     pub(crate) fn status_flags(&self) -> usize {
         self.flags
@@ -2108,6 +2149,7 @@ impl OpenFile {
             };
         }
         let n = data.len().min(avail);
+        p.data.try_reserve(n).map_err(|_| Errno::NoMem)?;
         p.data.extend(&data[..n]);
         if n > 0 {
             p.event_gen = p.event_gen.wrapping_add(1);
@@ -2244,6 +2286,7 @@ impl OpenFile {
                     return Err(nonblock_or_wait(self.flags));
                 }
                 let count = data.len().min(avail);
+                p.data.try_reserve(count).map_err(|_| Errno::NoMem)?;
                 p.data.extend(&data[..count]);
                 if count > 0 {
                     p.event_gen = p.event_gen.wrapping_add(1);
@@ -2397,8 +2440,44 @@ fn nonblock_or_wait(flags: usize) -> Errno {
         Errno::WouldBlock
     }
 }
-/// 按进程工作目录读取可执行文件，返回独立内核镜像。
-pub fn executable(ctx: &Context, path: &str) -> Result<Vec<u8>, Errno> {
+/// 持有 inode 引用的可执行文件句柄，供流式读取。
+pub struct ExecutableFile {
+    ino: u32,
+    len: usize,
+}
+
+impl ExecutableFile {
+    /// 文件字节总长度。
+    pub fn size(&self) -> usize {
+        self.len
+    }
+
+    /// 从指定偏移精确读取 `dst.len()` 字节；提前 EOF 或底层错误返回 EIO。
+    pub fn read_exact_at(&self, offset: usize, dst: &mut [u8]) -> Result<(), Errno> {
+        let end = offset.checked_add(dst.len()).ok_or(Errno::Io)?;
+        if end > self.len {
+            return Err(Errno::Io);
+        }
+        let mut done = 0;
+        while done < dst.len() {
+            let n = fs::read(self.ino, offset + done, &mut dst[done..])?;
+            if n == 0 {
+                return Err(Errno::Io);
+            }
+            done += n;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ExecutableFile {
+    fn drop(&mut self) {
+        fs::release(self.ino);
+    }
+}
+
+/// 校验并打开可执行文件，返回持有 inode 引用的句柄。
+pub fn open_executable(ctx: &Context, path: &str) -> Result<ExecutableFile, Errno> {
     // /proc/self/exe 指向当前进程的可执行文件（proc(5)）；execve 与
     // open 共用该重写。没有盘上可执行路径（内核内嵌程序）时按 ENOENT。
     let redirected;
@@ -2422,17 +2501,18 @@ pub fn executable(ctx: &Context, path: &str) -> Result<Vec<u8>, Errno> {
         return Err(Errno::Access);
     }
     let len = usize::try_from(len).map_err(|_| Errno::NoMem)?;
+    fs::retain(ino)?;
+    Ok(ExecutableFile { ino, len })
+}
+
+/// 读取可执行文件完整字节内容。
+pub fn executable(ctx: &Context, path: &str) -> Result<Vec<u8>, Errno> {
+    let file = open_executable(ctx, path)?;
+    let len = file.size();
     let mut data = Vec::new();
     data.try_reserve_exact(len).map_err(|_| Errno::NoMem)?;
     data.resize(len, 0);
-    let mut done = 0;
-    while done < len {
-        let n = fs::read(ino, done, &mut data[done..])?;
-        if n == 0 {
-            return Err(Errno::Io);
-        }
-        done += n;
-    }
+    file.read_exact_at(0, &mut data)?;
     Ok(data)
 }
 /// 获取 mmap 用的普通文件，权限来自打开方式。

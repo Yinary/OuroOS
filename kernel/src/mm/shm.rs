@@ -257,3 +257,8 @@ pub fn set(shmid: usize, raw: &[u8; 112]) -> Result<(), Errno> {
 pub const fn normalize_cmd(cmd: i32) -> i32 {
     cmd & !IPC_64
 }
+
+/// 清空全部 System V 共享内存段并释放物理页帧。
+pub fn clear_all() {
+    SHM_TABLE.lock().segments.clear();
+}

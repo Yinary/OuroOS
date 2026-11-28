@@ -68,3 +68,10 @@ LoongArch 关机使用 PolyHAL 0.4.0（MIT）中 QEMU virt GED 的寄存器地�
 - `third_party/rsext4`（Apache-2.0，rsext4 0.8.1）新增补丁（均标注 `// OuroOS patch:`，明细见 `third_party/rsext4/README.md`）：
   - `file/create.rs` 新增 `create_special_inode` 支持 `S_IFREG`/`S_IFIFO`/`S_IFCHR`/`S_IFBLK`/`S_IFSOCK` 及 Ext4 `i_block[0..2]` 设备号编码；
   - `file/delete.rs` 与 `file/link.rs` 同步扩展无数据块特殊节点的 `free_inode`、`unlink_regular_entry` 与 `link_inode` 类型处理（参考 Ext4 磁盘格式规范，未复制 GPL 源码）。
+
+## 本轮哈希树查找、位图连续分配与大块缓冲补丁（2026-11-27）
+
+- `third_party/rsext4`（Apache-2.0，rsext4 0.8.1）新增补丁（均标注 `// OuroOS patch:`，明细见 `third_party/rsext4/README.md`）：
+  - `hashtree/lookup.rs` 与 `loopfile.rs` 补齐有效单层哈希树目录的 `"."`/`".."` 查找与哈希冲突续链扫描，权威 `EntryNotFound` 直接返回未命中，消除每次 `ENOENT` 的双重全目录线性扫描与告警刷屏；
+  - `bmalloc/block.rs` 与 `ext4/alloc.rs` 改为字节级快跳只读探查连续空闲块，消除无效位图标脏与多块碎片误报；
+  - `file/io.rs` 与 `cache/data_block.rs` 收紧连续块读写暂存缓冲为 64 KiB 并改为可失败预留，块对齐整段读取直写调用方缓冲免除二次拷贝，消除不可失败 1 MiB 堆分配导致的内核 OOM panic。
