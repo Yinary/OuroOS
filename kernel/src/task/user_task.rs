@@ -165,7 +165,8 @@ pub fn user_task_entry() -> ! {
                 let blocked_now = thread.signal.blocked();
                 match super::signal::take_any(&mut rec.signal, &mut thread.signal, blocked_now) {
                     None => None,
-                    Some((sig, slot)) => {
+                    Some((sig, mut slot)) => {
+                        super::posix_timer::on_signal_dequeued(rec, &mut slot);
                         let d = rec.signal.disposition(sig);
                         if d.handler == SIG_DFL || d.handler == SIG_IGN {
                             delivery_verdict(sig, slot, d)
@@ -571,7 +572,10 @@ fn park_check_signals(
         let tw_hit = tw_set
             .and_then(|set| super::signal::take_any(&mut rec.signal, &mut thread.signal, !set));
         match tw_hit {
-            Some((sig, slot)) => ParkPeek::TwHit { sig, slot },
+            Some((sig, mut slot)) => {
+                super::posix_timer::on_signal_dequeued(rec, &mut slot);
+                ParkPeek::TwHit { sig, slot }
+            }
             None => match super::signal::peek_any(&rec.signal, &thread.signal, blocked) {
                 None => ParkPeek::Empty,
                 Some((sig, _)) => {
@@ -581,9 +585,10 @@ fn park_check_signals(
                         ParkPeek::Handler(d)
                     } else {
                         // IGN 为防御分支。
-                        let (sig, slot) =
+                        let (sig, mut slot) =
                             super::signal::take_any(&mut rec.signal, &mut thread.signal, blocked)
                                 .expect("peeked signal still deliverable");
+                        super::posix_timer::on_signal_dequeued(rec, &mut slot);
                         ParkPeek::Default { sig, slot, d }
                     }
                 }
@@ -802,7 +807,12 @@ fn process_call(
                     ) {
                         (Some(index), Some(thread)) => {
                             let rec = &mut reg.records[index];
-                            super::signal::take_any(&mut rec.signal, &mut thread.signal, !set)
+                            super::signal::take_any(&mut rec.signal, &mut thread.signal, !set).map(
+                                |(sig, mut slot)| {
+                                    super::posix_timer::on_signal_dequeued(rec, &mut slot);
+                                    (sig, slot)
+                                },
+                            )
                         }
                         _ => None,
                     }
@@ -844,6 +854,12 @@ fn process_call(
                                                     &mut thread.signal,
                                                     !set,
                                                 )
+                                                .map(|(sig, mut slot)| {
+                                                    super::posix_timer::on_signal_dequeued(
+                                                        rec, &mut slot,
+                                                    );
+                                                    (sig, slot)
+                                                })
                                             }
                                             _ => None,
                                         }
@@ -1337,6 +1353,11 @@ fn process_call(
                 }
             }
         }
+        sysnr::TIMER_CREATE => super::posix_timer::sys_timer_create(parent, args),
+        sysnr::TIMER_GETTIME => super::posix_timer::sys_timer_gettime(parent, args),
+        sysnr::TIMER_GETOVERRUN => super::posix_timer::sys_timer_getoverrun(parent, args),
+        sysnr::TIMER_SETTIME => super::posix_timer::sys_timer_settime(parent, args),
+        sysnr::TIMER_DELETE => super::posix_timer::sys_timer_delete(parent, args),
         sysnr::CLOCK_SETTIME => clock_settime(parent, args),
         sysnr::CLOCK_GETTIME => clock_gettime(parent, args),
         sysnr::CLOCK_GETRES => clock_getres(parent, args),
@@ -2440,6 +2461,7 @@ fn clock_settime(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
         return Err(Errno::Perm);
     }
     crate::time::set_realtime(core::time::Duration::new(sec as u64, nsec as u32));
+    super::posix_timer::on_realtime_changed();
     Ok(0)
 }
 
@@ -2482,6 +2504,7 @@ fn set_time_of_day(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
             return Err(Errno::Invalid);
         }
         crate::time::set_realtime(core::time::Duration::new(sec as u64, (usec as u32) * 1000));
+        super::posix_timer::on_realtime_changed();
     }
     Ok(0)
 }

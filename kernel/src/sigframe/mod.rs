@@ -53,6 +53,11 @@ pub(super) fn fill_siginfo(out: &mut [u8], sig: u8, slot: &SigInfoSlot) {
             out[16..20].copy_from_slice(&slot.pid.to_ne_bytes());
             out[24..32].copy_from_slice(&slot.addr.to_ne_bytes());
         }
+        crate::task::signal::SI_TIMER => {
+            out[16..20].copy_from_slice(&slot.timer_id.to_ne_bytes());
+            out[20..24].copy_from_slice(&slot.overrun.to_ne_bytes());
+            out[24..32].copy_from_slice(&slot.addr.to_ne_bytes());
+        }
         _ => {
             out[16..20].copy_from_slice(&slot.pid.to_ne_bytes());
         }
