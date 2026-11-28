@@ -212,6 +212,14 @@ pub fn dispatch(
                 let text = fs::procfs_maps(space)?;
                 return ctx.open_proc_text(ino, text, flags, flags & 0x80000 != 0);
             }
+            if let Some(field) = match path.as_str() {
+                "/proc/sys/fs/mqueue/queues_max" => Some(crate::ipc::mqueue::MqSysctl::QueuesMax),
+                "/proc/sys/fs/mqueue/msg_max" => Some(crate::ipc::mqueue::MqSysctl::MsgMax),
+                "/proc/sys/fs/mqueue/msgsize_max" => Some(crate::ipc::mqueue::MqSysctl::MsgSizeMax),
+                _ => None,
+            } {
+                return ctx.open_proc_mq_sysctl(field, flags, flags & 0x80000 != 0);
+            }
             if fs::is_procfs_text(&path) {
                 let ino = fs::lookup(&path)?;
                 let text = fs::procfs_text(&path)?;

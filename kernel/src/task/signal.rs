@@ -159,6 +159,8 @@ pub const CLD_KILLED: i32 = 2;
 pub const SI_QUEUE: i32 = -1;
 /// siginfo si_code：SI_TIMER，POSIX 定时器到期发送。
 pub const SI_TIMER: i32 = -2;
+/// siginfo si_code：SI_MESGQ，POSIX 消息队列异步通知发送。
+pub const SI_MESGQ: i32 = -3;
 /// siginfo si_code：SI_TKILL，tkill/tgkill 发送。
 pub const SI_TKILL: i32 = -6;
 

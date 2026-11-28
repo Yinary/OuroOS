@@ -917,8 +917,9 @@ mod registry {
             debug_assert!(!orphan || reg.records.iter().all(|r| r.pid != pid));
             taken
         };
-        // 锁外释放该进程持有的全部 POSIX 记录锁，再 Drop 地址空间与 FD 表。
+        // 锁外释放该进程持有的全部 POSIX 记录锁与 POSIX 消息队列通知，再 Drop 地址空间与 FD 表。
         crate::fs::locks::release_process_locks(pid as u32);
+        crate::ipc::mqueue::on_process_exit(pid);
         drop(taken);
     }
 

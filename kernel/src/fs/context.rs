@@ -89,6 +89,11 @@ pub(super) fn detach_directory(ino: u32) {
 
 /// 下一个新建管道的唯一实例号；单调递增，0 保留表示槽位空闲。
 static NEXT_PIPE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// 分配全局唯一 poll/epoll 唤醒键（供管道、eventfd、timerfd、POSIX 消息队列复用）。
+pub(crate) fn alloc_wake_id() -> u64 {
+    NEXT_PIPE_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
 /// 下一个打开文件描述（OFD）的唯一标识号，供 flock 与 OFD 记录锁区分归属。
 static NEXT_OFD_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
@@ -170,6 +175,10 @@ enum Kind {
     },
     /// epoll_create1(2) 事件多路复用实例
     Epoll(Arc<Mutex<super::event::EpollInstance>>),
+    /// POSIX 消息队列描述符（mq_open）
+    MQueue(Arc<Mutex<crate::ipc::mqueue::PosixMQueue>>),
+    /// /proc/sys/fs/mqueue/* 可读写运行期参数文件
+    ProcMqSysctl(crate::ipc::mqueue::MqSysctl),
 }
 /// 共享偏移、打开标志和文件资源的持有者。
 pub(crate) struct OpenFile {
@@ -333,6 +342,11 @@ impl Context {
         let previous = self.umask;
         self.umask = mask as u16 & 0o777;
         previous as usize
+    }
+
+    /// 查询当前进程权限掩码。
+    pub(crate) fn umask(&self) -> u16 {
+        self.umask
     }
 
     /// 对新建文件和目录的请求权限应用当前进程掩码（保留特殊权限位 0o7000）。
@@ -932,9 +946,19 @@ impl Context {
             cloexec,
         });
         if let Some(old) = replaced {
-            let key = old.handle.lock().lock_key();
+            let (key, maybe_mq) = {
+                let guard = old.handle.lock();
+                let mq = match &guard.kind {
+                    Kind::MQueue(q) => Some(q.clone()),
+                    _ => None,
+                };
+                (guard.lock_key(), mq)
+            };
             if tgid != 0 {
                 fs::locks::release_posix_for_key(tgid, key);
+                if let Some(mq) = maybe_mq {
+                    self.clear_mqueue_notify_if_last(&mq, tgid as usize);
+                }
             }
         }
         Ok(to)
@@ -949,11 +973,35 @@ impl Context {
             .take()
             .ok_or(Errno::BadF)?;
         if tgid != 0 {
-            let key = desc.handle.lock().lock_key();
+            let (key, maybe_mq) = {
+                let guard = desc.handle.lock();
+                let mq = match &guard.kind {
+                    Kind::MQueue(q) => Some(q.clone()),
+                    _ => None,
+                };
+                (guard.lock_key(), mq)
+            };
             fs::locks::release_posix_for_key(tgid, key);
+            if let Some(mq) = maybe_mq {
+                self.clear_mqueue_notify_if_last(&mq, tgid as usize);
+            }
         }
         drop(desc);
         Ok(())
+    }
+
+    /// 当进程关闭指向同一 POSIX 消息队列的最后一个描述符时，撤销该进程登记的 mq_notify。
+    fn clear_mqueue_notify_if_last(
+        &self,
+        queue: &Arc<Mutex<crate::ipc::mqueue::PosixMQueue>>,
+        tgid: usize,
+    ) {
+        let still_open = self.fds.iter().flatten().any(
+            |d| matches!(&d.handle.lock().kind, Kind::MQueue(other) if Arc::ptr_eq(other, queue)),
+        );
+        if !still_open {
+            queue.lock().clear_notify_for(tgid);
+        }
     }
 
     /// 安装 inode 的打开文件对象，失败自动释放已持有的引用。
@@ -1013,6 +1061,25 @@ impl Context {
         let file = OpenFile {
             ofd_id: next_ofd_id(),
             kind: Kind::ProcText { ino, text },
+            offset: 0,
+            flags: flags & !OPEN_CREATION_FLAGS,
+        };
+        self.install(fs::try_arc(Mutex::new(file))?, cloexec)
+    }
+
+    /// 打开 /proc/sys/fs/mqueue/* 可读写参数文件。
+    pub(crate) fn open_proc_mq_sysctl(
+        &mut self,
+        field: crate::ipc::mqueue::MqSysctl,
+        flags: usize,
+        cloexec: bool,
+    ) -> Result<usize, Errno> {
+        if flags & 0x10000 != 0 {
+            return Err(Errno::NotDir);
+        }
+        let file = OpenFile {
+            ofd_id: next_ofd_id(),
+            kind: Kind::ProcMqSysctl(field),
             offset: 0,
             flags: flags & !OPEN_CREATION_FLAGS,
         };
@@ -1536,6 +1603,37 @@ impl Context {
         self.install(file, flags & EPOLL_CLOEXEC != 0)
     }
 
+    /// 安装 POSIX 消息队列描述符（按 Linux mq_open(2) 强制设置 FD_CLOEXEC）。
+    pub(crate) fn open_mqueue(
+        &mut self,
+        queue: Arc<Mutex<crate::ipc::mqueue::PosixMQueue>>,
+        flags: usize,
+    ) -> Result<usize, Errno> {
+        let file = fs::try_arc(Mutex::new(OpenFile {
+            ofd_id: next_ofd_id(),
+            kind: Kind::MQueue(queue),
+            offset: 0,
+            flags,
+        }))?;
+        self.install(file, true)
+    }
+
+    /// 取得 POSIX 消息队列句柄与底层队列对象；非队列描述符返回 EBADF。
+    pub(crate) fn mqueue_handle(
+        &self,
+        fd: usize,
+    ) -> Result<(Handle, Arc<Mutex<crate::ipc::mqueue::PosixMQueue>>), Errno> {
+        let handle = self.get(fd)?;
+        let queue = {
+            let f = handle.lock();
+            match &f.kind {
+                Kind::MQueue(q) => q.clone(),
+                _ => return Err(Errno::BadF),
+            }
+        };
+        Ok((handle, queue))
+    }
+
     /// epoll_ctl(2)：向 epoll 实例增、改、删目标描述符。
     pub(crate) fn epoll_ctl(
         &self,
@@ -1860,6 +1958,26 @@ impl OpenFile {
                 block_size: 4096,
                 ..Default::default()
             }),
+            Kind::MQueue(q) => {
+                let (mode, size) = q.lock().stat_info();
+                Ok(fs::Metadata {
+                    mode,
+                    links: 1,
+                    size,
+                    block_size: 4096,
+                    ..Default::default()
+                })
+            }
+            Kind::ProcMqSysctl(field) => {
+                let len = alloc::format!("{}\n", crate::ipc::mqueue::read_sysctl(*field)).len();
+                Ok(fs::Metadata {
+                    mode: 0o100644,
+                    links: 1,
+                    size: len as u64,
+                    block_size: 4096,
+                    ..Default::default()
+                })
+            }
             _ => Ok(fs::Metadata {
                 mode: (if matches!(&self.kind, Kind::Pipe { .. }) {
                     0x1000
@@ -1940,6 +2058,12 @@ impl OpenFile {
                 2 => text.len(),
                 _ => return Err(Errno::Invalid),
             },
+            Kind::ProcMqSysctl(field) => match whence {
+                0 => 0,
+                1 => self.offset,
+                2 => alloc::format!("{}\n", crate::ipc::mqueue::read_sysctl(*field)).len(),
+                _ => return Err(Errno::Invalid),
+            },
             Kind::DevNull | Kind::Rtc => match whence {
                 0 => 0,
                 1 => self.offset,
@@ -1985,6 +2109,7 @@ impl OpenFile {
                 | Kind::EventFd { .. }
                 | Kind::TimerFd { .. }
                 | Kind::Epoll(_)
+                | Kind::MQueue(_)
                 | Kind::Input
                 | Kind::Output
         )
@@ -1995,6 +2120,7 @@ impl OpenFile {
             Kind::Pipe { pipe, .. } => pipe.lock().event_gen,
             Kind::EventFd { efd, .. } => efd.lock().event_gen(),
             Kind::TimerFd { tfd, .. } => tfd.lock().event_gen(),
+            Kind::MQueue(q) => q.lock().event_gen(),
             _ => 0,
         }
     }
@@ -2244,6 +2370,17 @@ impl OpenFile {
                 self.offset = self.offset.checked_add(delivered).ok_or(Errno::Invalid)?;
                 Ok(delivered)
             }
+            Kind::ProcMqSysctl(field) => {
+                let text = alloc::format!("{}\n", crate::ipc::mqueue::read_sysctl(*field));
+                let bytes = text.as_bytes().get(self.offset..).unwrap_or(&[]);
+                let count = data.len().min(bytes.len());
+                let delivered = deliver(&bytes[..count])?;
+                if delivered > count {
+                    return Err(Errno::Invalid);
+                }
+                self.offset = self.offset.checked_add(delivered).ok_or(Errno::Invalid)?;
+                Ok(delivered)
+            }
             Kind::Inode { .. } | Kind::DevBlk { .. } => {
                 let count = self.read_at(self.offset, data, false, deliver)?;
                 self.offset = self.offset.checked_add(count).ok_or(Errno::Invalid)?;
@@ -2314,6 +2451,13 @@ impl OpenFile {
                 let count = fs::write(*ino, offset, data)?;
                 self.offset = offset.checked_add(count).ok_or(Errno::Invalid)?;
                 Ok(count)
+            }
+            Kind::ProcMqSysctl(field) => {
+                let text = core::str::from_utf8(data).map_err(|_| Errno::Invalid)?;
+                let val: usize = text.trim().parse().map_err(|_| Errno::Invalid)?;
+                crate::ipc::mqueue::write_sysctl(*field, val)?;
+                self.offset = self.offset.saturating_add(data.len());
+                Ok(data.len())
             }
             _ => Err(Errno::BadF),
         }
@@ -2521,7 +2665,9 @@ pub(super) fn fd_poll_events(file: &mut OpenFile, requested: u16, depth: usize) 
     match &file.kind {
         Kind::Input => 0x41 & requested,
         Kind::Output => 0x104 & requested,
-        Kind::Inode { .. } | Kind::ProcText { .. } | Kind::ProcFdDir(_) => 0x145 & requested,
+        Kind::Inode { .. } | Kind::ProcText { .. } | Kind::ProcFdDir(_) | Kind::ProcMqSysctl(_) => {
+            0x145 & requested
+        }
         // /dev/null、/dev/zero、/dev/urandom 与 rtc 永远可读可写；块节点同
         Kind::DevNull
         | Kind::DevZero
@@ -2531,6 +2677,7 @@ pub(super) fn fd_poll_events(file: &mut OpenFile, requested: u16, depth: usize) 
         Kind::Socket(id) => crate::net::poll_events(*id, requested),
         Kind::EventFd { efd, .. } => efd.lock().poll_events(requested),
         Kind::TimerFd { tfd, .. } => tfd.lock().poll_events(requested),
+        Kind::MQueue(q) => q.lock().poll_events(requested),
         Kind::Epoll(ep) => {
             if ep.lock().has_ready(depth) {
                 0x41 & requested

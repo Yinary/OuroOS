@@ -175,6 +175,13 @@ pub mod sysnr {
     pub const CLONE: usize = 220;
     pub const EXECVE: usize = 221;
     pub const WAIT4: usize = 260;
+    // POSIX 消息队列
+    pub const MQ_OPEN: usize = 180;
+    pub const MQ_UNLINK: usize = 181;
+    pub const MQ_TIMEDSEND: usize = 182;
+    pub const MQ_TIMEDRECEIVE: usize = 183;
+    pub const MQ_NOTIFY: usize = 184;
+    pub const MQ_GETSETATTR: usize = 185;
     // System V IPC（消息队列 / 信号量 / 共享内存）
     pub const MSGGET: usize = 186;
     pub const MSGCTL: usize = 187;
@@ -748,6 +755,12 @@ pub fn dispatch(
         | sysnr::CONNECT
         | sysnr::SENDTO
         | sysnr::RECVFROM
+        | sysnr::MQ_OPEN
+        | sysnr::MQ_UNLINK
+        | sysnr::MQ_TIMEDSEND
+        | sysnr::MQ_TIMEDRECEIVE
+        | sysnr::MQ_NOTIFY
+        | sysnr::MQ_GETSETATTR
         | sysnr::MSGGET
         | sysnr::MSGCTL
         | sysnr::MSGRCV

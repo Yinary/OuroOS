@@ -85,10 +85,15 @@ pub(super) const SYS_SEM: u32 = u32::MAX - 24;
 pub(super) const SYSVIPC_DIR: u32 = u32::MAX - 25;
 pub(super) const SYSVIPC_MSG: u32 = u32::MAX - 26;
 pub(super) const SYSVIPC_SEM: u32 = u32::MAX - 27;
+/// /proc/sys/fs/mqueue 目录与参数节点（queues_max / msg_max / msgsize_max）。
+pub(super) const SYS_FS_MQUEUE_DIR: u32 = u32::MAX - 29;
+pub(super) const SYS_FS_MQUEUE_QUEUES_MAX: u32 = u32::MAX - 30;
+pub(super) const SYS_FS_MQUEUE_MSG_MAX: u32 = u32::MAX - 31;
+pub(super) const SYS_FS_MQUEUE_MSGSIZE_MAX: u32 = u32::MAX - 32;
 
 /// 判断 inode 是否属于虚拟节点区间（固定虚拟节点或 /proc/<pid> 派生节点）。
 pub(super) fn is_virtual_ino(ino: u32) -> bool {
-    ino >= CPUINFO || pid_ino_parts(ino).is_some()
+    ino >= SYS_FS_MQUEUE_MSGSIZE_MAX || pid_ino_parts(ino).is_some()
 }
 
 /// /proc/sys/kernel/{msgmni,msgmax,msgmnb,sem} 只读快照（与 ipc 模块限额常量同源）。
