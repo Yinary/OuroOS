@@ -32,12 +32,7 @@ pub fn dispatch(
         sysnr::UMASK => Ok(ctx.set_umask(a[0])),
         sysnr::UTIMENSAT => utimensat(ctx, space, a),
         sysnr::TRUNCATE | sysnr::FTRUNCATE => truncate(nr, ctx, space, a),
-        sysnr::FALLOCATE => {
-            let file = ctx.get(a[0])?;
-            let file = file.lock();
-            file.fallocate(a[1] as u32 as i32, a[2] as i64, a[3] as i64)?;
-            Ok(0)
-        }
+        sysnr::FALLOCATE => fallocate_call(ctx, a),
         sysnr::RENAMEAT | sysnr::RENAMEAT2 => renameat(nr, ctx, space, a),
         sysnr::GETCWD => {
             let cwd = ctx.cwd()?;
@@ -206,6 +201,13 @@ pub fn dispatch(
             }
             if path == "/proc/self/fd" {
                 return ctx.open_proc_fd_dir(flags, flags & 0x80000 != 0);
+            }
+            if let Some(fd_str) = path.strip_prefix("/proc/self/fd/") {
+                if !fd_str.is_empty() && fd_str.bytes().all(|b| b.is_ascii_digit()) {
+                    let src_fd: usize = fd_str.parse().map_err(|_| Errno::NoEntry)?;
+                    return ctx.reopen_fd(src_fd, flags, flags & 0x80000 != 0);
+                }
+                return Err(Errno::NoEntry);
             }
             if path == "/proc/self/maps" {
                 let ino = fs::lookup(&path)?;
@@ -394,8 +396,116 @@ pub fn dispatch(
         sysnr::TIMERFD_CREATE => ctx.open_timerfd(a[0] as u32 as i32, a[1] as u32 as usize),
         sysnr::TIMERFD_SETTIME => timerfd_settime(ctx, space, a),
         sysnr::TIMERFD_GETTIME => timerfd_gettime(ctx, space, a),
+        sysnr::MEMFD_CREATE => memfd_create(ctx, space, a, credentials),
         _ => Err(Errno::NoSys),
     }
+}
+
+/// fallocate(2)：支持默认预分配扩展、FALLOC_FL_KEEP_SIZE、FALLOC_FL_PUNCH_HOLE|KEEP_SIZE 与 FALLOC_FL_ZERO_RANGE。
+fn fallocate_call(ctx: &Context, a: [usize; 6]) -> Result<usize, Errno> {
+    const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+    const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+    const FALLOC_FL_ZERO_RANGE: u32 = 0x10;
+    const SUPPORTED_MODES: u32 = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE;
+
+    let mode = a[1] as u32;
+    let offset = a[2] as i64;
+    let len = a[3] as i64;
+    if offset < 0 || len <= 0 {
+        return Err(Errno::Invalid);
+    }
+    let end = (offset as u64)
+        .checked_add(len as u64)
+        .filter(|&e| e <= i64::MAX as u64)
+        .ok_or(Errno::FileTooBig)?;
+    if mode & !SUPPORTED_MODES != 0 {
+        return Err(Errno::NotSupported);
+    }
+    if mode & FALLOC_FL_PUNCH_HOLE != 0 && mode & FALLOC_FL_KEEP_SIZE == 0 {
+        return Err(Errno::NotSupported);
+    }
+    if mode & FALLOC_FL_PUNCH_HOLE != 0 && mode & FALLOC_FL_ZERO_RANGE != 0 {
+        return Err(Errno::NotSupported);
+    }
+
+    let handle = ctx.get(a[0])?;
+    let ino = {
+        let f = handle.lock();
+        if f.status_flags() & 0x200000 != 0 || f.status_flags() & 3 == 0 {
+            return Err(Errno::BadF);
+        }
+        if f.is_directory() {
+            return Err(Errno::IsDir);
+        }
+        if f.pipe_id().is_some() {
+            return Err(Errno::SeekPipe);
+        }
+        if !f.is_regular_file()? {
+            return Err(Errno::NoDevice);
+        }
+        f.inode()?
+    };
+
+    if fs::memfd::is_memfd_ino(ino) {
+        fs::memfd::fallocate(ino, mode, offset as usize, len as usize)?;
+        return Ok(0);
+    }
+
+    let cur = fs::stat(ino)?.1;
+    let keep = mode & FALLOC_FL_KEEP_SIZE != 0;
+    if mode & FALLOC_FL_PUNCH_HOLE == 0 && end > cur {
+        let stats = fs::filesystem_stats(ino)?;
+        let bs = u64::from(stats.block_size).max(4096);
+        let needed_blocks = (end - cur).div_ceil(bs);
+        if needed_blocks > stats.available_blocks {
+            return Err(Errno::NoSpace);
+        }
+    }
+    if mode & FALLOC_FL_PUNCH_HOLE != 0 {
+        let zstart = (offset as u64).min(cur) as usize;
+        let zend = end.min(cur) as usize;
+        let zeros = [0u8; 4096];
+        let mut pos = zstart;
+        while pos < zend {
+            let n = (zend - pos).min(zeros.len());
+            fs::write(ino, pos, &zeros[..n])?;
+            pos += n;
+        }
+    } else if mode & FALLOC_FL_ZERO_RANGE != 0 {
+        if !keep && end > cur {
+            fs::truncate(ino, end)?;
+        }
+        let limit = if keep { cur } else { end.max(cur) };
+        let zstart = (offset as u64).min(limit) as usize;
+        let zend = end.min(limit) as usize;
+        let zeros = [0u8; 4096];
+        let mut pos = zstart;
+        while pos < zend {
+            let n = (zend - pos).min(zeros.len());
+            fs::write(ino, pos, &zeros[..n])?;
+            pos += n;
+        }
+    } else if !keep && end > cur {
+        fs::truncate(ino, end)?;
+    }
+    Ok(0)
+}
+
+/// memfd_create(2)：创建匿名内存文件描述符（支持 MFD_CLOEXEC/MFD_ALLOW_SEALING/MFD_NOEXEC_SEAL/MFD_EXEC）。
+fn memfd_create(
+    ctx: &mut Context,
+    space: &UserAddressSpace,
+    a: [usize; 6],
+    credentials: &Credentials,
+) -> Result<usize, Errno> {
+    let name = user_access::read_cstr(space, a[0], 4096).map_err(|e| match e {
+        user_access::CStrError::Fault => Errno::Fault,
+        user_access::CStrError::NoMem => Errno::NoMem,
+        user_access::CStrError::TooLong | user_access::CStrError::InvalidUtf8 => Errno::Invalid,
+    })?;
+    let flags = a[1] as u32;
+    let ino = fs::memfd::create(&name, flags, credentials.euid, credentials.egid)?;
+    ctx.open_memfd(ino, name, flags & fs::memfd::MFD_CLOEXEC != 0)
 }
 
 /// epoll_ctl(2)：解析 16 字节非紧凑 struct epoll_event（rv64/la64 布局）并操作 epoll 兴趣表。
@@ -878,6 +988,29 @@ fn fcntl(
         4 => handle.lock().set_status_flags(argument as u32 as usize),
         1031 => handle.lock().set_pipe_size(argument as u32 as usize),
         1032 => handle.lock().pipe_size(),
+        1033 => {
+            // F_ADD_SEALS：仅 memfd 支持，要求可写 FD 且未施加 F_SEAL_SEAL。
+            let (ino, flags) = {
+                let f = handle.lock();
+                (f.inode().map_err(|_| Errno::Invalid)?, f.status_flags())
+            };
+            if !fs::memfd::is_memfd_ino(ino) {
+                return Err(Errno::Invalid);
+            }
+            if flags & 3 == 0 {
+                return Err(Errno::Perm);
+            }
+            fs::memfd::add_seals(ino, argument as u32)?;
+            Ok(0)
+        }
+        1034 => {
+            // F_GET_SEALS：查询 memfd 当前封存位掩码。
+            let ino = handle.lock().inode().map_err(|_| Errno::Invalid)?;
+            if !fs::memfd::is_memfd_ino(ino) {
+                return Err(Errno::Invalid);
+            }
+            Ok(fs::memfd::get_seals(ino)? as usize)
+        }
         F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
             let ofd_cmd = matches!(command, F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW);
             let mut raw = [0u8; 32];

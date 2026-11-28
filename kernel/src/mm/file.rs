@@ -105,15 +105,34 @@ pub(crate) fn compact_inos(inos: &[u32]) {
 /// 与打开描述符无关的 inode 引用。
 pub(crate) struct MappingFile {
     ino: u32,
+    writable_shared: bool,
 }
 impl MappingFile {
-    pub(crate) fn new(ino: u32) -> Result<Arc<Self>, Errno> {
+    pub(crate) fn new_for_map(ino: u32, writable_shared: bool) -> Result<Arc<Self>, Errno> {
         fs::retain(ino)?;
-        fs::try_arc(Self { ino })
+        if writable_shared && fs::memfd::is_memfd_ino(ino) {
+            fs::memfd::inc_writable_map(ino);
+        }
+        match fs::try_arc(Self {
+            ino,
+            writable_shared,
+        }) {
+            Ok(arc) => Ok(arc),
+            Err(e) => {
+                if writable_shared && fs::memfd::is_memfd_ino(ino) {
+                    fs::memfd::dec_writable_map(ino);
+                }
+                fs::release(ino);
+                Err(e)
+            }
+        }
     }
 }
 impl Drop for MappingFile {
     fn drop(&mut self) {
+        if self.writable_shared && fs::memfd::is_memfd_ino(self.ino) {
+            fs::memfd::dec_writable_map(self.ino);
+        }
         fs::release(self.ino);
     }
 }

@@ -78,6 +78,7 @@ pub mod sysnr {
     pub const UMASK: usize = 166;
     pub const SYNCFS: usize = 267;
     pub const RENAMEAT2: usize = 276;
+    pub const MEMFD_CREATE: usize = 279;
     pub const FADVISE64: usize = 223;
     pub const COPY_FILE_RANGE: usize = 285;
     pub const PREADV2: usize = 286;
@@ -454,6 +455,7 @@ pub fn dispatch(
         | sysnr::CHDIR
         | sysnr::FCHDIR
         | sysnr::OPENAT
+        | sysnr::MEMFD_CREATE
         | sysnr::CLOSE
         | sysnr::CLOSE_RANGE
         | sysnr::PIPE2

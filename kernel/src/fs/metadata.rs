@@ -146,6 +146,9 @@ pub(super) fn metadata(ino: u32) -> Result<Metadata, Errno> {
             ..Default::default()
         });
     }
+    if super::memfd::is_memfd_ino(ino) {
+        return super::memfd::metadata(ino);
+    }
     if ext2_mount::is_handle(ino) {
         ext2_mount::metadata(ino)
     } else if ino & FAT_INODE != 0 {

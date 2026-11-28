@@ -132,7 +132,7 @@ fn mmap_region(
             };
             use alloc::vec::Vec;
 
-            let file = MappingFile::new(ino)?;
+            let file = MappingFile::new_for_map(ino, shared && prot & 2 != 0)?;
             let mode = if shared {
                 Mode::Shared { writable }
             } else {

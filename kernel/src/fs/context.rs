@@ -1067,6 +1067,33 @@ impl Context {
         )
     }
 
+    /// 安装 memfd_create(2) 匿名内存文件对象（接管调用方已持有的初始引用计数，失败自动释放）。
+    pub(crate) fn open_memfd(
+        &mut self,
+        ino: u32,
+        name: String,
+        cloexec: bool,
+    ) -> Result<usize, Errno> {
+        let file = match fs::try_arc(Mutex::new(OpenFile {
+            ofd_id: next_ofd_id(),
+            kind: Kind::Inode {
+                ino,
+                path: name,
+                directory: None,
+            },
+            offset: 0,
+            flags: 2, // O_RDWR
+        })) {
+            Ok(f) => f,
+            Err(e) => {
+                fs::release(ino);
+                return Err(e);
+            }
+        };
+        // 若 install 失败，file Drop 会调用 fs::release(ino)。
+        self.install(file, cloexec)
+    }
+
     /// 打开只读 /proc/meminfo 快照。
     pub(crate) fn open_meminfo(&mut self, flags: usize, cloexec: bool) -> Result<usize, Errno> {
         self.open_proc_text(
@@ -1117,6 +1144,49 @@ impl Context {
             flags: flags & !OPEN_CREATION_FLAGS,
         };
         self.install(fs::try_arc(Mutex::new(file))?, cloexec)
+    }
+
+    /// 通过 `/proc/self/fd/<n>` 重新打开已有描述符对应的底层 inode（独立偏移与新打开标志）。
+    pub(crate) fn reopen_fd(
+        &mut self,
+        src_fd: usize,
+        flags: usize,
+        cloexec: bool,
+    ) -> Result<usize, Errno> {
+        const O_CREAT: usize = 0x40;
+        const O_EXCL: usize = 0x80;
+        const O_TRUNC: usize = 0x200;
+        const O_DIRECTORY: usize = 0x10000;
+        const O_PATH: usize = 0x200000;
+        let handle = self.get(src_fd).map_err(|_| Errno::NoEntry)?;
+        if flags & (O_CREAT | O_EXCL) == (O_CREAT | O_EXCL) {
+            return Err(Errno::Exists);
+        }
+        let info = {
+            let f = handle.lock();
+            match &f.kind {
+                Kind::Inode {
+                    ino,
+                    path,
+                    directory,
+                } => Some((*ino, path.clone(), directory.is_some())),
+                _ => None,
+            }
+        };
+        let Some((ino, path, is_dir)) = info else {
+            return self.install(handle, cloexec);
+        };
+        let o_path = flags & O_PATH != 0;
+        if flags & O_DIRECTORY != 0 && !is_dir {
+            return Err(Errno::NotDir);
+        }
+        if is_dir && (flags & 3 != 0 || flags & O_CREAT != 0) && !o_path {
+            return Err(Errno::IsDir);
+        }
+        if flags & O_TRUNC != 0 && flags & 3 != 0 && !o_path {
+            fs::truncate(ino, 0)?;
+        }
+        self.open_inode(ino, path, flags, cloexec, is_dir)
     }
 
     /// 打开 /proc/self/fd 目录快照，供 opendir/getdents64 枚举当前打开的 FD 编号。
@@ -3068,6 +3138,15 @@ pub(crate) fn mapping(ctx: &Context, fd: usize, write: bool) -> Result<MappingSo
     match f.kind {
         Kind::DevZero => Ok(MappingSource::Zero { writable }),
         Kind::Inode { ino, .. } if fs::stat(ino)?.0 & 0xf000 == 0x8000 => {
+            if fs::memfd::is_memfd_ino(ino) && fs::memfd::is_write_sealed(ino) {
+                if write {
+                    return Err(Errno::Perm);
+                }
+                return Ok(MappingSource::File {
+                    ino,
+                    writable: false,
+                });
+            }
             Ok(MappingSource::File { ino, writable })
         }
         _ => Err(Errno::NoDevice),
