@@ -86,10 +86,10 @@ pub enum ClockKind {
 /// 检查 clockid 能否用于取时间，未知或负数返回 EINVAL。
 pub fn validate(clockid: i32) -> Result<(), Errno> {
     match clockid {
-        // CLOCK_REALTIME、CLOCK_REALTIME_COARSE、CLOCK_TAI
-        0 | 5 | 11 => Ok(()),
-        // CLOCK_MONOTONIC、CLOCK_MONOTONIC_RAW、CLOCK_MONOTONIC_COARSE、CLOCK_BOOTTIME
-        1 | 4 | 6 | 7 => Ok(()),
+        // CLOCK_REALTIME、CLOCK_REALTIME_COARSE、CLOCK_REALTIME_ALARM、CLOCK_TAI
+        0 | 5 | 8 | 11 => Ok(()),
+        // CLOCK_MONOTONIC、CLOCK_MONOTONIC_RAW、CLOCK_MONOTONIC_COARSE、CLOCK_BOOTTIME、CLOCK_BOOTTIME_ALARM
+        1 | 4 | 6 | 7 | 9 => Ok(()),
         // CLOCK_PROCESS_CPUTIME_ID、CLOCK_THREAD_CPUTIME_ID
         2 | 3 => Ok(()),
         _ => Err(Errno::Invalid),
@@ -99,8 +99,8 @@ pub fn validate(clockid: i32) -> Result<(), Errno> {
 /// clock_nanosleep 可用的时钟。已知但不支持睡眠的时钟返回 EOPNOTSUPP。
 pub fn sleepable(clockid: i32) -> Result<ClockKind, Errno> {
     match clockid {
-        0 | 11 => Ok(ClockKind::Realtime),
-        1 | 7 => Ok(ClockKind::Monotonic),
+        0 | 8 | 11 => Ok(ClockKind::Realtime),
+        1 | 7 | 9 => Ok(ClockKind::Monotonic),
         2 | 3 | 4 | 5 | 6 => Err(Errno::NotSupported),
         _ => Err(Errno::Invalid),
     }
@@ -110,7 +110,7 @@ pub fn sleepable(clockid: i32) -> Result<ClockKind, Errno> {
 pub fn lookup(clockid: i32, cpu: Duration) -> Result<Duration, Errno> {
     validate(clockid)?;
     Ok(match clockid {
-        0 | 5 | 11 => realtime(),
+        0 | 5 | 8 | 11 => realtime(),
         2 | 3 => cpu,
         _ => monotonic(),
     })

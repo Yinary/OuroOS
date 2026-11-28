@@ -10,6 +10,7 @@ static NEXT_OBJECT: AtomicUsize = AtomicUsize::new(1);
 
 struct SharedObject {
     id: usize,
+    writable: bool,
     pages: Mutex<Vec<(usize, OwnedFrame)>>,
 }
 
@@ -19,10 +20,11 @@ pub(crate) struct SharedPage {
     index: usize,
 }
 impl SharedPage {
-    pub(super) fn first() -> Result<Self, MapError> {
+    pub(super) fn first(writable: bool) -> Result<Self, MapError> {
         Ok(Self {
             object: Arc::try_new(SharedObject {
                 id: NEXT_OBJECT.fetch_add(1, Ordering::Relaxed),
+                writable,
                 pages: Mutex::new(Vec::new()),
             })
             .map_err(|_| MapError::OutOfMemory)?,
@@ -38,6 +40,10 @@ impl SharedPage {
             index: self.index.checked_add(n).ok_or(MapError::OutOfUserRange)?,
         })
     }
+    pub(super) fn writable(&self) -> bool {
+        self.object.writable
+    }
+
     pub(super) fn identity(&self) -> (usize, usize) {
         (self.object.id, self.index)
     }

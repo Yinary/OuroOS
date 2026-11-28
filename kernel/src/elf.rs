@@ -5,7 +5,7 @@
 
 #![deny(unsafe_code)]
 
-use alloc::string::String;
+use alloc::{string::String, vec::Vec};
 use polyhal::pagetable::{MappingFlags, PAGE_SIZE};
 
 use crate::mm::{address_space::UserAddressSpace, fence_icache};
@@ -15,6 +15,8 @@ use crate::mm::{address_space::UserAddressSpace, fence_icache};
 pub enum ElfError {
     /// 用户数据页、页表页或管理元数据不足。
     OutOfMemory,
+    /// 读取底层 ELF 映像发生 I/O 错误。
+    Io,
     /// 文件比 ELF 头还短
     Truncated,
     /// 魔数 / class / 数据序 / 版本不符合 ELF64 小端
@@ -117,42 +119,91 @@ pub struct ImageInfo {
     pub interp: Option<String>,
 }
 
-/// 只解析 ELF 头，取出 PT_INTERP 请求的解释器路径（不触达地址空间）。
-/// 供 exec 在持有注册表借用时预读解释器文件。
-pub fn interp_path(elf: &[u8]) -> Result<Option<String>, ElfError> {
-    parse_header(elf).map(|(_, interp)| interp)
+/// 可按偏移随机读取的 ELF 映像来源（内存切片或盘上可执行文件句柄）。
+pub trait ElfSource {
+    /// 映像字节总长度。
+    fn size(&self) -> usize;
+
+    /// 从偏移 `offset` 精确读取 `dst.len()` 字节到 `dst`。
+    fn read_exact_at(&self, offset: usize, dst: &mut [u8]) -> Result<(), ElfError>;
 }
 
-/// 解析并把主映像 ELF 加载进 `space`，返回入口与 auxv 所需信息。
+impl ElfSource for &[u8] {
+    fn size(&self) -> usize {
+        <[u8]>::len(self)
+    }
+
+    fn read_exact_at(&self, offset: usize, dst: &mut [u8]) -> Result<(), ElfError> {
+        let end = offset.checked_add(dst.len()).ok_or(ElfError::Truncated)?;
+        let src = self.get(offset..end).ok_or(ElfError::Truncated)?;
+        dst.copy_from_slice(src);
+        Ok(())
+    }
+}
+
+/// 已校验的 ELF64 头部与程序头表缓存。
+struct ParsedHeader {
+    e_type: u16,
+    e_entry: usize,
+    e_phoff: usize,
+    phnum: usize,
+    phdrs: Vec<u8>,
+    interp: Option<String>,
+}
+
+/// 只解析 ELF 头，取出 PT_INTERP 请求的解释器路径（不触达地址空间）。
+/// 供 exec 在持有注册表借用时预读解释器文件。
+pub fn interp_path_source(src: &dyn ElfSource) -> Result<Option<String>, ElfError> {
+    parse_header_source(src).map(|h| h.interp)
+}
+
+/// 内存切片版本的 [`interp_path_source`]。
+#[allow(dead_code)]
+pub fn interp_path(elf: &[u8]) -> Result<Option<String>, ElfError> {
+    interp_path_source(&elf)
+}
+
+/// 从 [`ElfSource`] 流式加载主映像 ELF 到 `space`，返回入口与 auxv 信息。
 ///
 /// ET_EXEC 使用固定地址（基址 0）；ET_DYN 以 [`et_dyn_base`] 为装载基址。
 /// BSS（memsz > filesz 的部分）依赖 [`UserAddressSpace::map_alloc`]
 /// 返回已清零的页，无需显式清零。加载完成后执行指令缓存同步。
-pub fn load_elf(space: &mut UserAddressSpace, elf: &[u8]) -> Result<ImageInfo, ElfError> {
-    let (e_type, interp) = parse_header(elf)?;
-    let bias = match e_type {
+pub fn load_elf_source(
+    space: &mut UserAddressSpace,
+    src: &dyn ElfSource,
+) -> Result<ImageInfo, ElfError> {
+    let header = parse_header_source(src)?;
+    let bias = match header.e_type {
         ET_EXEC => 0,
         ET_DYN => et_dyn_base(),
         _ => return Err(ElfError::BadType),
     };
     let mut staged = UserAddressSpace::new().map_err(map_error)?;
-    let info = load_image(&mut staged, elf, bias, interp)?;
+    let info = load_image_source(&mut staged, src, &header, bias, header.interp.clone())?;
     space.install_image(staged).map_err(map_error)?;
     fence_icache();
     Ok(info)
 }
 
-/// 在已构造的地址空间内装载解释器映像（响应主映像的 PT_INTERP）。
+/// 内存切片版本的 [`load_elf_source`]。
+pub fn load_elf(space: &mut UserAddressSpace, elf: &[u8]) -> Result<ImageInfo, ElfError> {
+    load_elf_source(space, &elf)
+}
+
+/// 在已有地址空间内流式加载解释器映像。
 ///
 /// 解释器自身的 ET_EXEC 使用固定地址；ET_DYN 在栈保护区下方寻找空洞
 /// 作为装载基址，避免与主映像或栈冲突。返回值供 AT_BASE 与初次 PC 使用。
-pub fn load_interp(space: &mut UserAddressSpace, elf: &[u8]) -> Result<ImageInfo, ElfError> {
-    let (e_type, interp) = parse_header(elf)?;
-    if interp.is_some() {
+pub fn load_interp_source(
+    space: &mut UserAddressSpace,
+    src: &dyn ElfSource,
+) -> Result<ImageInfo, ElfError> {
+    let header = parse_header_source(src)?;
+    if header.interp.is_some() {
         // 解释器再请求解释器不符合 ELF/ABI，直接拒绝
         return Err(ElfError::BadInterp);
     }
-    let bias = match e_type {
+    let bias = match header.e_type {
         ET_EXEC => 0,
         ET_DYN => {
             // 放置约束（审查 R5d）：bias 须对齐全部段有效的最大 p_align，
@@ -161,7 +212,7 @@ pub fn load_interp(space: &mut UserAddressSpace, elf: &[u8]) -> Result<ImageInfo
             // 对齐为 bias；起点 = bias+min ≥ 洞头由余量严格保证（推导：
             // align_down(H+A-min,A)+min ≥ H+1），非零最低 vaddr 或大
             // 对齐映像都不会把段起点移出已检查范围。
-            let (min_vaddr, pages, align) = image_span(elf)?;
+            let (min_vaddr, pages, align) = image_span(&header)?;
             let align = align.max(PAGE_SIZE);
             let top = crate::mm::address_space::USER_TOP;
             let slack = align / PAGE_SIZE;
@@ -178,26 +229,34 @@ pub fn load_interp(space: &mut UserAddressSpace, elf: &[u8]) -> Result<ImageInfo
         }
         _ => return Err(ElfError::BadType),
     };
-    let info = load_image(space, elf, bias, None)?;
+    let info = load_image_source(space, src, &header, bias, None)?;
     fence_icache();
     Ok(info)
 }
 
-/// 头部公共校验：魔数、class、e_type、e_machine、程序头表边界。
-/// 返回 (e_type, PT_INTERP 路径)。
-fn parse_header(elf: &[u8]) -> Result<(u16, Option<String>), ElfError> {
-    if elf.len() < 64 {
+/// 内存切片版本的 [`load_interp_source`]。
+#[allow(dead_code)]
+pub fn load_interp(space: &mut UserAddressSpace, elf: &[u8]) -> Result<ImageInfo, ElfError> {
+    load_interp_source(space, &elf)
+}
+
+/// 头部公共校验：魔数、class、e_type、e_machine、程序头表边界与 PT_INTERP。
+fn parse_header_source(src: &dyn ElfSource) -> Result<ParsedHeader, ElfError> {
+    let file_len = src.size();
+    if file_len < 64 {
         return Err(ElfError::Truncated);
     }
-    if elf[0] != 0x7f || elf[1] != b'E' || elf[2] != b'L' || elf[3] != b'F' {
+    let mut ehdr = [0u8; 64];
+    src.read_exact_at(0, &mut ehdr)?;
+    if ehdr[0] != 0x7f || ehdr[1] != b'E' || ehdr[2] != b'L' || ehdr[3] != b'F' {
         return Err(ElfError::BadIdent);
     }
-    if elf[EI_CLASS] != ELFCLASS64 || elf[EI_DATA] != ELFDATA2LSB || elf[EI_VERSION] != 1 {
+    if ehdr[EI_CLASS] != ELFCLASS64 || ehdr[EI_DATA] != ELFDATA2LSB || ehdr[EI_VERSION] != 1 {
         return Err(ElfError::BadIdent);
     }
-    let e_type = read_u16(elf, 16);
-    let e_machine = read_u16(elf, 18);
-    if read_u32(elf, 20) != 1 || read_u16(elf, 52) != 64 {
+    let e_type = read_u16(&ehdr, 16);
+    let e_machine = read_u16(&ehdr, 18);
+    if read_u32(&ehdr, 20) != 1 || read_u16(&ehdr, 52) != 64 {
         return Err(ElfError::BadIdent);
     }
     if e_type != ET_EXEC && e_type != ET_DYN {
@@ -206,70 +265,90 @@ fn parse_header(elf: &[u8]) -> Result<(u16, Option<String>), ElfError> {
     if e_machine != EM_CURRENT {
         return Err(ElfError::BadMachine);
     }
-    let e_phoff = read_u64(elf, 32) as usize;
-    let e_phentsize = read_u16(elf, 54);
-    let e_phnum = read_u16(elf, 56);
+    let e_entry = read_u64(&ehdr, 24) as usize;
+    let e_phoff = read_u64(&ehdr, 32) as usize;
+    let e_phentsize = read_u16(&ehdr, 54);
+    let e_phnum = read_u16(&ehdr, 56);
     if e_phentsize != PHENTSIZE {
         return Err(ElfError::BadProgramHeaders);
     }
     let phnum = e_phnum as usize;
+    let ph_bytes = phnum
+        .checked_mul(PHENTSIZE as usize)
+        .ok_or(ElfError::BadProgramHeaders)?;
     // 程序头表边界（含溢出检查）
     let phend = e_phoff
-        .checked_add(
-            phnum
-                .checked_mul(PHENTSIZE as usize)
-                .ok_or(ElfError::BadProgramHeaders)?,
-        )
+        .checked_add(ph_bytes)
         .ok_or(ElfError::BadProgramHeaders)?;
-    if phend > elf.len() {
+    if phend > file_len {
         return Err(ElfError::BadProgramHeaders);
+    }
+
+    let mut phdrs = Vec::new();
+    phdrs
+        .try_reserve_exact(ph_bytes)
+        .map_err(|_| ElfError::OutOfMemory)?;
+    phdrs.resize(ph_bytes, 0);
+    if ph_bytes > 0 {
+        src.read_exact_at(e_phoff, &mut phdrs)?;
     }
 
     let mut interp = None;
     for i in 0..phnum {
-        let ph = e_phoff + i * PHENTSIZE as usize;
-        if read_u32(elf, ph) == PT_INTERP {
+        let ph = i * PHENTSIZE as usize;
+        if read_u32(&phdrs, ph) == PT_INTERP {
             if interp.is_some() {
                 return Err(ElfError::BadInterp);
             }
-            let offset = read_u64(elf, ph + 8) as usize;
-            let filesz = read_u64(elf, ph + 32) as usize;
+            let offset = read_u64(&phdrs, ph + 8) as usize;
+            let filesz = read_u64(&phdrs, ph + 32) as usize;
             let end = offset.checked_add(filesz).ok_or(ElfError::BadInterp)?;
-            if filesz < 2 || end > elf.len() || elf[end - 1] != 0 {
+            if !(2..=4096).contains(&filesz) || end > file_len {
                 return Err(ElfError::BadInterp);
             }
-            let text =
-                core::str::from_utf8(&elf[offset..end - 1]).map_err(|_| ElfError::BadInterp)?;
+            let mut raw = Vec::new();
+            raw.try_reserve_exact(filesz)
+                .map_err(|_| ElfError::OutOfMemory)?;
+            raw.resize(filesz, 0);
+            src.read_exact_at(offset, &mut raw)?;
+            if raw[filesz - 1] != 0 {
+                return Err(ElfError::BadInterp);
+            }
+            let text = core::str::from_utf8(&raw[..filesz - 1]).map_err(|_| ElfError::BadInterp)?;
             if text.is_empty() || text.contains('\0') {
                 return Err(ElfError::BadInterp);
             }
             let mut path = String::new();
             path.try_reserve(text.len())
-                .map_err(|_| ElfError::BadInterp)?;
+                .map_err(|_| ElfError::OutOfMemory)?;
             path.push_str(text);
             interp = Some(path);
         }
     }
-    Ok((e_type, interp))
+    Ok(ParsedHeader {
+        e_type,
+        e_entry,
+        e_phoff,
+        phnum,
+        phdrs,
+        interp,
+    })
 }
 
-/// ET_DYN 映像所有 PT_LOAD 段合计占据的页数（用于寻找装载空洞）。
 /// ET_DYN 映像的跨度信息：最低 PT_LOAD 起址、占据页数、全部段中
 /// 有效的最大 p_align（装载基址需满足该对齐）。
-fn image_span(elf: &[u8]) -> Result<(usize, usize, usize), ElfError> {
-    let e_phoff = read_u64(elf, 32) as usize;
-    let phnum = read_u16(elf, 56) as usize;
+fn image_span(header: &ParsedHeader) -> Result<(usize, usize, usize), ElfError> {
     let mut min: Option<usize> = None;
     let mut max = 0usize;
     let mut align = PAGE_SIZE;
-    for i in 0..phnum {
-        let ph = e_phoff + i * PHENTSIZE as usize;
-        if read_u32(elf, ph) != PT_LOAD {
+    for i in 0..header.phnum {
+        let ph = i * PHENTSIZE as usize;
+        if read_u32(&header.phdrs, ph) != PT_LOAD {
             continue;
         }
-        let vaddr = read_u64(elf, ph + 16) as usize;
-        let memsz = read_u64(elf, ph + 40) as usize;
-        let p_align = read_u64(elf, ph + 48) as usize;
+        let vaddr = read_u64(&header.phdrs, ph + 16) as usize;
+        let memsz = read_u64(&header.phdrs, ph + 40) as usize;
+        let p_align = read_u64(&header.phdrs, ph + 48) as usize;
         let end = vaddr.checked_add(memsz).ok_or(ElfError::BadSegment)?;
         min = Some(min.map_or(vaddr, |m| m.min(vaddr)));
         max = max.max(end);
@@ -291,34 +370,45 @@ fn map_error(e: crate::mm::address_space::MapError) -> ElfError {
     }
 }
 
-/// 把映像按装载基址 `bias` 装入 `space`（不新建地址空间）。
-fn load_image(
+/// 流式加载 `PT_LOAD` 段的单次读取块大小（64 KiB）。
+const ELF_LOAD_CHUNK: usize = 64 * 1024;
+
+/// 把映像按装载基址 `bias` 流式装入 `space`（不新建地址空间）。
+fn load_image_source(
     space: &mut UserAddressSpace,
-    elf: &[u8],
+    src: &dyn ElfSource,
+    header: &ParsedHeader,
     bias: usize,
     interp: Option<String>,
 ) -> Result<ImageInfo, ElfError> {
-    let e_entry = read_u64(elf, 24) as usize;
-    let e_phoff = read_u64(elf, 32) as usize;
-    let phnum = read_u16(elf, 56) as usize;
+    let e_entry = header.e_entry;
+    let e_phoff = header.e_phoff;
+    let phnum = header.phnum;
     let phend = e_phoff + phnum * PHENTSIZE as usize;
 
+    let buf_cap = src.size().clamp(PAGE_SIZE, ELF_LOAD_CHUNK);
+    let mut chunk_buf = Vec::new();
+    chunk_buf
+        .try_reserve_exact(buf_cap)
+        .map_err(|_| ElfError::OutOfMemory)?;
+    chunk_buf.resize(buf_cap, 0);
+
     for i in 0..phnum {
-        let ph = e_phoff + i * PHENTSIZE as usize;
-        let p_type = read_u32(elf, ph);
+        let ph = i * PHENTSIZE as usize;
+        let p_type = read_u32(&header.phdrs, ph);
         if p_type == PT_LOAD {
-            load_segment(space, elf, ph, bias)?;
+            load_segment_source(space, src, &header.phdrs, ph, bias, &mut chunk_buf)?;
         }
-        // PT_INTERP 已在 parse_header 收集；PT_NOTE / PT_GNU_* 等与加载无关
+        // PT_INTERP 已在 parse_header_source 收集；PT_NOTE / PT_GNU_* 等与加载无关
     }
 
     let entry = e_entry.checked_add(bias).ok_or(ElfError::EntryInvalid)?;
     let entry_in_segment = (0..phnum).any(|i| {
-        let ph = e_phoff + i * PHENTSIZE as usize;
-        let start = read_u64(elf, ph + 16) as usize;
-        let size = read_u64(elf, ph + 40) as usize;
-        read_u32(elf, ph) == PT_LOAD
-            && read_u32(elf, ph + 4) & 1 != 0
+        let ph = i * PHENTSIZE as usize;
+        let start = read_u64(&header.phdrs, ph + 16) as usize;
+        let size = read_u64(&header.phdrs, ph + 40) as usize;
+        read_u32(&header.phdrs, ph) == PT_LOAD
+            && read_u32(&header.phdrs, ph + 4) & 1 != 0
             && start <= e_entry
             && start.checked_add(size).is_some_and(|end| e_entry < end)
     });
@@ -339,12 +429,12 @@ fn load_image(
     }
 
     let headers = (0..phnum).find_map(|i| {
-        let ph = e_phoff + i * PHENTSIZE as usize;
-        let offset = read_u64(elf, ph + 8) as usize;
-        let va = read_u64(elf, ph + 16) as usize;
-        let size = read_u64(elf, ph + 32) as usize;
-        if read_u32(elf, ph) != PT_LOAD
-            || read_u32(elf, ph + 4) & 4 == 0
+        let ph = i * PHENTSIZE as usize;
+        let offset = read_u64(&header.phdrs, ph + 8) as usize;
+        let va = read_u64(&header.phdrs, ph + 16) as usize;
+        let size = read_u64(&header.phdrs, ph + 32) as usize;
+        if read_u32(&header.phdrs, ph) != PT_LOAD
+            || read_u32(&header.phdrs, ph + 4) & 4 == 0
             || offset > e_phoff
             || phend > offset.checked_add(size)?
         {
@@ -364,27 +454,29 @@ fn load_image(
     })
 }
 
-/// 加载单个 PT_LOAD 段（`ph` 为该程序头在文件内的偏移）。
+/// 加载单个 PT_LOAD 段（`ph` 为该程序头在 `phdrs` 缓冲内的偏移）。
 /// `bias` 为装载基址，加到每个虚拟地址上；相位检查针对文件原始值。
-fn load_segment(
+fn load_segment_source(
     space: &mut UserAddressSpace,
-    elf: &[u8],
+    src: &dyn ElfSource,
+    phdrs: &[u8],
     ph: usize,
     bias: usize,
+    chunk_buf: &mut [u8],
 ) -> Result<(), ElfError> {
-    let p_flags = read_u32(elf, ph + 4);
-    let p_offset = read_u64(elf, ph + 8) as usize;
-    let p_vaddr = read_u64(elf, ph + 16) as usize;
-    let p_filesz = read_u64(elf, ph + 32) as usize;
-    let p_memsz = read_u64(elf, ph + 40) as usize;
-    let p_align = read_u64(elf, ph + 48) as usize;
+    let p_flags = read_u32(phdrs, ph + 4);
+    let p_offset = read_u64(phdrs, ph + 8) as usize;
+    let p_vaddr = read_u64(phdrs, ph + 16) as usize;
+    let p_filesz = read_u64(phdrs, ph + 32) as usize;
+    let p_memsz = read_u64(phdrs, ph + 40) as usize;
+    let p_align = read_u64(phdrs, ph + 48) as usize;
 
     if p_filesz > p_memsz {
         return Err(ElfError::BadSegment);
     }
     // 文件范围检查
     let file_end = p_offset.checked_add(p_filesz).ok_or(ElfError::BadSegment)?;
-    if file_end > elf.len() {
+    if file_end > src.size() {
         return Err(ElfError::BadSegment);
     }
     let vaddr = p_vaddr.checked_add(bias).ok_or(ElfError::BadSegment)?;
@@ -403,14 +495,30 @@ fn load_segment(
     let page_start = vaddr / PAGE_SIZE * PAGE_SIZE;
     let mem_end = vaddr.checked_add(p_memsz).ok_or(ElfError::BadSegment)?;
     let file_va_end = vaddr.checked_add(p_filesz).ok_or(ElfError::BadSegment)?;
+    let mut buf_off = 0usize;
+    let mut buf_len = 0usize;
     for page in (page_start..mem_end).step_by(PAGE_SIZE) {
         space.map_alloc(page, flags).map_err(map_error)?;
         let begin = page.max(vaddr);
         let end = (page + PAGE_SIZE).min(file_va_end);
         if begin < end {
+            let chunk_len = end - begin;
             let file_off = p_offset + (begin - vaddr);
+            if file_off < buf_off || file_off + chunk_len > buf_off + buf_len {
+                let mut read_len = (file_end - file_off).min(chunk_buf.len());
+                if file_off % PAGE_SIZE == 0
+                    && file_off + read_len < file_end
+                    && read_len >= PAGE_SIZE
+                {
+                    read_len &= !(PAGE_SIZE - 1);
+                }
+                src.read_exact_at(file_off, &mut chunk_buf[..read_len])?;
+                buf_off = file_off;
+                buf_len = read_len;
+            }
+            let rel = file_off - buf_off;
             space
-                .init_elf_page(begin, &elf[file_off..file_off + end - begin])
+                .init_elf_page(begin, &chunk_buf[rel..rel + chunk_len])
                 .map_err(map_error)?;
         }
     }

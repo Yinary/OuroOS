@@ -45,6 +45,7 @@ pub mod sysnr {
     pub const FSTATFS: usize = 44;
     pub const TRUNCATE: usize = 45;
     pub const FTRUNCATE: usize = 46;
+    pub const FALLOCATE: usize = 47;
     pub const CHDIR: usize = 49;
     pub const FCHDIR: usize = 50;
     pub const OPENAT: usize = 56;
@@ -96,6 +97,11 @@ pub mod sysnr {
     pub const NANOSLEEP: usize = 101;
     pub const GETITIMER: usize = 102;
     pub const SETITIMER: usize = 103;
+    pub const TIMER_CREATE: usize = 107;
+    pub const TIMER_GETTIME: usize = 108;
+    pub const TIMER_GETOVERRUN: usize = 109;
+    pub const TIMER_SETTIME: usize = 110;
+    pub const TIMER_DELETE: usize = 111;
     pub const CLOCK_SETTIME: usize = 112;
     pub const CLOCK_GETTIME: usize = 113;
     pub const CLOCK_GETRES: usize = 114;
@@ -175,6 +181,13 @@ pub mod sysnr {
     pub const CLONE: usize = 220;
     pub const EXECVE: usize = 221;
     pub const WAIT4: usize = 260;
+    // POSIX 消息队列
+    pub const MQ_OPEN: usize = 180;
+    pub const MQ_UNLINK: usize = 181;
+    pub const MQ_TIMEDSEND: usize = 182;
+    pub const MQ_TIMEDRECEIVE: usize = 183;
+    pub const MQ_NOTIFY: usize = 184;
+    pub const MQ_GETSETATTR: usize = 185;
     // System V IPC（消息队列 / 信号量 / 共享内存）
     pub const MSGGET: usize = 186;
     pub const MSGCTL: usize = 187;
@@ -202,7 +215,11 @@ pub mod sysnr {
     pub const SETSOCKOPT: usize = 208;
     pub const GETSOCKOPT: usize = 209;
     pub const SHUTDOWN: usize = 210;
+    pub const SENDMSG: usize = 211;
+    pub const RECVMSG: usize = 212;
     pub const ACCEPT4: usize = 242;
+    pub const RECVMMSG: usize = 243;
+    pub const SENDMMSG: usize = 269;
     // 内存
     pub const READAHEAD: usize = 213;
     pub const BRK: usize = 214;
@@ -429,6 +446,7 @@ pub fn dispatch(
         | sysnr::FSTATFS
         | sysnr::TRUNCATE
         | sysnr::FTRUNCATE
+        | sysnr::FALLOCATE
         | sysnr::CHDIR
         | sysnr::FCHDIR
         | sysnr::OPENAT
@@ -696,6 +714,11 @@ pub fn dispatch(
         | sysnr::NANOSLEEP
         | sysnr::GETITIMER
         | sysnr::SETITIMER
+        | sysnr::TIMER_CREATE
+        | sysnr::TIMER_GETTIME
+        | sysnr::TIMER_GETOVERRUN
+        | sysnr::TIMER_SETTIME
+        | sysnr::TIMER_DELETE
         | sysnr::CLOCK_SETTIME
         | sysnr::CLOCK_GETTIME
         | sysnr::CLOCK_GETRES
@@ -753,6 +776,16 @@ pub fn dispatch(
         | sysnr::CONNECT
         | sysnr::SENDTO
         | sysnr::RECVFROM
+        | sysnr::SENDMSG
+        | sysnr::RECVMSG
+        | sysnr::SENDMMSG
+        | sysnr::RECVMMSG
+        | sysnr::MQ_OPEN
+        | sysnr::MQ_UNLINK
+        | sysnr::MQ_TIMEDSEND
+        | sysnr::MQ_TIMEDRECEIVE
+        | sysnr::MQ_NOTIFY
+        | sysnr::MQ_GETSETATTR
         | sysnr::MSGGET
         | sysnr::MSGCTL
         | sysnr::MSGRCV

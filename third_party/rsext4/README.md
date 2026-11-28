@@ -14,6 +14,14 @@ OuroOS 随库维护以下补丁。
 - 单独读取目录块中的目录项字节，供 OuroOS 实现 `getdents64`。
 - 普通文件删除。单独移除目录项并更新链接数，由内核在最后一个打开引用释放后回收 inode、已写入和预分配的 extent。回收前丢弃对应的数据块缓存。暂不回收外部扩展属性块或旧式块映射。
 - JBD2 同步。自动提交和显式同步使用日志 inode 的物理块映射。挂载时先落盘恢复标志，卸载时先提交并写回日志事务，再清除标志。
+- 按父 inode 创建 FIFO 节点。复用目录项插入、链接数更新和删名流程，失败时回滚。
+
+- 按父 inode 创建符号链接。新增 `file::create_symlink_inode`，原样保存目标，目标小于一个块。失败回滚目录项后释放新 inode 与目标数据块。
+
+- 按 inode 创建硬链接。新增 `file::link_entry`，支持普通文件与符号链接。插入或更新失败时撤销名称和链接计数。按 inode 删名接口支持符号链接，并对目录项和 inode 更新使用同一回滚机制。
+
+- 大目录硬链接性能。单卷缓存一个线性大目录的名称指纹，命中后核对原始目录项，最多 131072 个槽位。分配失败回退扫描；插入优先尝试上次成功的逻辑块。满块只读检查；删除保留可核验的候选指纹，重命名、目录 inode 修改和回滚使索引失效。
+
 - 按父目录 inode 移除空目录名。更新父目录链接数和被移除目录的链接数，复用目录块与 inode 回滚，以及无引用时的 inode 回收。
 - 按 inode 修改归属。新增 `metadata::chown_inode`，路径和 FD 共用现有属主、属组、ctime 和校验和更新。
 - 按 inode 更新时间。新增 `metadata::utimens_inode`，复用已有时间字段、校验和与元数据更新流程，供 FD 和符号链接操作使用；双方均 Omit 时不写入，只读卷拒绝实际更新。
@@ -46,3 +54,7 @@ Cargo 清单移除了随上游测试程序提供的目标。内核默认启用�
   1. `file/create.rs` 新增 `create_special_inode`（`create_regular_inode` 复用该实现），按父 inode 在线性目录创建普通文件（`S_IFREG`）、命名管道（`S_IFIFO`）、字符设备（`S_IFCHR`）、块设备（`S_IFBLK`）与套接字节点（`S_IFSOCK`），非普通节点不置 `EXT4_EXTENTS_FL`，字符/块设备按 Ext4 `old_encode_dev`/`new_encode_dev` 约定将设备号写入 `i_block[0]`/`i_block[1]` 并写入对应 `EXT4_FT_*` 目录项类型；
   2. `file/delete.rs` 扩展 `unlink_regular_entry` 放行命名管道、字符/块设备与套接字节点，并在 `free_inode` 中为无数据块的特殊节点跳过 `extent_block_map` 遍历；
   3. `file/link.rs` 扩展 `link_inode` 按目标 inode 类型写入对应 `EXT4_FT_*` 目录项类型。
+- 哈希树目录查找、位图连续分配与大块缓冲补丁：
+  1. `hashtree/lookup.rs` 与 `loopfile.rs` 在有效单层哈希树目录（`EXT4_INDEX_FL`、`indirect_levels == 0` 且受支持哈希版本）下直接处理 `"."`/`".."` 与哈希冲突续链块（`hash & 1 != 0`），把权威未命中（`HashTreeError::EntryNotFound`）直接返回 `Ok(None)`，消除每次 `ENOENT` 的两次全目录线性扫描、冗余 CRC32C 校验与 `warn!` 刷屏；
+  2. `bmalloc/block.rs` 与 `ext4/alloc.rs` 新增字节级快跳只读探查 `find_contiguous_in_slice`，连续块分配先只读探查再修改位图，避免碎片探测把未修改位图块标脏并仅在单块分配失败时记 `warn!`；
+  3. `file/io.rs` 与 `cache/data_block.rs` 将连续块读写暂存缓冲上限收紧至 64 KiB（16 块）并改用可失败 `try_reserve_exact`（返回 `ENOMEM`），块对齐整段读取直接经 `read_run` 写入调用方缓冲免去临时分配、清零与二次拷贝，并修复 `write_dirty_runs` 块数上限单位误用问题。
