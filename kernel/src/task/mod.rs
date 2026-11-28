@@ -229,6 +229,10 @@ pub struct ProcessRecord {
     pub cap_bset: u64,
     /// PR_SET_SECUREBITS / PR_GET_SECUREBITS（fork 继承，exec 保留）。
     pub securebits: u32,
+    /// 子进程退出时发送给父进程的信号号（默认 SIGCHLD=17，clone3 可设为 0 或其他合法信号）。
+    pub exit_signal: u8,
+    /// membarrier(2) 已注册的私有加速屏障命令位掩码（fork 继承，exec 清零）。
+    pub membarrier_registered: u32,
 }
 
 /// 线程记录：线程私有的信号状态与 prctl 属性。地址空间等组级资源在 ProcessRecord。
@@ -618,6 +622,8 @@ mod registry {
             thp_disable: false,
             cap_bset: CAP_FULL_SET,
             securebits: 0,
+            exit_signal: SIGCHLD,
+            membarrier_registered: 0,
             user_ns: 0,
             system_ns: 0,
             child_user_ns: 0,
@@ -723,11 +729,12 @@ mod registry {
                 },
                 ..Default::default()
             };
+            let exit_sig = rec.exit_signal;
             let taken = (rec.space.take(), rec.fs.take());
             if had_itimer {
                 recompute_next_itimer(&reg);
             }
-            // 自动收割（IGN/SA_NOCLDWAIT）与 SIGCHLD 通知解耦：前者决定
+            // 自动收割（IGN/SA_NOCLDWAIT）与退出信号通知解耦：前者决定
             // 是否留僵尸并入父时间，通知统一经 generate 按处置过滤。
             // 全程持 REGISTRY 锁内联完成。
             let auto_reap = if orphan {
@@ -742,7 +749,8 @@ mod registry {
                 {
                     Some(parent) => {
                         let d = parent.signal.disposition(SIGCHLD);
-                        let auto_reap = d.handler == SIG_IGN || d.flags & SA_NOCLDWAIT != 0;
+                        let auto_reap = exit_sig == SIGCHLD
+                            && (d.handler == SIG_IGN || d.flags & SA_NOCLDWAIT != 0);
                         if auto_reap {
                             parent.child_user_ns = parent
                                 .child_user_ns
@@ -751,10 +759,11 @@ mod registry {
                                 .child_system_ns
                                 .saturating_add(own_system.saturating_add(child_system));
                         }
-                        // SIGCHLD 生产点 IGN 无条件丢弃（do_notify_parent 的
-                        // sig=0，屏蔽也不例外）；其余经 generate 过滤入队。
-                        if d.handler != SIG_IGN {
-                            parent.signal.generate(SIGCHLD, chld_slot, parent_blocked);
+                        if exit_sig != 0 {
+                            let sig_d = parent.signal.disposition(exit_sig);
+                            if sig_d.handler != SIG_IGN {
+                                parent.signal.generate(exit_sig, chld_slot, parent_blocked);
+                            }
                         }
                         auto_reap
                     }

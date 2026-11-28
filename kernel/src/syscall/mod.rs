@@ -77,6 +77,7 @@ pub mod sysnr {
     pub const FADVISE64: usize = 223;
     pub const COPY_FILE_RANGE: usize = 285;
     pub const STATX: usize = 291;
+    pub const OPENAT2: usize = 437;
     pub const EPOLL_PWAIT2: usize = 441;
     // 进程
     pub const EXIT: usize = 93;
@@ -169,6 +170,10 @@ pub mod sysnr {
     pub const CLONE: usize = 220;
     pub const EXECVE: usize = 221;
     pub const WAIT4: usize = 260;
+    pub const KCMP: usize = 272;
+    pub const EXECVEAT: usize = 281;
+    pub const MEMBARRIER: usize = 283;
+    pub const CLONE3: usize = 435;
     // System V IPC（消息队列 / 信号量 / 共享内存）
     pub const MSGGET: usize = 186;
     pub const MSGCTL: usize = 187;
@@ -426,6 +431,7 @@ pub fn dispatch(
         | sysnr::CHDIR
         | sysnr::FCHDIR
         | sysnr::OPENAT
+        | sysnr::OPENAT2
         | sysnr::CLOSE
         | sysnr::PIPE2
         | sysnr::GETDENTS64
@@ -710,9 +716,13 @@ pub fn dispatch(
         | sysnr::GETEGID
         | sysnr::GETTID
         | sysnr::CLONE
+        | sysnr::CLONE3
         | sysnr::FUTEX
         | sysnr::GET_ROBUST_LIST
         | sysnr::EXECVE
+        | sysnr::EXECVEAT
+        | sysnr::KCMP
+        | sysnr::MEMBARRIER
         | sysnr::WAIT4
         | sysnr::WAITID
         | sysnr::GETRUSAGE

@@ -666,6 +666,9 @@ fn park_check_signals(
                     ParkOutcome::Completed
                 }
             }
+            // wait4/waitid 刚被唤醒时先返回重查僵尸子进程（Linux do_wait 优先收割已退出子进程，
+            // 仅在无子进程可收割时才向用户返回 -EINTR）。
+            WaitReason::Children if !allow_park => ParkOutcome::Incomplete,
             // SA_RESTART：pipe 读写与 wait 的等待不完成不睡，信号留给循环顶检查点。
             // ppoll、pselect6 与 epoll_pwait/epoll_pwait2 被 handler 信号打断一律以 -EINTR 完成。
             WaitReason::Pipe | WaitReason::PipeId(_) | WaitReason::Children
@@ -1394,6 +1397,43 @@ fn process_call(
             Ok(()) => return ProcessResult::Replaced,
             Err(e) => Err(e),
         },
+        sysnr::EXECVEAT => {
+            let dirfd = args[0] as u32 as i32 as isize as usize;
+            match super::exec::exec_at(
+                parent,
+                dirfd,
+                args[1],
+                args[2],
+                args[3],
+                args[4] as u32,
+                frame,
+            ) {
+                Ok(()) => return ProcessResult::Replaced,
+                Err(e) => Err(e),
+            }
+        }
+        sysnr::MEMBARRIER => membarrier_call(parent, args[0] as u32 as i32, args[1] as u32),
+        sysnr::KCMP => kcmp_call(
+            args[0] as u32 as i32,
+            args[1] as u32 as i32,
+            args[2] as u32 as i32,
+            args[3],
+            args[4],
+        ),
+        sysnr::CLONE3 => {
+            if let Some(done) = vfork_child.take() {
+                Ok(done)
+            } else {
+                match clone3_call(parent, frame, args[0], args[1]) {
+                    Ok((pid, true)) => {
+                        *vfork_child = Some(pid);
+                        return ProcessResult::Wait(WaitReason::Vfork(pid));
+                    }
+                    Ok((pid, false)) => Ok(pid),
+                    Err(e) => Err(e),
+                }
+            }
+        }
         // clone(2) 的 child_tid 参数序是架构 ABI 的一部分：RV64 为
         // (flags, stack, ptid, tls, ctid)，LA64 为 (flags, stack, ptid,
         // ctid, tls)（对照两架构 clone.s 与 Linux fork.c 的拷贝语义）。
@@ -1408,7 +1448,7 @@ fn process_call(
             } else if args[0] & CLONE_THREAD != 0 {
                 fork_thread(parent, frame, args[0], args[1], args[2], tls, child_tid)
             } else if args[0] & CLONE_VFORK != 0 {
-                match fork_vfork(parent, frame, args[0], args[1], child_tid) {
+                match fork_vfork(parent, frame, args[0], args[1], args[2], child_tid) {
                     Ok(pid) => {
                         *vfork_child = Some(pid);
                         return ProcessResult::Wait(WaitReason::Vfork(pid));
@@ -1416,7 +1456,7 @@ fn process_call(
                     Err(e) => Err(e),
                 }
             } else {
-                fork_user(parent, frame, args[0], args[1], child_tid)
+                fork_user(parent, frame, args[0], args[1], args[2], child_tid, None)
             }
         }
         sysnr::FUTEX => {
@@ -1490,9 +1530,12 @@ fn process_call(
         }
         sysnr::WAIT4 => {
             // wait4(2)：pid > 0 指定孩子，-1 等任意孩子，0 等本进程组，
-            // 其余负值等进程组 -pid 的孩子；无可收割孩子时挂起，无孩子 ECHILD。
-            // 收割即从注册表删除；可请求停止、恢复事件，当前不产生这两种状态。
-            if args[2] & !(1 | 2 | 8) != 0 {
+            // 其余负值等进程组 -pid 的孩子；支持 __WCLONE/__WALL/__WNOTHREAD。
+            const W_ALLOWED: usize = 1 | 2 | 8 | 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
+            const W_ALL: usize = 0x4000_0000;
+            const W_CLONE: usize = 0x8000_0000;
+            let opts = args[2] as u32 as usize;
+            if opts & !W_ALLOWED != 0 {
                 Err(Errno::Invalid)
             } else {
                 let wanted = args[0] as i32;
@@ -1502,7 +1545,15 @@ fn process_call(
                     let caller_pgid = REGISTRY.lock().group(parent).map_or(0, |r| r.pgid);
                     let wanted_pgid = (-(wanted as i64)) as usize;
                     let matches = |r: &super::ProcessRecord| {
-                        r.parent == parent
+                        let sig_ok = if opts & W_ALL != 0 {
+                            true
+                        } else if opts & W_CLONE != 0 {
+                            r.exit_signal != super::signal::SIGCHLD
+                        } else {
+                            r.exit_signal == super::signal::SIGCHLD
+                        };
+                        sig_ok
+                            && r.parent == parent
                             && if wanted == -1 {
                                 true
                             } else if wanted == 0 {
@@ -3413,19 +3464,292 @@ const CLONE_PARENT_SETTID: usize = 0x0010_0000;
 const CLONE_VFORK: usize = 0x0000_4000;
 const CLONE_DETACHED: usize = 0x0040_0000;
 
+/// membarrier(2)：单核架构下通过全局顺序栅栏满足语义，保留按进程注册检查（未注册返回 EPERM）。
+fn membarrier_call(pid: Pid, cmd: i32, flags: u32) -> Result<usize, Errno> {
+    const CMD_QUERY: i32 = 0;
+    const CMD_GLOBAL: i32 = 1 << 0;
+    const CMD_GLOBAL_EXPEDITED: i32 = 1 << 1;
+    const CMD_REGISTER_GLOBAL_EXPEDITED: i32 = 1 << 2;
+    const CMD_PRIVATE_EXPEDITED: i32 = 1 << 3;
+    const CMD_REGISTER_PRIVATE_EXPEDITED: i32 = 1 << 4;
+    const CMD_PRIVATE_EXPEDITED_SYNC_CORE: i32 = 1 << 5;
+    const CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: i32 = 1 << 6;
+    const SUPPORTED: usize = (CMD_GLOBAL
+        | CMD_GLOBAL_EXPEDITED
+        | CMD_REGISTER_GLOBAL_EXPEDITED
+        | CMD_PRIVATE_EXPEDITED
+        | CMD_REGISTER_PRIVATE_EXPEDITED
+        | CMD_PRIVATE_EXPEDITED_SYNC_CORE
+        | CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE) as usize;
+
+    if flags != 0 {
+        return Err(Errno::Invalid);
+    }
+    match cmd {
+        CMD_QUERY => Ok(SUPPORTED),
+        CMD_GLOBAL | CMD_GLOBAL_EXPEDITED => {
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            Ok(0)
+        }
+        CMD_REGISTER_GLOBAL_EXPEDITED => Ok(0),
+        CMD_REGISTER_PRIVATE_EXPEDITED => {
+            let mut reg = REGISTRY.lock();
+            let rec = reg.group_mut(pid).ok_or(Errno::NoProcess)?;
+            rec.membarrier_registered |= CMD_PRIVATE_EXPEDITED as u32;
+            Ok(0)
+        }
+        CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => {
+            let mut reg = REGISTRY.lock();
+            let rec = reg.group_mut(pid).ok_or(Errno::NoProcess)?;
+            rec.membarrier_registered |= CMD_PRIVATE_EXPEDITED_SYNC_CORE as u32;
+            Ok(0)
+        }
+        CMD_PRIVATE_EXPEDITED | CMD_PRIVATE_EXPEDITED_SYNC_CORE => {
+            let reg = REGISTRY.lock();
+            let rec = reg.group(pid).ok_or(Errno::NoProcess)?;
+            if rec.membarrier_registered & (cmd as u32) == 0 {
+                return Err(Errno::Perm);
+            }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            Ok(0)
+        }
+        _ => Err(Errno::Invalid),
+    }
+}
+
+/// kcmp(2)：比较两个进程/线程是否共享打开文件、地址空间、文件表或信号处置等内核资源。
+fn kcmp_call(pid1: i32, pid2: i32, kind: i32, idx1: usize, idx2: usize) -> Result<usize, Errno> {
+    const KCMP_FILE: i32 = 0;
+    const KCMP_VM: i32 = 1;
+    const KCMP_FILES: i32 = 2;
+    const KCMP_FS: i32 = 3;
+    const KCMP_SIGHAND: i32 = 4;
+    const KCMP_IO: i32 = 5;
+    const KCMP_SYSVSEM: i32 = 6;
+    if pid1 <= 0 || pid2 <= 0 {
+        return Err(Errno::NoProcess);
+    }
+    let cmp_ord = |a: usize, b: usize| -> usize {
+        match a.cmp(&b) {
+            core::cmp::Ordering::Equal => 0,
+            core::cmp::Ordering::Less => 1,
+            core::cmp::Ordering::Greater => 2,
+        }
+    };
+    let reg = REGISTRY.lock();
+    let t1 = reg.thread(pid1 as usize).ok_or(Errno::NoProcess)?;
+    let t2 = reg.thread(pid2 as usize).ok_or(Errno::NoProcess)?;
+    let g1 = reg.group(t1.tgid).ok_or(Errno::NoProcess)?;
+    let g2 = reg.group(t2.tgid).ok_or(Errno::NoProcess)?;
+    match kind {
+        KCMP_FILE => {
+            let fs1 = g1.fs.as_ref().ok_or(Errno::BadF)?;
+            let fs2 = g2.fs.as_ref().ok_or(Errno::BadF)?;
+            let k1 = fs1.file_object_key(idx1)?;
+            let k2 = fs2.file_object_key(idx2)?;
+            Ok(cmp_ord(k1, k2))
+        }
+        KCMP_VM | KCMP_FILES | KCMP_FS | KCMP_SIGHAND | KCMP_IO | KCMP_SYSVSEM => {
+            Ok(cmp_ord(g1.pid, g2.pid))
+        }
+        _ => Err(Errno::Invalid),
+    }
+}
+
+/// clone3(2)：按 Linux `struct clone_args` 校验扩展尺寸与标志组合，复用 `fork_user`/`fork_vfork`/`fork_thread`。
+fn clone3_call(
+    parent: Pid,
+    frame: &TrapFrame,
+    args_ptr: usize,
+    size: usize,
+) -> Result<(Pid, bool), Errno> {
+    const CLONE_ARGS_SIZE_VER0: usize = 64;
+    const CLONE_ARGS_SIZE_VER2: usize = 88;
+    const CLONE_PIDFD: u64 = 0x0000_1000;
+    const CLONE_PARENT: u64 = 0x0000_8000;
+    const CLONE_NEWNS: u64 = 0x0002_0000;
+    const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+
+    if size < CLONE_ARGS_SIZE_VER0 {
+        return Err(Errno::Invalid);
+    }
+    if size > 4096 {
+        return Err(Errno::TooBig);
+    }
+    let mut raw = [0u8; CLONE_ARGS_SIZE_VER2];
+    {
+        let reg = REGISTRY.lock();
+        let space = reg
+            .group(parent)
+            .and_then(|r| r.space.as_ref())
+            .ok_or(Errno::NoProcess)?
+            .as_space();
+        let copy_len = size.min(CLONE_ARGS_SIZE_VER2);
+        user_access::copy_from_user(space, args_ptr, &mut raw[..copy_len])
+            .map_err(|_| Errno::Fault)?;
+        if size > CLONE_ARGS_SIZE_VER2 {
+            let mut tail = [0u8; 256];
+            let mut off = CLONE_ARGS_SIZE_VER2;
+            while off < size {
+                let n = (size - off).min(tail.len());
+                let ptr = args_ptr.checked_add(off).ok_or(Errno::Fault)?;
+                user_access::copy_from_user(space, ptr, &mut tail[..n])
+                    .map_err(|_| Errno::Fault)?;
+                if tail[..n].iter().any(|&b| b != 0) {
+                    return Err(Errno::TooBig);
+                }
+                off += n;
+            }
+        }
+    }
+    let rd = |off: usize| -> u64 {
+        u64::from_ne_bytes([
+            raw[off],
+            raw[off + 1],
+            raw[off + 2],
+            raw[off + 3],
+            raw[off + 4],
+            raw[off + 5],
+            raw[off + 6],
+            raw[off + 7],
+        ])
+    };
+    let flags = rd(0);
+    let _pidfd = rd(8);
+    let child_tid = rd(16) as usize;
+    let parent_tid = rd(24) as usize;
+    let exit_signal = rd(32);
+    let stack = rd(40) as usize;
+    let stack_size = rd(48) as usize;
+    let tls = rd(56) as usize;
+    let set_tid = rd(64);
+    let set_tid_size = rd(72);
+
+    // CSIGNAL 位不得放进 clone3 flags；exit_signal 不得超过 64。
+    if flags & 0xff != 0 || exit_signal > 64 {
+        return Err(Errno::Invalid);
+    }
+    if flags & (CLONE_THREAD as u64 | CLONE_PARENT) != 0 && exit_signal != 0 {
+        return Err(Errno::Invalid);
+    }
+    if flags & (CLONE_SIGHAND as u64) != 0 && flags & (CLONE_VM as u64) == 0 {
+        return Err(Errno::Invalid);
+    }
+    if flags & (CLONE_THREAD as u64) != 0 && flags & (CLONE_SIGHAND as u64) == 0 {
+        return Err(Errno::Invalid);
+    }
+    if flags & (CLONE_FS as u64) != 0 && flags & CLONE_NEWNS != 0 {
+        return Err(Errno::Invalid);
+    }
+    if flags & CLONE_PIDFD != 0 && flags & (CLONE_THREAD as u64 | CLONE_DETACHED as u64) != 0 {
+        return Err(Errno::Invalid);
+    }
+    if flags & CLONE_INTO_CGROUP != 0 {
+        return Err(Errno::NotSupported);
+    }
+    if (stack == 0) != (stack_size == 0) {
+        return Err(Errno::Invalid);
+    }
+    let child_sp = if stack != 0 {
+        stack.checked_add(stack_size).ok_or(Errno::Invalid)?
+    } else {
+        0
+    };
+    if set_tid_size > 0 {
+        if set_tid_size > 32 {
+            return Err(Errno::Invalid);
+        }
+        if set_tid == 0 {
+            return Err(Errno::Fault);
+        }
+        return Err(Errno::Invalid);
+    }
+    if flags & CLONE_PIDFD != 0 {
+        let pidfd_ptr = _pidfd as usize;
+        let reg = REGISTRY.lock();
+        let space = reg
+            .group(parent)
+            .and_then(|r| r.space.as_ref())
+            .ok_or(Errno::NoProcess)?
+            .as_space();
+        user_access::check_user_range(pidfd_ptr, 4).map_err(|_| Errno::Fault)?;
+        let mut probe = [0u8; 4];
+        user_access::copy_from_user(space, pidfd_ptr, &mut probe).map_err(|_| Errno::Fault)?;
+        user_access::copy_to_user(space, pidfd_ptr, &probe).map_err(|_| Errno::Fault)?;
+        return Err(Errno::NotSupported);
+    }
+    let flags_usize = usize::try_from(flags).map_err(|_| Errno::Invalid)?;
+    if flags_usize & CLONE_THREAD != 0 {
+        let tid = fork_thread(
+            parent,
+            frame,
+            flags_usize,
+            child_sp,
+            parent_tid,
+            tls,
+            child_tid,
+        )?;
+        return Ok((tid, false));
+    }
+    if flags_usize & CLONE_VFORK != 0 {
+        let pid = fork_vfork(
+            parent,
+            frame,
+            flags_usize | (exit_signal as usize),
+            child_sp,
+            parent_tid,
+            child_tid,
+        )?;
+        return Ok((pid, true));
+    }
+    let pid = fork_user(
+        parent,
+        frame,
+        flags_usize,
+        child_sp,
+        parent_tid,
+        child_tid,
+        Some(exit_signal as u8),
+    )?;
+    Ok((pid, false))
+}
+
 /// 创建独立地址空间的子进程，保留父现场，子进程从下一条指令返回零。
-/// 退出信号必须是 SIGCHLD；另接受 NPTL fork 使用的 CLONE_CHILD_CLEARTID 与
-/// CLONE_CHILD_SETTID。带 CLONE_THREAD 的调用走 [`fork_thread`]。
+/// `override_exit_sig` 为 `Some(sig)` 时来自 `clone3(2)`，否则取 `flags & 0xff`（要求 SIGCHLD）。
 fn fork_user(
     parent: Pid,
     frame: &TrapFrame,
     flags: usize,
     stack: usize,
+    parent_tid: usize,
     child_tid: usize,
+    override_exit_sig: Option<u8>,
 ) -> Result<usize, Errno> {
-    let allowed = 17 | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID;
-    if flags & !allowed != 0 || flags & 0xff != 17 {
-        return Err(Errno::Invalid);
+    let allowed = 0xff | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID | CLONE_PARENT_SETTID;
+    let exit_sig = match override_exit_sig {
+        Some(sig) => {
+            if flags & !(CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID | CLONE_PARENT_SETTID) != 0 {
+                return Err(Errno::Invalid);
+            }
+            sig
+        }
+        None => {
+            if flags & !allowed != 0 || flags & 0xff != 17 {
+                return Err(Errno::Invalid);
+            }
+            17
+        }
+    };
+    if flags & CLONE_PARENT_SETTID != 0 {
+        let reg = REGISTRY.lock();
+        let space = reg
+            .group(parent)
+            .and_then(|r| r.space.as_ref())
+            .ok_or(Errno::NoProcess)?
+            .as_space();
+        user_access::check_user_range(parent_tid, 4).map_err(|_| Errno::Fault)?;
+        let mut probe = [0u8; 4];
+        user_access::copy_from_user(space, parent_tid, &mut probe).map_err(|_| Errno::Fault)?;
     }
     let (space, creds) = {
         let mut reg = REGISTRY.lock();
@@ -3496,7 +3820,17 @@ fn fork_user(
                 }
                 core::cmp::Ordering::Equal => {}
             }
-            let (pgid, sid, rlimits, dumpable, keepcaps, thp_disable, cap_bset, securebits) = {
+            let (
+                pgid,
+                sid,
+                rlimits,
+                dumpable,
+                keepcaps,
+                thp_disable,
+                cap_bset,
+                securebits,
+                membarrier_registered,
+            ) = {
                 let p = &reg.records[pi];
                 (
                     p.pgid,
@@ -3507,6 +3841,7 @@ fn fork_user(
                     p.thp_disable,
                     p.cap_bset,
                     p.securebits,
+                    p.membarrier_registered,
                 )
             };
             // 子进程继承备用栈，pending/info 清零；child_subreaper 按 prctl(2) 在 fork 时清零。
@@ -3523,6 +3858,8 @@ fn fork_user(
             child.thp_disable = thp_disable;
             child.cap_bset = cap_bset;
             child.securebits = securebits;
+            child.exit_signal = exit_sig;
+            child.membarrier_registered = membarrier_registered;
         }
         let parent_thread = reg.threads.iter().position(|t| t.tid == parent);
         let child_thread = reg.threads.iter().position(|t| t.tid == pid);
@@ -3571,6 +3908,15 @@ fn fork_user(
                 thread.clear_child_tid = child_tid;
             }
         }
+        if flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
+            if let Some(space) = reg.group(parent).and_then(|r| r.space.as_ref()) {
+                let _ = crate::mm::user_access::copy_to_user(
+                    space.as_space(),
+                    parent_tid,
+                    &(pid as u32).to_ne_bytes(),
+                );
+            }
+        }
     }
     sched::enqueue(task);
     Ok(pid)
@@ -3585,22 +3931,32 @@ fn fork_vfork(
     frame: &TrapFrame,
     flags: usize,
     stack: usize,
+    parent_tid: usize,
     child_tid: usize,
 ) -> Result<Pid, Errno> {
-    let allowed = 17
+    let allowed = 0xff
         | CLONE_VM
         | CLONE_VFORK
         | CLONE_PARENT_SETTID
         | CLONE_CHILD_CLEARTID
         | CLONE_CHILD_SETTID;
-    if flags & 0xff != 17
+    let exit_sig = (flags & 0xff) as u8;
+    if exit_sig > 64
         || flags & (CLONE_VM | CLONE_VFORK) != (CLONE_VM | CLONE_VFORK)
         || flags & !allowed != 0
     {
         return Err(Errno::Invalid);
     }
-    let inner = 17 | (flags & (CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID));
-    fork_user(parent, frame, inner, stack, child_tid)
+    let inner = flags & (CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID | CLONE_PARENT_SETTID);
+    fork_user(
+        parent,
+        frame,
+        inner,
+        stack,
+        parent_tid,
+        child_tid,
+        Some(exit_sig),
+    )
 }
 
 fn fork_thread(

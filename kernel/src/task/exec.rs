@@ -166,25 +166,61 @@ fn parse_shebang(image: &[u8]) -> Option<(alloc::string::String, Option<alloc::s
     Some((interp_path, arg))
 }
 
-/// 全部准备成功才替换旧地址空间，失败保留原程序和现场。
+/// execve(2) 入口：复用 `exec_at(AT_FDCWD, ..., 0)`。
 pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Errno> {
-    let (image, interp_image, argv, envp, path) = {
+    exec_at(
+        pid,
+        (-100isize) as usize,
+        args[0],
+        args[1],
+        args[2],
+        0,
+        frame,
+    )
+}
+
+/// execveat(2) / execve(2) 统一实现：全部准备成功才替换旧地址空间，失败保留原程序和现场。
+pub fn exec_at(
+    pid: Pid,
+    dirfd: usize,
+    path_ptr: usize,
+    argv_ptr: usize,
+    envp_ptr: usize,
+    flags: u32,
+    frame: &mut TrapFrame,
+) -> Result<(), Errno> {
+    const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+    const AT_EMPTY_PATH: u32 = 0x1000;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno::Invalid);
+    }
+    let (image, interp_image, argv, envp, path, exe_value) = {
         let reg = REGISTRY.lock();
         let rec = reg.group(pid).ok_or(Errno::Invalid)?;
         let space = rec.space.as_ref().ok_or(Errno::Invalid)?.as_space();
-        let path = crate::syscall::fs::user_string(space, args[0])?;
-        let mut argv = strings(space, args[1])?;
-        let envp = strings(space, args[2])?;
+        let path = crate::syscall::fs::user_string(space, path_ptr)?;
+        let mut argv = strings(space, argv_ptr)?;
+        let envp = strings(space, envp_ptr)?;
         let fs = rec.fs.as_ref().ok_or(Errno::Invalid)?;
-        let mut image = context::executable(fs, &path)?;
+        let (mut image, resolved_exe) = context::executable_at(fs, dirfd, &path, flags)?;
+        let empty_fd_exec = path.is_empty() && (flags & AT_EMPTY_PATH != 0);
+        let fd_cloexec = empty_fd_exec && (dirfd as isize != -100) && fs.is_cloexec(dirfd);
         let mut depth = 0;
         // #! 脚本转交解释器（binfmt_script；嵌套上限对齐 Linux 的 4 层）。
         // argv[0] 被替换为解释器，脚本路径作为解释器的首个操作数。
-        let mut script_path = path.clone();
+        let mut script_path = if empty_fd_exec {
+            resolved_exe.clone()
+        } else {
+            path.clone()
+        };
         loop {
             let Some((interp_path, script_arg)) = parse_shebang(&image) else {
                 break;
             };
+            // Linux execveat(2): 通过带 FD_CLOEXEC 的 fd 执行 #! 脚本无法传给解释器，返回 ENOENT。
+            if depth == 0 && fd_cloexec {
+                return Err(Errno::NoEntry);
+            }
             depth += 1;
             if depth > 4 {
                 return Err(Errno::Loop);
@@ -213,7 +249,12 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
             .map_err(|_| Errno::ExecFormat)?
             .map(|p| context::executable(fs, &p))
             .transpose()?;
-        (image, interp_image, argv, envp, path)
+        let execfn = if path.is_empty() {
+            resolved_exe.clone()
+        } else {
+            path
+        };
+        (image, interp_image, argv, envp, execfn, resolved_exe)
     };
     let mut space = UserAddressSpace::new().map_err(|_| Errno::NoMem)?;
     let ids = {
@@ -265,18 +306,6 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
         cmdline.extend_from_slice(arg.as_bytes());
         cmdline.push(0);
     }
-    // 规范化可执行路径（/proc/self/exe 用）并预分配存储；规范化失败
-    // 退化为原始 path，分配失败整体回滚
-    // 规范化可执行路径（/proc/self/exe 用）；解析失败意味着原路径无效，
-    // execve 本身应失败（Linux 语义：路径解析错误不吞掉）
-    let exe_value = {
-        let reg = REGISTRY.lock();
-        let ctx = reg
-            .group(pid)
-            .and_then(|r| r.fs.as_ref())
-            .ok_or(Errno::Invalid)?;
-        ctx.path((-100isize) as usize, &path)?
-    };
     let mut locked = REGISTRY.lock();
     let reg = &mut *locked;
     let index = reg.group_index(pid).ok_or(Errno::Invalid)?;
@@ -290,6 +319,7 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
     rec.signal.reset_for_exec();
     rec.dumpable = 1;
     rec.keepcaps = false;
+    rec.membarrier_registered = 0;
     let new_comm = crate::task::comm_from_path(&path);
     let tgid = rec.pid;
     if let Some(thread) = reg.threads.iter_mut().find(|t| t.tid == pid) {
