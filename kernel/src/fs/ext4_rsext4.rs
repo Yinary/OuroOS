@@ -204,6 +204,11 @@ pub(super) fn root_disk_name() -> char {
     (b'a' + ROOT_DISK_ID.load(core::sync::atomic::Ordering::Relaxed) as u8) as char
 }
 
+/// 检查根卷是否占用该块设备。
+pub(super) fn uses_disk(disk: usize) -> bool {
+    mounted() && ROOT_DISK_ID.load(core::sync::atomic::Ordering::Relaxed) == disk
+}
+
 fn try_mount(id: usize, start: usize, len: usize) -> Result<(), Errno> {
     if len < BLOCK_SIZE {
         return Err(Errno::Invalid);
@@ -213,6 +218,10 @@ fn try_mount(id: usize, start: usize, len: usize) -> Result<(), Errno> {
     // 超级块中的 magic 和 log_block_size。
     if sb[56..58] != [0x53, 0xef] || sb[24..28] != [2, 0, 0, 0] {
         return Err(Errno::Invalid);
+    }
+    // 根卷盘上 inode 号不能占用辅助卷句柄范围。
+    if u32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]) >= super::ext2_mount::FIRST_HANDLE {
+        return Err(Errno::NotSupported);
     }
     // 分组几何用于分配缓存，声明的块范围必须落在卷内。
     let lo = u32::from_le_bytes([sb[4], sb[5], sb[6], sb[7]]);
@@ -290,8 +299,8 @@ fn access<T>(f: impl FnOnce(&mut Volume) -> Ext4Result<T>) -> Result<T, Errno> {
 fn error(err: Ext4Error) -> Errno {
     use rsext4::Errno as Ext4Errno;
     match err.code {
-        Ext4Errno::ENOENT => Errno::NoEntry,
         Ext4Errno::EPERM => Errno::Perm,
+        Ext4Errno::ENOENT => Errno::NoEntry,
         Ext4Errno::EACCES => Errno::Access,
         Ext4Errno::ENOTDIR => Errno::NotDir,
         Ext4Errno::EISDIR => Errno::IsDir,
@@ -384,6 +393,7 @@ fn build_metadata(v: &mut Volume, ino: u32) -> Ext4Result<super::Metadata> {
     };
     Ok(super::Metadata {
         ino: ino as u64,
+        handle: None,
         dev: 1,
         rdev: rdev as u64,
         mode: inode.i_mode,
@@ -562,51 +572,63 @@ pub(super) fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
     })
 }
 
-/// 在指定父目录创建带设备号的特殊节点（普通文件、FIFO、字符/块设备或套接字）。
-pub(super) fn create_node(parent: u32, name: &str, mode: u16, rdev: u64) -> Result<u32, Errno> {
+/// 创建普通或特殊节点，保存设备号与文件系统身份。
+pub(super) fn create_node(
+    parent: u32,
+    name: &str,
+    mode: u16,
+    rdev: u64,
+    owner: (u32, u32),
+) -> Result<u32, Errno> {
     if !WRITABLE {
         return Err(Errno::ReadOnly);
     }
     access(|v| {
-        let parent = InodeNumber::new(parent)?;
-        rsext4::file::create_special_inode(&mut v.device, &mut v.fs, parent, name, mode, rdev)
-            .map(|ino| ino.raw())
-    })
-}
-
-/// 在指定父目录创建符号链接，允许相对或悬空目标。
-pub(super) fn symlink(parent: u32, name: &str, target: &str) -> Result<u32, Errno> {
-    if !WRITABLE {
-        return Err(Errno::ReadOnly);
-    }
-    access(|v| {
-        let ino = rsext4::file::create_symlink_inode(
+        v.invalidate_dcache();
+        rsext4::file::create_special_inode(
             &mut v.device,
             &mut v.fs,
             InodeNumber::new(parent)?,
             name,
-            target,
-        )?;
-        v.invalidate_dcache();
-        Ok(ino.raw())
+            mode,
+            rdev,
+            owner,
+        )
+        .map(|ino| ino.raw())
+        .inspect_err(|e| {
+            if matches!(e.code, rsext4::Errno::EIO | rsext4::Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })
     })
 }
 
-/// 在指定父目录为已有非目录 inode 创建硬链接。
-pub(super) fn link(target_ino: u32, parent: u32, name: &str) -> Result<(), Errno> {
+/// 创建不分配数据块的 FIFO 节点。
+pub(super) fn create_fifo(
+    parent: u32,
+    name: &str,
+    mode: u16,
+    owner: (u32, u32),
+) -> Result<(), Errno> {
     if !WRITABLE {
         return Err(Errno::ReadOnly);
     }
     access(|v| {
-        rsext4::file::link_inode(
+        v.invalidate_dcache();
+        rsext4::file::create_fifo_inode(
             &mut v.device,
             &mut v.fs,
-            InodeNumber::new(target_ino)?,
             InodeNumber::new(parent)?,
             name,
-        )?;
-        v.invalidate_dcache();
-        Ok(())
+            mode,
+            owner,
+        )
+        .map(|_| ())
+        .inspect_err(|e| {
+            if matches!(e.code, rsext4::Errno::EIO | rsext4::Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })
     })
 }
 
@@ -798,14 +820,68 @@ pub(super) fn rmdir(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
     })
 }
 
-/// 移除普通文件名；没有链接和打开引用时回收 inode。
-pub(super) fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
+/// 创建符号链接并保存目标文本。
+pub(super) fn symlink(
+    parent: u32,
+    name: &str,
+    target: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        v.invalidate_dcache();
+        rsext4::file::create_symlink_inode(
+            &mut v.fs,
+            &mut v.device,
+            InodeNumber::new(parent)?,
+            name,
+            target,
+            uid,
+            gid,
+        )
+        .inspect_err(|e| {
+            use rsext4::Errno as Ext4Errno;
+            if matches!(e.code, Ext4Errno::EIO | Ext4Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })
+    })
+}
+
+/// 在父目录中添加指向已有 inode 的名称。
+pub(super) fn link(ino: u32, parent: u32, name: &str) -> Result<(), Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        v.invalidate_dcache();
+        rsext4::file::link_entry(
+            &mut v.fs,
+            &mut v.device,
+            InodeNumber::new(parent)?,
+            InodeNumber::new(ino)?,
+            name,
+        )
+        .inspect_err(|e| {
+            use rsext4::Errno as Ext4Errno;
+            if matches!(e.code, Ext4Errno::EIO | Ext4Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })
+    })
+}
+
+/// 移除非目录 inode 的名称，无链接和打开引用时回收，返回是否已当场回收。
+pub(super) fn unlink(parent: u32, ino: u32, name: &str) -> Result<bool, Errno> {
     if !WRITABLE {
         return Err(Errno::ReadOnly);
     }
     access(|v| {
         let inode = InodeNumber::new(ino)?;
-        let links = rsext4::file::unlink_regular_entry(
+        let links = rsext4::file::unlink_file_entry(
             &mut v.fs,
             &mut v.device,
             InodeNumber::new(parent)?,
@@ -821,19 +897,20 @@ pub(super) fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
         v.invalidate_dcache();
         if links == 0 && !v.opens.iter().any(|&(id, _)| id == ino) {
             reclaim_unlinked(v, ino)?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     })
 }
 
-/// 串行更新目录项，旧目标 inode 无链接且无打开引用时才回收。
+/// 串行更新目录项，旧目标 inode 无链接且无打开引用时才回收；返回被当场回收的目标 inode。
 pub(super) fn rename(
     old: u32,
     name: &str,
     new: u32,
     target: &str,
     no_replace: bool,
-) -> Result<(), Errno> {
+) -> Result<Option<u32>, Errno> {
     if !WRITABLE {
         return Err(Errno::ReadOnly);
     }
@@ -856,9 +933,10 @@ pub(super) fn rename(
         if let Some(ino) = replaced {
             if !v.opens.iter().any(|&(id, _)| id == ino.raw()) {
                 reclaim_unlinked(v, ino.raw())?;
+                return Ok(Some(ino.raw()));
             }
         }
-        Ok(())
+        Ok(None)
     })
 }
 
@@ -888,24 +966,32 @@ pub(super) fn retain(ino: u32) -> Result<(), Errno> {
     Ok(())
 }
 
-/// 释放引用，最后一个引用关闭时检查 inode 是否可回收。
-pub(super) fn release(ino: u32) {
+/// 释放引用，最后一个引用关闭时检查 inode 是否可回收；返回是否回收了已断链 inode。
+pub(super) fn release(ino: u32) -> bool {
     if !WRITABLE {
-        return;
+        return false;
     }
     let mut root = ROOT.lock();
-    let Some(v) = root.as_mut() else { return };
+    let Some(v) = root.as_mut() else {
+        return false;
+    };
     let Some(i) = v.opens.iter().position(|&(id, _)| id == ino) else {
-        return;
+        return false;
     };
     v.opens[i].1 -= 1;
     if v.opens[i].1 == 0 {
         v.opens.swap_remove(i);
         if v.failed {
-            return;
+            return false;
         }
+        let unlinked = InodeNumber::new(ino)
+            .and_then(|num| v.fs.get_inode_by_num(&mut v.device, num))
+            .is_ok_and(|inode| inode.i_links_count == 0);
         if let Err(e) = reclaim_unlinked(v, ino) {
             log::error!("Ext4 inode {ino} reclaim failed: {e}");
+            return false;
         }
+        return unlinked;
     }
+    false
 }

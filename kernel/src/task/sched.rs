@@ -458,18 +458,72 @@ pub(super) fn reserve_task() -> Result<(), crate::mm::frame::FrameError> {
 }
 /// 按 pid 取调度属性三元组（策略、优先级、谦让值）；任务不在调度器的三张表里时返回 None。
 pub fn attrs_of(pid: Pid) -> Option<(u8, i32, i32)> {
+    attrs_ext_of(pid).map(|(policy, priority, nice, _, _)| (policy, priority, nice))
+}
+
+/// 按 pid 取完整调度属性（策略、优先级、谦让值、标志位、deadline 三元组）。
+pub fn attrs_ext_of(pid: Pid) -> Option<(u8, i32, i32, u64, [u64; 3])> {
     let slot = SCHED.lock();
     let s = slot.as_ref()?;
     if let Some(task) = s.current.as_ref().filter(|t| t.pid == pid) {
-        return Some((task.policy, task.priority, task.nice));
+        return Some((
+            task.policy,
+            task.priority,
+            task.nice,
+            task.sched_flags,
+            task.sched_dl,
+        ));
     }
     if let Some(task) = s.ready.iter().find(|t| t.pid == pid) {
-        return Some((task.policy, task.priority, task.nice));
+        return Some((
+            task.policy,
+            task.priority,
+            task.nice,
+            task.sched_flags,
+            task.sched_dl,
+        ));
     }
     s.waiting
         .iter()
         .find(|(t, _)| t.pid == pid)
-        .map(|(t, _)| (t.policy, t.priority, t.nice))
+        .map(|(t, _)| (t.policy, t.priority, t.nice, t.sched_flags, t.sched_dl))
+}
+
+/// 设置完整调度属性（sched_setattr 用）；pid 不在调度器表里返回 false。
+pub fn set_sched_attr(
+    pid: Pid,
+    policy: u8,
+    priority: i32,
+    nice: i32,
+    sched_flags: u64,
+    sched_dl: [u64; 3],
+) -> bool {
+    let mut slot = SCHED.lock();
+    let Some(s) = slot.as_mut() else {
+        return false;
+    };
+    let apply = |t: &mut Task| {
+        t.policy = policy;
+        t.priority = priority;
+        t.nice = nice;
+        t.sched_flags = sched_flags;
+        t.sched_dl = sched_dl;
+    };
+    if let Some(task) = s.current.as_mut().filter(|t| t.pid == pid) {
+        apply(task);
+        return true;
+    }
+    if let Some(task) = s.ready.iter_mut().find(|t| t.pid == pid) {
+        apply(task);
+        return true;
+    }
+    s.waiting
+        .iter_mut()
+        .find(|(t, _)| t.pid == pid)
+        .is_some_and(|(t, _)| {
+            apply(t);
+            true
+        })
 }
 
 /// 按 pid 取调度策略与优先级；任务不在调度器的三张表里时返回 None。
