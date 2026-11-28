@@ -2,6 +2,30 @@
 
 use log::{error, warn};
 
+// OuroOS patch: 满目录块只读扫描，避免将未修改的块标脏。
+fn has_space(data: &[u8], required: usize) -> bool {
+    let mut offset = 0;
+    while offset + 8 <= data.len() {
+        let record = &data[offset..];
+        let ino = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
+        let length = u16::from_le_bytes([record[4], record[5]]) as usize;
+        if length < 8 || length > data.len() - offset || record[7] == Ext4DirEntryTail::RESERVED_FT
+        {
+            return false;
+        }
+        let used = if ino == 0 {
+            0
+        } else {
+            (8 + record[6] as usize + 3) & !3
+        };
+        if length >= used && length - used >= required {
+            return true;
+        }
+        offset += length;
+    }
+    false
+}
+
 // OuroOS patch: identify ENOSPC before the new directory entry can be published.
 const DIRECTORY_GROWTH: &str = "allocate directory block";
 
@@ -38,6 +62,31 @@ pub fn insert_dir_entry<B: BlockDevice>(
     child_name: &str,
     file_type: u8,
 ) -> Ext4Result<()> {
+    insert_dir_entry_with_hint(
+        fs,
+        device,
+        parent_ino_num,
+        parent_inode,
+        child_ino,
+        child_name,
+        file_type,
+        0,
+    )
+    .map(|_| ())
+}
+
+/// 优先尝试提示块；找不到空位时仍扫描其余目录块。
+pub(crate) fn insert_dir_entry_with_hint<B: BlockDevice>(
+    fs: &mut Ext4FileSystem,
+    device: &mut Jbd2Dev<B>,
+    parent_ino_num: InodeNumber,
+    parent_inode: &mut Ext4Inode,
+    child_ino: InodeNumber,
+    child_name: &str,
+    file_type: u8,
+    hint: usize,
+) -> Ext4Result<(usize, AbsoluteBN)> {
+    fs.directory_index = None;
     let has_checksum = ext4_superblock_has_metadata_csum(&fs.superblock);
     let name_bytes = child_name.as_bytes();
     let name_len = core::cmp::min(name_bytes.len(), Ext4DirEntry2::MAX_NAME_LEN as usize);
@@ -63,7 +112,9 @@ pub fn insert_dir_entry<B: BlockDevice>(
     // Try to satisfy the insertion inside already mapped directory blocks first.
     let blocks = resolve_inode_blocks(fs, device, parent_inode)?;
 
-    for lbn in 0..total_blocks {
+    let mut inserted_lbn = 0;
+    let preferred = core::iter::once(hint).filter(|lbn| *lbn < total_blocks);
+    for lbn in preferred.chain((0..total_blocks).filter(|lbn| *lbn != hint)) {
         if modified_phys.is_some() {
             break;
         }
@@ -79,6 +130,13 @@ pub fn insert_dir_entry<B: BlockDevice>(
             }
         };
 
+        let cached = fs.datablock_cache.get_or_load(device, phys)?;
+        if !has_space(&cached.data, new_rec_len) {
+            continue;
+        }
+        drop(cached);
+
+        inserted_lbn = lbn;
         if let Err(e) = fs.datablock_cache.modify(device, phys, |data| {
             if inserted {
                 return;
@@ -174,7 +232,8 @@ pub fn insert_dir_entry<B: BlockDevice>(
     if let Some(modified_block) = modified_phys {
         // Publish the modified directory block before subsequent lookup.
         // OuroOS patch: 目录块入 JBD2 队列（目录事务原子性），不直写 home
-        fs.datablock_cache.flush_via_journal(device, modified_block)?;
+        fs.datablock_cache
+            .flush_via_journal(device, modified_block)?;
         // The hash tree is stale after insertion; force subsequent lookups
         // through the authoritative linear directory scan.
         if parent_inode.i_flags & Ext4Inode::EXT4_INDEX_FL != 0 {
@@ -184,7 +243,7 @@ pub fn insert_dir_entry<B: BlockDevice>(
             })?;
         }
         fs.touch_parent_dir_for_entry_change(device, parent_ino_num)?;
-        return Ok(());
+        return Ok((inserted_lbn, modified_block));
     }
 
     // No existing record could host the child, so append a fresh directory block.
@@ -272,5 +331,5 @@ pub fn insert_dir_entry<B: BlockDevice>(
         Ext4InodeMetadataUpdate::parent_dir_change(),
     )?;
 
-    Ok(())
+    Ok((new_lbn as usize, new_block))
 }

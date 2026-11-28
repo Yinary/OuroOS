@@ -45,6 +45,7 @@ pub mod sysnr {
     pub const FSTATFS: usize = 44;
     pub const TRUNCATE: usize = 45;
     pub const FTRUNCATE: usize = 46;
+    pub const FALLOCATE: usize = 47;
     pub const CHDIR: usize = 49;
     pub const FCHDIR: usize = 50;
     pub const OPENAT: usize = 56;
@@ -428,6 +429,7 @@ pub fn dispatch(
         | sysnr::FSTATFS
         | sysnr::TRUNCATE
         | sysnr::FTRUNCATE
+        | sysnr::FALLOCATE
         | sysnr::CHDIR
         | sysnr::FCHDIR
         | sysnr::OPENAT

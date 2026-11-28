@@ -1505,6 +1505,9 @@ impl UserAddressSpace {
         flags: MappingFlags,
         fixed: bool,
     ) -> Result<(), MapError> {
+        if flags.contains(MappingFlags::W) && !first.writable() {
+            return Err(MapError::PermissionDenied);
+        }
         let end = end_of(start, count)?;
         check_flags(flags)?;
         if end > GUARD_BOTTOM {
@@ -1520,15 +1523,16 @@ impl UserAddressSpace {
         }
         self.map_backed_kind(start, frames, flags, fixed, AreaKind::SharedAnonymous)
     }
-    /// 建立可跨 fork 共享的匿名页；引用元数据与数据页均可失败分配。
-    pub fn map_shared_anonymous(
+    /// 建立可跨 fork 共享的零填充映射，可限制后续写权限。
+    pub(crate) fn map_shared_anonymous(
         &mut self,
         start: usize,
         count: usize,
         flags: MappingFlags,
         fixed: bool,
+        writable: bool,
     ) -> Result<(), MapError> {
-        let first = SharedPage::first()?;
+        let first = SharedPage::first(writable)?;
         self.map_shared_pages(start, &first, count, flags, fixed)
     }
     /// 挂接 System V 共享内存段：预留挂接表槽位后映射共享页，失败时保持原状。
@@ -1845,7 +1849,14 @@ impl UserAddressSpace {
         }
         if flags.contains(MappingFlags::W)
             && self.pages.iter().any(|p| {
-                p.va >= start && p.va < end && matches!(&*p.backing(), Backing::File(f) if f.mode == (Mode::Shared { writable: false }))
+                if p.va < start || p.va >= end {
+                    return false;
+                }
+                match &*p.backing() {
+                    Backing::File(f) => f.mode == Mode::Shared { writable: false },
+                    Backing::AnonymousShared(p) => !p.writable(),
+                    _ => false,
+                }
             })
         {
             return Err(MapError::PermissionDenied);
@@ -1942,6 +1953,35 @@ impl Drop for UserAddressSpace {
         if self.pt.borrow_mut().is_active() {
             self.pt.borrow_mut().deactivate();
         }
+        // 按去重后的 inode 批量压缩 RESIDENT 弱引用表。
+        let mut dirty_inos = [0u32; 32];
+        let mut dirty_len = 0usize;
+        let mut record_ino = |ino: u32| {
+            if dirty_inos[..dirty_len].contains(&ino) {
+                return;
+            }
+            if dirty_len == dirty_inos.len() {
+                file::compact_inos(&dirty_inos[..dirty_len]);
+                dirty_len = 0;
+            }
+            dirty_inos[dirty_len] = ino;
+            dirty_len += 1;
+        };
+        for page in &self.pages {
+            if let Backing::File(f) = &*page.frame.borrow() {
+                if let Some(ino) = f.release_deferred() {
+                    record_ino(ino);
+                }
+            }
+        }
+        for page in self.pending.get_mut().iter() {
+            if let Backing::File(f) = &*page.frame.borrow() {
+                if let Some(ino) = f.release_deferred() {
+                    record_ino(ino);
+                }
+            }
+        }
+        file::compact_inos(&dirty_inos[..dirty_len]);
     }
 }
 /// 物理 RAM 的内核直映别名，仅用于拥有/验证过的物理页。

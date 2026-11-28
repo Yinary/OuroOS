@@ -186,6 +186,20 @@ pub fn get_file_inode<B: BlockDevice>(
         let target = name.as_bytes();
         let mut found_inode_num: Option<InodeNumber> = None;
 
+        if let Some(result) =
+            crate::dir::index::cached_lookup(fs, block_dev, current_ino_num, &current_inode, target)
+        {
+            let entry = match result {
+                Ok(entry) => entry,
+                Err(error) if error.code == Errno::ENOENT => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            current_ino_num = entry.ino;
+            current_inode = fs.get_inode_by_num(block_dev, entry.ino)?;
+            path_vec.push((current_ino_num, current_inode));
+            continue;
+        }
+
         // Prefer the hashed directory path and fall back to a full scan only when needed.
         match lookup_directory_entry(fs, block_dev, &current_inode, target) {
             Ok(result) => {
@@ -194,6 +208,10 @@ pub fn get_file_inode<B: BlockDevice>(
             }
             Err(crate::hashtree::HashTreeError::InvalidDirectoryEntry) => {
                 return Err(Ext4Error::corrupted());
+            }
+            // OuroOS patch: 哈希树权威未命中直接返回 None
+            Err(crate::hashtree::HashTreeError::EntryNotFound) => {
+                return Ok(None);
             }
             Err(_) => {
                 debug!("Hash tree lookup failed, falling back to linear search");
