@@ -311,7 +311,7 @@ impl Registry {
     }
 }
 
-/// 终态行积攒上限：只保留最近退出的任务记录，避免长跑测例下无界占用内核堆。
+/// `EXIT_REPORTS` 环形缓冲容量上限。
 const MAX_EXIT_REPORTS: usize = 512;
 
 /// 终态行积攒表：收割即删后注册表不留历史，输出推迟到时代结束，
@@ -319,7 +319,7 @@ const MAX_EXIT_REPORTS: usize = 512;
 static EXIT_REPORTS: DebugMutex<VecDeque<(Pid, &'static str, ExitInfo)>> =
     DebugMutex::new("EXIT_REPORTS", VecDeque::new());
 
-/// 容器容量显著大于当前元素数时按可失败预留重建紧凑缓冲，回收 fork 风暴后的超配堆块。
+/// 元素数远小于容量时缩容，分配失败则保留原缓冲。
 fn maybe_shrink_vec<T>(v: &mut Vec<T>, min_cap: usize) {
     if v.capacity() > min_cap * 2 && v.len() * 4 <= v.capacity() {
         let target = v.len().max(min_cap);
@@ -707,7 +707,7 @@ mod registry {
             let had_itimer = rec.itimer_real.take().is_some();
             // 快照置僵尸（procfs 可见的存活规则与注册表一致）
             proc_table_mark_zombie(pid);
-            // 积攒终态行；到达环形上限淘汰最旧条目，容量不足时丢弃（打印非关键路径）
+            // 积攒终态行；满容淘汰最旧条目，分配失败则丢弃。
             {
                 let mut reports = EXIT_REPORTS.lock();
                 if reports.len() >= MAX_EXIT_REPORTS {
@@ -1066,7 +1066,7 @@ pub fn run(baseline: (usize, usize)) {
     if let Err(e) = crate::fs::cache::flush(None) {
         log::error!("shared page writeback pending at task exit: {:?}", e);
     }
-    // 全部用户任务退出后回收仍驻留的 System V 共享内存段（按 POSIX 语义可跨进程存活至系统关机）。
+    // 回收关机时仍驻留的 System V 共享内存段。
     mm::shm::clear_all();
     let (total, free) = mm::frame::stats();
     assert_eq!(

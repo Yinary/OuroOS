@@ -1305,7 +1305,7 @@ extern "C" fn ouro_main() -> ! {
     run_selected_group(b"iozone-glibc", started);
     run_selected_group(b"cyclictest-musl", started);
     run_selected_group(b"cyclictest-glibc", started);
-    // 双架构全量启用双库 LTP（每组 1200 秒通用预算），置于 lmbench 之前以免单机总时限被 lmbench 耗尽。
+    // 双架构启用双库 LTP，每组预算 1200 秒。
     run_ltp(
         b"/musl\0",
         b"musl\0",

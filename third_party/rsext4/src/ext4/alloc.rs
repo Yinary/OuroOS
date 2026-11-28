@@ -51,8 +51,7 @@ impl Ext4FileSystem {
                 }
             }
 
-            // OuroOS patch: probe read-only before bitmap_cache.modify so failed contiguous
-            // searches do not dirty untouched bitmaps or emit false-positive fragmentation warns.
+            // OuroOS patch: 只读预探连续空闲块，避免未命中时标脏位图
             let has_run = {
                 let bm = self
                     .bitmap_cache

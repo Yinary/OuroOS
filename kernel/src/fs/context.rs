@@ -1489,7 +1489,7 @@ impl OpenFile {
         }
     }
 
-    /// 预分配文件空间（fallocate(2)，当前支持默认模式与 FALLOC_FL_KEEP_SIZE 稀疏预留）。
+    /// 对应 Linux `fallocate(2)`，支持默认模式与 `FALLOC_FL_KEEP_SIZE`；参数非法或类型不符返回对应 errno。
     pub(crate) fn fallocate(&self, mode: i32, offset: i64, len: i64) -> Result<(), Errno> {
         const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
         if self.flags & 0x200000 != 0 || self.flags & 3 == 0 {
@@ -2283,8 +2283,7 @@ fn nonblock_or_wait(flags: usize) -> Errno {
         Errno::WouldBlock
     }
 }
-/// 按进程工作目录读取可执行文件，返回独立内核镜像。
-/// 按路径校验并打开可执行文件句柄，持有 inode 引用直到 Drop，供 execve 流式按页装载。
+/// 持有 inode 引用的可执行文件句柄，供流式读取。
 pub struct ExecutableFile {
     ino: u32,
     len: usize,
@@ -2296,7 +2295,7 @@ impl ExecutableFile {
         self.len
     }
 
-    /// 从指定偏移精确读取 `dst.len()` 字节；遇到提前 EOF 或底层错误返回 EIO。
+    /// 从指定偏移精确读取 `dst.len()` 字节；提前 EOF 或底层错误返回 EIO。
     pub fn read_exact_at(&self, offset: usize, dst: &mut [u8]) -> Result<(), Errno> {
         let end = offset.checked_add(dst.len()).ok_or(Errno::Io)?;
         if end > self.len {
@@ -2320,7 +2319,7 @@ impl Drop for ExecutableFile {
     }
 }
 
-/// 校验普通可执行文件并保留 inode 引用，避免为大 ELF 分配整块连续内核堆缓冲。
+/// 校验并打开可执行文件，返回持有 inode 引用的句柄。
 pub fn open_executable(ctx: &Context, path: &str) -> Result<ExecutableFile, Errno> {
     // /proc/self/exe 指向当前进程的可执行文件（proc(5)）；execve 与
     // open 共用该重写。没有盘上可执行路径（内核内嵌程序）时按 ENOENT。
@@ -2349,6 +2348,7 @@ pub fn open_executable(ctx: &Context, path: &str) -> Result<ExecutableFile, Errn
     Ok(ExecutableFile { ino, len })
 }
 
+/// 读取可执行文件完整字节内容。
 pub fn executable(ctx: &Context, path: &str) -> Result<Vec<u8>, Errno> {
     let file = open_executable(ctx, path)?;
     let len = file.size();

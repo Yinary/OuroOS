@@ -128,7 +128,7 @@ impl BlockAllocator {
         Ok(None)
     }
 
-    // OuroOS patch: byte-granularity fast scan for contiguous free blocks (0xff/0x00 skip).
+    // OuroOS patch: 字节级连续空闲块扫描
     /// Find the first contiguous free range with the requested length directly on a bitmap slice.
     pub(crate) fn find_contiguous_in_slice(&self, bitmap_data: &[u8], count: u32) -> Option<u32> {
         if count == 0 || count > self.blocks_per_group {

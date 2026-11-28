@@ -141,7 +141,7 @@ impl ElfSource for &[u8] {
     }
 }
 
-/// 已校验的 ELF64 头部与程序头表缓存（通常仅数百字节，避免整文件读入内核堆）。
+/// 已校验的 ELF64 头部与程序头表缓存。
 struct ParsedHeader {
     e_type: u16,
     e_entry: usize,
@@ -163,7 +163,7 @@ pub fn interp_path(elf: &[u8]) -> Result<Option<String>, ElfError> {
     interp_path_source(&elf)
 }
 
-/// 从任意 [`ElfSource`] 按页流式把主映像 ELF 加载进 `space`，返回入口与 auxv 所需信息。
+/// 从 [`ElfSource`] 流式加载主映像 ELF 到 `space`，返回入口与 auxv 信息。
 ///
 /// ET_EXEC 使用固定地址（基址 0）；ET_DYN 以 [`et_dyn_base`] 为装载基址。
 /// BSS（memsz > filesz 的部分）依赖 [`UserAddressSpace::map_alloc`]
@@ -185,12 +185,12 @@ pub fn load_elf_source(
     Ok(info)
 }
 
-/// 内存切片版本的 [`load_elf_source`]（内嵌镜像与自检使用）。
+/// 内存切片版本的 [`load_elf_source`]。
 pub fn load_elf(space: &mut UserAddressSpace, elf: &[u8]) -> Result<ImageInfo, ElfError> {
     load_elf_source(space, &elf)
 }
 
-/// 在已构造的地址空间内按页流式装载解释器映像（响应主映像的 PT_INTERP）。
+/// 在已有地址空间内流式加载解释器映像。
 ///
 /// 解释器自身的 ET_EXEC 使用固定地址；ET_DYN 在栈保护区下方寻找空洞
 /// 作为装载基址，避免与主映像或栈冲突。返回值供 AT_BASE 与初次 PC 使用。
@@ -370,7 +370,7 @@ fn map_error(e: crate::mm::address_space::MapError) -> ElfError {
     }
 }
 
-/// 流式装载 PT_LOAD 段时复用的内核暂存块大小（64 KiB，对齐底层块读写批大小，避免大 ELF 整文件堆分配与逐页锁开销）。
+/// 流式加载 `PT_LOAD` 段的单次读取块大小（64 KiB）。
 const ELF_LOAD_CHUNK: usize = 64 * 1024;
 
 /// 把映像按装载基址 `bias` 流式装入 `space`（不新建地址空间）。
@@ -386,7 +386,6 @@ fn load_image_source(
     let phnum = header.phnum;
     let phend = e_phoff + phnum * PHENTSIZE as usize;
 
-    // 复用单个 64 KiB 暂存块分批读取 PT_LOAD 段，兼顾零大块堆碎片与低文件系统加锁频次。
     let buf_cap = src.size().clamp(PAGE_SIZE, ELF_LOAD_CHUNK);
     let mut chunk_buf = Vec::new();
     chunk_buf

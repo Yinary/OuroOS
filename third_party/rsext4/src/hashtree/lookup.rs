@@ -36,7 +36,7 @@ pub(super) fn lookup<B: BlockDevice>(
 
     let root_block = manager.get_root_block(block_dev, dir_inode)?;
     let root_data = manager.read_block_data(fs, block_dev, root_block)?;
-    // OuroOS patch: "." and ".." reside in block 0 of an HTree root, not in leaf blocks.
+    // OuroOS patch: 哈希树目录的 "." 和 ".." 位于根块
     if matches!(target_name, b"." | b"..") {
         return manager.search_in_leaf_data(&root_data, target_name, root_block);
     }
@@ -72,8 +72,7 @@ pub(super) fn lookup<B: BlockDevice>(
             );
             Ok(result)
         }
-        // OuroOS patch: valid HTree EntryNotFound (including continuation blocks) is authoritative;
-        // do not emit warn! or linearly re-scan the entire directory on normal ENOENT.
+        // OuroOS patch: 有效哈希树未命中直接返回 EntryNotFound
         Err(HashTreeError::InvalidDirectoryEntry) => Err(HashTreeError::InvalidDirectoryEntry),
         Err(HashTreeError::EntryNotFound) => Err(HashTreeError::EntryNotFound),
         Err(err) => {
@@ -155,7 +154,7 @@ impl HashTreeManager {
         }
 
         let mut idx = selected_idx.ok_or(HashTreeError::EntryNotFound)?;
-        // OuroOS patch: follow Ext4 HTree hash-collision continuation blocks (bit 0 == 1).
+        // OuroOS patch: 沿冲突续链块（hash 最低位为 1）继续查找
         loop {
             let entry = &entries[idx];
             let block_num = resolve_inode_block(block_dev, &mut dir_inode.clone(), entry.block)

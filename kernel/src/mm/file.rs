@@ -85,7 +85,7 @@ pub(crate) fn compact_ino(ino: u32) {
     compact_inos(&[ino]);
 }
 
-/// 在单次 RESIDENT 锁内批量压缩一组 inode 的弱引用登记组，避免地址空间析构时逐页重复加锁扫描。
+/// 批量清理一组 inode 在 `RESIDENT` 中的失效弱引用。
 pub(crate) fn compact_inos(inos: &[u32]) {
     if inos.is_empty() {
         return;
@@ -221,7 +221,7 @@ impl FilePage {
                 || matches!(&p.data, Data::Shared(page) if !page.is_valid())
         })
     }
-    /// 释放驻留页引用并回收空闲共享页，但延迟 `RESIDENT` 压缩，供地址空间析构按 inode 批量执行。
+    /// 释放驻留页引用并回收空闲共享页，返回待压缩的 inode 号。
     pub(super) fn release_deferred(&self) -> Option<u32> {
         if self.data.borrow_mut().take().is_none() {
             return None;
@@ -321,7 +321,7 @@ impl FilePage {
 }
 impl Drop for FilePage {
     fn drop(&mut self) {
-        // 进程直接退出而不经 munmap 时同样需要回收共享页与 RESIDENT 弱引用组。
+        // 释放残留共享页并清理 RESIDENT 登记。
         self.discard();
     }
 }

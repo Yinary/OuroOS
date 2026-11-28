@@ -718,7 +718,7 @@ impl DataBlockCache {
         dirty_blocks: &[(AbsoluteBN, u64, Vec<u8>)],
         block_size: usize,
     ) -> Ext4Result<()> {
-        // OuroOS patch: 限制单次合并写回为 16 块（64 KiB）并走可失败预留，修复原 BLOCK_SIZE * 100 单位错误及不可失败大分配。
+        // OuroOS patch: 单次写回上限 16 块（64 KiB）并走可失败预留
         let max_part_blocks = 16usize;
         let mut idx = 0usize;
         while idx < dirty_blocks.len() {

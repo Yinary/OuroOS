@@ -258,7 +258,7 @@ pub const fn normalize_cmd(cmd: i32) -> i32 {
     cmd & !IPC_64
 }
 
-/// 关机前清空未由用户态 IPC_RMID 销毁的 System V 共享内存段，释放其物理页帧。
+/// 清空全部 System V 共享内存段并释放物理页帧。
 pub fn clear_all() {
     SHM_TABLE.lock().segments.clear();
 }

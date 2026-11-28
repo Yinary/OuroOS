@@ -1942,7 +1942,7 @@ impl Drop for UserAddressSpace {
         if self.pt.borrow_mut().is_active() {
             self.pt.borrow_mut().deactivate();
         }
-        // 按唯一 inode 批量压缩 RESIDENT 弱引用表，避免逐页析构触发 O(N^2) 锁与线性扫描。
+        // 按去重后的 inode 批量压缩 RESIDENT 弱引用表。
         let mut dirty_inos = [0u32; 32];
         let mut dirty_len = 0usize;
         let mut record_ino = |ino: u32| {
