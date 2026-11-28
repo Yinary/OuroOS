@@ -10,7 +10,8 @@ pub mod signal;
 mod task;
 pub mod user_task;
 
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use polyhal::{irq::IRQ, println};
 
@@ -187,6 +188,40 @@ pub fn comm_from_path(path: &str) -> [u8; 16] {
     comm_from_bytes(base.as_bytes())
 }
 
+/// pidfd(2) 共享进程实例状态：锁外供 poll/epoll 查询退出状态与边沿版本，防止 PID 复用误判。
+pub struct PidFdState {
+    pid: Pid,
+    exited: AtomicBool,
+    event_gen: AtomicU64,
+}
+
+impl PidFdState {
+    pub fn new(pid: Pid, exited: bool) -> Self {
+        Self {
+            pid,
+            exited: AtomicBool::new(exited),
+            event_gen: AtomicU64::new(1),
+        }
+    }
+
+    pub fn pid(&self) -> Pid {
+        self.pid
+    }
+
+    pub fn is_exited(&self) -> bool {
+        self.exited.load(Ordering::Acquire)
+    }
+
+    pub fn event_gen(&self) -> u64 {
+        self.event_gen.load(Ordering::Acquire)
+    }
+
+    pub fn mark_exited(&self) {
+        self.exited.store(true, Ordering::Release);
+        self.event_gen.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// 进程注册表条目：Task 之外的全部资源与终态。
 /// 生命周期：wait 成功收割即删除；孤儿过继 init，运行时间累归丢弃。
 /// 表内只存活跃进程与未被收割的僵尸。
@@ -233,6 +268,8 @@ pub struct ProcessRecord {
     pub cap_bset: u64,
     /// PR_SET_SECUREBITS / PR_GET_SECUREBITS（fork 继承，exec 保留）。
     pub securebits: u32,
+    /// pidfd_open(2) 按需创建的进程实例句柄，退出时置位并唤醒 poll/epoll。
+    pub pidfd_state: Option<Arc<PidFdState>>,
 }
 
 /// 线程记录：线程私有的信号状态与 prctl 属性。地址空间等组级资源在 ProcessRecord。
@@ -650,6 +687,7 @@ mod registry {
             thp_disable: false,
             cap_bset: CAP_FULL_SET,
             securebits: 0,
+            pidfd_state: None,
             user_ns: 0,
             system_ns: 0,
             child_user_ns: 0,
@@ -719,6 +757,10 @@ mod registry {
             let mut reg = REGISTRY.lock();
             let rec = reg.group_mut(pid).expect("exiting task is not registered");
             rec.exit = Some(exit);
+            if let Some(ref state) = rec.pidfd_state {
+                state.mark_exited();
+                sched::request_pipe_wake();
+            }
             let had_itimer = rec.itimer_real.take().is_some() || !rec.posix_timers.is_empty();
             rec.posix_timers.clear();
             // 快照置僵尸（procfs 可见的存活规则与注册表一致）

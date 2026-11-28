@@ -181,6 +181,10 @@ pub mod sysnr {
     pub const CLONE: usize = 220;
     pub const EXECVE: usize = 221;
     pub const WAIT4: usize = 260;
+    pub const KCMP: usize = 272;
+    pub const PIDFD_SEND_SIGNAL: usize = 424;
+    pub const PIDFD_OPEN: usize = 434;
+    pub const PIDFD_GETFD: usize = 438;
     // POSIX 消息队列
     pub const MQ_OPEN: usize = 180;
     pub const MQ_UNLINK: usize = 181;
@@ -755,6 +759,10 @@ pub fn dispatch(
         | sysnr::EXECVE
         | sysnr::WAIT4
         | sysnr::WAITID
+        | sysnr::KCMP
+        | sysnr::PIDFD_OPEN
+        | sysnr::PIDFD_SEND_SIGNAL
+        | sysnr::PIDFD_GETFD
         | sysnr::GETRUSAGE
         | sysnr::SCHED_SETPARAM
         | sysnr::SCHED_SETSCHEDULER
