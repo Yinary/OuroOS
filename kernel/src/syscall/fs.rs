@@ -32,6 +32,12 @@ pub fn dispatch(
         sysnr::UMASK => Ok(ctx.set_umask(a[0])),
         sysnr::UTIMENSAT => utimensat(ctx, space, a),
         sysnr::TRUNCATE | sysnr::FTRUNCATE => truncate(nr, ctx, space, a),
+        sysnr::FALLOCATE => {
+            let file = ctx.get(a[0])?;
+            let file = file.lock();
+            file.fallocate(a[1] as u32 as i32, a[2] as i64, a[3] as i64)?;
+            Ok(0)
+        }
         sysnr::RENAMEAT | sysnr::RENAMEAT2 => renameat(nr, ctx, space, a),
         sysnr::GETCWD => {
             let cwd = ctx.cwd()?;
@@ -71,27 +77,24 @@ pub fn dispatch(
             }
         }
         sysnr::MOUNT => {
-            if a[3] != 0 {
-                return Err(Errno::NotSupported);
-            }
-            let source = user_string(space, a[0])?;
             let target = ctx.path((-100isize) as usize, &user_string(space, a[1])?)?;
             let kind = user_string(space, a[2])?;
-            if kind != "vfat" && kind != "fat" {
+            if !matches!(kind.as_str(), "ext2" | "vfat" | "fat") {
                 return Err(Errno::NoDevice);
             }
-            if fs::stat(fs::lookup(&target)?)?.0 & 0xf000 != 0x4000 {
-                return Err(Errno::NotDir);
+            if kind == "ext2" && credentials.euid != 0 {
+                return Err(Errno::Perm);
             }
-            fs::fat::mount(&source, &target)?;
+            let source = user_string(space, a[0])?;
+            fs::mount(&source, &target, &kind, a[3])?;
             Ok(0)
         }
-        sysnr::FACCESSAT => faccessat(ctx, space, a),
+        sysnr::FACCESSAT => access_check_common(ctx, space, a, 0, credentials),
         sysnr::FCHOWNAT | sysnr::FCHOWN => chown(nr, ctx, space, a, credentials),
         sysnr::FCHMOD => fchmod(ctx, space, a),
         sysnr::FCHMODAT => fchmodat(ctx, space, a),
         sysnr::MKNODAT => mknodat(ctx, space, a, credentials),
-        sysnr::FACCESSAT2 => faccessat2(ctx, space, a),
+        sysnr::FACCESSAT2 => access_check_common(ctx, space, a, a[3] as u32, credentials),
         sysnr::IOCTL => ioctl(ctx, space, a),
 
         sysnr::UMOUNT2 => {
@@ -99,37 +102,11 @@ pub fn dispatch(
                 return Err(Errno::NotSupported);
             }
             let target = ctx.path((-100isize) as usize, &user_string(space, a[0])?)?;
-            fs::fat::unmount(&target)?;
+            fs::unmount(&target, credentials.euid == 0)?;
             Ok(0)
         }
-        sysnr::SYMLINKAT => {
-            let target = user_string(space, a[0])?;
-            let linkpath = user_string(space, a[2])?;
-            let dirfd = a[1] as u32 as i32 as isize as usize;
-            ctx.symlink(dirfd, &linkpath, &target)?;
-            Ok(0)
-        }
-        sysnr::LINKAT => {
-            const AT_SYMLINK_FOLLOW: u32 = 0x400;
-            const AT_EMPTY_PATH: u32 = 0x1000;
-            let flags = a[4] as u32;
-            if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
-                return Err(Errno::Invalid);
-            }
-            let old = user_string(space, a[1])?;
-            let new = user_string(space, a[3])?;
-            let old_dir = a[0] as u32 as i32 as isize as usize;
-            let new_dir = a[2] as u32 as i32 as isize as usize;
-            ctx.link(
-                old_dir,
-                &old,
-                new_dir,
-                &new,
-                flags & AT_SYMLINK_FOLLOW != 0,
-                flags & AT_EMPTY_PATH != 0,
-            )?;
-            Ok(0)
-        }
+        sysnr::LINKAT => linkat(ctx, space, a, credentials),
+        sysnr::SYMLINKAT => symlinkat(ctx, space, a, credentials),
         sysnr::SENDFILE => sendfile(ctx, space, a),
         sysnr::SPLICE => splice(ctx, space, a),
         sysnr::TEE => tee(ctx, a),
@@ -140,36 +117,26 @@ pub fn dispatch(
                 return Err(Errno::Invalid);
             }
             let input = user_string(space, a[1])?;
-            let dirfd = a[0] as u32 as i32 as isize as usize;
-            if a[2] & 0x200 != 0 {
-                match input.trim_end_matches('/').rsplit('/').next() {
-                    Some(".") => return Err(Errno::Invalid),
-                    Some("..") => return Err(Errno::NotEmpty),
-                    _ => {}
-                }
-                let (path, p, name) = ctx.resolve_parent_entry(dirfd, &input, Errno::Busy)?;
-                let info = fs::query(&path, false)?;
-                if info.mode & 0xf000 != 0x4000 {
-                    return Err(Errno::NotDir);
-                }
-                if path == "/" || fs::contains_mount(&path) {
-                    return Err(Errno::Busy);
-                }
-                fs::rmdir(p, info.ino as u32, &name)?;
+            let dir = a[0] as u32 as i32 as isize as usize;
+            if a[2] == 0 {
+                ctx.unlink(dir, &input)?;
                 return Ok(0);
             }
-            if input.ends_with('/') {
-                let (path, _, _) = ctx.resolve_parent_entry(dirfd, &input, Errno::IsDir)?;
-                let info = fs::query(&path, false)?;
-                return Err(if info.mode & 0xf000 == 0x4000 {
-                    Errno::IsDir
-                } else {
-                    Errno::NotDir
-                });
+            let path = ctx.path(dir, &input)?;
+            let ino = fs::lookup(&path)?;
+            match input.trim_end_matches('/').rsplit('/').next() {
+                Some(".") => return Err(Errno::Invalid),
+                Some("..") => return Err(Errno::NotEmpty),
+                _ => {}
             }
-            let (path, p, name) = ctx.resolve_parent_entry(dirfd, &input, Errno::IsDir)?;
-            let info = fs::query(&path, false)?;
-            fs::unlink(p, info.ino as u32, &name)?;
+            if fs::stat(ino)?.0 & 0xf000 != 0x4000 {
+                return Err(Errno::NotDir);
+            }
+            if path == "/" || fs::contains_mount(&path) {
+                return Err(Errno::Busy);
+            }
+            let (_, p, name) = ctx.resolve_parent_entry(dir, &input, Errno::Busy)?;
+            fs::rmdir(p, ino, &name)?;
             Ok(0)
         }
         sysnr::PIPE2 => {
@@ -194,7 +161,7 @@ pub fn dispatch(
             if info.mode & 0xf000 != 0x4000 {
                 return Err(Errno::NotDir);
             }
-            ctx.set_cwd(resolved, info.ino as u32)?;
+            ctx.set_cwd(resolved, info.inode_handle())?;
             Ok(0)
         }
         sysnr::FCHDIR => {
@@ -202,185 +169,144 @@ pub fn dispatch(
             Ok(0)
         }
         sysnr::OPENAT => {
-            const O_CREAT: usize = 0x40;
-            const O_EXCL: usize = 0x80;
-            const O_TRUNC: usize = 0x200;
-            const O_DIRECTORY: usize = 0x10000;
             const O_NOFOLLOW: usize = 0x20000;
-            const O_CLOEXEC: usize = 0x80000;
             const O_PATH: usize = 0x200000;
-            if a[2] & 3 == 3 {
-                return Err(Errno::Invalid);
-            }
-            if a[2] & O_DIRECTORY != 0 && a[2] & O_CREAT != 0 {
-                return Err(Errno::Invalid);
-            }
-            let raw_input = user_string(space, a[1])?;
-            let dirfd = a[0] as u32 as i32 as isize as usize;
-            let joined = ctx.join_raw(dirfd, &raw_input)?;
-            if joined.starts_with("/proc") || joined.starts_with("/dev") {
-                if let Ok(path) = ctx.path(dirfd, &raw_input) {
-                    if path == "/proc/meminfo" {
-                        return ctx.open_meminfo(a[2], a[2] & O_CLOEXEC != 0);
-                    }
-                    if path == "/proc/self/maps" {
-                        let text = fs::procfs_maps(space)?;
-                        return ctx.open_proc_text(text, a[2], a[2] & O_CLOEXEC != 0);
-                    }
-                    if path == "/proc/self/fd" {
-                        return ctx.open_proc_fd_dir(a[2], a[2] & O_CLOEXEC != 0);
-                    }
-                    if fs::is_procfs_text(&path) {
-                        let text = fs::procfs_text(&path)?;
-                        return ctx.open_proc_text(text, a[2], a[2] & O_CLOEXEC != 0);
-                    }
-                    if path == "/dev/null" {
-                        return ctx.open_devnull(a[2], a[2] & O_CLOEXEC != 0);
-                    }
-                    if path == "/dev/zero" {
-                        return ctx.open_devzero(a[2], a[2] & O_CLOEXEC != 0);
-                    }
-                    if path == "/dev/urandom" {
-                        return ctx.open_devrandom(true, a[2], a[2] & O_CLOEXEC != 0);
-                    }
-                    if path == "/dev/random" {
-                        return ctx.open_devrandom(false, a[2], a[2] & O_CLOEXEC != 0);
-                    }
-                    if path == "/dev/misc/rtc" {
-                        return ctx.open_rtc(a[2], a[2] & O_CLOEXEC != 0);
-                    }
-                    if let Some((disk, part)) = fs::lookup_blk_node(&path) {
-                        if let Ok((start, len)) = crate::drivers::partition(disk, part) {
-                            return ctx.open_devblk(
-                                disk,
-                                start,
-                                len as u64,
-                                a[2],
-                                a[2] & O_CLOEXEC != 0,
-                            );
-                        }
-                        return Err(Errno::NoDevice);
-                    }
-                }
-            }
-            let creat = a[2] & O_CREAT != 0;
-            let excl = a[2] & O_EXCL != 0;
-            let nofollow = a[2] & O_NOFOLLOW != 0;
-            let o_path = a[2] & O_PATH != 0;
-            let trailing_slash = raw_input.ends_with('/');
-            let (ino, mode, open_path) = if creat && excl {
-                if trailing_slash {
-                    return Err(Errno::IsDir);
-                }
-                let (canonical, p, name) =
-                    ctx.resolve_parent_entry(dirfd, &raw_input, Errno::Exists)?;
-                match fs::query(&canonical, false) {
-                    Ok(_) => return Err(Errno::Exists),
-                    Err(Errno::NoEntry) => {
-                        let new_mode = 0x8000 | ctx.creation_mode(a[3]);
-                        let ino = fs::create(p, &name, new_mode)?;
-                        (ino, new_mode, canonical)
-                    }
-                    Err(e) => return Err(e),
-                }
+            let path_only = a[2] & O_PATH != 0;
+            let flags = if path_only {
+                a[2] & (O_PATH | O_NOFOLLOW | 0x10000 | 0x80000)
             } else {
-                let follow = !nofollow || trailing_slash;
-                match fs::resolve(&joined, follow) {
-                    Ok((resolved, info)) => {
-                        if info.mode & 0xf000 == 0xa000 && !o_path {
-                            return Err(Errno::Loop);
-                        }
-                        if trailing_slash && info.mode & 0xf000 != 0x4000 {
-                            return Err(Errno::NotDir);
-                        }
-                        (info.ino as u32, info.mode, resolved)
-                    }
-                    Err(Errno::NoEntry) if creat => {
-                        if trailing_slash {
-                            return Err(Errno::IsDir);
-                        }
-                        let new_mode = 0x8000 | ctx.creation_mode(a[3]);
-                        // 悬空符号链接 + O_CREAT（无 O_EXCL）：按 Linux open(2) 跟随链接并创建目标文件。
-                        if let Ok((sym_path, sym_info)) = fs::resolve(&joined, false) {
-                            if sym_info.mode & 0xf000 == 0xa000 {
-                                if nofollow {
-                                    return Err(Errno::Loop);
-                                }
-                                let target = fs::read_link(sym_info.ino as u32)?;
-                                let target_joined = if target.starts_with('/') {
-                                    target
-                                } else {
-                                    let sym_parent = match sym_path.rfind('/') {
-                                        Some(0) | None => "/",
-                                        Some(i) => &sym_path[..i],
-                                    };
-                                    let mut full = String::new();
-                                    full.try_reserve(sym_parent.len() + target.len() + 1)
-                                        .map_err(|_| Errno::NoMem)?;
-                                    full.push_str(sym_parent);
-                                    if sym_parent != "/" {
-                                        full.push('/');
-                                    }
-                                    full.push_str(&target);
-                                    full
-                                };
-                                let (canonical, p, name) = ctx.resolve_parent_entry(
-                                    (-100isize) as usize,
-                                    &target_joined,
-                                    Errno::Exists,
-                                )?;
-                                let ino = fs::create(p, &name, new_mode)?;
-                                (ino, new_mode, canonical)
-                            } else {
-                                let (canonical, p, name) =
-                                    ctx.resolve_parent_entry(dirfd, &raw_input, Errno::Exists)?;
-                                let ino = fs::create(p, &name, new_mode)?;
-                                (ino, new_mode, canonical)
-                            }
-                        } else {
-                            let (canonical, p, name) =
-                                ctx.resolve_parent_entry(dirfd, &raw_input, Errno::Exists)?;
-                            let ino = fs::create(p, &name, new_mode)?;
-                            (ino, new_mode, canonical)
-                        }
-                    }
-                    Err(e) => return Err(e),
+                a[2]
+            };
+            let create = flags & 64 != 0;
+            let exclusive = create && flags & 0x80 != 0;
+            let nofollow = flags & O_NOFOLLOW != 0;
+            if flags & 3 == 3 || flags & 0x10000 != 0 && create {
+                return Err(Errno::Invalid);
+            }
+            let dir = a[0] as u32 as i32 as isize as usize;
+            let input = user_string(space, a[1])?;
+            let (path, entry) = match ctx.open_path(dir, &input, !(nofollow || exclusive), create) {
+                Ok((path, entry)) => (path, Some(entry)),
+                Err(Errno::NoDevice) if !fs::mounted() => (ctx.path(dir, &input)?, None),
+                Err(e) => return Err(e),
+            };
+            if let Some(fs::ResolvedEntry::Existing(ref info)) = entry {
+                if exclusive {
+                    return Err(Errno::Exists);
+                }
+                if info.mode & 0xf000 == 0xa000 && nofollow && !path_only {
+                    return Err(Errno::Loop);
+                }
+                if flags & 0x10000 != 0 && info.mode & 0xf000 != 0x4000 {
+                    return Err(Errno::NotDir);
+                }
+            }
+            if path == "/proc/meminfo" {
+                return ctx.open_meminfo(flags, flags & 0x80000 != 0);
+            }
+            if path == "/proc/self/fd" {
+                return ctx.open_proc_fd_dir(flags, flags & 0x80000 != 0);
+            }
+            if path == "/proc/self/maps" {
+                let ino = fs::lookup(&path)?;
+                let text = fs::procfs_maps(space)?;
+                return ctx.open_proc_text(ino, text, flags, flags & 0x80000 != 0);
+            }
+            if let Some(field) = match path.as_str() {
+                "/proc/sys/fs/mqueue/queues_max" => Some(crate::ipc::mqueue::MqSysctl::QueuesMax),
+                "/proc/sys/fs/mqueue/msg_max" => Some(crate::ipc::mqueue::MqSysctl::MsgMax),
+                "/proc/sys/fs/mqueue/msgsize_max" => Some(crate::ipc::mqueue::MqSysctl::MsgSizeMax),
+                _ => None,
+            } {
+                return ctx.open_proc_mq_sysctl(field, flags, flags & 0x80000 != 0);
+            }
+            if fs::is_procfs_text(&path) {
+                let ino = fs::lookup(&path)?;
+                let text = fs::procfs_text(&path)?;
+                return ctx.open_proc_text(ino, text, flags, flags & 0x80000 != 0);
+            }
+            if let Some(rest) = path.strip_prefix("/proc/") {
+                if matches!(rest, "cpuinfo" | "mounts")
+                    || rest
+                        .split_once('/')
+                        .is_some_and(|(_, f)| matches!(f, "stat" | "cmdline" | "status"))
+                {
+                    let ino = fs::lookup(&path)?;
+                    let text = fs::procfs_text(&path)?;
+                    return ctx.open_proc_text(ino, text, flags, flags & 0x80000 != 0);
+                }
+            }
+            if path == "/dev/null" {
+                return ctx.open_devnull(flags, flags & 0x80000 != 0);
+            }
+            if path == "/dev/zero" {
+                return ctx.open_devzero(flags, flags & 0x80000 != 0);
+            }
+            if path == "/dev/urandom" {
+                return ctx.open_devrandom(true, flags, flags & 0x80000 != 0);
+            }
+            if path == "/dev/random" {
+                return ctx.open_devrandom(false, flags, flags & 0x80000 != 0);
+            }
+            if path == "/dev/misc/rtc" {
+                return ctx.open_rtc(flags, flags & 0x80000 != 0);
+            }
+            if let Some((disk, part)) = fs::lookup_blk_node(&path) {
+                if credentials.euid != 0 && !path_only {
+                    return Err(Errno::Access);
+                }
+                if let Ok((start, len)) = crate::drivers::partition(disk, part) {
+                    return ctx.open_devblk(
+                        disk,
+                        part,
+                        start,
+                        len as u64,
+                        flags,
+                        flags & 0x80000 != 0,
+                    );
+                }
+                return Err(Errno::NoDevice);
+            }
+            let (ino, mode) = match entry.ok_or(Errno::NoDevice)? {
+                fs::ResolvedEntry::Existing(info) => (info.inode_handle(), info.mode),
+                fs::ResolvedEntry::Missing { parent } => {
+                    let name = path.rsplit('/').next().ok_or(Errno::NoEntry)?;
+                    let mode = 0x8000 | ctx.creation_mode(a[3]);
+                    let owner = (credentials.fsuid, credentials.fsgid);
+                    (fs::create_regular(parent, name, mode, owner)?, mode)
                 }
             };
-            if a[2] & O_DIRECTORY != 0 && mode & 0xf000 != 0x4000 {
-                return Err(Errno::NotDir);
-            }
-            if mode & 0xf000 == 0x4000 && (a[2] & 3 != 0 || creat) && !o_path {
+            if mode & 0xf000 == 0x4000 && (flags & 3 != 0 || create) {
                 return Err(Errno::IsDir);
             }
-            if mode & 0xf000 == 0x1000 && !o_path {
-                return ctx.open_fifo(ino, a[2], a[2] & O_CLOEXEC != 0, tgid);
+            if flags & 3 != 0 {
+                fs::check_write_open(ino)?;
             }
-            if mode & 0xf000 == 0xc000 && !o_path {
-                return Err(Errno::NxIo);
+            if mode & 0xf000 == 0x1000 && !path_only {
+                return ctx.open_fifo(ino, flags, flags & 0x80000 != 0, tgid);
             }
-            if mode & 0xf000 == 0x2000 && !o_path {
+            if mode & 0xf000 == 0x2000 && !path_only {
                 let rdev = fs::metadata(ino)?.rdev;
-                let cloexec = a[2] & O_CLOEXEC != 0;
+                let cloexec = flags & 0x80000 != 0;
                 return match rdev {
-                    0x0103 => ctx.open_devnull(a[2], cloexec),
-                    0x0105 => ctx.open_devzero(a[2], cloexec),
-                    0x0108 => ctx.open_devrandom(false, a[2], cloexec),
-                    0x0109 => ctx.open_devrandom(true, a[2], cloexec),
+                    0x0103 => ctx.open_devnull(flags, cloexec),
+                    0x0105 => ctx.open_devzero(flags, cloexec),
+                    0x0108 => ctx.open_devrandom(false, flags, cloexec),
+                    0x0109 => ctx.open_devrandom(true, flags, cloexec),
                     _ => Err(Errno::NxIo),
                 };
             }
-            if mode & 0xf000 == 0x6000 && !o_path {
+            if matches!(mode & 0xf000, 0x6000 | 0xc000) && !path_only {
                 return Err(Errno::NxIo);
             }
-            if a[2] & O_TRUNC != 0 && a[2] & 3 != 0 && !o_path {
+            if flags & 0x200 != 0 && flags & 3 != 0 {
                 fs::truncate(ino, 0)?;
             }
             ctx.open_inode(
                 ino,
-                open_path,
-                a[2],
-                a[2] & O_CLOEXEC != 0,
+                path,
+                flags,
+                flags & 0x80000 != 0,
                 mode & 0xf000 == 0x4000,
             )
         }
@@ -388,16 +314,32 @@ pub fn dispatch(
             let _ = fs::sync();
             Ok(0)
         }
-        #[cfg(not(feature = "rsext4-readonly"))]
-        sysnr::FSYNC => {
+        sysnr::FSYNC | sysnr::FDATASYNC => {
             let handle = ctx.get(a[0])?;
-            let ino = handle.lock().inode()?;
-            fs::sync_inode(ino)?;
+            let result = handle.lock().sync_inode();
+            result?;
             Ok(0)
         }
+        sysnr::SYNCFS => {
+            let _ = ctx.get(a[0])?;
+            let _ = fs::sync();
+            Ok(0)
+        }
+        sysnr::SYNC_FILE_RANGE => sync_file_range(ctx, a),
         sysnr::CLOSE => {
             ctx.close(a[0], tgid)?;
             Ok(0)
+        }
+        sysnr::CLOSE_RANGE => {
+            const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
+            const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+            let first = a[0] as u32 as usize;
+            let last = a[1] as u32 as usize;
+            let flags = a[2] as u32;
+            if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
+                return Err(Errno::Invalid);
+            }
+            ctx.close_range(first, last, flags & CLOSE_RANGE_CLOEXEC != 0, tgid)
         }
         sysnr::LSEEK => {
             let handle = ctx.get(a[0])?;
@@ -411,7 +353,9 @@ pub fn dispatch(
         | sysnr::PREAD64
         | sysnr::PWRITE64
         | sysnr::PREADV
-        | sysnr::PWRITEV => rw(nr, a, space, ctx),
+        | sysnr::PWRITEV
+        | sysnr::PREADV2
+        | sysnr::PWRITEV2 => rw(nr, a, space, ctx),
         sysnr::READLINKAT => readlinkat(ctx, space, a),
         sysnr::FSTATAT | sysnr::STATX => {
             let extended = nr == sysnr::STATX;
@@ -559,7 +503,7 @@ fn truncate(
     if nr == sysnr::TRUNCATE {
         let path = user_string(space, a[0])?;
         let info = ctx.query((-100isize) as usize, &path, false, true)?;
-        fs::truncate(info.ino as u32, length as u64)?;
+        fs::truncate(info.inode_handle(), length as u64)?;
     } else {
         ctx.get(a[0] as u32 as usize)?
             .lock()
@@ -579,6 +523,7 @@ fn getdents64(
 ) -> Result<usize, Errno> {
     let handle = ctx.get(fd)?;
     let mut f = handle.lock();
+    f.check_access(true)?;
     if let Some(entries) = f.proc_fd_entries() {
         let mut out = [0u8; 4096];
         let cap = count.min(out.len());
@@ -670,6 +615,49 @@ fn getdents64(
     Ok(used)
 }
 
+/// Linux symlinkat：在指定目录下创建保存 UTF-8 目标的符号链接。
+fn symlinkat(
+    ctx: &Context,
+    space: &UserAddressSpace,
+    a: [usize; 6],
+    credentials: &Credentials,
+) -> Result<usize, Errno> {
+    let target = user_string(space, a[0])?;
+    let path = user_string(space, a[2])?;
+    ctx.symlink(
+        a[1] as u32 as i32 as isize as usize,
+        &path,
+        &target,
+        credentials,
+    )?;
+    Ok(0)
+}
+
+/// Linux linkat：检查目录访问权限后创建硬链接，可跟随源路径末项的符号链接。
+fn linkat(
+    ctx: &Context,
+    space: &UserAddressSpace,
+    a: [usize; 6],
+    credentials: &Credentials,
+) -> Result<usize, Errno> {
+    const AT_SYMLINK_FOLLOW: u32 = 0x400;
+    let flags = a[4] as u32;
+    if flags & !(AT_SYMLINK_FOLLOW | 0x1000) != 0 {
+        return Err(Errno::Invalid);
+    }
+    let old = user_string(space, a[1])?;
+    let new = user_string(space, a[3])?;
+    ctx.link(
+        a[0] as u32 as i32 as isize as usize,
+        &old,
+        a[2] as u32 as i32 as isize as usize,
+        &new,
+        flags,
+        credentials,
+    )?;
+    Ok(0)
+}
+
 /// Linux renameat/renameat2：支持普通改名及 NOREPLACE；交换和 whiteout 暂不支持。
 fn renameat(
     nr: usize,
@@ -740,7 +728,7 @@ fn utimensat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<u
         return ctx.get(dir)?.lock().update_times(times).map(|_| 0);
     }
     let info = ctx.query(dir, &path, flags & 0x1000 != 0, flags & 0x100 == 0)?;
-    fs::update_times(info.ino as u32, times)?;
+    fs::update_times(info.inode_handle(), times)?;
     Ok(0)
 }
 
@@ -784,7 +772,7 @@ fn chown(
             fd_inode(dir as usize, true)?
         } else {
             ctx.query(dir as usize, &path, empty, flags & AT_SYMLINK_NOFOLLOW == 0)?
-                .ino as u32
+                .inode_handle()
         };
         (ino, id(a[2]), id(a[3]))
     };
@@ -802,7 +790,7 @@ fn statfs(
     let stats = if nr == sysnr::STATFS {
         let path = user_string(space, a[0])?;
         let info = ctx.query((-100isize) as usize, &path, false, true)?;
-        fs::filesystem_stats(info.ino as u32)?
+        fs::filesystem_stats(info.inode_handle())?
     } else {
         ctx.get(a[0] as u32 as usize)?.lock().filesystem_stats()?
     };
@@ -845,7 +833,7 @@ fn readlinkat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<
             Errno::Invalid
         });
     }
-    let target = fs::read_link(info.ino as u32)?;
+    let target = fs::read_link(info.inode_handle())?;
     let n = target.len().min(capacity as usize);
     user_access::copy_to_user(space, a[2], &target.as_bytes()[..n]).map_err(|_| Errno::Fault)?;
     Ok(n)
@@ -1076,42 +1064,100 @@ impl UserIo<'_> {
     }
 }
 
+/// sync_file_range(2)：校验 flags、负偏移/长度、溢出与文件类型后同步对应范围。
+fn sync_file_range(ctx: &Context, a: [usize; 6]) -> Result<usize, Errno> {
+    let flags = a[3] as u32;
+    if flags & !7 != 0 {
+        return Err(Errno::Invalid);
+    }
+    let offset = a[1] as i64;
+    let nbytes = a[2] as i64;
+    if offset < 0 || nbytes < 0 {
+        return Err(Errno::Invalid);
+    }
+    if nbytes > 0
+        && (offset as u64)
+            .checked_add(nbytes as u64)
+            .is_none_or(|end| end > i64::MAX as u64)
+    {
+        return Err(Errno::Invalid);
+    }
+    let handle = ctx.get(a[0])?;
+    handle.lock().sync_file_range(flags != 0)?;
+    Ok(0)
+}
+
 /// 普通与定位、单缓冲区与向量 I/O 共用搬运流程；定位偏移不写入打开文件对象。
 fn rw(nr: usize, a: [usize; 6], space: &UserAddressSpace, ctx: &Context) -> Result<usize, Errno> {
+    const RWF_HIPRI: u32 = 0x01;
+    const RWF_DSYNC: u32 = 0x02;
+    const RWF_SYNC: u32 = 0x04;
+    const RWF_NOWAIT: u32 = 0x08;
+    const RWF_APPEND: u32 = 0x10;
+    const RWF_SUPPORTED: u32 = RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_NOWAIT | RWF_APPEND;
+
     let reading = matches!(
         nr,
-        sysnr::READ | sysnr::READV | sysnr::PREAD64 | sysnr::PREADV
+        sysnr::READ | sysnr::READV | sysnr::PREAD64 | sysnr::PREADV | sysnr::PREADV2
     );
     let vector = matches!(
         nr,
-        sysnr::READV | sysnr::WRITEV | sysnr::PREADV | sysnr::PWRITEV
+        sysnr::READV
+            | sysnr::WRITEV
+            | sysnr::PREADV
+            | sysnr::PWRITEV
+            | sysnr::PREADV2
+            | sysnr::PWRITEV2
     );
-    let positioned = matches!(
-        nr,
-        sysnr::PREAD64 | sysnr::PWRITE64 | sysnr::PREADV | sysnr::PWRITEV
-    );
-    // rv64/la64 的 pos_l 已容纳完整 64 位偏移，原始 preadv/pwritev 的 pos_h 不参与取值。
-    let offset = if positioned {
-        if (a[3] as isize) < 0 {
-            return Err(Errno::Invalid);
+    let v2 = matches!(nr, sysnr::PREADV2 | sysnr::PWRITEV2);
+    let rwf_flags = if v2 { a[5] as u32 } else { 0 };
+    if v2 && rwf_flags & !RWF_SUPPORTED != 0 {
+        return Err(Errno::NotSupported);
+    }
+
+    // rv64/la64 的 pos_l 已容纳完整 64 位偏移；preadv2/pwritev2 允许 pos == -1 表示使用并更新当前文件偏移。
+    let offset = match nr {
+        sysnr::PREAD64 | sysnr::PWRITE64 | sysnr::PREADV | sysnr::PWRITEV => {
+            if (a[3] as isize) < 0 {
+                return Err(Errno::Invalid);
+            }
+            Some(a[3])
         }
-        Some(a[3])
-    } else {
-        None
+        sysnr::PREADV2 | sysnr::PWRITEV2 => {
+            let pos = a[3] as i64;
+            if pos == -1 {
+                None
+            } else if pos < -1 {
+                return Err(Errno::Invalid);
+            } else {
+                Some(pos as usize)
+            }
+        }
+        _ => None,
     };
     let handle = ctx.get(a[0])?;
     let mut file = handle.lock();
-    if positioned {
+    if offset.is_some() {
         file.check_positioned()?;
     }
     file.check_access(reading)?;
-    if vector {
+    if v2 && rwf_flags & RWF_NOWAIT != 0 && !file.supports_nowait() {
+        return Err(Errno::NotSupported);
+    }
+    let force_append = !reading && v2 && (rwf_flags & RWF_APPEND != 0);
+    let res = if vector {
         let buffers = import_iov(space, a[1], a[2])?;
-        transfer(space, &mut file, &buffers, reading, offset)
+        transfer(space, &mut file, &buffers, reading, offset, force_append)
     } else {
         let b = buffer(a[1], a[2])?;
-        transfer(space, &mut file, &[b], reading, offset)
+        transfer(space, &mut file, &[b], reading, offset, force_append)
+    };
+    if let Ok(done) = res {
+        if !reading && done > 0 && (rwf_flags & (RWF_DSYNC | RWF_SYNC) != 0) {
+            file.sync_if_inode();
+        }
     }
+    res
 }
 
 /// 小读写直接走栈上 256 字节缓冲，避免自旋锁与堆池开销。
@@ -1162,6 +1208,7 @@ fn transfer(
     buffers: &[UserBuffer],
     reading: bool,
     position: Option<usize>,
+    force_append: bool,
 ) -> Result<usize, Errno> {
     let total = buffers
         .iter()
@@ -1179,6 +1226,7 @@ fn transfer(
             total,
             reading,
             position,
+            force_append,
             &mut stack_buf[..total],
         );
     }
@@ -1191,10 +1239,12 @@ fn transfer(
         total,
         reading,
         position,
+        force_append,
         &mut scratch.0[..cap],
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transfer_with_buf(
     space: &UserAddressSpace,
     file: &mut fs::context::OpenFile,
@@ -1202,6 +1252,7 @@ fn transfer_with_buf(
     total: usize,
     reading: bool,
     mut position: Option<usize>,
+    force_append: bool,
     chunk: &mut [u8],
 ) -> Result<usize, Errno> {
     let mut user = UserIo {
@@ -1230,7 +1281,13 @@ fn transfer_with_buf(
                     user_access::copy_from_user(space, address, &mut chunk[start..start + len])
                         .map_err(|_| Errno::Fault)
                 })?;
-                if let Some(pos) = position {
+                if force_append {
+                    if position.is_some() {
+                        file.write_append_at(&chunk[..copied], done == 0)
+                    } else {
+                        file.write_append_chunk(&chunk[..copied], done == 0)
+                    }
+                } else if let Some(pos) = position {
                     file.write_at(pos, &chunk[..copied], done == 0)
                 } else {
                     file.write_chunk(&chunk[..copied], done == 0)
@@ -1311,39 +1368,21 @@ fn encode_statx(m: &fs::Metadata) -> [u8; 256] {
     }
     out
 }
-/// faccessat(2)（dirfd, path, mode, 无 flags）：glibc 在某些版本会把
-/// 第 4 寄存器残留为任意值，raw 入口不得读取第 4 参数（否则非零残留
-/// 被误判为非法 flags，RV glibc which 即因此失败）。
-fn faccessat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
-    access_check_common(ctx, space, a, true)
-}
-
-/// faccessat2(2)（dirfd, path, mode, flags）：flags 接受 AT_EACCESS(0x200)/
-/// AT_SYMLINK_NOFOLLOW(0x100)；AT_EACCESS 在无凭证模型下与默认等价。
-fn faccessat2(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<usize, Errno> {
-    access_check_common(ctx, space, a, false)
-}
-
-/// access 系列共用主体；`raw` 为 true 时忽略第 4 参数（faccessat 的 ABI）。
+/// Linux faccessat/faccessat2：按身份检查路径权限；原始 faccessat 不读取第 4 参数。
 fn access_check_common(
     ctx: &Context,
     space: &UserAddressSpace,
     a: [usize; 6],
-    raw: bool,
+    flags: u32,
+    credentials: &Credentials,
 ) -> Result<usize, Errno> {
-    if !raw && a[3] & !0x300 != 0 {
+    let mode = a[2] as u32;
+    if mode & !0x7 != 0 || flags & !0x1300 != 0 {
         return Err(Errno::Invalid);
     }
-    let path = ctx.path(a[0], &user_string(space, a[1])?)?;
-    let ino = fs::lookup(&path)?;
-    let (st_mode, ..) = fs::stat(ino)?;
-    let mode = a[2];
-    if mode & !0x7 != 0 {
-        return Err(Errno::Invalid);
-    }
-    if mode & 1 != 0 && st_mode & 0o111 == 0 {
-        return Err(Errno::Access);
-    }
+    let path = user_string(space, a[1])?;
+    let dir = a[0] as u32 as i32 as isize as usize;
+    ctx.access(dir, &path, mode as u16, flags, credentials)?;
     Ok(0)
 }
 
@@ -1372,8 +1411,7 @@ fn apply_chmod(path: &str, ino: u32, mode: usize) -> Result<usize, Errno> {
     Ok(0)
 }
 
-/// mknodat(2)：支持普通文件（S_IFREG/0）、命名管道（S_IFIFO）、套接字节点（S_IFSOCK）、
-/// 字符/块设备节点（S_IFCHR/S_IFBLK，非特权进程返回 EPERM；/dev/ 下块设备走块设备登记）。
+/// Linux mknodat：创建普通或特殊节点；设备节点要求特权，/dev 块设备保留注册语义。
 fn mknodat(
     ctx: &Context,
     space: &UserAddressSpace,
@@ -1385,6 +1423,13 @@ fn mknodat(
     let mode = a[2];
     let dev = a[3] as u64;
     let ftype = mode & 0xf000;
+    if ftype == 0o060000 && credentials.euid != 0 {
+        return Err(Errno::Perm);
+    }
+    if ftype == 0o010000 {
+        ctx.create_fifo(dirfd, &input, mode, credentials)?;
+        return Ok(0);
+    }
     let create_type: u16 = match ftype {
         0 | 0o100000 => 0x8000,
         0o010000 => 0x1000,
@@ -1411,7 +1456,13 @@ fn mknodat(
             if input.ends_with('/') {
                 return Err(Errno::NoEntry);
             }
-            fs::create_node(p, &name, create_type | ctx.creation_mode(mode), dev)?;
+            fs::create_node(
+                p,
+                &name,
+                create_type | ctx.creation_mode(mode),
+                dev,
+                (credentials.fsuid, credentials.fsgid),
+            )?;
             Ok(0)
         }
         Err(e) => Err(e),

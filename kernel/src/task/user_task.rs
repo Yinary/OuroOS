@@ -165,7 +165,8 @@ pub fn user_task_entry() -> ! {
                 let blocked_now = thread.signal.blocked();
                 match super::signal::take_any(&mut rec.signal, &mut thread.signal, blocked_now) {
                     None => None,
-                    Some((sig, slot)) => {
+                    Some((sig, mut slot)) => {
+                        super::posix_timer::on_signal_dequeued(rec, &mut slot);
                         let d = rec.signal.disposition(sig);
                         if d.handler == SIG_DFL || d.handler == SIG_IGN {
                             delivery_verdict(sig, slot, d)
@@ -571,7 +572,10 @@ fn park_check_signals(
         let tw_hit = tw_set
             .and_then(|set| super::signal::take_any(&mut rec.signal, &mut thread.signal, !set));
         match tw_hit {
-            Some((sig, slot)) => ParkPeek::TwHit { sig, slot },
+            Some((sig, mut slot)) => {
+                super::posix_timer::on_signal_dequeued(rec, &mut slot);
+                ParkPeek::TwHit { sig, slot }
+            }
             None => match super::signal::peek_any(&rec.signal, &thread.signal, blocked) {
                 None => ParkPeek::Empty,
                 Some((sig, _)) => {
@@ -581,9 +585,10 @@ fn park_check_signals(
                         ParkPeek::Handler(d)
                     } else {
                         // IGN 为防御分支。
-                        let (sig, slot) =
+                        let (sig, mut slot) =
                             super::signal::take_any(&mut rec.signal, &mut thread.signal, blocked)
                                 .expect("peeked signal still deliverable");
+                        super::posix_timer::on_signal_dequeued(rec, &mut slot);
                         ParkPeek::Default { sig, slot, d }
                     }
                 }
@@ -680,8 +685,12 @@ fn park_check_signals(
             // 其余：完成 syscall 返回 -EINTR；信号留给循环顶检查点。
             _ => {
                 *sleep_deadline = None;
-                if ipc_wait.take().is_some_and(|w| w.is_sem) {
-                    crate::ipc::sem::clear_waiter(pid);
+                if let Some(w) = ipc_wait.take() {
+                    if w.is_sem {
+                        crate::ipc::sem::clear_waiter(pid);
+                    } else {
+                        crate::ipc::mqueue::clear_waiter(pid);
+                    }
                 }
                 frame.syscall_ok();
                 frame[TrapFrameArgs::RET] = crate::syscall::to_abi(Err(Errno::Interrupted));
@@ -798,7 +807,12 @@ fn process_call(
                     ) {
                         (Some(index), Some(thread)) => {
                             let rec = &mut reg.records[index];
-                            super::signal::take_any(&mut rec.signal, &mut thread.signal, !set)
+                            super::signal::take_any(&mut rec.signal, &mut thread.signal, !set).map(
+                                |(sig, mut slot)| {
+                                    super::posix_timer::on_signal_dequeued(rec, &mut slot);
+                                    (sig, slot)
+                                },
+                            )
                         }
                         _ => None,
                     }
@@ -840,6 +854,12 @@ fn process_call(
                                                     &mut thread.signal,
                                                     !set,
                                                 )
+                                                .map(|(sig, mut slot)| {
+                                                    super::posix_timer::on_signal_dequeued(
+                                                        rec, &mut slot,
+                                                    );
+                                                    (sig, slot)
+                                                })
                                             }
                                             _ => None,
                                         }
@@ -1333,6 +1353,11 @@ fn process_call(
                 }
             }
         }
+        sysnr::TIMER_CREATE => super::posix_timer::sys_timer_create(parent, args),
+        sysnr::TIMER_GETTIME => super::posix_timer::sys_timer_gettime(parent, args),
+        sysnr::TIMER_GETOVERRUN => super::posix_timer::sys_timer_getoverrun(parent, args),
+        sysnr::TIMER_SETTIME => super::posix_timer::sys_timer_settime(parent, args),
+        sysnr::TIMER_DELETE => super::posix_timer::sys_timer_delete(parent, args),
         sysnr::CLOCK_SETTIME => clock_settime(parent, args),
         sysnr::CLOCK_GETTIME => clock_gettime(parent, args),
         sysnr::CLOCK_GETRES => clock_getres(parent, args),
@@ -1601,7 +1626,15 @@ fn process_call(
         sysnr::GETSID => get_pg_or_sid(parent, args[0], true),
         sysnr::SETSID => set_sid(parent),
         sysnr::KILL | sysnr::TKILL | sysnr::TGKILL => kill_or_tgkill(parent, nr, args),
-        sysnr::ACCEPT | sysnr::ACCEPT4 | sysnr::CONNECT | sysnr::SENDTO | sysnr::RECVFROM => {
+        sysnr::ACCEPT
+        | sysnr::ACCEPT4
+        | sysnr::CONNECT
+        | sysnr::SENDTO
+        | sysnr::RECVFROM
+        | sysnr::SENDMSG
+        | sysnr::RECVMSG
+        | sysnr::SENDMMSG
+        | sysnr::RECVMMSG => {
             let flow = {
                 let mut locked = REGISTRY.lock();
                 let reg = &mut *locked;
@@ -1737,6 +1770,165 @@ fn process_call(
                             cur_wait,
                         ),
                     },
+                    None => crate::ipc::IpcFlow::Done(Err(Errno::NoProcess)),
+                }
+            };
+            match flow {
+                crate::ipc::IpcFlow::Done(res) => {
+                    *ipc_wait = None;
+                    res
+                }
+                crate::ipc::IpcFlow::Wait {
+                    key,
+                    deadline,
+                    state,
+                } => {
+                    *ipc_wait = Some(state);
+                    return ProcessResult::Wait(WaitReason::Ipc { key, deadline });
+                }
+            }
+        }
+        sysnr::MQ_OPEN => {
+            let mut reg = REGISTRY.lock();
+            match reg.group_mut(parent) {
+                Some(rec) => {
+                    let rlim = rec.rlimits[12][0];
+                    match (rec.space.as_ref(), rec.fs.as_mut()) {
+                        (Some(space), Some(fs)) => crate::ipc::mqueue::open(
+                            space.as_space(),
+                            fs,
+                            args[0],
+                            args[1] as u32 as i32,
+                            args[2] as u32,
+                            args[3],
+                            &rec.creds,
+                            rlim,
+                        ),
+                        _ => Err(Errno::NoProcess),
+                    }
+                }
+                None => Err(Errno::NoProcess),
+            }
+        }
+        sysnr::MQ_UNLINK => {
+            let reg = REGISTRY.lock();
+            match reg
+                .group(parent)
+                .and_then(|r| Some((&r.creds, r.space.as_ref()?.as_space())))
+            {
+                Some((creds, space)) => crate::ipc::mqueue::unlink(space, args[0], creds),
+                None => Err(Errno::NoProcess),
+            }
+        }
+        sysnr::MQ_GETSETATTR => {
+            let reg = REGISTRY.lock();
+            match reg
+                .group(parent)
+                .and_then(|r| Some((r.fs.as_ref()?, r.space.as_ref()?.as_space())))
+            {
+                Some((fs, space)) => crate::ipc::mqueue::getsetattr(
+                    space,
+                    fs,
+                    args[0] as u32 as i32,
+                    args[1],
+                    args[2],
+                ),
+                None => Err(Errno::NoProcess),
+            }
+        }
+        sysnr::MQ_NOTIFY => {
+            let reg = REGISTRY.lock();
+            match reg
+                .group(parent)
+                .and_then(|r| Some((r.pid, r.fs.as_ref()?, r.space.as_ref()?.as_space())))
+            {
+                Some((tgid, fs, space)) => {
+                    crate::ipc::mqueue::notify(space, fs, args[0] as u32 as i32, args[1], tgid)
+                }
+                None => Err(Errno::NoProcess),
+            }
+        }
+        sysnr::MQ_TIMEDSEND => {
+            let cur_wait = *ipc_wait;
+            let outcome = {
+                let reg = REGISTRY.lock();
+                match reg
+                    .group(parent)
+                    .and_then(|r| Some((r.pid, r.fs.as_ref()?, r.space.as_ref()?.as_space())))
+                {
+                    Some((tgid, fs, space)) => crate::ipc::mqueue::timedsend(
+                        space,
+                        fs,
+                        args[0] as u32 as i32,
+                        args[1],
+                        args[2],
+                        args[3] as u32,
+                        args[4],
+                        tgid,
+                        cur_wait,
+                    ),
+                    None => crate::ipc::mqueue::SendOutcome::Flow(crate::ipc::IpcFlow::Done(Err(
+                        Errno::NoProcess,
+                    ))),
+                }
+            };
+            match outcome {
+                crate::ipc::mqueue::SendOutcome::Sent(pending) => {
+                    *ipc_wait = None;
+                    if let Some(p) = pending {
+                        match p.kind {
+                            crate::ipc::mqueue::MqNotifyKind::None => {}
+                            crate::ipc::mqueue::MqNotifyKind::Signal { sig, sigval } => {
+                                let _ = send_signal(
+                                    p.target_tgid,
+                                    sig,
+                                    crate::ipc::mqueue::make_notify_slot(p.sender_tgid, sigval),
+                                );
+                            }
+                            crate::ipc::mqueue::MqNotifyKind::Thread {
+                                sock_id,
+                                mut cookie,
+                            } => {
+                                cookie[31] = crate::ipc::mqueue::NOTIFY_WOKENUP;
+                                let _ = crate::net::enqueue_netlink(sock_id, &cookie);
+                            }
+                        }
+                    }
+                    Ok(0)
+                }
+                crate::ipc::mqueue::SendOutcome::Flow(crate::ipc::IpcFlow::Done(res)) => {
+                    *ipc_wait = None;
+                    res
+                }
+                crate::ipc::mqueue::SendOutcome::Flow(crate::ipc::IpcFlow::Wait {
+                    key,
+                    deadline,
+                    state,
+                }) => {
+                    *ipc_wait = Some(state);
+                    return ProcessResult::Wait(WaitReason::Ipc { key, deadline });
+                }
+            }
+        }
+        sysnr::MQ_TIMEDRECEIVE => {
+            let cur_wait = *ipc_wait;
+            let flow = {
+                let reg = REGISTRY.lock();
+                match reg
+                    .group(parent)
+                    .and_then(|r| Some((r.fs.as_ref()?, r.space.as_ref()?.as_space())))
+                {
+                    Some((fs, space)) => crate::ipc::mqueue::timedreceive(
+                        space,
+                        fs,
+                        args[0] as u32 as i32,
+                        args[1],
+                        args[2],
+                        args[3],
+                        args[4],
+                        parent,
+                        cur_wait,
+                    ),
                     None => crate::ipc::IpcFlow::Done(Err(Errno::NoProcess)),
                 }
             };
@@ -2564,6 +2756,7 @@ fn clock_settime(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
         return Err(Errno::Perm);
     }
     crate::time::set_realtime(core::time::Duration::new(sec as u64, nsec as u32));
+    super::posix_timer::on_realtime_changed();
     Ok(0)
 }
 
@@ -2606,6 +2799,7 @@ fn set_time_of_day(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
             return Err(Errno::Invalid);
         }
         crate::time::set_realtime(core::time::Duration::new(sec as u64, (usec as u32) * 1000));
+        super::posix_timer::on_realtime_changed();
     }
     Ok(0)
 }

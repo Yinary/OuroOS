@@ -11,6 +11,14 @@
 | [rust-fatfs](https://github.com/rafalh/rust-fatfs) 38b3a7950bf0e765e34286d1dfe76c519ee347e2 | MIT | 锁定 Git revision，no_std + alloc + lfn，FAT 挂载/读写/unlink（无目录列举） | 2026-11-10 |
 | [Linux](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git) 6.x `arch/{riscv,loongarch}/kernel/signal.c` 与 UAPI 头（signal/sigcontext/ucontext/siginfo） | GPL-2.0（仅对照，未复制代码） | 信号帧布局/魔数/stub 指令编码的 ABI 事实标准：`kernel/src/sigframe/` 逐项对照并经交叉 gcc offsetof 实测核验；投递/EINTR 语义参考 `kernel/signal.c`（仅思路） | 2026-11-19 |
 
+FIFO 节点补丁：按父 inode 创建无数据块的 FIFO，允许硬链接和删名，失败时撤销目录项后归还 inode。
+
+符号链接创建补丁：rsext4 新增按父目录 inode 创建符号链接的入口，按长度选择 inode 内嵌或数据块存储，失败时复用目录项回滚。
+
+硬链接补丁：rsext4 新增按 inode 创建硬链接的入口，并扩展符号链接删名及失败回滚。Linux 接口和链接数上限用于核对行为，未复制源码。
+
+大目录性能补丁：rsext4 为单个线性大目录维护有界名称索引及插入位置提示，完整名称仍从目录块核验。修正满块扫描产生的额外脏块，索引失败时回退既有查找，目录变更与回滚维护有效性。
+
 目录删除补丁：rsext4 新增按父目录 inode 移除空目录名的接口，复用目录项回滚和无引用 inode 回收。
 
 属主更新补丁：rsext4 新增 `metadata::chown_inode`，复用现有元数据更新流程。Linux v6.12 `fs/attr.c` 仅用于核对基本授权语义，未复制源码。
@@ -60,3 +68,10 @@ LoongArch 关机使用 PolyHAL 0.4.0（MIT）中 QEMU virt GED 的寄存器地�
 - `third_party/rsext4`（Apache-2.0，rsext4 0.8.1）新增补丁（均标注 `// OuroOS patch:`，明细见 `third_party/rsext4/README.md`）：
   - `file/create.rs` 新增 `create_special_inode` 支持 `S_IFREG`/`S_IFIFO`/`S_IFCHR`/`S_IFBLK`/`S_IFSOCK` 及 Ext4 `i_block[0..2]` 设备号编码；
   - `file/delete.rs` 与 `file/link.rs` 同步扩展无数据块特殊节点的 `free_inode`、`unlink_regular_entry` 与 `link_inode` 类型处理（参考 Ext4 磁盘格式规范，未复制 GPL 源码）。
+
+## 本轮哈希树查找、位图连续分配与大块缓冲补丁（2026-11-27）
+
+- `third_party/rsext4`（Apache-2.0，rsext4 0.8.1）新增补丁（均标注 `// OuroOS patch:`，明细见 `third_party/rsext4/README.md`）：
+  - `hashtree/lookup.rs` 与 `loopfile.rs` 补齐有效单层哈希树目录的 `"."`/`".."` 查找与哈希冲突续链扫描，权威 `EntryNotFound` 直接返回未命中，消除每次 `ENOENT` 的双重全目录线性扫描与告警刷屏；
+  - `bmalloc/block.rs` 与 `ext4/alloc.rs` 改为字节级快跳只读探查连续空闲块，消除无效位图标脏与多块碎片误报；
+  - `file/io.rs` 与 `cache/data_block.rs` 收紧连续块读写暂存缓冲为 64 KiB 并改为可失败预留，块对齐整段读取直写调用方缓冲免除二次拷贝，消除不可失败 1 MiB 堆分配导致的内核 OOM panic。
