@@ -70,7 +70,7 @@ pub(super) const SELF_DIR: u32 = u32::MAX - 15;
 /// /proc/self/maps
 pub(super) const SELF_MAPS: u32 = u32::MAX - 16;
 /// /proc/self/fd 目录
-pub(super) const SELF_FD_DIR: u32 = u32::MAX - 17;
+pub(crate) const SELF_FD_DIR: u32 = u32::MAX - 17;
 /// /proc/sys/kernel/tainted 文件
 pub(super) const TAINTED: u32 = u32::MAX - 18;
 /// /proc/sys/fs 目录
@@ -90,10 +90,29 @@ pub(super) const SYS_FS_MQUEUE_DIR: u32 = u32::MAX - 29;
 pub(super) const SYS_FS_MQUEUE_QUEUES_MAX: u32 = u32::MAX - 30;
 pub(super) const SYS_FS_MQUEUE_MSG_MAX: u32 = u32::MAX - 31;
 pub(super) const SYS_FS_MQUEUE_MSGSIZE_MAX: u32 = u32::MAX - 32;
+/// /proc/sys/fs/inotify 目录及其三个限额只读节点。
+pub(super) const SYS_INOTIFY_DIR: u32 = u32::MAX - 33;
+pub(super) const INOTIFY_MAX_QUEUED: u32 = u32::MAX - 34;
+pub(super) const INOTIFY_MAX_INSTANCES: u32 = u32::MAX - 35;
+pub(super) const INOTIFY_MAX_WATCHES: u32 = u32::MAX - 36;
 
 /// 判断 inode 是否属于虚拟节点区间（固定虚拟节点或 /proc/<pid> 派生节点）。
 pub(crate) fn is_virtual_ino(ino: u32) -> bool {
-    ino >= SYS_FS_MQUEUE_MSGSIZE_MAX || pid_ino_parts(ino).is_some()
+    ino >= INOTIFY_MAX_WATCHES || pid_ino_parts(ino).is_some()
+}
+
+/// /proc/sys/fs/inotify/{max_queued_events,max_user_instances,max_user_watches} 快照。
+pub(super) fn sys_fs_inotify(name: &str) -> Result<String, Errno> {
+    let val = match name {
+        "max_queued_events" => super::inotify::max_queued_events(),
+        "max_user_instances" => super::inotify::max_user_instances(),
+        "max_user_watches" => super::inotify::max_user_watches(),
+        _ => return Err(Errno::NoEntry),
+    };
+    let mut out = String::new();
+    out.try_reserve(24).map_err(|_| Errno::NoMem)?;
+    let _ = writeln!(out, "{}", val);
+    Ok(out)
 }
 
 /// /proc/sys/kernel/{msgmni,msgmax,msgmnb,sem} 只读快照（与 ipc 模块限额常量同源）。
@@ -190,7 +209,7 @@ pub fn pid_ino_parts(ino: u32) -> Option<(u32, u8)> {
     let rel = ino - 0x4000_0000;
     let pid = rel / 16;
     let file = rel % 16;
-    if pid == 0 || file > 5 {
+    if pid == 0 || file > 6 {
         return None;
     }
     Some((pid, file as u8))

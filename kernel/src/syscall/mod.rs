@@ -43,8 +43,11 @@ pub mod sysnr {
     pub const EPOLL_PWAIT: usize = 22;
     pub const DUP: usize = 23;
     pub const DUP3: usize = 24;
-    pub const IOCTL: usize = 29;
     pub const FCNTL: usize = 25;
+    pub const INOTIFY_INIT1: usize = 26;
+    pub const INOTIFY_ADD_WATCH: usize = 27;
+    pub const INOTIFY_RM_WATCH: usize = 28;
+    pub const IOCTL: usize = 29;
     pub const FLOCK: usize = 32;
     pub const MKDIRAT: usize = 34;
     pub const UNLINKAT: usize = 35;
@@ -463,6 +466,9 @@ pub fn dispatch(
         | sysnr::DUP
         | sysnr::DUP3
         | sysnr::FCNTL
+        | sysnr::INOTIFY_INIT1
+        | sysnr::INOTIFY_ADD_WATCH
+        | sysnr::INOTIFY_RM_WATCH
         | sysnr::FLOCK
         | sysnr::MKDIRAT
         | sysnr::UNLINKAT
