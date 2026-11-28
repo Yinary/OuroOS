@@ -874,8 +874,8 @@ pub(super) fn link(ino: u32, parent: u32, name: &str) -> Result<(), Errno> {
     })
 }
 
-/// 移除非目录 inode 的名称，无链接和打开引用时回收。
-pub(super) fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
+/// 移除非目录 inode 的名称，无链接和打开引用时回收，返回是否已当场回收。
+pub(super) fn unlink(parent: u32, ino: u32, name: &str) -> Result<bool, Errno> {
     if !WRITABLE {
         return Err(Errno::ReadOnly);
     }
@@ -897,19 +897,20 @@ pub(super) fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
         v.invalidate_dcache();
         if links == 0 && !v.opens.iter().any(|&(id, _)| id == ino) {
             reclaim_unlinked(v, ino)?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     })
 }
 
-/// 串行更新目录项，旧目标 inode 无链接且无打开引用时才回收。
+/// 串行更新目录项，旧目标 inode 无链接且无打开引用时才回收；返回被当场回收的目标 inode。
 pub(super) fn rename(
     old: u32,
     name: &str,
     new: u32,
     target: &str,
     no_replace: bool,
-) -> Result<(), Errno> {
+) -> Result<Option<u32>, Errno> {
     if !WRITABLE {
         return Err(Errno::ReadOnly);
     }
@@ -932,9 +933,10 @@ pub(super) fn rename(
         if let Some(ino) = replaced {
             if !v.opens.iter().any(|&(id, _)| id == ino.raw()) {
                 reclaim_unlinked(v, ino.raw())?;
+                return Ok(Some(ino.raw()));
             }
         }
-        Ok(())
+        Ok(None)
     })
 }
 
@@ -964,24 +966,32 @@ pub(super) fn retain(ino: u32) -> Result<(), Errno> {
     Ok(())
 }
 
-/// 释放引用，最后一个引用关闭时检查 inode 是否可回收。
-pub(super) fn release(ino: u32) {
+/// 释放引用，最后一个引用关闭时检查 inode 是否可回收；返回是否回收了已断链 inode。
+pub(super) fn release(ino: u32) -> bool {
     if !WRITABLE {
-        return;
+        return false;
     }
     let mut root = ROOT.lock();
-    let Some(v) = root.as_mut() else { return };
+    let Some(v) = root.as_mut() else {
+        return false;
+    };
     let Some(i) = v.opens.iter().position(|&(id, _)| id == ino) else {
-        return;
+        return false;
     };
     v.opens[i].1 -= 1;
     if v.opens[i].1 == 0 {
         v.opens.swap_remove(i);
         if v.failed {
-            return;
+            return false;
         }
+        let unlinked = InodeNumber::new(ino)
+            .and_then(|num| v.fs.get_inode_by_num(&mut v.device, num))
+            .is_ok_and(|inode| inode.i_links_count == 0);
         if let Err(e) = reclaim_unlinked(v, ino) {
             log::error!("Ext4 inode {ino} reclaim failed: {e}");
+            return false;
         }
+        return unlinked;
     }
+    false
 }

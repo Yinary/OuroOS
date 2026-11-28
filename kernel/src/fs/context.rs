@@ -24,17 +24,17 @@ const OPEN_CREATION_FLAGS: usize = 0x40 | 0x80 | 0x100 | 0x200 | 0x80000;
 static DIRECTORIES: Mutex<Vec<Weak<DirectoryPath>>> = Mutex::new(Vec::new());
 
 struct DirectoryPath {
-    path: String,
+    path: Mutex<String>,
     ino: Option<u32>,
     detached: AtomicBool,
 }
 
 impl DirectoryPath {
-    fn path(&self) -> Result<&str, Errno> {
+    fn path(&self) -> Result<String, Errno> {
         if self.detached.load(Ordering::Acquire) {
             return Err(Errno::NoEntry);
         }
-        Ok(&self.path)
+        string(&self.path.lock())
     }
 }
 
@@ -51,7 +51,7 @@ fn directory_path(path: String, ino: Option<u32>) -> Result<Arc<DirectoryPath>, 
         fs::retain(ino)?;
     }
     let path = fs::try_arc(DirectoryPath {
-        path,
+        path: Mutex::new(path),
         ino,
         detached: AtomicBool::new(false),
     })?;
@@ -75,7 +75,28 @@ pub(crate) fn directory_busy(path: &str) -> bool {
         .lock()
         .iter()
         .filter_map(Weak::upgrade)
-        .any(|p| p.path().is_ok_and(|candidate| contains(path, candidate)))
+        .any(|p| p.path().is_ok_and(|candidate| contains(path, &candidate)))
+}
+
+/// 目录改名后同步更新仍被引用的工作目录与目录 FD 路径前缀。
+fn rename_directories(old_path: &str, new_path: &str) {
+    for dir in DIRECTORIES.lock().iter().filter_map(Weak::upgrade) {
+        let mut cur = dir.path.lock();
+        if cur.as_str() == old_path {
+            if let Ok(updated) = string(new_path) {
+                *cur = updated;
+            }
+        } else if let Some(suffix) = cur.strip_prefix(old_path) {
+            if suffix.starts_with('/') {
+                let mut updated = String::new();
+                if updated.try_reserve(new_path.len() + suffix.len()).is_ok() {
+                    updated.push_str(new_path);
+                    updated.push_str(suffix);
+                    *cur = updated;
+                }
+            }
+        }
+    }
 }
 
 /// 标记已从名字空间移除的目录；现有引用继续持有 inode。
@@ -175,6 +196,16 @@ enum Kind {
     },
     /// epoll_create1(2) 事件多路复用实例
     Epoll(Arc<Mutex<super::event::EpollInstance>>),
+    /// inotify_init1(2) 文件系统事件监控实例
+    Inotify {
+        id: u64,
+        inotify: Arc<Mutex<super::inotify::InotifyInstance>>,
+    },
+    /// 可读写 `/proc/sys/fs/inotify/*` sysctl 节点
+    ProcSysctl {
+        kind: super::inotify::SysctlKind,
+        text: String,
+    },
     /// signalfd4(2) 信号事件描述符（存储监听信号集掩码）
     SignalFd {
         mask: u64,
@@ -200,9 +231,21 @@ impl Drop for OpenFile {
         match &self.kind {
             Kind::Inode {
                 ino,
-                directory: None,
-                ..
-            } => fs::release(*ino),
+                path,
+                directory,
+            } => {
+                if self.flags & 0x200000 == 0 && fs::inotify::has_watches() {
+                    let mask = if self.flags & 3 != 0 {
+                        fs::inotify::IN_CLOSE_WRITE
+                    } else {
+                        fs::inotify::IN_CLOSE_NOWRITE
+                    };
+                    fs::inotify::notify_path_event(*ino, path, directory.is_some(), mask);
+                }
+                if directory.is_none() {
+                    fs::release(*ino);
+                }
+            }
             Kind::Pipe {
                 id,
                 pipe,
@@ -270,6 +313,8 @@ pub struct Context {
     /// 本进程最近一次 execve 的绝对路径（/proc/self/exe 的目标，proc(5)）。
     /// 内核内嵌启动的程序没有盘上路径，保持为空串。
     exe_path: String,
+    /// 本进程拥有的 Linux AIO 上下文表（不跨 fork 继承，exec 时清理）。
+    aio: super::aio::AioTable,
 }
 fn string(s: &str) -> Result<String, Errno> {
     let mut result = String::new();
@@ -299,9 +344,10 @@ impl Context {
             nofile_limit: [FD_DEFAULT_SOFT, FD_DEFAULT_HARD],
             umask: 0o022,
             exe_path: String::new(),
+            aio: super::aio::AioTable::new(),
         })
     }
-    /// fork 复制描述符表，保留共享偏移。
+    /// fork 复制描述符表，保留共享偏移；AIO 上下文表不跨 fork 继承。
     pub fn fork(&self) -> Result<Self, Errno> {
         let mut fds = Vec::new();
         fds.try_reserve(self.fds.len()).map_err(|_| Errno::NoMem)?;
@@ -312,7 +358,33 @@ impl Context {
             nofile_limit: self.nofile_limit,
             umask: self.umask,
             exe_path: self.exe_path.clone(),
+            aio: super::aio::AioTable::new(),
         })
+    }
+    pub(crate) fn aio(&self) -> &super::aio::AioTable {
+        &self.aio
+    }
+    pub(crate) fn aio_mut(&mut self) -> &mut super::aio::AioTable {
+        &mut self.aio
+    }
+    /// 校验 `fd` 是否指向有效 eventfd（供 AIO `IOCB_FLAG_RESFD` 使用）。
+    pub(crate) fn check_eventfd(&self, fd: usize) -> Result<(), Errno> {
+        let handle = self.get(fd).map_err(|_| Errno::Invalid)?;
+        let f = handle.lock();
+        if matches!(f.kind, Kind::EventFd { .. }) {
+            Ok(())
+        } else {
+            Err(Errno::Invalid)
+        }
+    }
+    /// 向 eventfd 累加 1（供 AIO `IOCB_FLAG_RESFD` 完成通知）。
+    pub(crate) fn signal_eventfd(&self, fd: usize) {
+        if let Ok(handle) = self.get(fd) {
+            let f = handle.lock();
+            if let Kind::EventFd { efd, .. } = &f.kind {
+                let _ = efd.lock().write(&1u64.to_ne_bytes(), true);
+            }
+        }
     }
     /// 查询本进程 RLIMIT_NOFILE 的软硬限额。
     pub(crate) fn nofile_limit(&self) -> [usize; 2] {
@@ -448,9 +520,9 @@ impl Context {
         let mut out = if input.starts_with('/') {
             string("/")?
         } else if dir as isize == -100 {
-            string(self.cwd()?)?
+            self.cwd()?
         } else {
-            string(self.get(dir)?.lock().directory_path()?)?
+            self.get(dir)?.lock().directory_path()?
         };
         out.try_reserve(input.len() + 1).map_err(|_| Errno::NoMem)?;
         let mut parent_end = None;
@@ -513,7 +585,7 @@ impl Context {
                 if let Some(ino) = self.cwd.ino {
                     return fs::metadata::metadata(ino);
                 }
-                return fs::query(self.cwd()?, true);
+                return fs::query(&self.cwd()?, true);
             }
             return self.get(dir)?.lock().metadata();
         }
@@ -528,9 +600,9 @@ impl Context {
 
     fn absolute_path(&self, dir: usize, input: &str) -> Result<String, Errno> {
         let mut path = if dir as isize == -100 {
-            string(self.cwd()?)?
+            self.cwd()?
         } else {
-            string(self.get(dir)?.lock().directory_path()?)?
+            self.get(dir)?.lock().directory_path()?
         };
         path.try_reserve(input.len() + 1)
             .map_err(|_| Errno::NoMem)?;
@@ -560,7 +632,7 @@ impl Context {
     }
 
     /// 返回当前工作目录路径。已删名的目录返回 ENOENT。
-    pub(crate) fn cwd(&self) -> Result<&str, Errno> {
+    pub(crate) fn cwd(&self) -> Result<String, Errno> {
         self.cwd.path()
     }
 
@@ -585,7 +657,7 @@ impl Context {
                     ino,
                     directory: Some(dir),
                     ..
-                } => (string(dir.path()?)?, *ino),
+                } => (dir.path()?, *ino),
                 _ => return Err(Errno::NotDir),
             }
         };
@@ -632,9 +704,9 @@ impl Context {
             let mut base = if input.starts_with('/') {
                 string("")?
             } else if dir as isize == -100 {
-                string(self.cwd()?)?
+                self.cwd()?
             } else {
-                string(self.get(dir)?.lock().directory_path()?)?
+                self.get(dir)?.lock().directory_path()?
             };
             base.try_reserve(parent.len() + 1)
                 .map_err(|_| Errno::NoMem)?;
@@ -749,9 +821,9 @@ impl Context {
         let base = if path.starts_with('/') {
             string("/")?
         } else if dir as isize == -100 {
-            string(self.cwd()?)?
+            self.cwd()?
         } else {
-            string(self.get(dir)?.lock().directory_path()?)?
+            self.get(dir)?.lock().directory_path()?
         };
         fs::metadata::resolve_with_credentials(&base, path, follow, credentials)
     }
@@ -772,9 +844,9 @@ impl Context {
             let base = if path.starts_with('/') {
                 string("/")?
             } else if dir as isize == -100 {
-                string(self.cwd()?)?
+                self.cwd()?
             } else {
-                string(self.get(dir)?.lock().directory_path()?)?
+                self.get(dir)?.lock().directory_path()?
             };
             fs::metadata::resolve_with_identity(&base, path, flags & 0x100 == 0, identity)?.1
         };
@@ -813,9 +885,9 @@ impl Context {
             return string(input);
         }
         let mut base = if dir as isize == -100 {
-            string(self.cwd()?)?
+            self.cwd()?
         } else {
-            string(self.get(dir)?.lock().directory_path()?)?
+            self.get(dir)?.lock().directory_path()?
         };
         base.try_reserve(input.len() + 1)
             .map_err(|_| Errno::NoMem)?;
@@ -854,9 +926,9 @@ impl Context {
         let mut base = if input.starts_with('/') {
             string("")?
         } else if dir as isize == -100 {
-            string(self.cwd()?)?
+            self.cwd()?
         } else {
-            string(self.get(dir)?.lock().directory_path()?)?
+            self.get(dir)?.lock().directory_path()?
         };
         base.try_reserve(parent.len() + 1)
             .map_err(|_| Errno::NoMem)?;
@@ -919,15 +991,31 @@ impl Context {
                 .as_ref()
                 .is_some_and(|t| t.dev == source.dev && t.ino == source.ino)
         {
-            return fs::rename(old_parent, &old_name, new_parent, &new_name, false);
+            fs::rename(old_parent, &old_name, new_parent, &new_name, false)?;
+            return Ok(());
         }
-        if source.mode & 0xf000 == 0x4000 && directory_busy(&old_path)
-            || target.as_ref().is_some_and(|t| t.mode & 0xf000 == 0x4000)
-                && directory_busy(&new_path)
-        {
+        if target.as_ref().is_some_and(|t| t.mode & 0xf000 == 0x4000) && directory_busy(&new_path) {
             return Err(Errno::Busy);
         }
-        fs::rename(old_parent, &old_name, new_parent, &new_name, no_replace)
+        let reclaimed = fs::rename(old_parent, &old_name, new_parent, &new_name, no_replace)?;
+        let is_dir = source.mode & 0xf000 == 0x4000;
+        if is_dir {
+            rename_directories(&old_path, &new_path);
+        }
+        if fs::inotify::has_watches() {
+            fs::inotify::notify_rename(
+                old_parent,
+                &old_name,
+                new_parent,
+                &new_name,
+                source.ino as u32,
+                is_dir,
+            );
+            if let Some(ino) = reclaimed {
+                fs::inotify::notify_delete_self(ino);
+            }
+        }
+        Ok(())
     }
 
     /// 将打开文件复制到指定 FD，替换原描述符；若目标槽原有 FD 则按 POSIX 释放该进程对应锁。
@@ -1057,7 +1145,13 @@ impl Context {
             fs::retain(ino)?;
             None
         };
-        self.install(
+        let emit_open = flags & 0x200000 == 0 && fs::inotify::has_watches();
+        let open_ev_path = if emit_open {
+            Some(string(&path)?)
+        } else {
+            None
+        };
+        let fd = self.install(
             fs::try_arc(Mutex::new(OpenFile {
                 ofd_id: next_ofd_id(),
                 kind: Kind::Inode {
@@ -1069,7 +1163,11 @@ impl Context {
                 flags: flags & !OPEN_CREATION_FLAGS,
             }))?,
             cloexec,
-        )
+        )?;
+        if let Some(ev_path) = open_ev_path {
+            fs::inotify::notify_path_event(ino, &ev_path, is_directory, fs::inotify::IN_OPEN);
+        }
+        Ok(fd)
     }
 
     /// 安装 memfd_create(2) 匿名内存文件对象（接管调用方已持有的初始引用计数，失败自动释放）。
@@ -1132,6 +1230,26 @@ impl Context {
         self.install(fs::try_arc(Mutex::new(file))?, cloexec)
     }
 
+    /// 打开可读写 `/proc/sys/fs/inotify/*` sysctl 节点。
+    pub(crate) fn open_proc_sysctl(
+        &mut self,
+        kind: super::inotify::SysctlKind,
+        flags: usize,
+        cloexec: bool,
+    ) -> Result<usize, Errno> {
+        if flags & 0x10000 != 0 {
+            return Err(Errno::NotDir);
+        }
+        let text = kind.format()?;
+        let file = OpenFile {
+            ofd_id: next_ofd_id(),
+            kind: Kind::ProcSysctl { kind, text },
+            offset: 0,
+            flags: flags & !OPEN_CREATION_FLAGS,
+        };
+        self.install(fs::try_arc(Mutex::new(file))?, cloexec)
+    }
+
     /// 打开 /proc/sys/fs/mqueue/* 可读写参数文件。
     pub(crate) fn open_proc_mq_sysctl(
         &mut self,
@@ -1149,6 +1267,25 @@ impl Context {
             flags: flags & !OPEN_CREATION_FLAGS,
         };
         self.install(fs::try_arc(Mutex::new(file))?, cloexec)
+    }
+
+    /// 格式化当前进程指定 fd 的 `/proc/<pid>/fdinfo/<fd>` 文本快照。
+    pub(crate) fn format_fdinfo(&self, fd: usize) -> Result<String, Errno> {
+        use core::fmt::Write;
+        let handle = self.get(fd).map_err(|_| Errno::NoEntry)?;
+        let f = handle.lock();
+        let mut out = String::new();
+        out.try_reserve(128).map_err(|_| Errno::NoMem)?;
+        let ino = f.metadata().map(|m| m.ino).unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "pos:\t{}\nflags:\t0{:o}\nmnt_id:\t1\nino:\t{}",
+            f.offset, f.flags, ino
+        );
+        if let Kind::Inotify { inotify, .. } = &f.kind {
+            inotify.lock().format_fdinfo(&mut out)?;
+        }
+        Ok(out)
     }
 
     /// 通过 `/proc/self/fd/<n>` 重新打开已有描述符对应的底层 inode（独立偏移与新打开标志）。
@@ -1321,6 +1458,9 @@ impl Context {
         if cmd == FIONREAD {
             let avail: i32 = match &f.kind {
                 Kind::Pipe { pipe, .. } => pipe.lock().data.len().min(i32::MAX as usize) as i32,
+                Kind::Inotify { inotify, .. } => {
+                    inotify.lock().queued_bytes().min(i32::MAX as usize) as i32
+                }
                 Kind::Inode {
                     ino,
                     directory: None,
@@ -1410,7 +1550,7 @@ impl Context {
         };
         let file = handle.lock();
         match &file.kind {
-            Kind::Pipe { id, .. } | Kind::EventFd { id, .. } => {
+            Kind::Pipe { id, .. } | Kind::EventFd { id, .. } | Kind::Inotify { id, .. } => {
                 crate::task::WaitReason::PipeId(*id)
             }
             Kind::Socket(id) => crate::task::WaitReason::PipeId(id.wake_id()),
@@ -1939,6 +2079,78 @@ impl Context {
         let mut guard = ep.lock();
         guard.collect_ready(maxevents, 0, pending_signals)
     }
+
+    /// inotify_init1(2)：创建文件事件监控实例描述符（O_RDONLY，按需置 O_NONBLOCK/FD_CLOEXEC）。
+    pub(crate) fn open_inotify(&mut self, flags: usize) -> Result<usize, Errno> {
+        use super::inotify::{InotifyInstance, IN_CLOEXEC, IN_NONBLOCK};
+        if flags & !(IN_NONBLOCK | IN_CLOEXEC) != 0 {
+            return Err(Errno::Invalid);
+        }
+        let id = NEXT_PIPE_ID.fetch_add(1, Ordering::Relaxed);
+        let inotify = InotifyInstance::create(id)?;
+        let file_flags = if flags & IN_NONBLOCK != 0 { 0x800 } else { 0 };
+        let file = fs::try_arc(Mutex::new(OpenFile {
+            ofd_id: next_ofd_id(),
+            kind: Kind::Inotify { id, inotify },
+            offset: 0,
+            flags: file_flags,
+        }))?;
+        self.install(file, flags & IN_CLOEXEC != 0)
+    }
+
+    /// inotify_add_watch(2)：解析目标路径并向 inotify 实例添加或更新监控项。
+    pub(crate) fn inotify_add_watch(
+        &self,
+        fd: usize,
+        pathname: &str,
+        mask: u32,
+        credentials: &crate::task::Credentials,
+    ) -> Result<usize, Errno> {
+        use super::inotify::{InotifyInstance, IN_DONT_FOLLOW, IN_ONLYDIR};
+        let handle = self.get(fd)?;
+        let inotify = {
+            let f = handle.lock();
+            match &f.kind {
+                Kind::Inotify { inotify, .. } => inotify.clone(),
+                _ => return Err(Errno::Invalid),
+            }
+        };
+        InotifyInstance::validate_mask(mask)?;
+        let follow = (mask & IN_DONT_FOLLOW == 0) || pathname.ends_with('/');
+        let info = self.query((-100isize) as usize, pathname, false, follow)?;
+        let is_dir = info.mode & 0xf000 == 0x4000;
+        if ((mask & IN_ONLYDIR != 0) || pathname.ends_with('/')) && !is_dir {
+            return Err(Errno::NotDir);
+        }
+        if credentials.euid != 0 {
+            let bit = if credentials.euid == info.uid {
+                0o400
+            } else if credentials.egid == info.gid || credentials.groups.contains(&info.gid) {
+                0o040
+            } else {
+                0o004
+            };
+            if info.mode & bit == 0 {
+                return Err(Errno::Access);
+            }
+        }
+        let wd = inotify.lock().add_watch(info.ino as u32, is_dir, mask)?;
+        Ok(wd as usize)
+    }
+
+    /// inotify_rm_watch(2)：移除指定 watch descriptor 并入队 IN_IGNORED。
+    pub(crate) fn inotify_rm_watch(&self, fd: usize, wd: i32) -> Result<usize, Errno> {
+        let handle = self.get(fd)?;
+        let inotify = {
+            let f = handle.lock();
+            match &f.kind {
+                Kind::Inotify { inotify, .. } => inotify.clone(),
+                _ => return Err(Errno::Invalid),
+            }
+        };
+        inotify.lock().rm_watch(wd)?;
+        Ok(0)
+    }
 }
 
 /// 确认路径存在且为目录。
@@ -2161,7 +2373,7 @@ impl OpenFile {
         }
     }
 
-    fn directory_path(&self) -> Result<&str, Errno> {
+    fn directory_path(&self) -> Result<String, Errno> {
         match &self.kind {
             Kind::Inode {
                 directory: Some(dir),
@@ -2241,6 +2453,14 @@ impl OpenFile {
                 block_size: 4096,
                 ..Default::default()
             }),
+            Kind::ProcSysctl { text, .. } => Ok(fs::Metadata {
+                ino: super::procfs::MEMINFO as u64,
+                mode: 0o100644,
+                links: 1,
+                size: text.len() as u64,
+                block_size: 4096,
+                ..Default::default()
+            }),
             Kind::ProcText { ino, text } => Ok(fs::Metadata {
                 ino: u64::from(*ino),
                 mode: 0o100444,
@@ -2258,6 +2478,7 @@ impl OpenFile {
             Kind::EventFd { .. }
             | Kind::TimerFd { .. }
             | Kind::Epoll(_)
+            | Kind::Inotify { .. }
             | Kind::SignalFd { .. }
             | Kind::PidFd(_) => Ok(fs::Metadata {
                 mode: 0o000600,
@@ -2359,7 +2580,7 @@ impl OpenFile {
                 2 => fs::stat(*ino)?.1 as usize,
                 _ => return Err(Errno::Invalid),
             },
-            Kind::ProcText { text, .. } => match whence {
+            Kind::ProcText { text, .. } | Kind::ProcSysctl { text, .. } => match whence {
                 0 => 0,
                 1 => self.offset,
                 2 => text.len(),
@@ -2393,14 +2614,23 @@ impl OpenFile {
         Ok(self.offset)
     }
 
-    /// 零字节读写前置检查：eventfd/timerfd/epoll 拒绝小于 8 字节的读写并报 EINVAL。
-    pub(crate) fn check_zero_rw(&self, _reading: bool) -> Result<usize, Errno> {
-        match self.kind {
+    /// 零字节读写前置检查：eventfd/timerfd/epoll/signalfd/pidfd/inotify 拒绝不合法零长读写并报 EINVAL。
+    pub(crate) fn check_zero_rw(&self, reading: bool) -> Result<usize, Errno> {
+        match &self.kind {
             Kind::EventFd { .. }
             | Kind::TimerFd { .. }
             | Kind::Epoll(_)
             | Kind::SignalFd { .. }
             | Kind::PidFd(_) => Err(Errno::Invalid),
+            Kind::Inotify { inotify, .. } => {
+                if !reading {
+                    Err(Errno::Invalid)
+                } else if inotify.lock().is_empty() {
+                    Err(nonblock_or_wait(self.flags))
+                } else {
+                    Err(Errno::Invalid)
+                }
+            }
             _ => Ok(0),
         }
     }
@@ -2420,6 +2650,7 @@ impl OpenFile {
                 | Kind::EventFd { .. }
                 | Kind::TimerFd { .. }
                 | Kind::Epoll(_)
+                | Kind::Inotify { .. }
                 | Kind::SignalFd { .. }
                 | Kind::PidFd(_)
                 | Kind::MQueue(_)
@@ -2433,6 +2664,7 @@ impl OpenFile {
             Kind::Pipe { pipe, .. } => pipe.lock().event_gen,
             Kind::EventFd { efd, .. } => efd.lock().event_gen(),
             Kind::TimerFd { tfd, .. } => tfd.lock().event_gen(),
+            Kind::Inotify { inotify, .. } => inotify.lock().event_gen(),
             Kind::SignalFd { event_gen, .. } => *event_gen,
             Kind::PidFd(state) => state.event_gen(),
             Kind::MQueue(q) => q.lock().event_gen(),
@@ -2686,9 +2918,12 @@ impl OpenFile {
                 tfd.lock().read(self.flags & 0x800 != 0, deliver)
             }
             Kind::Epoll(_) | Kind::SignalFd { .. } | Kind::PidFd(_) => Err(Errno::Invalid),
+            Kind::Inotify { inotify, .. } => {
+                inotify.lock().read(data, self.flags & 0x800 != 0, deliver)
+            }
             Kind::DevNull | Kind::Rtc => Ok(0),
             Kind::DevZero | Kind::DevRandom { .. } => self.read_at(0, data, false, deliver),
-            Kind::ProcText { text, .. } => {
+            Kind::ProcText { text, .. } | Kind::ProcSysctl { text, .. } => {
                 let bytes = text.as_bytes().get(self.offset..).unwrap_or(&[]);
                 let count = data.len().min(bytes.len());
                 let delivered = deliver(&bytes[..count])?;
@@ -2760,9 +2995,11 @@ impl OpenFile {
                 Ok(count)
             }
             Kind::EventFd { efd, .. } => efd.lock().write(data, self.flags & 0x800 != 0),
-            Kind::TimerFd { .. } | Kind::Epoll(_) | Kind::SignalFd { .. } | Kind::PidFd(_) => {
-                Err(Errno::Invalid)
-            }
+            Kind::TimerFd { .. }
+            | Kind::Epoll(_)
+            | Kind::Inotify { .. }
+            | Kind::SignalFd { .. }
+            | Kind::PidFd(_) => Err(Errno::Invalid),
             Kind::Socket(id) => {
                 let nonblock = self.flags & 0x800 != 0;
                 crate::net::sendto(*id, data, 0, None, nonblock)
@@ -2772,7 +3009,7 @@ impl OpenFile {
                 self.offset = self.offset.checked_add(count).ok_or(Errno::Invalid)?;
                 Ok(count)
             }
-            Kind::Inode { ino, .. } => {
+            Kind::Inode { ino, path, .. } => {
                 let offset = if self.flags & 0x400 != 0 {
                     fs::stat(*ino)?.1 as usize
                 } else {
@@ -2780,7 +3017,20 @@ impl OpenFile {
                 };
                 let count = fs::write(*ino, offset, data)?;
                 self.offset = offset.checked_add(count).ok_or(Errno::Invalid)?;
+                if count > 0 && fs::inotify::has_watches() {
+                    fs::inotify::notify_path_event(*ino, path, false, fs::inotify::IN_MODIFY);
+                }
                 Ok(count)
+            }
+            Kind::ProcSysctl { kind, .. } => {
+                kind.parse_and_set(data)?;
+                let updated = kind.format().ok();
+                if let Some(new_text) = updated {
+                    if let Kind::ProcSysctl { text, .. } = &mut self.kind {
+                        *text = new_text;
+                    }
+                }
+                Ok(data.len())
             }
             Kind::ProcMqSysctl(field) => {
                 let text = core::str::from_utf8(data).map_err(|_| Errno::Invalid)?;
@@ -2860,14 +3110,17 @@ impl OpenFile {
             }
             return Ok(delivered);
         }
-        let ino = match self.kind {
-            Kind::Inode { ino, .. } => ino,
+        let (ino, path) = match &self.kind {
+            Kind::Inode { ino, path, .. } => (*ino, path.as_str()),
             _ => return Err(Errno::SeekPipe),
         };
         let count = fs::read(ino, offset, data)?;
         let delivered = deliver(&data[..count])?;
         if delivered > count {
             return Err(Errno::Invalid);
+        }
+        if delivered > 0 && fs::inotify::has_watches() {
+            fs::inotify::notify_path_event(ino, path, false, fs::inotify::IN_ACCESS);
         }
         Ok(delivered)
     }
@@ -2894,8 +3147,8 @@ impl OpenFile {
         ) {
             return Ok(data.len());
         }
-        let ino = match self.kind {
-            Kind::Inode { ino, .. } => ino,
+        let (ino, path) = match &self.kind {
+            Kind::Inode { ino, path, .. } => (*ino, path.as_str()),
             _ => return Err(Errno::SeekPipe),
         };
         let offset = if self.flags & 0x400 != 0 {
@@ -2903,7 +3156,19 @@ impl OpenFile {
         } else {
             offset
         };
-        fs::write(ino, offset, data)
+        let count = fs::write(ino, offset, data)?;
+        if count > 0 && fs::inotify::has_watches() {
+            fs::inotify::notify_path_event(ino, path, false, fs::inotify::IN_MODIFY);
+        }
+        Ok(count)
+    }
+
+    /// 若打开对象关联磁盘 inode，返回其记录的打开路径（供 inotify 父目录事件使用）。
+    pub(crate) fn inode_path(&self) -> Option<&str> {
+        match &self.kind {
+            Kind::Inode { path, .. } => Some(path.as_str()),
+            _ => None,
+        }
     }
 
     /// 强制以追加模式写入文件末尾，不修改共享偏移（供 pwritev2 带显式偏移的 RWF_APPEND 使用）。
@@ -3029,9 +3294,11 @@ pub(super) fn fd_poll_events(
     match &file.kind {
         Kind::Input => 0x41 & requested,
         Kind::Output => 0x104 & requested,
-        Kind::Inode { .. } | Kind::ProcText { .. } | Kind::ProcFdDir(_) | Kind::ProcMqSysctl(_) => {
-            0x145 & requested
-        }
+        Kind::Inode { .. }
+        | Kind::ProcText { .. }
+        | Kind::ProcFdDir(_)
+        | Kind::ProcSysctl { .. }
+        | Kind::ProcMqSysctl(_) => 0x145 & requested,
         // /dev/null、/dev/zero、/dev/urandom 与 rtc 永远可读可写；块节点同
         Kind::DevNull
         | Kind::DevZero
@@ -3058,6 +3325,13 @@ pub(super) fn fd_poll_events(
         Kind::MQueue(q) => q.lock().poll_events(requested),
         Kind::Epoll(ep) => {
             if ep.lock().has_ready(depth, pending_signals) {
+                0x41 & requested
+            } else {
+                0
+            }
+        }
+        Kind::Inotify { inotify, .. } => {
+            if !inotify.lock().is_empty() {
                 0x41 & requested
             } else {
                 0
@@ -3282,8 +3556,9 @@ pub(crate) fn mapping(ctx: &Context, fd: usize, write: bool) -> Result<MappingSo
     }
 }
 
-/// exec 成功提交后关闭 CLOEXEC 描述符，标志不与 dup 的源 fd 共享。
+/// exec 成功提交后关闭 CLOEXEC 描述符并清空本进程 AIO 上下文。
 pub fn close_exec(ctx: &mut Context) {
+    ctx.aio.clear();
     for fd in &mut ctx.fds {
         if fd.as_ref().is_some_and(|d| d.cloexec) {
             *fd = None;
