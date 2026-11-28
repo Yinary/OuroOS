@@ -62,6 +62,8 @@ pub mod sysnr {
     pub const PREADV: usize = 69;
     pub const PWRITEV: usize = 70;
     pub const SENDFILE: usize = 71;
+    pub const SIGNALFD4: usize = 74;
+    pub const VMSPLICE: usize = 75;
     pub const SPLICE: usize = 76;
     pub const TEE: usize = 77;
     pub const READLINKAT: usize = 78;
@@ -472,6 +474,7 @@ pub fn dispatch(
         | sysnr::PREADV2
         | sysnr::PWRITEV2
         | sysnr::SENDFILE
+        | sysnr::VMSPLICE
         | sysnr::SPLICE
         | sysnr::TEE
         | sysnr::FADVISE64
@@ -495,6 +498,18 @@ pub fn dispatch(
         | sysnr::MKNODAT
         | sysnr::IOCTL
         | sysnr::STATX => {
+            if nr == sysnr::READ {
+                if let Some((sfd_mask, nonblock)) = fs.signalfd_info(args[0]) {
+                    let ret = read_signalfd(
+                        space, fs, signal, thread, args[0], args[1], args[2], sfd_mask, nonblock,
+                    );
+                    if ret == Err(Errno::WouldBlock) {
+                        return Flow::Wait(WaitReason::Pipe);
+                    }
+                    cx[TrapFrameArgs::RET] = to_abi(ret);
+                    return Flow::Continue;
+                }
+            }
             let ret = self::fs::dispatch(
                 nr,
                 [args[0], args[1], args[2], args[3], args[4], args[5]],
@@ -534,6 +549,7 @@ pub fn dispatch(
                         | sysnr::WRITEV
                         | sysnr::PWRITEV2
                         | sysnr::SENDFILE
+                        | sysnr::VMSPLICE
                         | sysnr::SPLICE
                         | sysnr::TEE
                 )
@@ -548,6 +564,11 @@ pub fn dispatch(
                     thread.signal.blocked(),
                 );
             }
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
+        sysnr::SIGNALFD4 => {
+            let ret = signalfd4(space, fs, args);
             cx[TrapFrameArgs::RET] = to_abi(ret);
             Flow::Continue
         }
@@ -1022,6 +1043,91 @@ impl UtsNames {
 
 static UTS_NAMES: crate::sync::DebugMutex<UtsNames> =
     crate::sync::DebugMutex::new("UTS_NAMES", UtsNames::new());
+
+/// signalfd4(2)：创建或更新信号文件描述符的监听信号集，屏蔽不可捕获的 SIGKILL/SIGSTOP。
+fn signalfd4(
+    space: &UserAddressSpace,
+    fs: &mut crate::fs::context::Context,
+    args: [usize; 6],
+) -> Result<usize, Errno> {
+    const SFD_NONBLOCK: u32 = 0x800;
+    const SFD_CLOEXEC: u32 = 0x80000;
+    let ufd = args[0] as u32 as i32;
+    let mask_ptr = args[1];
+    let sizemask = args[2];
+    let flags = args[3] as u32;
+    if flags & !(SFD_NONBLOCK | SFD_CLOEXEC) != 0 {
+        return Err(Errno::Invalid);
+    }
+    if sizemask != 8 {
+        return Err(Errno::Invalid);
+    }
+    let mut raw = [0u8; 8];
+    user_access::copy_from_user(space, mask_ptr, &mut raw).map_err(|_| Errno::Fault)?;
+    let mut mask = u64::from_ne_bytes(raw);
+    mask &= !((1u64 << (crate::task::signal::SIGKILL - 1))
+        | (1u64 << (crate::task::signal::SIGSTOP - 1)));
+    fs.open_or_update_signalfd(
+        ufd,
+        mask,
+        flags & SFD_NONBLOCK != 0,
+        flags & SFD_CLOEXEC != 0,
+    )
+}
+
+/// read(2) 读取 signalfd：按 128 字节 struct signalfd_siginfo 逐条出队匹配的待决信号。
+#[allow(clippy::too_many_arguments)]
+fn read_signalfd(
+    space: &UserAddressSpace,
+    fs: &crate::fs::context::Context,
+    signal: &mut crate::task::signal::SignalGroup,
+    thread: &mut crate::task::ThreadRecord,
+    fd: usize,
+    buf: usize,
+    count: usize,
+    mask: u64,
+    nonblock: bool,
+) -> Result<usize, Errno> {
+    const SIGINFO_SIZE: usize = 128;
+    if count < SIGINFO_SIZE {
+        return Err(Errno::Invalid);
+    }
+    let mut done = 0usize;
+    while done + SIGINFO_SIZE <= count {
+        let Some((sig, slot)) = crate::task::signal::peek_any(signal, &thread.signal, !mask) else {
+            if done == 0 {
+                return Err(if nonblock {
+                    Errno::Again
+                } else {
+                    Errno::WouldBlock
+                });
+            }
+            break;
+        };
+        let mut raw = [0u8; SIGINFO_SIZE];
+        raw[0..4].copy_from_slice(&(sig as u32).to_ne_bytes());
+        raw[4..8].copy_from_slice(&slot.errno.to_ne_bytes());
+        raw[8..12].copy_from_slice(&slot.code.to_ne_bytes());
+        raw[12..16].copy_from_slice(&slot.pid.to_ne_bytes());
+        raw[40..44].copy_from_slice(&slot.status.to_ne_bytes());
+        raw[72..80].copy_from_slice(&(slot.addr as u64).to_ne_bytes());
+        let dst = buf.checked_add(done).ok_or(Errno::Fault)?;
+        if user_access::copy_to_user(space, dst, &raw).is_err() {
+            return if done > 0 {
+                fs.bump_signalfd_gen(fd);
+                Ok(done)
+            } else {
+                Err(Errno::Fault)
+            };
+        }
+        let _ = crate::task::signal::take_any(signal, &mut thread.signal, !mask);
+        done += SIGINFO_SIZE;
+    }
+    if done > 0 {
+        fs.bump_signalfd_gen(fd);
+    }
+    Ok(done)
+}
 
 /// Result → Linux ABI 返回值：Ok(n) → n；Err(e) → -errno
 pub(crate) fn to_abi(ret: Result<usize, Errno>) -> usize {
