@@ -572,6 +572,37 @@ pub(super) fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
     })
 }
 
+/// 创建普通或特殊节点，保存设备号与文件系统身份。
+pub(super) fn create_node(
+    parent: u32,
+    name: &str,
+    mode: u16,
+    rdev: u64,
+    owner: (u32, u32),
+) -> Result<u32, Errno> {
+    if !WRITABLE {
+        return Err(Errno::ReadOnly);
+    }
+    access(|v| {
+        v.invalidate_dcache();
+        rsext4::file::create_special_inode(
+            &mut v.device,
+            &mut v.fs,
+            InodeNumber::new(parent)?,
+            name,
+            mode,
+            rdev,
+            owner,
+        )
+        .map(|ino| ino.raw())
+        .inspect_err(|e| {
+            if matches!(e.code, rsext4::Errno::EIO | rsext4::Errno::EUCLEAN) {
+                v.failed = true;
+            }
+        })
+    })
+}
+
 /// 创建不分配数据块的 FIFO 节点。
 pub(super) fn create_fifo(
     parent: u32,
@@ -843,7 +874,7 @@ pub(super) fn link(ino: u32, parent: u32, name: &str) -> Result<(), Errno> {
     })
 }
 
-/// 移除普通文件或符号链接的名称；无链接和打开引用时回收 inode。
+/// 移除非目录 inode 的名称，无链接和打开引用时回收。
 pub(super) fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
     if !WRITABLE {
         return Err(Errno::ReadOnly);

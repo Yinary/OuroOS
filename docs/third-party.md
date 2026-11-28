@@ -62,3 +62,9 @@ LoongArch 关机使用 PolyHAL 0.4.0（MIT）中 QEMU virt GED 的寄存器地�
   - `file/create.rs` 新增 `create_symlink_inode`（支持相对与悬空目标，区分 <60 字节快速内联与块存储长链接）；
   - `file/link.rs` 新增 `link_inode`（按 inode 创建非目录硬链接，支持 `EMLINK` 检查与失败回滚）；
   - `file/delete.rs` 扩展 `unlink_regular_entry` 支持删除符号链接，并在 `free_inode` 中为快速内联符号链接跳过块指针遍历。
+
+## 本轮命名管道与特殊节点涉及的第三方补丁（2026-11-27）
+
+- `third_party/rsext4`（Apache-2.0，rsext4 0.8.1）新增补丁（均标注 `// OuroOS patch:`，明细见 `third_party/rsext4/README.md`）：
+  - `file/create.rs` 新增 `create_special_inode` 支持 `S_IFREG`/`S_IFIFO`/`S_IFCHR`/`S_IFBLK`/`S_IFSOCK` 及 Ext4 `i_block[0..2]` 设备号编码；
+  - `file/delete.rs` 与 `file/link.rs` 同步扩展无数据块特殊节点的 `free_inode`、`unlink_regular_entry` 与 `link_inode` 类型处理（参考 Ext4 磁盘格式规范，未复制 GPL 源码）。

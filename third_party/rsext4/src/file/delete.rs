@@ -20,9 +20,13 @@ pub fn free_inode<B: BlockDevice>(
     } else {
         (BLOCK_SIZE / 512) as u64
     };
-    let fast_symlink =
-        inode.is_symlink() && inode.size() < 60 && inode.blocks_count() == xattr_sectors;
-    let mut used_blocks: Vec<AbsoluteBN> = if fast_symlink {
+    let no_data_blocks =
+        (inode.is_symlink() && inode.size() < 60 && inode.blocks_count() == xattr_sectors)
+            || matches!(
+                inode.i_mode & 0xf000,
+                Ext4Inode::S_IFIFO | Ext4Inode::S_IFCHR | Ext4Inode::S_IFBLK | Ext4Inode::S_IFSOCK
+            );
+    let mut used_blocks: Vec<AbsoluteBN> = if no_data_blocks {
         Vec::new()
     } else {
         let mut blocks: Vec<AbsoluteBN> = extent_block_map(block_dev, inode, true)?
@@ -65,7 +69,7 @@ pub fn free_inode<B: BlockDevice>(
 }
 
 // OuroOS patch: leave inode reclamation to the caller that owns open references.
-/// 移除普通文件、符号链接或 FIFO 的目录项，返回剩余链接数。
+/// 移除非目录 inode 的目录项，返回剩余链接数。
 pub fn unlink_file_entry<B: BlockDevice>(
     fs: &mut Ext4FileSystem,
     device: &mut Jbd2Dev<B>,
@@ -88,10 +92,16 @@ pub fn unlink_file_entry<B: BlockDevice>(
     if inode.is_dir() {
         return Err(Ext4Error::is_dir());
     }
-    if !inode.is_file()
-        && !inode.is_symlink()
-        && inode.i_mode & Ext4Inode::S_IFMT != Ext4Inode::S_IFIFO
-    {
+    // OuroOS patch: allow unlinking symlinks, FIFOs, devices, and sockets in addition to regular files.
+    if !matches!(
+        inode.i_mode & 0xf000,
+        Ext4Inode::S_IFREG
+            | Ext4Inode::S_IFLNK
+            | Ext4Inode::S_IFIFO
+            | Ext4Inode::S_IFCHR
+            | Ext4Inode::S_IFBLK
+            | Ext4Inode::S_IFSOCK
+    ) {
         return Err(Ext4Error::unsupported());
     }
     let links = inode
@@ -345,7 +355,7 @@ pub(crate) fn find_named_entry_in_parent<B: BlockDevice>(
     parent_inode: &Ext4Inode,
     name_bytes: &[u8],
 ) -> Ext4Result<ParentDirEntry> {
-    use crate::hashtree::{lookup_directory_entry, Ext4InodeHashTreeExt};
+    use crate::hashtree::{Ext4InodeHashTreeExt, lookup_directory_entry};
 
     if !parent_inode.is_dir() {
         return Err(Ext4Error::not_dir());

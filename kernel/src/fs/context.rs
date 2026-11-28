@@ -101,7 +101,22 @@ struct Pipe {
     capacity: usize,
     readers: usize,
     writers: usize,
+    event_gen: u64,
+    fifo_ino: Option<u32>,
+    opening_readers: Vec<u32>,
+    opening_writers: Vec<u32>,
 }
+
+struct FifoEntry {
+    ino: u32,
+    id: u64,
+    pipe: Arc<Mutex<Pipe>>,
+}
+
+/// 命名管道（FIFO）运行期注册表，按 Ext4 inode 编号关联共享管道缓冲。
+/// 锁序约定：始终先锁 FIFOS 再锁单条 Pipe，严禁反向加锁。
+static FIFOS: Mutex<Vec<FifoEntry>> = Mutex::new(Vec::new());
+
 const PIPE_MAX_SIZE: usize = 1024 * 1024;
 enum Kind {
     Input,
@@ -110,6 +125,8 @@ enum Kind {
         id: u64,
         pipe: Arc<Mutex<Pipe>>,
         reading: bool,
+        writing: bool,
+        ino: Option<u32>,
     },
     Inode {
         ino: u32,
@@ -141,6 +158,18 @@ enum Kind {
     },
     /// 本地回环套接字句柄
     Socket(crate::net::SocketId),
+    /// eventfd2(2) 事件计数器句柄
+    EventFd {
+        id: u64,
+        efd: Arc<Mutex<super::event::EventFd>>,
+    },
+    /// timerfd_create(2) 定时器句柄
+    TimerFd {
+        id: u64,
+        tfd: Arc<Mutex<super::event::TimerFd>>,
+    },
+    /// epoll_create1(2) 事件多路复用实例
+    Epoll(Arc<Mutex<super::event::EpollInstance>>),
 }
 /// 共享偏移、打开标志和文件资源的持有者。
 pub(crate) struct OpenFile {
@@ -158,12 +187,44 @@ impl Drop for OpenFile {
                 directory: None,
                 ..
             } => fs::release(*ino),
-            Kind::Pipe { id, pipe, reading } => {
-                let mut p = pipe.lock();
-                if *reading {
-                    p.readers -= 1;
-                } else {
-                    p.writers -= 1;
+            Kind::Pipe {
+                id,
+                pipe,
+                reading,
+                writing,
+                ino,
+            } => {
+                let maybe_cleanup = {
+                    let mut p = pipe.lock();
+                    if *reading {
+                        p.readers = p.readers.saturating_sub(1);
+                    }
+                    if *writing {
+                        p.writers = p.writers.saturating_sub(1);
+                    }
+                    p.event_gen = p.event_gen.wrapping_add(1);
+                    if p.readers == 0 && p.writers == 0 {
+                        p.fifo_ino
+                    } else {
+                        None
+                    }
+                };
+                if let Some(fifo_ino) = maybe_cleanup {
+                    let mut fifos = FIFOS.lock();
+                    fifos.retain(|e| {
+                        if e.ino != fifo_ino {
+                            return true;
+                        }
+                        let p = e.pipe.lock();
+                        p.readers > 0
+                            || p.writers > 0
+                            || !p.opening_readers.is_empty()
+                            || !p.opening_writers.is_empty()
+                    });
+                }
+                if let Some(fifo_ino) = *ino {
+                    fs::release(fifo_ino);
+                    crate::task::sched::request_pipe_wake();
                 }
                 // 对端计数变化可能使等待者可读（EOF）或写失败（EPIPE），
                 // 按管道实例定向唤醒；无锁原子槽位，可在任意持锁环境下调用。
@@ -487,6 +548,40 @@ impl Context {
         let retained = (path != "/" && ino & fs::FAT_INODE == 0).then_some(ino);
         self.cwd = directory_path(path, retained)?;
         Ok(())
+    }
+
+    /// fchdir(2)：将工作目录切换到已打开的目录 FD（允许 O_PATH 目录 FD）；非特权进程校验搜索权限。
+    pub(crate) fn fchdir(
+        &mut self,
+        fd: usize,
+        credentials: &crate::task::Credentials,
+    ) -> Result<(), Errno> {
+        let handle = self.get(fd)?;
+        let (path, ino) = {
+            let f = handle.lock();
+            match &f.kind {
+                Kind::Inode {
+                    ino,
+                    directory: Some(dir),
+                    ..
+                } => (string(dir.path()?)?, *ino),
+                _ => return Err(Errno::NotDir),
+            }
+        };
+        if credentials.euid != 0 {
+            let meta = fs::metadata::metadata(ino)?;
+            let bit = if credentials.euid == meta.uid {
+                0o100
+            } else if credentials.egid == meta.gid {
+                0o010
+            } else {
+                0o001
+            };
+            if meta.mode & bit == 0 {
+                return Err(Errno::Access);
+            }
+        }
+        self.set_cwd(path, ino)
     }
 
     fn entry_path(
@@ -982,13 +1077,16 @@ impl Context {
         let handle = self.get(fd)?;
         let (ino, path) = {
             let f = handle.lock();
-            let Kind::Inode { ino, path, .. } = &f.kind else {
-                return Err(Errno::NoEntry);
-            };
-            if f.detached_directory() {
-                return Err(Errno::NoEntry);
+            match &f.kind {
+                Kind::Inode { ino, path, .. } => {
+                    if f.detached_directory() {
+                        return Err(Errno::NoEntry);
+                    }
+                    (*ino, path.clone())
+                }
+                Kind::Pipe { ino: Some(ino), .. } => (*ino, String::new()),
+                _ => return Err(Errno::NoEntry),
             }
-            (*ino, path.clone())
         };
         super::chmod_apply(path.as_str(), ino, mode, space)
     }
@@ -1108,14 +1206,22 @@ impl Context {
         self.install(fs::try_arc(Mutex::new(file))?, cloexec)
     }
 
-    /// 若 `fd` 指向管道端或套接字，返回其定向唤醒键，供调度器精准唤醒。
-    pub(crate) fn wait_id(&self, fd: usize) -> Option<u64> {
-        let handle = self.get(fd).ok()?;
+    /// 为阻塞读写的 fd 选择精确等待原因（管道/eventfd/套接字定向唤醒，timerfd 挂接硬件到期）。
+    pub(crate) fn wait_reason_for_fd(&self, fd: usize) -> crate::task::WaitReason {
+        let Ok(handle) = self.get(fd) else {
+            return crate::task::WaitReason::Pipe;
+        };
         let file = handle.lock();
-        match file.kind {
-            Kind::Pipe { id, .. } => Some(id),
-            Kind::Socket(id) => Some(id.wake_id()),
-            _ => None,
+        match &file.kind {
+            Kind::Pipe { id, .. } | Kind::EventFd { id, .. } => {
+                crate::task::WaitReason::PipeId(*id)
+            }
+            Kind::Socket(id) => crate::task::WaitReason::PipeId(id.wake_id()),
+            Kind::TimerFd { id, tfd } => match tfd.lock().next_deadline() {
+                Some(d) => crate::task::WaitReason::PollUntil(d),
+                None => crate::task::WaitReason::PipeId(*id),
+            },
+            _ => crate::task::WaitReason::Pipe,
         }
     }
 
@@ -1129,6 +1235,10 @@ impl Context {
             capacity: PIPE_CAPACITY,
             readers: 1,
             writers: 1,
+            event_gen: 1,
+            fifo_ino: None,
+            opening_readers: Vec::new(),
+            opening_writers: Vec::new(),
         }))?;
         let r = fs::try_arc(Mutex::new(OpenFile {
             ofd_id: next_ofd_id(),
@@ -1136,6 +1246,8 @@ impl Context {
                 id,
                 pipe: pipe.clone(),
                 reading: true,
+                writing: false,
+                ino: None,
             },
             offset: 0,
             flags: flags & 0x800,
@@ -1146,6 +1258,8 @@ impl Context {
                 id,
                 pipe,
                 reading: false,
+                writing: true,
+                ino: None,
             },
             offset: 0,
             flags: (flags & 0x800) | 1,
@@ -1159,6 +1273,145 @@ impl Context {
             }
         };
         Ok((rfd, wfd))
+    }
+
+    /// 打开命名管道（FIFO，fifo(7) 语义）：支持 O_RDONLY、O_WRONLY、O_RDWR 与 O_NONBLOCK。
+    pub(crate) fn open_fifo(
+        &mut self,
+        ino: u32,
+        flags: usize,
+        cloexec: bool,
+        tgid: u32,
+    ) -> Result<usize, Errno> {
+        let acc = flags & 3;
+        let nonblock = flags & 0x800 != 0;
+        let (id, pipe) = {
+            let mut fifos = FIFOS.lock();
+            if let Some(entry) = fifos.iter().find(|e| e.ino == ino) {
+                (entry.id, entry.pipe.clone())
+            } else {
+                let mut data = VecDeque::new();
+                data.try_reserve(4096).map_err(|_| Errno::NoMem)?;
+                let id = NEXT_PIPE_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                let pipe = fs::try_arc(Mutex::new(Pipe {
+                    data,
+                    capacity: PIPE_CAPACITY,
+                    readers: 0,
+                    writers: 0,
+                    event_gen: 1,
+                    fifo_ino: Some(ino),
+                    opening_readers: Vec::new(),
+                    opening_writers: Vec::new(),
+                }))?;
+                fifos.try_reserve(1).map_err(|_| Errno::NoMem)?;
+                fifos.push(FifoEntry {
+                    ino,
+                    id,
+                    pipe: pipe.clone(),
+                });
+                (id, pipe)
+            }
+        };
+
+        let (reading, writing) = {
+            let mut p = pipe.lock();
+            match acc {
+                2 => {
+                    p.opening_readers.retain(|&x| x != tgid);
+                    p.opening_writers.retain(|&x| x != tgid);
+                    p.readers += 1;
+                    p.writers += 1;
+                    (true, true)
+                }
+                0 => {
+                    if nonblock || p.writers > 0 || !p.opening_writers.is_empty() {
+                        p.opening_readers.retain(|&x| x != tgid);
+                        p.readers += 1;
+                        (true, false)
+                    } else {
+                        if !p.opening_readers.contains(&tgid) {
+                            p.opening_readers.try_reserve(1).map_err(|_| Errno::NoMem)?;
+                            p.opening_readers.push(tgid);
+                        }
+                        return Err(Errno::WouldBlock);
+                    }
+                }
+                1 => {
+                    if p.readers == 0 && p.opening_readers.is_empty() {
+                        if nonblock {
+                            let empty = p.writers == 0 && p.opening_writers.is_empty();
+                            drop(p);
+                            if empty {
+                                let mut fifos = FIFOS.lock();
+                                fifos.retain(|e| {
+                                    if e.ino != ino {
+                                        return true;
+                                    }
+                                    let q = e.pipe.lock();
+                                    q.readers > 0
+                                        || q.writers > 0
+                                        || !q.opening_readers.is_empty()
+                                        || !q.opening_writers.is_empty()
+                                });
+                            }
+                            return Err(Errno::NxIo);
+                        }
+                        if !p.opening_writers.contains(&tgid) {
+                            p.opening_writers.try_reserve(1).map_err(|_| Errno::NoMem)?;
+                            p.opening_writers.push(tgid);
+                        }
+                        return Err(Errno::WouldBlock);
+                    }
+                    p.opening_writers.retain(|&x| x != tgid);
+                    p.writers += 1;
+                    p.event_gen = p.event_gen.wrapping_add(1);
+                    (false, true)
+                }
+                _ => return Err(Errno::Invalid),
+            }
+        };
+
+        crate::task::sched::request_pipe_wake();
+        crate::task::sched::request_pipe_id_wake(id);
+        if let Err(e) = fs::retain(ino) {
+            let mut p = pipe.lock();
+            if reading {
+                p.readers = p.readers.saturating_sub(1);
+            }
+            if writing {
+                p.writers = p.writers.saturating_sub(1);
+            }
+            return Err(e);
+        }
+        let file = fs::try_arc(Mutex::new(OpenFile {
+            ofd_id: next_ofd_id(),
+            kind: Kind::Pipe {
+                id,
+                pipe,
+                reading,
+                writing,
+                ino: Some(ino),
+            },
+            offset: 0,
+            flags: flags & !OPEN_CREATION_FLAGS,
+        }))?;
+        self.install(file, cloexec)
+    }
+
+    /// 若 `fd` 指向管道或套接字，返回当前是否有可读数据（供 splice/tee 选择精确等待目标）。
+    pub(crate) fn has_readable_data(&self, fd: usize) -> bool {
+        let Ok(handle) = self.get(fd) else {
+            return false;
+        };
+        let f = handle.lock();
+        match &f.kind {
+            Kind::Pipe { pipe, .. } => {
+                let p = pipe.lock();
+                !p.data.is_empty() || p.writers == 0
+            }
+            Kind::Socket(id) => crate::net::poll_events(*id, 0x01) != 0,
+            _ => true,
+        }
     }
 
     /// 将新创建的套接字句柄安装到 FD 表（默认 O_RDWR，按需置 O_NONBLOCK/FD_CLOEXEC）。
@@ -1194,6 +1447,156 @@ impl Context {
             Kind::Socket(id) => Ok((id, f.flags & 0x800 != 0)),
             _ => Err(Errno::NotSock),
         }
+    }
+
+    /// eventfd2(2)：创建事件计数器描述符。
+    pub(crate) fn open_eventfd(&mut self, initval: u32, flags: usize) -> Result<usize, Errno> {
+        use super::event::{EventFd, EFD_CLOEXEC, EFD_NONBLOCK, EFD_SEMAPHORE};
+        if flags & !(EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC) != 0 {
+            return Err(Errno::Invalid);
+        }
+        let id = NEXT_PIPE_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let efd = fs::try_arc(Mutex::new(EventFd::new(
+            id,
+            initval,
+            flags & EFD_SEMAPHORE != 0,
+        )))?;
+        let file_flags = 2 | if flags & EFD_NONBLOCK != 0 { 0x800 } else { 0 };
+        let file = fs::try_arc(Mutex::new(OpenFile {
+            ofd_id: next_ofd_id(),
+            kind: Kind::EventFd { id, efd },
+            offset: 0,
+            flags: file_flags,
+        }))?;
+        self.install(file, flags & EFD_CLOEXEC != 0)
+    }
+
+    /// timerfd_create(2)：创建定时器描述符。
+    pub(crate) fn open_timerfd(&mut self, clockid: i32, flags: usize) -> Result<usize, Errno> {
+        use super::event::{TimerFd, TFD_CLOEXEC, TFD_NONBLOCK};
+        if flags & !(TFD_NONBLOCK | TFD_CLOEXEC) != 0 {
+            return Err(Errno::Invalid);
+        }
+        let id = NEXT_PIPE_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let tfd = fs::try_arc(Mutex::new(TimerFd::new(id, clockid)?))?;
+        let file_flags = 2 | if flags & TFD_NONBLOCK != 0 { 0x800 } else { 0 };
+        let file = fs::try_arc(Mutex::new(OpenFile {
+            ofd_id: next_ofd_id(),
+            kind: Kind::TimerFd { id, tfd },
+            offset: 0,
+            flags: file_flags,
+        }))?;
+        self.install(file, flags & TFD_CLOEXEC != 0)
+    }
+
+    /// timerfd_settime(2)：设置或撤防定时器并返回旧值。
+    pub(crate) fn timerfd_settime(
+        &self,
+        fd: usize,
+        flags: usize,
+        interval: core::time::Duration,
+        value: core::time::Duration,
+    ) -> Result<(core::time::Duration, core::time::Duration), Errno> {
+        let handle = self.get(fd)?;
+        let f = handle.lock();
+        let Kind::TimerFd { tfd, .. } = &f.kind else {
+            return Err(Errno::Invalid);
+        };
+        let res = tfd.lock().settime(flags, interval, value);
+        res
+    }
+
+    /// timerfd_gettime(2)：查询当前周期与剩余时间。
+    pub(crate) fn timerfd_gettime(
+        &self,
+        fd: usize,
+    ) -> Result<(core::time::Duration, core::time::Duration), Errno> {
+        let handle = self.get(fd)?;
+        let f = handle.lock();
+        let Kind::TimerFd { tfd, .. } = &f.kind else {
+            return Err(Errno::Invalid);
+        };
+        let res = tfd.lock().gettime();
+        Ok(res)
+    }
+
+    /// epoll_create1(2)：创建 epoll 实例描述符。
+    pub(crate) fn open_epoll(&mut self, flags: usize) -> Result<usize, Errno> {
+        use super::event::{EpollInstance, EPOLL_CLOEXEC};
+        if flags & !EPOLL_CLOEXEC != 0 {
+            return Err(Errno::Invalid);
+        }
+        let ep = fs::try_arc(Mutex::new(EpollInstance::new()))?;
+        let file = fs::try_arc(Mutex::new(OpenFile {
+            ofd_id: next_ofd_id(),
+            kind: Kind::Epoll(ep),
+            offset: 0,
+            flags: 2,
+        }))?;
+        self.install(file, flags & EPOLL_CLOEXEC != 0)
+    }
+
+    /// epoll_ctl(2)：向 epoll 实例增、改、删目标描述符。
+    pub(crate) fn epoll_ctl(
+        &self,
+        epfd: usize,
+        op: i32,
+        fd: usize,
+        event: Option<(u32, u64)>,
+    ) -> Result<(), Errno> {
+        use super::event::{EpollInstance, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD};
+        let ep_handle = self.get(epfd)?;
+        let target_handle = self.get(fd)?;
+        if epfd == fd || Arc::ptr_eq(&ep_handle, &target_handle) {
+            return Err(Errno::Invalid);
+        }
+        let ep = {
+            let f = ep_handle.lock();
+            f.epoll_instance().ok_or(Errno::Invalid)?
+        };
+        let (supported, target_ep) = {
+            let tf = target_handle.lock();
+            (tf.epoll_supported(), tf.epoll_instance())
+        };
+        if !supported {
+            return Err(Errno::Perm);
+        }
+        match op {
+            EPOLL_CTL_ADD => {
+                let (events, data) = event.ok_or(Errno::Fault)?;
+                if let Some(ref child_ep) = target_ep {
+                    EpollInstance::check_nesting(&ep, child_ep)?;
+                }
+                ep.lock()
+                    .add(&ep, fd, &target_handle, events, data, target_ep.as_ref())
+            }
+            EPOLL_CTL_MOD => {
+                let (events, data) = event.ok_or(Errno::Fault)?;
+                ep.lock().modify(fd, &target_handle, events, data)
+            }
+            EPOLL_CTL_DEL => ep.lock().delete(
+                Arc::as_ptr(&ep) as usize,
+                fd,
+                &target_handle,
+                target_ep.as_ref(),
+            ),
+            _ => Err(Errno::Invalid),
+        }
+    }
+
+    /// 采集 epoll 实例当前就绪事件及最早武装 timerfd 到期时刻。
+    pub(crate) fn epoll_collect(
+        &self,
+        epfd: usize,
+        maxevents: usize,
+    ) -> Result<(Vec<u8>, usize, Option<core::time::Duration>), Errno> {
+        let ep_handle = self.get(epfd)?;
+        let ep = {
+            let f = ep_handle.lock();
+            f.epoll_instance().ok_or(Errno::Invalid)?
+        };
+        let mut guard = ep.lock();
+        guard.collect_ready(maxevents, 0)
     }
 }
 
@@ -1311,7 +1714,7 @@ impl OpenFile {
     /// 获取 inode；没有后端 inode 的对象返回 EINVAL。
     pub(crate) fn inode(&self) -> Result<u32, Errno> {
         match self.kind {
-            Kind::Inode { ino, .. } => Ok(ino),
+            Kind::Inode { ino, .. } | Kind::Pipe { ino: Some(ino), .. } => Ok(ino),
             _ => Err(Errno::Invalid),
         }
     }
@@ -1340,10 +1743,12 @@ impl OpenFile {
         }
     }
 
-    /// 更新打开 inode 的访问和修改时间；管道与控制台返回 EOPNOTSUPP。
+    /// 更新打开 inode 的访问和修改时间；匿名管道与控制台返回 EOPNOTSUPP。
     pub(crate) fn update_times(&self, times: [fs::TimeUpdate; 2]) -> Result<(), Errno> {
         match self.kind {
-            Kind::Inode { ino, .. } => fs::update_times(ino, times),
+            Kind::Inode { ino, .. } | Kind::Pipe { ino: Some(ino), .. } => {
+                fs::update_times(ino, times)
+            }
             _ => Err(Errno::NotSupported),
         }
     }
@@ -1386,6 +1791,7 @@ impl OpenFile {
                 }
                 fs::metadata::metadata(*ino)
             }
+            Kind::Pipe { ino: Some(ino), .. } => fs::metadata::metadata(*ino),
             Kind::ProcFdDir(_) => Ok(fs::Metadata {
                 ino: super::procfs::SELF_FD_DIR as u64,
                 mode: 0o040555,
@@ -1403,6 +1809,12 @@ impl OpenFile {
             }),
             Kind::Socket(_) => Ok(fs::Metadata {
                 mode: 0o140777,
+                links: 1,
+                block_size: 4096,
+                ..Default::default()
+            }),
+            Kind::EventFd { .. } | Kind::TimerFd { .. } | Kind::Epoll(_) => Ok(fs::Metadata {
+                mode: 0o000600,
                 links: 1,
                 block_size: 4096,
                 ..Default::default()
@@ -1509,6 +1921,200 @@ impl OpenFile {
         Ok(self.offset)
     }
 
+    /// 零字节读写前置检查：eventfd/timerfd/epoll 拒绝小于 8 字节的读写并报 EINVAL。
+    pub(crate) fn check_zero_rw(&self, _reading: bool) -> Result<usize, Errno> {
+        match self.kind {
+            Kind::EventFd { .. } | Kind::TimerFd { .. } | Kind::Epoll(_) => Err(Errno::Invalid),
+            _ => Ok(0),
+        }
+    }
+
+    pub(super) fn epoll_instance(&self) -> Option<Arc<Mutex<super::event::EpollInstance>>> {
+        match &self.kind {
+            Kind::Epoll(ep) => Some(ep.clone()),
+            _ => None,
+        }
+    }
+
+    fn epoll_supported(&self) -> bool {
+        matches!(
+            self.kind,
+            Kind::Pipe { .. }
+                | Kind::Socket(_)
+                | Kind::EventFd { .. }
+                | Kind::TimerFd { .. }
+                | Kind::Epoll(_)
+                | Kind::Input
+                | Kind::Output
+        )
+    }
+
+    pub(super) fn event_gen(&mut self) -> u64 {
+        match &self.kind {
+            Kind::Pipe { pipe, .. } => pipe.lock().event_gen,
+            Kind::EventFd { efd, .. } => efd.lock().event_gen(),
+            Kind::TimerFd { tfd, .. } => tfd.lock().event_gen(),
+            _ => 0,
+        }
+    }
+
+    pub(super) fn timer_deadline(&mut self, depth: usize) -> Option<core::time::Duration> {
+        match &self.kind {
+            Kind::TimerFd { tfd, .. } => tfd.lock().next_deadline(),
+            Kind::Epoll(ep) => ep.lock().earliest_timer_deadline(depth),
+            _ => None,
+        }
+    }
+
+    /// 若为管道或命名管道，返回其管道实例号。
+    pub(crate) fn pipe_id(&self) -> Option<u64> {
+        match &self.kind {
+            Kind::Pipe { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// 是否为套接字打开对象。
+    pub(crate) fn is_socket(&self) -> bool {
+        matches!(self.kind, Kind::Socket(_))
+    }
+
+    /// 是否为已连接的套接字打开对象（供 splice 校验）。
+    pub(crate) fn is_connected_socket(&self) -> bool {
+        match &self.kind {
+            Kind::Socket(id) => crate::net::is_connected(*id),
+            _ => false,
+        }
+    }
+
+    /// 是否为普通文件 inode（非目录、非管道、非套接字、非设备）。
+    pub(crate) fn is_regular_file(&self) -> Result<bool, Errno> {
+        match &self.kind {
+            Kind::Inode {
+                ino,
+                directory: None,
+                ..
+            } => Ok(fs::stat(*ino)?.0 & 0xf000 == 0x8000),
+            _ => Ok(false),
+        }
+    }
+
+    /// 返回管道剩余可写空间；无读端返回 EPIPE，无空间返回 EAGAIN/WouldBlock。
+    pub(crate) fn pipe_writable_space(&self, nonblock: bool) -> Result<usize, Errno> {
+        let Kind::Pipe { pipe, .. } = &self.kind else {
+            return Err(Errno::Invalid);
+        };
+        let p = pipe.lock();
+        if p.readers == 0 {
+            return Err(Errno::Pipe);
+        }
+        let avail = p.capacity.saturating_sub(p.data.len());
+        if avail == 0 {
+            return if nonblock || self.flags & 0x800 != 0 {
+                Err(Errno::Again)
+            } else {
+                Err(Errno::WouldBlock)
+            };
+        }
+        Ok(avail)
+    }
+
+    /// 按显式 nonblock 标志从套接字读入内核缓冲区（供 splice 使用）。
+    pub(crate) fn read_socket_into(&self, dst: &mut [u8], nonblock: bool) -> Result<usize, Errno> {
+        let Kind::Socket(id) = &self.kind else {
+            return Err(Errno::Invalid);
+        };
+        let nb = nonblock || self.flags & 0x800 != 0;
+        crate::net::recvfrom(*id, dst, 0, nb, |bytes, _| Ok(bytes.len()))
+    }
+
+    /// 按显式 nonblock 标志向套接字写入内核缓冲区（供 splice 使用）。
+    pub(crate) fn write_socket_from(&self, data: &[u8], nonblock: bool) -> Result<usize, Errno> {
+        let Kind::Socket(id) = &self.kind else {
+            return Err(Errno::Invalid);
+        };
+        let nb = nonblock || self.flags & 0x800 != 0;
+        crate::net::sendto(*id, data, 0, None, nb)
+    }
+
+    /// 按显式 nonblock 标志从指定偏移只看不消费地读取管道内容（供 splice/tee 使用）。
+    pub(crate) fn peek_pipe_into(
+        &self,
+        skip: usize,
+        dst: &mut [u8],
+        nonblock: bool,
+    ) -> Result<usize, Errno> {
+        let Kind::Pipe { pipe, .. } = &self.kind else {
+            return Err(Errno::Invalid);
+        };
+        let p = pipe.lock();
+        if p.data.len() <= skip {
+            return if skip > 0 || p.writers == 0 {
+                Ok(0)
+            } else if nonblock || self.flags & 0x800 != 0 {
+                Err(Errno::Again)
+            } else {
+                Err(Errno::WouldBlock)
+            };
+        }
+        let avail = p.data.len() - skip;
+        let count = dst.len().min(avail);
+        let (first, second) = p.data.as_slices();
+        if skip < first.len() {
+            let take_first = count.min(first.len() - skip);
+            dst[..take_first].copy_from_slice(&first[skip..skip + take_first]);
+            if take_first < count {
+                dst[take_first..count].copy_from_slice(&second[..count - take_first]);
+            }
+        } else {
+            let s = skip - first.len();
+            dst[..count].copy_from_slice(&second[s..s + count]);
+        }
+        Ok(count)
+    }
+
+    /// 消费管道前端已成功搬运的字节并唤醒写端（供 pipe->pipe splice 使用）。
+    pub(crate) fn consume_pipe(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Kind::Pipe { id, pipe, .. } = &self.kind {
+            let mut p = pipe.lock();
+            let take = count.min(p.data.len());
+            p.data.drain(..take);
+            if take > 0 {
+                p.event_gen = p.event_gen.wrapping_add(1);
+            }
+            crate::task::sched::request_pipe_id_wake(*id);
+        }
+    }
+
+    /// 按显式 nonblock 标志向管道写入字节（供 splice/tee 使用）。
+    pub(crate) fn write_pipe_from(&self, data: &[u8], nonblock: bool) -> Result<usize, Errno> {
+        let Kind::Pipe { id, pipe, .. } = &self.kind else {
+            return Err(Errno::Invalid);
+        };
+        let mut p = pipe.lock();
+        if p.readers == 0 {
+            return Err(Errno::Pipe);
+        }
+        let avail = p.capacity.saturating_sub(p.data.len());
+        let need = if data.len() <= 4096 { data.len() } else { 1 };
+        if avail < need {
+            return if nonblock || self.flags & 0x800 != 0 {
+                Err(Errno::Again)
+            } else {
+                Err(Errno::WouldBlock)
+            };
+        }
+        let n = data.len().min(avail);
+        p.data.extend(&data[..n]);
+        if n > 0 {
+            p.event_gen = p.event_gen.wrapping_add(1);
+        }
+        crate::task::sched::request_pipe_id_wake(*id);
+        Ok(n)
+    }
     /// 将一段内容直接读入调用方提供的内核缓冲区（供 sendfile 等内核态搬运使用）。
     pub(crate) fn read_into_buf(
         &mut self,
@@ -1565,9 +2171,25 @@ impl OpenFile {
                     return Err(Errno::Invalid);
                 }
                 p.data.drain(..delivered);
+                if delivered > 0 {
+                    p.event_gen = p.event_gen.wrapping_add(1);
+                }
                 crate::task::sched::request_pipe_id_wake(*id);
                 Ok(delivered)
             }
+            Kind::EventFd { efd, .. } => {
+                if data.len() < 8 {
+                    return Err(Errno::Invalid);
+                }
+                efd.lock().read(self.flags & 0x800 != 0, deliver)
+            }
+            Kind::TimerFd { tfd, .. } => {
+                if data.len() < 8 {
+                    return Err(Errno::Invalid);
+                }
+                tfd.lock().read(self.flags & 0x800 != 0, deliver)
+            }
+            Kind::Epoll(_) => Err(Errno::Invalid),
             Kind::DevNull | Kind::Rtc => Ok(0),
             Kind::DevZero | Kind::DevRandom { .. } => self.read_at(0, data, false, deliver),
             Kind::ProcText { text, .. } => {
@@ -1623,9 +2245,14 @@ impl OpenFile {
                 }
                 let count = data.len().min(avail);
                 p.data.extend(&data[..count]);
+                if count > 0 {
+                    p.event_gen = p.event_gen.wrapping_add(1);
+                }
                 crate::task::sched::request_pipe_id_wake(*id);
                 Ok(count)
             }
+            Kind::EventFd { efd, .. } => efd.lock().write(data, self.flags & 0x800 != 0),
+            Kind::TimerFd { .. } | Kind::Epoll(_) => Err(Errno::Invalid),
             Kind::Socket(id) => {
                 let nonblock = self.flags & 0x800 != 0;
                 crate::net::sendto(*id, data, 0, None, nonblock)
@@ -1809,8 +2436,8 @@ pub fn executable(ctx: &Context, path: &str) -> Result<Vec<u8>, Errno> {
     Ok(data)
 }
 /// 获取 mmap 用的普通文件，权限来自打开方式。
-/// 单文件描述符在 poll/select 下的就绪事件计算。
-fn fd_poll_events(file: &OpenFile, requested: u16) -> u16 {
+/// 单文件描述符在 poll/select/epoll 下的就绪事件计算。
+pub(super) fn fd_poll_events(file: &mut OpenFile, requested: u16, depth: usize) -> u16 {
     match &file.kind {
         Kind::Input => 0x41 & requested,
         Kind::Output => 0x104 & requested,
@@ -1822,36 +2449,56 @@ fn fd_poll_events(file: &OpenFile, requested: u16) -> u16 {
         | Kind::Rtc
         | Kind::DevBlk { .. } => 0x145 & requested,
         Kind::Socket(id) => crate::net::poll_events(*id, requested),
-        Kind::Pipe { pipe, reading, .. } => {
-            let p = pipe.lock();
-            if *reading {
-                (if p.data.is_empty() {
-                    0
-                } else {
-                    0x41 & requested
-                }) | (if p.writers == 0 { 16 } else { 0 })
+        Kind::EventFd { efd, .. } => efd.lock().poll_events(requested),
+        Kind::TimerFd { tfd, .. } => tfd.lock().poll_events(requested),
+        Kind::Epoll(ep) => {
+            if ep.lock().has_ready(depth) {
+                0x41 & requested
             } else {
-                (if p.data.len() < p.capacity {
-                    0x104 & requested
-                } else {
-                    0
-                }) | (if p.readers == 0 { 8 } else { 0 })
+                0
             }
+        }
+        Kind::Pipe {
+            pipe,
+            reading,
+            writing,
+            ..
+        } => {
+            let p = pipe.lock();
+            let mut ev = 0u16;
+            if *reading {
+                if !p.data.is_empty() {
+                    ev |= 0x41 & requested;
+                }
+                if p.writers == 0 {
+                    ev |= 16;
+                }
+            }
+            if *writing {
+                if p.data.len() < p.capacity {
+                    ev |= 0x104 & requested;
+                }
+                if p.readers == 0 {
+                    ev |= 8;
+                }
+            }
+            ev
         }
     }
 }
 
-/// poll(2) 子集：按 fd 表状态返回就绪数；pipe 与套接字的等待由任务层处理。
+/// poll(2) 子集：按 fd 表状态返回 `(就绪数, 最早 timerfd 截止时刻)`。
 pub(crate) fn poll(
     ctx: &Context,
     space: &UserAddressSpace,
     addr: usize,
     count: usize,
-) -> Result<usize, Errno> {
+) -> Result<(usize, Option<core::time::Duration>), Errno> {
     if count > 1024 {
         return Err(Errno::Invalid);
     }
     let mut ready = 0;
+    let mut earliest_timer: Option<core::time::Duration> = None;
     for i in 0..count {
         let at = addr.checked_add(i * 8).ok_or(Errno::Fault)?;
         let mut bytes = [0; 8];
@@ -1861,7 +2508,14 @@ pub(crate) fn poll(
         let events: u16 = if fd < 0 {
             0
         } else if let Ok(file) = ctx.get(fd as usize) {
-            fd_poll_events(&file.lock(), requested)
+            let mut guard = file.lock();
+            if let Some(d) = guard.timer_deadline(0) {
+                earliest_timer = Some(match earliest_timer {
+                    Some(cur) => cur.min(d),
+                    None => d,
+                });
+            }
+            fd_poll_events(&mut guard, requested, 0)
         } else {
             32
         };
@@ -1871,7 +2525,7 @@ pub(crate) fn poll(
             ready += 1;
         }
     }
-    Ok(ready)
+    Ok((ready, earliest_timer))
 }
 
 /// pselect6(2) 的位图快照：仅在调用真正结束时才写回用户空间，
@@ -1882,6 +2536,7 @@ pub(crate) struct SelectSets {
     write: [u8; 128],
     except: [u8; 128],
     pub(crate) ready: usize,
+    pub(crate) earliest_timer: Option<core::time::Duration>,
 }
 
 /// 检查 pselect6(2) 位图集合的就绪情况；遇无效 FD 立即返回 EBADF。
@@ -1922,6 +2577,7 @@ pub(crate) fn select_check(
         write: [0u8; 128],
         except: [0u8; 128],
         ready: 0,
+        earliest_timer: None,
     };
     const ALL_SELECT_MASK: u16 = 0x2147;
     for fd in 0..nfds {
@@ -1934,7 +2590,14 @@ pub(crate) fn select_check(
             continue;
         }
         let handle = ctx.get(fd)?;
-        let ev = fd_poll_events(&handle.lock(), ALL_SELECT_MASK);
+        let mut guard = handle.lock();
+        if let Some(d) = guard.timer_deadline(0) {
+            out.earliest_timer = Some(match out.earliest_timer {
+                Some(cur) => cur.min(d),
+                None => d,
+            });
+        }
+        let ev = fd_poll_events(&mut guard, ALL_SELECT_MASK, 0);
         if want_r && (ev & (0x1 | 0x40 | 0x10 | 0x8 | 0x2000) != 0) {
             out.read[idx] |= bit;
             out.ready += 1;

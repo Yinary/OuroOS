@@ -1,4 +1,4 @@
-//! 文件与符号链接的 inode 分配和目录项发布。
+//! 文件、特殊节点与符号链接的 inode 分配和目录项发布。
 use super::{delete::rollback_entry_insert, *};
 
 // OuroOS patch: create a regular file by parent inode.
@@ -13,7 +13,7 @@ pub fn create_regular_inode<B: BlockDevice>(
     if mode & Ext4Inode::S_IFMT != Ext4Inode::S_IFREG {
         return Err(Ext4Error::unsupported());
     }
-    create_empty_inode(device, fs, parent, name, mode, None)
+    create_empty_inode(device, fs, parent, name, mode, 0, None)
 }
 
 // OuroOS patch: 按父 inode 创建无盘上数据块的 FIFO。
@@ -32,8 +32,23 @@ pub fn create_fifo_inode<B: BlockDevice>(
         parent,
         name,
         Ext4Inode::S_IFIFO | (mode & 0o7777),
+        0,
         Some(owner),
     )
+}
+
+// OuroOS patch: 特殊节点复用分配、设备号编码与发布回滚。
+/// 在父目录中创建普通文件或特殊节点，并保存调用者的文件系统身份。
+pub fn create_special_inode<B: BlockDevice>(
+    device: &mut Jbd2Dev<B>,
+    fs: &mut Ext4FileSystem,
+    parent: InodeNumber,
+    name: &str,
+    mode: u16,
+    rdev: u64,
+    owner: (u32, u32),
+) -> Ext4Result<InodeNumber> {
+    create_empty_inode(device, fs, parent, name, mode, rdev, Some(owner))
 }
 
 fn create_empty_inode<B: BlockDevice>(
@@ -42,11 +57,22 @@ fn create_empty_inode<B: BlockDevice>(
     parent: InodeNumber,
     name: &str,
     mode: u16,
+    rdev: u64,
     owner: Option<(u32, u32)>,
 ) -> Ext4Result<InodeNumber> {
     if fs.readonly {
         return Err(Ext4Error::read_only());
     }
+    let ftype = mode & Ext4Inode::S_IFMT;
+    let kind = match ftype {
+        Ext4Inode::S_IFREG => Ext4DirEntry2::EXT4_FT_REG_FILE,
+        Ext4Inode::S_IFIFO => Ext4DirEntry2::EXT4_FT_FIFO,
+        Ext4Inode::S_IFCHR => Ext4DirEntry2::EXT4_FT_CHRDEV,
+        Ext4Inode::S_IFBLK => Ext4DirEntry2::EXT4_FT_BLKDEV,
+        Ext4Inode::S_IFSOCK => Ext4DirEntry2::EXT4_FT_SOCK,
+        _ => return Err(Ext4Error::unsupported()),
+    };
+    let special = ftype != Ext4Inode::S_IFREG;
     if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\0']) {
         return Err(Ext4Error::invalid_input());
     }
@@ -73,10 +99,18 @@ fn create_empty_inode<B: BlockDevice>(
     inode.i_links_count = 1;
     inode.i_flags =
         Ext4Inode::mask_flags_for_mode(mode, dir.i_flags & Ext4Inode::EXT4_FL_INHERITED);
-    let fifo = mode & Ext4Inode::S_IFMT == Ext4Inode::S_IFIFO;
-    if !fifo && fs.superblock.has_extents() {
+    if !special && fs.superblock.has_extents() {
         inode.i_flags |= Ext4Inode::EXT4_EXTENTS_FL;
         inode.write_extend_header();
+    }
+    if matches!(ftype, Ext4Inode::S_IFCHR | Ext4Inode::S_IFBLK) {
+        let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
+        let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff);
+        if major < 256 && minor < 256 {
+            inode.i_block[0] = ((major << 8) | minor) as u32;
+        } else {
+            inode.i_block[1] = ((minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)) as u32;
+        }
     }
     let mut update = Ext4InodeMetadataUpdate::create(mode);
     if let Some((uid, gid)) = owner {
@@ -88,25 +122,20 @@ fn create_empty_inode<B: BlockDevice>(
         });
     }
     if let Err(error) = fs.finalize_inode_update(device, ino, &mut inode, update) {
-        if fifo {
-            discard_new_fifo(fs, device, ino).map_err(|_| Ext4Error::io())?;
+        if special {
+            discard_new_special(fs, device, ino).map_err(|_| Ext4Error::io())?;
         } else {
             discard_unpublished_inode(fs, device, ino, &[]);
         }
         return Err(error);
     }
-    let kind = if fifo {
-        Ext4DirEntry2::EXT4_FT_FIFO
-    } else {
-        Ext4DirEntry2::EXT4_FT_REG_FILE
-    };
     if let Err(error) = insert_dir_entry(fs, device, parent, &mut dir, ino, name, kind) {
-        if fifo {
+        if special {
             if !no_space_before_insert(error) {
                 rollback_entry_insert(fs, device, parent, ino, name, &original, &dir)
                     .map_err(|_| Ext4Error::io())?;
             }
-            discard_new_fifo(fs, device, ino).map_err(|_| Ext4Error::io())?;
+            discard_new_special(fs, device, ino).map_err(|_| Ext4Error::io())?;
         } else if no_space_before_insert(error) {
             free_inode(fs, device, ino, &mut inode)?;
         }
@@ -115,7 +144,7 @@ fn create_empty_inode<B: BlockDevice>(
     Ok(ino)
 }
 
-fn discard_new_fifo<B: BlockDevice>(
+fn discard_new_special<B: BlockDevice>(
     fs: &mut Ext4FileSystem,
     dev: &mut Jbd2Dev<B>,
     ino: InodeNumber,

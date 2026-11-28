@@ -54,6 +54,14 @@ impl PreparedPages {
     }
 }
 
+/// 检查用户缓冲区地址区间是否有效且完全落在用户虚拟地址空间内（等价于 Linux access_ok）。
+pub fn check_user_range(vaddr: usize, len: usize) -> Result<(), AccessError> {
+    if vaddr == 0 && len > 0 {
+        return Err(AccessError::Fault);
+    }
+    check_span(vaddr, len).map(|_| ())
+}
+
 fn prepare_pages(
     space: &UserAddressSpace,
     vaddr: usize,

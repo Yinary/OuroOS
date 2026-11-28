@@ -10,6 +10,7 @@ pub use ext4::mounted;
 pub mod block_cache;
 pub mod cache;
 pub mod context;
+pub mod event;
 mod ext2;
 mod ext2_mount;
 pub mod fat;
@@ -346,6 +347,27 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
     if path == "/proc/sys/kernel/tainted" {
         return Ok(procfs::TAINTED);
     }
+    if path == "/proc/sys/kernel/msgmni" {
+        return Ok(procfs::SYS_MSGMNI);
+    }
+    if path == "/proc/sys/kernel/msgmax" {
+        return Ok(procfs::SYS_MSGMAX);
+    }
+    if path == "/proc/sys/kernel/msgmnb" {
+        return Ok(procfs::SYS_MSGMNB);
+    }
+    if path == "/proc/sys/kernel/sem" {
+        return Ok(procfs::SYS_SEM);
+    }
+    if path == "/proc/sysvipc" {
+        return Ok(procfs::SYSVIPC_DIR);
+    }
+    if path == "/proc/sysvipc/msg" {
+        return Ok(procfs::SYSVIPC_MSG);
+    }
+    if path == "/proc/sysvipc/sem" {
+        return Ok(procfs::SYSVIPC_SEM);
+    }
     if path == "/proc/sys/fs" {
         return Ok(procfs::SYS_FS_DIR);
     }
@@ -403,6 +425,49 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
     if ino == procfs::CPUINFO {
         return Ok((0o100444, procfs::cpuinfo()?.len() as u64, 1, 0));
     }
+    if ino == procfs::SYSVIPC_MSG {
+        return Ok((
+            0o100444,
+            crate::ipc::msg::proc_sysvipc()?.len() as u64,
+            1,
+            0,
+        ));
+    }
+    if ino == procfs::SYSVIPC_SEM {
+        return Ok((
+            0o100444,
+            crate::ipc::sem::proc_sysvipc()?.len() as u64,
+            1,
+            0,
+        ));
+    }
+    if ino == procfs::SYS_MSGMNI {
+        return Ok((
+            0o100444,
+            procfs::sys_kernel_ipc("msgmni")?.len() as u64,
+            1,
+            0,
+        ));
+    }
+    if ino == procfs::SYS_MSGMAX {
+        return Ok((
+            0o100444,
+            procfs::sys_kernel_ipc("msgmax")?.len() as u64,
+            1,
+            0,
+        ));
+    }
+    if ino == procfs::SYS_MSGMNB {
+        return Ok((
+            0o100444,
+            procfs::sys_kernel_ipc("msgmnb")?.len() as u64,
+            1,
+            0,
+        ));
+    }
+    if ino == procfs::SYS_SEM {
+        return Ok((0o100444, procfs::sys_kernel_ipc("sem")?.len() as u64, 1, 0));
+    }
     if ino == procfs::PID_MAX {
         return Ok((0o100444, procfs::pid_max().len() as u64, 1, 0));
     }
@@ -424,6 +489,7 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
             | procfs::SYS_DIR
             | procfs::SYS_KERNEL_DIR
             | procfs::SYS_FS_DIR
+            | procfs::SYSVIPC_DIR
             | procfs::SELF_DIR
             | procfs::SELF_FD_DIR
     ) {
@@ -496,6 +562,43 @@ pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
     }
 }
 
+/// 在对应卷创建节点，辅助卷只支持普通文件。
+pub fn create_node(
+    parent: u32,
+    name: &str,
+    mode: u16,
+    rdev: u64,
+    owner: (u32, u32),
+) -> Result<u32, Errno> {
+    if parent == procfs::DEVDIR {
+        let dev_ino = match ext4::lookup("/dev") {
+            Ok(ino) => ino,
+            Err(Errno::NoEntry) => {
+                let root = ext4::lookup("/")?;
+                ext4::create(root, "dev", 0o040755)?
+            }
+            Err(e) => return Err(e),
+        };
+        return ext4::create_node(dev_ino, name, mode, rdev, owner);
+    }
+    if ext2_mount::is_handle(parent) {
+        return if mode & 0xf000 == 0x8000 {
+            ext2_mount::create(parent, name, mode, owner)
+        } else {
+            Err(Errno::NotSupported)
+        };
+    }
+    if parent & FAT_INODE != 0 {
+        if mode & 0xf000 == 0x8000 {
+            fat::create(parent, name, mode)
+        } else {
+            Err(Errno::NotSupported)
+        }
+    } else {
+        ext4::create_node(parent, name, mode, rdev, owner)
+    }
+}
+
 /// 创建普通文件，Ext2 使用调用进程的文件系统凭证。
 pub(crate) fn create_regular(
     parent: u32,
@@ -539,6 +642,9 @@ pub(crate) fn create_fifo(
     mode: u16,
     owner: (u32, u32),
 ) -> Result<(), Errno> {
+    if parent == procfs::DEVDIR {
+        return create_node(parent, name, 0x1000 | (mode & 0o7777), 0, owner).map(|_| ());
+    }
     if parent & FAT_INODE != 0
         || ext2_mount::is_handle(parent)
         || procfs::pid_ino_parts(parent).is_some()
@@ -576,7 +682,7 @@ pub(crate) fn symlink(
     ext4::symlink(parent, name, target, uid, gid)
 }
 
-/// 在同一 Ext4 挂载内为普通文件或符号链接添加硬链接。
+/// 在同卷为非目录 inode 添加名称，跨卷返回 EXDEV。
 pub(crate) fn link(source: &Metadata, parent: u32, name: &str) -> Result<(), Errno> {
     if source.dev != metadata::metadata(parent)?.dev {
         return Err(Errno::CrossDevice);
@@ -586,8 +692,11 @@ pub(crate) fn link(source: &Metadata, parent: u32, name: &str) -> Result<(), Err
         return ext2_mount::link(ino, parent, name);
     }
     if ino & FAT_INODE != 0
-        || procfs::pid_ino_parts(ino).is_some()
-        || !matches!(source.mode & 0xf000, 0x8000 | 0xa000 | 0x1000)
+        || procfs::is_virtual_ino(ino)
+        || !matches!(
+            source.mode & 0xf000,
+            0x8000 | 0xa000 | 0x1000 | 0x2000 | 0x6000 | 0xc000
+        )
     {
         return Err(Errno::Perm);
     }
@@ -691,6 +800,11 @@ pub(crate) fn read_dir(
     } else {
         ext4::read_dir(ino, offset, visit)
     }
+}
+
+/// 按 inode 查询元数据快照。
+pub(crate) fn metadata(ino: u32) -> Result<Metadata, Errno> {
+    metadata::metadata(ino)
 }
 
 /// 写入文件指定偏移，返回实际字节数。
@@ -810,6 +924,12 @@ pub fn is_procfs_text(path: &str) -> bool {
         "/proc/mounts"
             | "/proc/sys/kernel/pid_max"
             | "/proc/sys/kernel/tainted"
+            | "/proc/sys/kernel/msgmni"
+            | "/proc/sys/kernel/msgmax"
+            | "/proc/sys/kernel/msgmnb"
+            | "/proc/sys/kernel/sem"
+            | "/proc/sysvipc/msg"
+            | "/proc/sysvipc/sem"
             | "/proc/sys/fs/pipe-max-size"
             | "/proc/version"
     ) {
@@ -845,6 +965,15 @@ pub fn procfs_text(path: &str) -> Result<alloc::string::String, Errno> {
         s.try_reserve_exact(src.len()).map_err(|_| Errno::NoMem)?;
         s.push_str(src);
         return Ok(s);
+    }
+    if let Some(name) = path.strip_prefix("/proc/sys/kernel/") {
+        return procfs::sys_kernel_ipc(name);
+    }
+    if path == "/proc/sysvipc/msg" {
+        return crate::ipc::msg::proc_sysvipc();
+    }
+    if path == "/proc/sysvipc/sem" {
+        return crate::ipc::sem::proc_sysvipc();
     }
     if path == "/proc/sys/fs/pipe-max-size" {
         let mut s = alloc::string::String::new();
@@ -895,8 +1024,8 @@ pub fn chmod_apply(
     _space: &crate::mm::address_space::UserAddressSpace,
 ) -> Result<usize, Errno> {
     let (cur_mode, ..) = stat(ino)?;
-    if cur_mode & 0xf000 != 0x8000 && cur_mode & 0xf000 != 0x4000 {
-        return Err(Errno::Invalid); // 仅普通文件与目录可 chmod
+    if !matches!(cur_mode & 0xf000, 0x8000 | 0x4000 | 0x1000) {
+        return Err(Errno::Invalid);
     }
     chmod_by_ino(ino, path, mode as u16 & 0o7777)?;
     Ok(0)

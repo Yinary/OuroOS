@@ -35,7 +35,7 @@ pub use create::{create_symbol_link, create_symbol_link_with_owner, mkfile, mkfi
 // OuroOS patch: create a regular file by parent inode.
 pub use create::create_regular_inode;
 // OuroOS patch: 按父 inode 创建命名管道节点。
-pub use create::create_fifo_inode;
+pub use create::{create_fifo_inode, create_special_inode};
 // OuroOS patch: create a symbolic link by parent inode.
 pub use create::create_symlink_inode;
 pub use delete::{
@@ -44,8 +44,8 @@ pub use delete::{
 // OuroOS patch: separate directory-entry removal from inode reclamation.
 pub use delete::unlink_file_entry;
 // OuroOS patch: reuse directory-entry lookup for mkdir.
-pub(crate) use delete::find_named_entry_in_parent;
 pub(crate) use delete::ParentDirEntry;
+pub(crate) use delete::find_named_entry_in_parent;
 pub use io::{
     read_file, read_inode_data_into, truncate, truncate_inode, write_file, write_inode_data,
     write_regular_inode_data,
