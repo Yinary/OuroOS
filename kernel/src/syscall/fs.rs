@@ -29,6 +29,18 @@ pub fn dispatch(
     tgid: u32,
 ) -> Result<usize, Errno> {
     match nr {
+        sysnr::SETXATTR | sysnr::LSETXATTR | sysnr::FSETXATTR => {
+            setxattr_call(nr, ctx, space, a, credentials)
+        }
+        sysnr::GETXATTR | sysnr::LGETXATTR | sysnr::FGETXATTR => {
+            getxattr_call(nr, ctx, space, a, credentials)
+        }
+        sysnr::LISTXATTR | sysnr::LLISTXATTR | sysnr::FLISTXATTR => {
+            listxattr_call(nr, ctx, space, a, credentials)
+        }
+        sysnr::REMOVEXATTR | sysnr::LREMOVEXATTR | sysnr::FREMOVEXATTR => {
+            removexattr_call(nr, ctx, space, a, credentials)
+        }
         sysnr::UMASK => Ok(ctx.set_umask(a[0])),
         sysnr::UTIMENSAT => utimensat(ctx, space, a),
         sysnr::TRUNCATE | sysnr::FTRUNCATE => truncate(nr, ctx, space, a),
@@ -2195,6 +2207,246 @@ fn tee(ctx: &Context, a: [usize; 6]) -> Result<usize, Errno> {
         }
     }
     Ok(done)
+}
+
+/// 解析扩展属性目标文件（路径跟随、不跟随或已打开 FD），返回 (inode, Metadata)。
+fn resolve_xattr_target(
+    ctx: &Context,
+    space: &UserAddressSpace,
+    target_arg: usize,
+    by_fd: bool,
+    follow: bool,
+) -> Result<(u32, fs::Metadata), Errno> {
+    const AT_FDCWD: usize = (-100isize) as usize;
+    const O_PATH: usize = 0x200000;
+    const FAT_INODE: u32 = 0x8000_0000;
+    let info = if by_fd {
+        let fd = target_arg as u32 as i32;
+        if fd < 0 {
+            return Err(Errno::BadF);
+        }
+        let handle = ctx.get(fd as usize)?;
+        let f = handle.lock();
+        if f.status_flags() & O_PATH != 0 {
+            return Err(Errno::BadF);
+        }
+        let ino = f.inode().map_err(|_| Errno::NotSupported)?;
+        if ino & FAT_INODE != 0 || fs::procfs::is_virtual_ino(ino) {
+            return Err(Errno::NotSupported);
+        }
+        fs::metadata(ino)?
+    } else {
+        let path = user_string(space, target_arg)?;
+        let info = ctx.query(AT_FDCWD, &path, false, follow)?;
+        let ino = info.ino as u32;
+        if ino & FAT_INODE != 0 || fs::procfs::is_virtual_ino(ino) {
+            return Err(Errno::NotSupported);
+        }
+        info
+    };
+    Ok((info.ino as u32, info))
+}
+
+/// 读取用户态扩展属性名（最多 XATTR_NAME_MAX=255 字节；空串或超长返回 ERANGE）。
+fn read_xattr_name(space: &UserAddressSpace, ptr: usize) -> Result<String, Errno> {
+    if ptr == 0 {
+        return Err(Errno::Fault);
+    }
+    match user_access::read_cstr(space, ptr, fs::xattr::XATTR_NAME_MAX) {
+        Ok(s) if s.is_empty() => Err(Errno::Range),
+        Ok(s) => Ok(s),
+        Err(user_access::CStrError::TooLong) => Err(Errno::Range),
+        Err(user_access::CStrError::Fault) => Err(Errno::Fault),
+        Err(user_access::CStrError::NoMem) => Err(Errno::NoMem),
+        Err(user_access::CStrError::InvalidUtf8) => Err(Errno::Invalid),
+    }
+}
+
+/// 校验扩展属性命名空间与文件类型/凭证权限（对齐 Linux fs/xattr.c xattr_permission）。
+fn check_xattr_perm(
+    ns: fs::xattr::Namespace,
+    info: &fs::Metadata,
+    creds: &Credentials,
+    write: bool,
+) -> Result<(), Errno> {
+    use fs::xattr::Namespace;
+    if write
+        && (fs::xattr::get_inode_flags(info.ino as u32)
+            & (fs::xattr::FS_IMMUTABLE_FL | fs::xattr::FS_APPEND_FL)
+            != 0)
+    {
+        return Err(Errno::Perm);
+    }
+    let ftype = info.mode & 0xf000;
+    let is_admin = creds.euid == 0 || creds.has_cap(crate::task::CAP_SYS_ADMIN);
+    match ns {
+        Namespace::System => Err(Errno::NotSupported),
+        Namespace::Trusted => {
+            if !is_admin {
+                Err(if write { Errno::Perm } else { Errno::NoData })
+            } else {
+                Ok(())
+            }
+        }
+        Namespace::Security => {
+            if write && !is_admin {
+                Err(Errno::Perm)
+            } else {
+                Ok(())
+            }
+        }
+        Namespace::User => {
+            if ftype != 0x8000 && ftype != 0x4000 {
+                return Err(if write { Errno::Perm } else { Errno::NoData });
+            }
+            if !is_admin {
+                if ftype == 0x4000 && info.mode & 0o1000 != 0 && write && creds.fsuid != info.uid {
+                    return Err(Errno::Perm);
+                }
+                let need_bit: u16 = if write { 2 } else { 4 };
+                let shift = if creds.fsuid == info.uid {
+                    6
+                } else if creds.fsgid == info.gid || creds.groups.contains(&info.gid) {
+                    3
+                } else {
+                    0
+                };
+                if ((info.mode >> shift) & need_bit) == 0 {
+                    return Err(Errno::Access);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn setxattr_call(
+    nr: usize,
+    ctx: &Context,
+    space: &UserAddressSpace,
+    a: [usize; 6],
+    creds: &Credentials,
+) -> Result<usize, Errno> {
+    let flags = a[4] as u32;
+    if flags & !(fs::xattr::XATTR_CREATE | fs::xattr::XATTR_REPLACE) != 0 {
+        return Err(Errno::Invalid);
+    }
+    let (ino, info) = resolve_xattr_target(
+        ctx,
+        space,
+        a[0],
+        nr == sysnr::FSETXATTR,
+        nr == sysnr::SETXATTR,
+    )?;
+    let name = read_xattr_name(space, a[1])?;
+    let ns = fs::xattr::parse_namespace(&name)?;
+    let size = a[3];
+    if size > fs::xattr::XATTR_SIZE_MAX {
+        return Err(Errno::TooBig);
+    }
+    let mut stack_val = [0u8; 256];
+    let heap_val: Vec<u8>;
+    let value_slice: &[u8] = if size == 0 {
+        &[]
+    } else {
+        if a[2] == 0 {
+            return Err(Errno::Fault);
+        }
+        if size <= stack_val.len() {
+            user_access::copy_from_user(space, a[2], &mut stack_val[..size])
+                .map_err(|_| Errno::Fault)?;
+            &stack_val[..size]
+        } else {
+            let mut v = Vec::new();
+            v.try_reserve_exact(size).map_err(|_| Errno::NoMem)?;
+            v.resize(size, 0);
+            user_access::copy_from_user(space, a[2], &mut v).map_err(|_| Errno::Fault)?;
+            heap_val = v;
+            &heap_val
+        }
+    };
+    check_xattr_perm(ns, &info, creds, true)?;
+    fs::xattr::set(ino, &name, value_slice, flags)?;
+    Ok(0)
+}
+
+fn getxattr_call(
+    nr: usize,
+    ctx: &Context,
+    space: &UserAddressSpace,
+    a: [usize; 6],
+    creds: &Credentials,
+) -> Result<usize, Errno> {
+    let (ino, info) = resolve_xattr_target(
+        ctx,
+        space,
+        a[0],
+        nr == sysnr::FGETXATTR,
+        nr == sysnr::GETXATTR,
+    )?;
+    let name = read_xattr_name(space, a[1])?;
+    let ns = fs::xattr::parse_namespace(&name)?;
+    check_xattr_perm(ns, &info, creds, false)?;
+    let dst_ptr = a[2];
+    let size = a[3];
+    if size > 0 && dst_ptr == 0 {
+        return Err(Errno::Fault);
+    }
+    fs::xattr::get(ino, &name, size, |data| {
+        if !data.is_empty() {
+            user_access::copy_to_user(space, dst_ptr, data).map_err(|_| Errno::Fault)?;
+        }
+        Ok(())
+    })
+}
+
+fn listxattr_call(
+    nr: usize,
+    ctx: &Context,
+    space: &UserAddressSpace,
+    a: [usize; 6],
+    creds: &Credentials,
+) -> Result<usize, Errno> {
+    let (ino, _info) = resolve_xattr_target(
+        ctx,
+        space,
+        a[0],
+        nr == sysnr::FLISTXATTR,
+        nr == sysnr::LISTXATTR,
+    )?;
+    let dst_ptr = a[1];
+    let size = a[2];
+    if size > 0 && dst_ptr == 0 {
+        return Err(Errno::Fault);
+    }
+    let show_trusted = creds.euid == 0 || creds.has_cap(crate::task::CAP_SYS_ADMIN);
+    fs::xattr::list(ino, size, show_trusted, |data| {
+        if !data.is_empty() {
+            user_access::copy_to_user(space, dst_ptr, data).map_err(|_| Errno::Fault)?;
+        }
+        Ok(())
+    })
+}
+
+fn removexattr_call(
+    nr: usize,
+    ctx: &Context,
+    space: &UserAddressSpace,
+    a: [usize; 6],
+    creds: &Credentials,
+) -> Result<usize, Errno> {
+    let (ino, info) = resolve_xattr_target(
+        ctx,
+        space,
+        a[0],
+        nr == sysnr::FREMOVEXATTR,
+        nr == sysnr::REMOVEXATTR,
+    )?;
+    let name = read_xattr_name(space, a[1])?;
+    let ns = fs::xattr::parse_namespace(&name)?;
+    check_xattr_perm(ns, &info, creds, true)?;
+    fs::xattr::remove(ino, &name)?;
+    Ok(0)
 }
 
 /// Linux vmsplice(2)：在用户 iovec 数组与管道描述符之间直接搬运数据。

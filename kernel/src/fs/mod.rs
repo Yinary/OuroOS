@@ -19,6 +19,7 @@ pub mod mapping;
 pub mod memfd;
 mod metadata;
 pub mod procfs;
+pub mod xattr;
 
 /// 仍被文件系统页缓存与块缓存持有的物理页帧总数（任务退出帧守恒自检用）。
 pub(crate) fn retained_frames() -> usize {
@@ -599,7 +600,7 @@ pub(crate) fn read_link(ino: u32) -> Result<alloc::string::String, Errno> {
 
 /// 在指定父目录下创建新对象。
 pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
-    if parent == procfs::DEVDIR {
+    let ino = if parent == procfs::DEVDIR {
         let dev_ino = match ext4::lookup("/dev") {
             Ok(ino) => ino,
             Err(Errno::NoEntry) => {
@@ -608,16 +609,16 @@ pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
             }
             Err(e) => return Err(e),
         };
-        return ext4::create(dev_ino, name, mode);
-    }
-    if ext2_mount::is_handle(parent) {
+        ext4::create(dev_ino, name, mode)?
+    } else if ext2_mount::is_handle(parent) {
         return Err(Errno::NotSupported);
-    }
-    if parent & FAT_INODE != 0 {
-        fat::create(parent, name, mode)
+    } else if parent & FAT_INODE != 0 {
+        fat::create(parent, name, mode)?
     } else {
-        ext4::create(parent, name, mode)
-    }
+        ext4::create(parent, name, mode)?
+    };
+    xattr::purge_inode(ino);
+    Ok(ino)
 }
 
 /// 在对应卷创建节点，辅助卷只支持普通文件。
@@ -628,7 +629,7 @@ pub fn create_node(
     rdev: u64,
     owner: (u32, u32),
 ) -> Result<u32, Errno> {
-    if parent == procfs::DEVDIR {
+    let ino = if parent == procfs::DEVDIR {
         let dev_ino = match ext4::lookup("/dev") {
             Ok(ino) => ino,
             Err(Errno::NoEntry) => {
@@ -637,24 +638,24 @@ pub fn create_node(
             }
             Err(e) => return Err(e),
         };
-        return ext4::create_node(dev_ino, name, mode, rdev, owner);
-    }
-    if ext2_mount::is_handle(parent) {
-        return if mode & 0xf000 == 0x8000 {
-            ext2_mount::create(parent, name, mode, owner)
-        } else {
-            Err(Errno::NotSupported)
-        };
-    }
-    if parent & FAT_INODE != 0 {
+        ext4::create_node(dev_ino, name, mode, rdev, owner)?
+    } else if ext2_mount::is_handle(parent) {
         if mode & 0xf000 == 0x8000 {
-            fat::create(parent, name, mode)
+            ext2_mount::create(parent, name, mode, owner)?
         } else {
-            Err(Errno::NotSupported)
+            return Err(Errno::NotSupported);
+        }
+    } else if parent & FAT_INODE != 0 {
+        if mode & 0xf000 == 0x8000 {
+            fat::create(parent, name, mode)?
+        } else {
+            return Err(Errno::NotSupported);
         }
     } else {
-        ext4::create_node(parent, name, mode, rdev, owner)
-    }
+        ext4::create_node(parent, name, mode, rdev, owner)?
+    };
+    xattr::purge_inode(ino);
+    Ok(ino)
 }
 
 /// 创建普通文件，Ext2 使用调用进程的文件系统凭证。
@@ -1130,6 +1131,7 @@ pub fn rmdir(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
         return Err(Errno::NotSupported);
     }
     ext4::rmdir(parent, ino, name)?;
+    xattr::purge_inode(ino);
     context::detach_directory(ino);
     Ok(())
 }

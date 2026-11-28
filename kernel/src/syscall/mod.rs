@@ -24,6 +24,18 @@ use crate::task::WaitReason;
 #[allow(dead_code)]
 pub mod sysnr {
     // 文件
+    pub const SETXATTR: usize = 5;
+    pub const LSETXATTR: usize = 6;
+    pub const FSETXATTR: usize = 7;
+    pub const GETXATTR: usize = 8;
+    pub const LGETXATTR: usize = 9;
+    pub const FGETXATTR: usize = 10;
+    pub const LISTXATTR: usize = 11;
+    pub const LLISTXATTR: usize = 12;
+    pub const FLISTXATTR: usize = 13;
+    pub const REMOVEXATTR: usize = 14;
+    pub const LREMOVEXATTR: usize = 15;
+    pub const FREMOVEXATTR: usize = 16;
     pub const GETCWD: usize = 17;
     pub const EVENTFD2: usize = 19;
     pub const EPOLL_CREATE1: usize = 20;
@@ -304,6 +316,8 @@ pub enum Errno {
     NoMsg,
     /// EIDRM: IPC 标识符已被移除。
     IdRm,
+    /// ENODATA: 扩展属性不存在或无可用数据。
+    NoData,
     /// ENOSYS: 未实现的系统调用
     NoSys,
     /// ETIMEDOUT: 等待超过期限。
@@ -380,6 +394,7 @@ impl Errno {
             Errno::Fault => 14,
             Errno::NoMsg => 42,
             Errno::IdRm => 43,
+            Errno::NoData => 61,
             Errno::NoSys => 38,
             Errno::TimedOut => 110,
             Self::NotSock => 88,
@@ -505,6 +520,18 @@ pub fn dispatch(
         | sysnr::FCHMOD
         | sysnr::MKNODAT
         | sysnr::IOCTL
+        | sysnr::SETXATTR
+        | sysnr::LSETXATTR
+        | sysnr::FSETXATTR
+        | sysnr::GETXATTR
+        | sysnr::LGETXATTR
+        | sysnr::FGETXATTR
+        | sysnr::LISTXATTR
+        | sysnr::LLISTXATTR
+        | sysnr::FLISTXATTR
+        | sysnr::REMOVEXATTR
+        | sysnr::LREMOVEXATTR
+        | sysnr::FREMOVEXATTR
         | sysnr::STATX => {
             if nr == sysnr::READ {
                 if let Some((sfd_mask, nonblock)) = fs.signalfd_info(args[0]) {

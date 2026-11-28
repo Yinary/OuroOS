@@ -1282,6 +1282,9 @@ impl Context {
         const BLKGETSIZE64: usize = 0x8008_1272;
         // FIONREAD：返回管道或普通文件当前可读字节数（i32）
         const FIONREAD: usize = 0x541B;
+        // FS_IOC_GETFLAGS / FS_IOC_SETFLAGS：Ext4 inode 标志位（u32，如 FS_IMMUTABLE_FL/FS_APPEND_FL）
+        const FS_IOC_GETFLAGS: usize = 0x8008_6601;
+        const FS_IOC_SETFLAGS: usize = 0x4008_6602;
         let file = self.get(fd)?;
         let f = file.lock();
         // ioctl(2) 的 cmd 是 unsigned int：部分 libc（如 musl）把负的 int
@@ -1295,7 +1298,26 @@ impl Context {
                 .map_err(|_| Errno::Fault)?;
             return Ok(0);
         }
-        let cmd = (cmd as u32) as usize;
+        if cmd == FS_IOC_GETFLAGS || cmd == FS_IOC_SETFLAGS {
+            let Kind::Inode { ino, .. } = &f.kind else {
+                return Err(Errno::InappropriateIoctl);
+            };
+            if (*ino & 0x8000_0000 != 0) || fs::procfs::is_virtual_ino(*ino) {
+                return Err(Errno::InappropriateIoctl);
+            }
+            if cmd == FS_IOC_GETFLAGS {
+                let flags = fs::xattr::get_inode_flags(*ino);
+                crate::mm::user_access::copy_to_user(space, arg, &flags.to_ne_bytes())
+                    .map_err(|_| Errno::Fault)?;
+            } else {
+                let mut raw = [0u8; 4];
+                crate::mm::user_access::copy_from_user(space, arg, &mut raw)
+                    .map_err(|_| Errno::Fault)?;
+                let flags = u32::from_ne_bytes(raw);
+                fs::xattr::set_inode_flags(*ino, flags);
+            }
+            return Ok(0);
+        }
         if cmd == FIONREAD {
             let avail: i32 = match &f.kind {
                 Kind::Pipe { pipe, .. } => pipe.lock().data.len().min(i32::MAX as usize) as i32,

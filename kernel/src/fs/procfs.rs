@@ -92,7 +92,7 @@ pub(super) const SYS_FS_MQUEUE_MSG_MAX: u32 = u32::MAX - 31;
 pub(super) const SYS_FS_MQUEUE_MSGSIZE_MAX: u32 = u32::MAX - 32;
 
 /// 判断 inode 是否属于虚拟节点区间（固定虚拟节点或 /proc/<pid> 派生节点）。
-pub(super) fn is_virtual_ino(ino: u32) -> bool {
+pub(crate) fn is_virtual_ino(ino: u32) -> bool {
     ino >= SYS_FS_MQUEUE_MSGSIZE_MAX || pid_ino_parts(ino).is_some()
 }
 
