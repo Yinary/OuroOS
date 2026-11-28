@@ -122,7 +122,7 @@ pub fn get(
         return Err(Errno::NoSpace);
     }
     table.segments.try_reserve(1).map_err(|_| Errno::NoMem)?;
-    let first = SharedPage::first().map_err(|_| Errno::NoMem)?;
+    let first = SharedPage::first(true).map_err(|_| Errno::NoMem)?;
 
     let id = table.next_id;
     table.next_id = table.next_id.checked_add(1).ok_or(Errno::NoSpace)?;

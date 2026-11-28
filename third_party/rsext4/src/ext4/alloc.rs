@@ -617,6 +617,7 @@ mod tests {
             mounted: true,
             readonly: false,
             journal_sb_block_start: None,
+            directory_index: None,
         }
     }
 
@@ -660,6 +661,7 @@ mod tests {
             mounted: true,
             readonly: false,
             journal_sb_block_start: None,
+            directory_index: None,
         }
     }
 

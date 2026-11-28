@@ -11,6 +11,14 @@
 | [rust-fatfs](https://github.com/rafalh/rust-fatfs) 38b3a7950bf0e765e34286d1dfe76c519ee347e2 | MIT | 锁定 Git revision，no_std + alloc + lfn，FAT 挂载/读写/unlink（无目录列举） | 2026-11-10 |
 | [Linux](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git) 6.x `arch/{riscv,loongarch}/kernel/signal.c` 与 UAPI 头（signal/sigcontext/ucontext/siginfo） | GPL-2.0（仅对照，未复制代码） | 信号帧布局/魔数/stub 指令编码的 ABI 事实标准：`kernel/src/sigframe/` 逐项对照并经交叉 gcc offsetof 实测核验；投递/EINTR 语义参考 `kernel/signal.c`（仅思路） | 2026-11-19 |
 
+FIFO 节点补丁：按父 inode 创建无数据块的 FIFO，允许硬链接和删名，失败时撤销目录项后归还 inode。
+
+符号链接创建补丁：rsext4 新增按父目录 inode 创建符号链接的入口，按长度选择 inode 内嵌或数据块存储，失败时复用目录项回滚。
+
+硬链接补丁：rsext4 新增按 inode 创建硬链接的入口，并扩展符号链接删名及失败回滚。Linux 接口和链接数上限用于核对行为，未复制源码。
+
+大目录性能补丁：rsext4 为单个线性大目录维护有界名称索引及插入位置提示，完整名称仍从目录块核验。修正满块扫描产生的额外脏块，索引失败时回退既有查找，目录变更与回滚维护有效性。
+
 目录删除补丁：rsext4 新增按父目录 inode 移除空目录名的接口，复用目录项回滚和无引用 inode 回收。
 
 属主更新补丁：rsext4 新增 `metadata::chown_inode`，复用现有元数据更新流程。Linux v6.12 `fs/attr.c` 仅用于核对基本授权语义，未复制源码。
