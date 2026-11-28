@@ -49,8 +49,13 @@ pub(super) fn fill_siginfo(out: &mut [u8], sig: u8, slot: &SigInfoSlot) {
         c if c > 0 => {
             out[16..24].copy_from_slice(&slot.addr.to_ne_bytes());
         }
-        crate::task::signal::SI_QUEUE => {
+        crate::task::signal::SI_QUEUE | crate::task::signal::SI_MESGQ => {
             out[16..20].copy_from_slice(&slot.pid.to_ne_bytes());
+            out[24..32].copy_from_slice(&slot.addr.to_ne_bytes());
+        }
+        crate::task::signal::SI_TIMER => {
+            out[16..20].copy_from_slice(&slot.timer_id.to_ne_bytes());
+            out[20..24].copy_from_slice(&slot.overrun.to_ne_bytes());
             out[24..32].copy_from_slice(&slot.addr.to_ne_bytes());
         }
         _ => {

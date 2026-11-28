@@ -47,6 +47,7 @@ struct Node {
 }
 struct Mount {
     device: u64,
+    disk: usize,
     path: String,
     fs: FileSystem<Disk>,
     nodes: Vec<Node>,
@@ -145,6 +146,7 @@ pub fn mount(source: &str, target: &str) -> Result<(), Errno> {
     mounts.try_reserve(1).map_err(|_| Errno::NoMem)?;
     mounts.push(Mount {
         device: NEXT_DEVICE.fetch_add(1, Ordering::Relaxed) as u64,
+        disk: id,
         path: string(target)?,
         fs,
         nodes: Vec::new(),
@@ -152,10 +154,15 @@ pub fn mount(source: &str, target: &str) -> Result<(), Errno> {
     MOUNT_COUNT.store(mounts.len(), Ordering::Release);
     Ok(())
 }
+
+/// 检查是否有 FAT 卷挂载在指定块设备上。
+pub(super) fn uses_disk(disk: usize) -> bool {
+    MOUNTS.lock().iter().any(|m| m.disk == disk)
+}
 /// 挂载源解析：严格按设备名（/dev/vd<字母>[分区]）对应总线枚举的块
 /// 设备与分区，无任何内容/位置驱动的别名特判。缺失设备返回 NoDevice，
 /// 由调用者如实报告。
-fn resolve_source(source: &str) -> Result<(usize, usize), Errno> {
+pub(super) fn resolve_source(source: &str) -> Result<(usize, usize), Errno> {
     // 1) 常规设备名解析（/dev/vd<字母>[分区]，总线枚举顺序）
     let dev = source.strip_prefix("/dev/vd").ok_or(Errno::NoDevice)?;
     let b = dev.as_bytes();

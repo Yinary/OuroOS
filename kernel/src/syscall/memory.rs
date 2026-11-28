@@ -78,17 +78,23 @@ fn mmap_region(
     a: [usize; 6],
     ctx: &crate::fs::context::Context,
 ) -> Result<usize, Errno> {
-    let [addr, len, prot, map_flags, _fd, offset] = a;
+    use crate::fs::context::{mapping, MappingSource};
+
+    let [addr, len, prot, map_flags, fd, offset] = a;
     if offset % PAGE_SIZE != 0 {
         return Err(Errno::Invalid);
     }
-    // 对齐 Linux ksys_mmap_pgoff：非匿名映射先校验 FD 有效性（EBADF），再校验长度
     if map_flags & 0x20 == 0 {
-        ctx.get(_fd)?;
+        let handle = ctx.get(fd)?;
+        if handle.lock().status_flags() & 0x200000 != 0 {
+            return Err(Errno::BadF);
+        }
     }
     let n = pages(len)?;
     let f = flags(prot)?;
-    if map_flags & 3 == 0 || (map_flags & 3 == 3 && map_flags & 0x20 != 0) {
+    let anonymous = map_flags & 0x20 != 0;
+    let kind = map_flags & 3;
+    if kind == 0 || (kind == 3 && anonymous) {
         return Err(Errno::Invalid);
     }
     let noreplace = map_flags & 0x100000 != 0;
@@ -99,77 +105,65 @@ fn mmap_region(
     if noreplace && space.overlaps(addr, n).map_err(error)? {
         return Err(Errno::Exists);
     }
-    if map_flags & 0x20 == 0 {
-        use crate::mm::address_space::Backing;
-        use alloc::vec::Vec;
-        if map_flags & !0x100013 != 0 {
-            return Err(Errno::NotSupported);
-        }
-        let shared = matches!(map_flags & 3, 1 | 3);
-        let (ino, writable) = crate::fs::context::mapping(ctx, _fd, shared && prot & 2 != 0)?;
+    if map_flags & !0x100033 != 0 {
+        return Err(Errno::NotSupported);
+    }
+    let shared = matches!(kind, 1 | 3);
+    let source = if anonymous {
+        None
+    } else {
+        let source = mapping(ctx, fd, shared && f.contains(F::W))?;
         offset
             .checked_add(len - 1)
             .filter(|n| *n <= i64::MAX as usize)
             .ok_or(Errno::Invalid)?;
-        if fixed && addr % PAGE_SIZE != 0 {
-            return Err(Errno::Invalid);
-        }
-        let start = if fixed {
-            addr
-        } else {
-            space.find_free(addr, n).map_err(error)?
-        };
-        use crate::mm::file::{FilePage, MappingFile, Mode};
-        let file = MappingFile::new(ino)?;
-        let mode = if shared {
-            Mode::Shared { writable }
-        } else {
-            Mode::Private
-        };
-        let mut frames = Vec::new();
-        frames.try_reserve(n).map_err(|_| Errno::NoMem)?;
-        for i in 0..n {
-            frames.push(Backing::File(FilePage::new(
-                file.clone(),
-                offset + i * PAGE_SIZE,
-                mode,
-            )));
-        }
-        space.map_backed(start, frames, f, fixed).map_err(error)?;
-        crate::mm::fence_icache();
-        return Ok(start);
-    }
-    if map_flags & !0x100033 != 0 {
-        return Err(Errno::NotSupported);
-    }
-    if map_flags & 3 == 1 {
-        if fixed && addr % PAGE_SIZE != 0 {
-            return Err(Errno::Invalid);
-        }
-        let start = if fixed {
-            addr
-        } else {
-            space.find_free(addr, n).map_err(error)?
-        };
-        space
-            .map_shared_anonymous(start, n, f, fixed)
-            .map_err(error)?;
-        return Ok(start);
-    }
-    if fixed {
-        if addr % PAGE_SIZE != 0 {
-            return Err(Errno::Invalid);
-        }
-        space.reserve_fixed(addr, n, f).map_err(error)?;
-        Ok(addr)
+        Some(source)
+    };
+    let start = if fixed {
+        addr
     } else {
-        let start = space.find_free(addr, n).map_err(error)?;
-        space
+        space.find_free(addr, n).map_err(error)?
+    };
+    match source {
+        Some(MappingSource::File { ino, writable }) => {
+            use crate::mm::{
+                address_space::Backing,
+                file::{FilePage, MappingFile, Mode},
+            };
+            use alloc::vec::Vec;
+
+            let file = MappingFile::new_for_map(ino, shared && prot & 2 != 0)?;
+            let mode = if shared {
+                Mode::Shared { writable }
+            } else {
+                Mode::Private
+            };
+            let mut frames = Vec::new();
+            frames.try_reserve(n).map_err(|_| Errno::NoMem)?;
+            for i in 0..n {
+                frames.push(Backing::File(FilePage::new(
+                    file.clone(),
+                    offset + i * PAGE_SIZE,
+                    mode,
+                )));
+            }
+            space.map_backed(start, frames, f, fixed).map_err(error)?;
+            crate::mm::fence_icache();
+        }
+        source if shared => {
+            let writable = !matches!(source, Some(MappingSource::Zero { writable: false }));
+            space
+                .map_shared_anonymous(start, n, f, fixed, writable)
+                .map_err(error)?;
+        }
+        _ if fixed => space.reserve_fixed(start, n, f).map_err(error)?,
+        _ => space
             .reserve_region(start, n, f, AreaKind::Anonymous)
-            .map_err(error)?;
-        Ok(start)
+            .map_err(error)?,
     }
+    Ok(start)
 }
+
 /// munmap(2)：起址必须页对齐，长度向上取整；空洞允许。
 pub(super) fn munmap(
     space: &mut UserAddressSpace,
@@ -403,11 +397,15 @@ pub(super) fn readahead(
     offset: usize,
     count: usize,
 ) -> Result<usize, Errno> {
-    let (ino, _) = crate::fs::context::mapping(ctx, fd, false).map_err(|e| match e {
+    use crate::fs::context::{mapping, MappingSource};
+    let MappingSource::File { ino, .. } = mapping(ctx, fd, false).map_err(|e| match e {
         Errno::Access => Errno::BadF,
         Errno::NoDevice => Errno::Invalid,
         other => other,
-    })?;
+    })?
+    else {
+        return Err(Errno::Invalid);
+    };
     if offset > i64::MAX as usize {
         return Err(Errno::Invalid);
     }

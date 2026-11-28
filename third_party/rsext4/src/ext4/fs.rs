@@ -6,6 +6,8 @@ use super::*;
 /// This aggregates the superblock, group descriptors, allocators, and caches
 /// needed after mount has reconstructed the filesystem view.
 pub struct Ext4FileSystem {
+    // OuroOS patch: 单个大目录的可失效名称索引。
+    pub(crate) directory_index: Option<crate::dir::index::DirectoryIndex>,
     /// In-memory copy of the primary superblock.
     pub superblock: Ext4Superblock,
     /// All loaded block-group descriptors.
@@ -150,6 +152,13 @@ impl Ext4FileSystem {
         B: BlockDevice,
         F: FnOnce(&mut Ext4Inode),
     {
+        if self
+            .directory_index
+            .as_ref()
+            .is_some_and(|index| index.parent == inode_num)
+        {
+            self.directory_index = None;
+        }
         // Resolve the owning group first so the inode-table start block can be
         // derived from the matching group descriptor.
         let (group_idx, _idx_in_group) = self.inode_allocator.global_to_group(inode_num)?;
