@@ -12,6 +12,7 @@ pub mod cache;
 pub mod context;
 pub mod event;
 pub mod fat;
+pub mod inotify;
 pub mod locks;
 pub mod mapping;
 mod metadata;
@@ -37,7 +38,12 @@ pub(crate) fn update_times(ino: u32, times: [TimeUpdate; 2]) -> Result<(), Errno
     if ino & FAT_INODE != 0 {
         Err(Errno::NotSupported)
     } else {
-        ext4::update_times(ino, times)
+        ext4::update_times(ino, times)?;
+        if inotify::has_watches() {
+            let is_dir = stat(ino).is_ok_and(|(m, ..)| m & 0xf000 == 0x4000);
+            inotify::notify_inode(ino, inotify::IN_ATTRIB, is_dir);
+        }
+        Ok(())
     }
 }
 
@@ -61,7 +67,11 @@ pub(crate) fn set_owner(
             return Err(Errno::Perm);
         }
     }
-    ext4::set_owner(ino, uid, gid)
+    ext4::set_owner(ino, uid, gid)?;
+    if inotify::has_watches() {
+        inotify::notify_inode(ino, inotify::IN_ATTRIB, info.mode & 0xf000 == 0x4000);
+    }
+    Ok(())
 }
 
 /// 已挂载文件系统的容量快照，块数以 block_size 字节为单位。
@@ -284,13 +294,25 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
     if path == "/proc/sys/fs/pipe-max-size" {
         return Ok(procfs::PIPE_MAX_SIZE_NODE);
     }
+    if path == "/proc/sys/fs/inotify" {
+        return Ok(procfs::SYS_INOTIFY_DIR);
+    }
+    if path == "/proc/sys/fs/inotify/max_queued_events" {
+        return Ok(procfs::INOTIFY_MAX_QUEUED);
+    }
+    if path == "/proc/sys/fs/inotify/max_user_instances" {
+        return Ok(procfs::INOTIFY_MAX_INSTANCES);
+    }
+    if path == "/proc/sys/fs/inotify/max_user_watches" {
+        return Ok(procfs::INOTIFY_MAX_WATCHES);
+    }
     if path == "/proc/self" {
         return Ok(procfs::SELF_DIR);
     }
     if path == "/proc/self/maps" {
         return Ok(procfs::SELF_MAPS);
     }
-    if path == "/proc/self/fd" {
+    if path == "/proc/self/fd" || path == "/proc/self/fdinfo" {
         return Ok(procfs::SELF_FD_DIR);
     }
     if let Some(rest) = path.strip_prefix("/proc/") {
@@ -303,6 +325,7 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
             "status" => Ok(base + 3),
             "comm" => Ok(base + 4),
             "timerslack_ns" => Ok(base + 5),
+            "fdinfo" => Ok(base + 6),
             _ => Err(Errno::NoEntry),
         };
     }
@@ -381,6 +404,30 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
     if ino == procfs::PIPE_MAX_SIZE_NODE {
         return Ok((0o100444, procfs::pipe_max_size().len() as u64, 1, 0));
     }
+    if ino == procfs::INOTIFY_MAX_QUEUED {
+        return Ok((
+            0o100444,
+            procfs::sys_fs_inotify("max_queued_events")?.len() as u64,
+            1,
+            0,
+        ));
+    }
+    if ino == procfs::INOTIFY_MAX_INSTANCES {
+        return Ok((
+            0o100444,
+            procfs::sys_fs_inotify("max_user_instances")?.len() as u64,
+            1,
+            0,
+        ));
+    }
+    if ino == procfs::INOTIFY_MAX_WATCHES {
+        return Ok((
+            0o100444,
+            procfs::sys_fs_inotify("max_user_watches")?.len() as u64,
+            1,
+            0,
+        ));
+    }
     if ino == procfs::VERSION {
         return Ok((0o100444, procfs::version().len() as u64, 1, 0));
     }
@@ -393,6 +440,7 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
             | procfs::SYS_DIR
             | procfs::SYS_KERNEL_DIR
             | procfs::SYS_FS_DIR
+            | procfs::SYS_INOTIFY_DIR
             | procfs::SYSVIPC_DIR
             | procfs::SELF_DIR
             | procfs::SELF_FD_DIR
@@ -401,7 +449,7 @@ pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
     }
     if let Some((pid, file)) = procfs::pid_ino_parts(ino) {
         return match file {
-            0 => Ok((0o040555, 0, 2, 0)),
+            0 | 6 => Ok((0o040555, 0, 2, 0)),
             1 => Ok((0o100444, procfs::pid_stat(pid)?.len() as u64, 1, 0)),
             2 => Ok((0o100444, procfs::pid_cmdline(pid)?.len() as u64, 1, 0)),
             3 => Ok((0o100444, procfs::pid_status(pid)?.len() as u64, 1, 0)),
@@ -436,7 +484,7 @@ pub(crate) fn read_link(ino: u32) -> Result<alloc::string::String, Errno> {
 
 /// 在指定父目录下创建新对象。
 pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
-    if parent == procfs::DEVDIR {
+    let (actual_parent, ino) = if parent == procfs::DEVDIR {
         let dev_ino = match ext4::lookup("/dev") {
             Ok(ino) => ino,
             Err(Errno::NoEntry) => {
@@ -445,18 +493,26 @@ pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
             }
             Err(e) => return Err(e),
         };
-        return ext4::create(dev_ino, name, mode);
-    }
-    if parent & FAT_INODE != 0 {
-        fat::create(parent, name, mode)
+        (dev_ino, ext4::create(dev_ino, name, mode)?)
+    } else if parent & FAT_INODE != 0 {
+        (parent, fat::create(parent, name, mode)?)
     } else {
-        ext4::create(parent, name, mode)
+        (parent, ext4::create(parent, name, mode)?)
+    };
+    if inotify::has_dir_watches() {
+        inotify::notify_dir_child(
+            actual_parent,
+            name,
+            mode & 0xf000 == 0x4000,
+            inotify::IN_CREATE,
+        );
     }
+    Ok(ino)
 }
 
 /// 在指定父目录下创建普通或特殊节点（含设备号 rdev）；FAT 仅支持普通文件。
 pub fn create_node(parent: u32, name: &str, mode: u16, rdev: u64) -> Result<u32, Errno> {
-    if parent == procfs::DEVDIR {
+    let (actual_parent, ino) = if parent == procfs::DEVDIR {
         let dev_ino = match ext4::lookup("/dev") {
             Ok(ino) => ino,
             Err(Errno::NoEntry) => {
@@ -465,17 +521,25 @@ pub fn create_node(parent: u32, name: &str, mode: u16, rdev: u64) -> Result<u32,
             }
             Err(e) => return Err(e),
         };
-        return ext4::create_node(dev_ino, name, mode, rdev);
-    }
-    if parent & FAT_INODE != 0 {
+        (dev_ino, ext4::create_node(dev_ino, name, mode, rdev)?)
+    } else if parent & FAT_INODE != 0 {
         if mode & 0xf000 == 0x8000 {
-            fat::create(parent, name, mode)
+            (parent, fat::create(parent, name, mode)?)
         } else {
-            Err(Errno::NotSupported)
+            return Err(Errno::NotSupported);
         }
     } else {
-        ext4::create_node(parent, name, mode, rdev)
+        (parent, ext4::create_node(parent, name, mode, rdev)?)
+    };
+    if inotify::has_dir_watches() {
+        inotify::notify_dir_child(
+            actual_parent,
+            name,
+            mode & 0xf000 == 0x4000,
+            inotify::IN_CREATE,
+        );
     }
+    Ok(ino)
 }
 
 /// 在指定父目录下创建符号链接；FAT 与虚拟目录不支持。
@@ -486,7 +550,11 @@ pub(crate) fn symlink(parent: u32, name: &str, target: &str) -> Result<u32, Errn
     if parent & FAT_INODE != 0 {
         return Err(Errno::NotSupported);
     }
-    ext4::symlink(parent, name, target)
+    let ino = ext4::symlink(parent, name, target)?;
+    if inotify::has_dir_watches() {
+        inotify::notify_dir_child(parent, name, false, inotify::IN_CREATE);
+    }
+    Ok(ino)
 }
 
 /// 在指定父目录下为已有 inode 建立硬链接；跨挂载返回 EXDEV，FAT 与虚拟节点不支持。
@@ -500,17 +568,22 @@ pub(crate) fn link(target_ino: u32, parent: u32, name: &str) -> Result<(), Errno
     if (target_ino | parent) & FAT_INODE != 0 {
         return Err(Errno::NotSupported);
     }
-    ext4::link(target_ino, parent, name)
+    ext4::link(target_ino, parent, name)?;
+    if inotify::has_watches() {
+        inotify::notify_inode(target_ino, inotify::IN_ATTRIB, false);
+        inotify::notify_dir_child(parent, name, false, inotify::IN_CREATE);
+    }
+    Ok(())
 }
 
-/// 在同一挂载内改名；FAT 暂不支持，跨挂载返回 EXDEV。
+/// 在同一挂载内改名；FAT 暂不支持，跨挂载返回 EXDEV。返回被当场回收的覆盖目标 inode。
 pub(crate) fn rename(
     old: u32,
     name: &str,
     new: u32,
     target: &str,
     no_replace: bool,
-) -> Result<(), Errno> {
+) -> Result<Option<u32>, Errno> {
     if metadata::metadata(old)?.dev != metadata::metadata(new)?.dev {
         return Err(Errno::CrossDevice);
     }
@@ -636,6 +709,9 @@ pub fn truncate(ino: u32, length: u64) -> Result<(), Errno> {
         cache::resize_inode(ino, current as usize, length as usize);
         mapping::commit_resize(ino, current, length);
     }
+    if result.is_ok() && inotify::has_watches() {
+        inotify::notify_inode(ino, inotify::IN_MODIFY, false);
+    }
     result
 }
 
@@ -673,20 +749,33 @@ pub fn release(ino: u32) {
     if procfs::is_virtual_ino(ino) {
         return;
     }
-    if ino & FAT_INODE != 0 {
+    let reclaimed = if ino & FAT_INODE != 0 {
         fat::release(ino);
+        false
     } else {
-        ext4::release(ino);
+        ext4::release(ino)
+    };
+    if reclaimed && inotify::has_watches() {
+        inotify::notify_delete_self(ino);
     }
 }
 
 /// 删除目录中的文件名，已打开的 inode 仍可访问。
 pub fn unlink(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
-    if ino & FAT_INODE != 0 {
-        fat::unlink(ino)
+    let reclaimed = if ino & FAT_INODE != 0 {
+        fat::unlink(ino)?;
+        true
     } else {
-        ext4::unlink(parent, ino, name)
+        ext4::unlink(parent, ino, name)?
+    };
+    if inotify::has_watches() {
+        inotify::notify_dir_child(parent, name, false, inotify::IN_DELETE);
+        inotify::notify_inode(ino, inotify::IN_ATTRIB, false);
+        if reclaimed {
+            inotify::notify_delete_self(ino);
+        }
     }
+    Ok(())
 }
 
 /// 判断路径是否属于按需生成快照的 procfs 只读文本文件。
@@ -703,6 +792,9 @@ pub fn is_procfs_text(path: &str) -> bool {
             | "/proc/sysvipc/msg"
             | "/proc/sysvipc/sem"
             | "/proc/sys/fs/pipe-max-size"
+            | "/proc/sys/fs/inotify/max_queued_events"
+            | "/proc/sys/fs/inotify/max_user_instances"
+            | "/proc/sys/fs/inotify/max_user_watches"
             | "/proc/version"
     ) {
         return true;
@@ -750,6 +842,9 @@ pub fn procfs_text(path: &str) -> Result<alloc::string::String, Errno> {
         s.try_reserve_exact(src.len()).map_err(|_| Errno::NoMem)?;
         s.push_str(src);
         return Ok(s);
+    }
+    if let Some(name) = path.strip_prefix("/proc/sys/fs/inotify/") {
+        return procfs::sys_fs_inotify(name);
     }
     if path == "/proc/version" {
         let mut s = alloc::string::String::new();
@@ -806,7 +901,12 @@ pub fn chmod_by_ino(ino: u32, path: &str, mode: u16) -> Result<(), Errno> {
     if ino & FAT_INODE != 0 {
         return Err(Errno::NotSupported);
     }
-    ext4::chmod_by_ino(ino, path, mode)
+    ext4::chmod_by_ino(ino, path, mode)?;
+    if inotify::has_watches() {
+        let is_dir = stat(ino).is_ok_and(|(m, ..)| m & 0xf000 == 0x4000);
+        inotify::notify_path_event(ino, path, is_dir, inotify::IN_ATTRIB);
+    }
+    Ok(())
 }
 
 /// 删除空目录（rmdir 语义）；FAT 未接入目录删除，返回 ENOTSUP。
@@ -816,6 +916,10 @@ pub fn rmdir(parent: u32, ino: u32, name: &str) -> Result<(), Errno> {
     }
     ext4::rmdir(parent, ino, name)?;
     context::detach_directory(ino);
+    if inotify::has_watches() {
+        inotify::notify_dir_child(parent, name, true, inotify::IN_DELETE);
+        inotify::notify_delete_self(ino);
+    }
     Ok(())
 }
 

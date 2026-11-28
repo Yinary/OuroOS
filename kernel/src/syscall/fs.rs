@@ -10,6 +10,24 @@ use crate::{
 };
 use alloc::{string::String, vec::Vec};
 
+/// 解析 `/proc/<self|current_tgid>/fdinfo/<fd>` 路径，返回 `<fd>` 数字串。
+fn parse_proc_fdinfo_path(path: &str, tgid: u32) -> Option<&str> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (pid_part, tail) = rest.split_once('/')?;
+    let is_self = pid_part == "self"
+        || (!pid_part.is_empty()
+            && pid_part.bytes().all(|b| b.is_ascii_digit())
+            && pid_part.parse::<u32>().ok() == Some(tgid));
+    if !is_self {
+        return None;
+    }
+    let fd_str = tail.strip_prefix("fdinfo/")?;
+    if fd_str.is_empty() || !fd_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(fd_str)
+}
+
 /// 从用户内存读取 NUL 结尾 UTF-8 字符串；不可访问或过长时返回错误。
 pub(crate) fn user_string(space: &UserAddressSpace, ptr: usize) -> Result<String, Errno> {
     user_access::read_cstr(space, ptr, 4096).map_err(|e| match e {
@@ -229,6 +247,14 @@ pub fn dispatch(
                     }
                     if path == "/proc/self/fd" {
                         return ctx.open_proc_fd_dir(a[2], a[2] & O_CLOEXEC != 0);
+                    }
+                    if let Some(kind) = fs::inotify::SysctlKind::from_path(&path) {
+                        return ctx.open_proc_sysctl(kind, a[2], a[2] & O_CLOEXEC != 0);
+                    }
+                    if let Some(fd_str) = parse_proc_fdinfo_path(&path, tgid) {
+                        let target_fd: usize = fd_str.parse().map_err(|_| Errno::NoEntry)?;
+                        let text = ctx.format_fdinfo(target_fd)?;
+                        return ctx.open_proc_text(text, a[2], a[2] & O_CLOEXEC != 0);
                     }
                     if fs::is_procfs_text(&path) {
                         let text = fs::procfs_text(&path)?;
@@ -450,6 +476,22 @@ pub fn dispatch(
         sysnr::TIMERFD_CREATE => ctx.open_timerfd(a[0] as u32 as i32, a[1] as u32 as usize),
         sysnr::TIMERFD_SETTIME => timerfd_settime(ctx, space, a),
         sysnr::TIMERFD_GETTIME => timerfd_gettime(ctx, space, a),
+        sysnr::INOTIFY_INIT1 => ctx.open_inotify(a[0] as u32 as usize),
+        sysnr::INOTIFY_ADD_WATCH => {
+            let fd = a[0] as u32 as i32;
+            if fd < 0 {
+                return Err(Errno::BadF);
+            }
+            let pathname = user_string(space, a[1])?;
+            ctx.inotify_add_watch(fd as usize, &pathname, a[2] as u32, credentials)
+        }
+        sysnr::INOTIFY_RM_WATCH => {
+            let fd = a[0] as u32 as i32;
+            if fd < 0 {
+                return Err(Errno::BadF);
+            }
+            ctx.inotify_rm_watch(fd as usize, a[1] as u32 as i32)
+        }
         _ => Err(Errno::NoSys),
     }
 }
@@ -560,10 +602,25 @@ fn truncate(
         let path = user_string(space, a[0])?;
         let info = ctx.query((-100isize) as usize, &path, false, true)?;
         fs::truncate(info.ino as u32, length as u64)?;
+        if fs::inotify::has_dir_watches() {
+            if let Ok(resolved) = ctx.path((-100isize) as usize, &path) {
+                fs::inotify::notify_parent_path(
+                    info.ino as u32,
+                    &resolved,
+                    false,
+                    fs::inotify::IN_MODIFY,
+                );
+            }
+        }
     } else {
-        ctx.get(a[0] as u32 as usize)?
-            .lock()
-            .truncate(length as u64)?;
+        let handle = ctx.get(a[0] as u32 as usize)?;
+        let f = handle.lock();
+        f.truncate(length as u64)?;
+        if fs::inotify::has_dir_watches() {
+            if let (Ok(ino), Some(p)) = (f.inode(), f.inode_path()) {
+                fs::inotify::notify_parent_path(ino, p, false, fs::inotify::IN_MODIFY);
+            }
+        }
     }
     Ok(0)
 }
