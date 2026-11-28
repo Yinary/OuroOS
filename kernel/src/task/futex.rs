@@ -1,6 +1,8 @@
 //! futex 系统调用：等待字身份、命令分派与截止时间。
 //! 键与唤醒动作在此计算，唤醒本体在注册表锁外执行。
 
+#![forbid(unsafe_code)]
+
 use core::time::Duration;
 
 use crate::{

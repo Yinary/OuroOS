@@ -1,6 +1,8 @@
 //! 时钟源：单调时钟取开机时间，墙钟在启动时与 RTC 的秒边界对齐，之后随单调时钟推进。
 //! 系统调用按 clockid 经本模块取时间。
 
+#![forbid(unsafe_code)]
+
 use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 
@@ -80,6 +82,7 @@ pub fn realtime() -> Duration {
 pub enum ClockKind {
     Realtime,
     Monotonic,
+    #[allow(dead_code)]
     Process,
 }
 
@@ -101,7 +104,7 @@ pub fn sleepable(clockid: i32) -> Result<ClockKind, Errno> {
     match clockid {
         0 | 8 | 11 => Ok(ClockKind::Realtime),
         1 | 7 | 9 => Ok(ClockKind::Monotonic),
-        2 | 3 | 4 | 5 | 6 => Err(Errno::NotSupported),
+        2..=6 => Err(Errno::NotSupported),
         _ => Err(Errno::Invalid),
     }
 }

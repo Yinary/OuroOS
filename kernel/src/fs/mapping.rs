@@ -7,6 +7,8 @@
 //! 3. `cache::invalidate_inode`：禁止旧共享页写回；
 //! 4. `commit_resize`：MM 撤销/缩短旧映射。
 
+#![forbid(unsafe_code)]
+
 use crate::syscall::Errno;
 use spin::Mutex;
 
@@ -18,16 +20,18 @@ pub trait Hooks: Sync {
 
 static HOOKS: Mutex<Option<&'static dyn Hooks>> = Mutex::new(None);
 
-/// 注册 MM hooks；只允许一次。
-#[allow(dead_code)] // MM 在后续 PR 注册
+/// 注册 MM hooks；只允许调用一次。
+#[allow(dead_code)]
 pub fn register(hooks: &'static dyn Hooks) {
     *HOOKS.lock() = Some(hooks);
 }
 
+/// 返回内存管理映射回调钩子是否已注册。
 pub fn registered() -> bool {
     HOOKS.lock().is_some()
 }
 
+/// 通知内存管理准备文件长度变更并预分配所需资源。
 pub fn prepare_resize(ino: u32, old: u64, new: u64) -> Result<(), Errno> {
     match *HOOKS.lock() {
         Some(hooks) => hooks.prepare_resize(ino, old, new),
@@ -35,6 +39,7 @@ pub fn prepare_resize(ino: u32, old: u64, new: u64) -> Result<(), Errno> {
     }
 }
 
+/// 提交文件长度变更并撤销受影响的旧文件映射。
 pub fn commit_resize(ino: u32, old: u64, new: u64) {
     if let Some(hooks) = *HOOKS.lock() {
         hooks.commit_resize(ino, old, new);

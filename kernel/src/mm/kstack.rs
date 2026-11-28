@@ -41,31 +41,48 @@ static WINDOW: Mutex<Window> = Mutex::new(Window {
     ready: false,
 });
 
-fn pte_slot(table: PhysAddr, index: usize) -> *mut usize {
-    debug_assert!(index < L0_ENTRIES);
-    // SAFETY: table 为帧分配器返回的整页，经直映别名可写，index 在页内。
-    unsafe { ((table.raw() | VIRT_ADDR_START) as *mut usize).add(index) }
+/// # Safety
+/// `table` 必须是指向有效已分配页表页的页对齐物理地址。
+unsafe fn read_pte(table: PhysAddr, index: usize) -> usize {
+    assert!(index < L0_ENTRIES, "kstack pte index out of bounds");
+    assert_ne!(table.raw(), 0, "kstack table physical address is zero");
+    // SAFETY: 调用方保证 `table` 为有效表页，断言确保 `index < L0_ENTRIES`。
+    unsafe {
+        ((table.raw() | VIRT_ADDR_START) as *const usize)
+            .add(index)
+            .read_volatile()
+    }
 }
-fn read_pte(table: PhysAddr, index: usize) -> usize {
-    // SAFETY: 同上，只读已分配表页内的表项。
-    unsafe { pte_slot(table, index).read_volatile() }
-}
-fn write_pte(table: PhysAddr, index: usize, value: usize) {
-    // SAFETY: 同上；单核独占修改，表页已初始化。
-    unsafe { pte_slot(table, index).write_volatile(value) }
+
+/// # Safety
+/// `table` 必须是指向有效且可写页表页的页对齐物理地址，且当前单核独占修改。
+unsafe fn write_pte(table: PhysAddr, index: usize, value: usize) {
+    assert!(index < L0_ENTRIES, "kstack pte index out of bounds");
+    assert_ne!(table.raw(), 0, "kstack table physical address is zero");
+    // SAFETY: 调用方保证 `table` 为独占表页，断言确保 `index < L0_ENTRIES`。
+    unsafe {
+        ((table.raw() | VIRT_ADDR_START) as *mut usize)
+            .add(index)
+            .write_volatile(value);
+    }
 }
 
 fn l0_for(page: usize) -> PhysAddr {
-    debug_assert!(page < WINDOW_PAGES);
+    assert!(page < WINDOW_PAGES, "kstack page index out of bounds");
     let l1 = PhysAddr::new(L1_TABLE.load(Ordering::Relaxed));
-    debug_assert_ne!(l1.raw(), 0, "kernel stack window not initialized");
-    arch::address(read_pte(l1, page / L0_ENTRIES))
+    assert_ne!(l1.raw(), 0, "kernel stack window not initialized");
+    // SAFETY: `L1_TABLE` 由 `init_window` 初始化为有效 L1 页表页。
+    arch::address(unsafe { read_pte(l1, page / L0_ENTRIES) })
 }
 fn set_leaf(page: usize, leaf: usize) {
-    write_pte(l0_for(page), page % L0_ENTRIES, leaf);
+    let l0 = l0_for(page);
+    // SAFETY: `l0_for` 返回已初始化的窗口 L0 表页，单核内核态独占修改。
+    unsafe { write_pte(l0, page % L0_ENTRIES, leaf) };
 }
 fn read_leaf(page: usize) -> usize {
-    read_pte(l0_for(page), page % L0_ENTRIES)
+    let l0 = l0_for(page);
+    // SAFETY: `l0_for` 返回已初始化的窗口 L0 表页。
+    unsafe { read_pte(l0, page % L0_ENTRIES) }
 }
 
 /// 将窗口 VA（或普通直映 VA）转换为 DMA 物理地址；调用方保证缓冲存活且物理连续。
@@ -93,9 +110,11 @@ pub(super) fn init_window() -> Result<(), FrameError> {
     for i in 0..L0_COUNT {
         let l0 = frame::frame_alloc(1)?;
         l0.clear_len(PAGE_SIZE);
-        write_pte(l1, i, arch::table(l0));
+        // SAFETY: `l1` 为刚分配的独占清零页表页，`i < L0_COUNT <= L0_ENTRIES`。
+        unsafe { write_pte(l1, i, arch::table(l0)) };
     }
-    write_pte(root, WINDOW_ROOT_INDEX, arch::table(l1));
+    // SAFETY: `root` 为启动期内核根页表页，单核初始化独占写入窗口根槽。
+    unsafe { write_pte(root, WINDOW_ROOT_INDEX, arch::table(l1)) };
     TLB::flush_all();
     L1_TABLE.store(l1.raw(), Ordering::Relaxed);
     WINDOW.lock().ready = true;

@@ -1,5 +1,7 @@
 //! 块层写回缓存：以物理页帧承载 4 KiB 块，对上透明实现 `rsext4::BlockDevice`。
 //! 契约见 docs/ostd-contracts.md §6。
+#![forbid(unsafe_code)]
+
 use crate::mm::frame::OwnedFrame;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -178,21 +180,19 @@ impl<B: BlockDevice> BlockCache<B> {
         if !self.enabled() {
             return Ok(None);
         }
-        if self.slots.len() < MAX_BLOCKS {
-            if self.slots.try_reserve(1).is_ok() {
-                if let Ok(frame) = OwnedFrame::new() {
-                    let slot_idx = self.slots.len();
-                    self.slots.push(Slot {
-                        block_id,
-                        frame,
-                        valid: true,
-                        dirty: false,
-                        referenced: true,
-                    });
-                    BLOCK_CACHE_FRAMES.fetch_add(1, Ordering::Relaxed);
-                    self.table_insert(block_id, slot_idx);
-                    return Ok(Some(slot_idx));
-                }
+        if self.slots.len() < MAX_BLOCKS && self.slots.try_reserve(1).is_ok() {
+            if let Ok(frame) = OwnedFrame::new() {
+                let slot_idx = self.slots.len();
+                self.slots.push(Slot {
+                    block_id,
+                    frame,
+                    valid: true,
+                    dirty: false,
+                    referenced: true,
+                });
+                BLOCK_CACHE_FRAMES.fetch_add(1, Ordering::Relaxed);
+                self.table_insert(block_id, slot_idx);
+                return Ok(Some(slot_idx));
             }
         }
         if self.slots.is_empty() {

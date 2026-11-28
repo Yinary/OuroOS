@@ -61,14 +61,16 @@
 | 物理内存唯一入口 | 只有 region → frame 登记；裸 `frame_alloc` 仅 kernel_pt、kstack、DMA 三处受限适配 |
 | 唯一释放凭证 | `OwnedFrame` 不可 Clone；释放前必须撤销映射并刷 TLB |
 | 分配即清零 | `OwnedFrame::new` 清零；kstack/DMA 显式清零 |
-| 拥有页字节访问 | `OwnedFrame::read/write/copy_from` 校验页内范围并封装直映指针；`address_space::init_elf_page` 提供 ELF 初始页写入接口 |
+| 拥有页字节访问 | `OwnedFrame::read/write/copy_from` 校验页内范围并经直映裸指针访问（不构造共享页 Rust 引用，单核非抢占下由调用方确保不覆写 COW 只读页）；`as_slice`/`as_mut_slice`/`fill_range_with` 要求 `&mut self` 以禁止共享 `FrameRef` 产生可变别名；`address_space::init_elf_page` 封装 ELF 初始页写入 |
+| 页表页访问收口 | `UserPageTable` 内部以私有 `TablePa` 凭证限定页表物理页来源并运行时断言索引 `< 512`；`kstack` 表项读写为私有 `unsafe fn` 且运行时断言索引与非零地址 |
 | 期望权限 ≠ 实际权限 | 两架构无 NX；`mprotect` 接受读写权限变更，可访问页实际可执行 |
 | PROT_NONE 占坑 | 保留数据页所有权，硬件叶项清零 |
 | 事务性 | 失败与未调用不可区分；map/replace/map_backed/deep_copy/exec 先备齐后提交 |
-| 两遍式用户访问 | 先整段校验再复制；失败不部分写；用户指针不成引用 |
+| 两遍式用户访问 | 先整段校验再经 `copy_nonoverlapping` 复制；`read_cstr` 同样分块拷入内核栈缓冲扫描 NUL；用户指针绝不构造为 Rust 引用 |
 | 地址空间 !Send | `PhantomData`；`LocalSpace` 是注册表用的单核凭证 |
 | TLB 全量刷 | map/protect/unmap/switch 都 `flush_all` |
 | 零堆依赖零 panic | mm 元数据全部 try_reserve；整内核用户路径的堆分配见 §1.5 |
+| 编译期 `unsafe` 边界 | 全内核 52/68 个文件开启 `#![forbid(unsafe_code)]`，覆盖 `fs/`、`syscall/`、`ipc/`、`net/`、`sigframe/`、`elf.rs` 等全部上层服务；全局堆经 `UnsafeCell` 包装消除 `static mut` |
 
 ### 1.3 补充约定
 
@@ -90,7 +92,7 @@
 | mmap 空洞 / MAP_FIXED | `find_free`、`replace_region` 事务替换 |
 | fork | `deep_copy` 完成子地址空间后，将父子共享的私有匿名、堆、栈、ELF 段与私有文件映射驻留页统一设为只读。首次写入时分配私有副本；只剩一个引用时恢复写权限。 |
 | exec 先建后切 | 新空间含 argv/envp/auxv，成功才替换 |
-| 页字节访问收口 | 拥有页复制及 ELF 初始页写入由 mm 封装；`elf.rs`、`fs/cache.rs`、`syscall/memory.rs`、`task/user_task.rs`、`task/exec.rs`、`task/task.rs` 拒绝 `unsafe` |
+| 页字节访问与 OSTD 边界收口 | 拥有页复制及 ELF 初始页写入由 mm 封装；`OwnedFrame::fill_range_with` 收紧为 `&mut self`、`read_cstr` 改用分块拷贝不造用户引用、`UserPageTable` 引入 `TablePa` 凭证、`allocator.rs` 消除 `static mut`，52/68 个内核文件启用 `#![forbid(unsafe_code)]` |
 | MAP_SHARED 文件页缓存 | `fs/cache.rs`；索引独立持有页，比较有效字节和上次写回基线，失败后可重试 |
 | 内核栈虚拟窗口 + 底部保护页 | `mm/kstack.rs`；16 GiB 起 32 MiB 共享窗口，槽 = guard + 8 栈页（可容纳 910 个并发任务），逐页映射，溢出即页错误 |
 ### 1.5 欠账
@@ -301,7 +303,7 @@ try_lock 失败即报告“持锁跨调度”。
 | getrandom | 设备树 rng-seed 播种 ChaCha20 流（单次请求上限 64 KiB，可失败分配）；flags 仅接受 GRND_NONBLOCK/GRND_RANDOM；无种子时一律 EAGAIN（无合法阻塞唤醒来源），绝不以时间/常量伪造熵 | 缺少可信启动熵时 execve 返回 EIO，保留旧映像；启动阶段若因此无法创建任何用户任务，内核同步文件系统并关机。 | 设计：不伪造熵；未实现：等待熵就绪 |
 | ioctl | 支持 `/dev/misc/rtc` 的 `RTC_RD_TIME` 、块设备的 BLKGETSIZE64 与管道/普通文件的 `FIONREAD`（`0x541B`，返回当前可读字节数 `i32`；cmd 按 `unsigned int` 截断比较）；其余命令与设备一律 ENOTTY | 终端 TCGETS/TCWINSZ、FIONBIO 等未实现（more 依赖的 isatty 降级为非终端） | 未实现 |
 | read/write/readv/writev | 小读写（≤256 字节）使用栈缓冲免锁，大读写复用单槽 64 KiB 可失败堆缓冲区；向量描述符先复制到内核，最多 1024 项，总长度超过 ssize_t 返回 EINVAL；每次最多搬运 0x7ffff000 字节；遇短传输、EOF 或错误停止，已有进展时返回已完成长度 | 用户缓冲区按页交付，读只推进实际交付的偏移；完整调用持有打开文件锁；OOM 返回 ENOMEM，零长度不分配数据缓冲区 | 无偏差 |
-| pread64/pwrite64/preadv/pwritev | 指定独立偏移，不修改共享文件偏移；负偏移 EINVAL，流式对象 ESPIPE；rv64/la64 原始向量定位 ABI 使用完整 pos_l，忽略 pos_h；O_APPEND 下定位写仍追加，与 Linux 已知行为一致 | 不支持 preadv2/pwritev2；Ext4 文件超限 EFBIG 独立于参数过长 E2BIG；部分错误仍按已完成字节数返回 | 未实现：preadv2/pwritev2 |
+| pread64/pwrite64/preadv/pwritev | 指定独立偏移，不修改共享文件偏移；负偏移 EINVAL，流式对象 ESPIPE；rv64/la64 原始向量定位 ABI 使用完整 pos_l，忽略 pos_h；O_APPEND 下定位写仍追加，与 Linux 已知行为一致 | Ext4 文件超限 EFBIG 独立于参数过长 E2BIG；部分错误仍按已完成字节数返回；`preadv2/pwritev2` 见下方专行 | 无偏差 |
 | fcntl / flock | 支持 F_DUPFD/F_DUPFD_CLOEXEC、F_GETFD/F_SETFD、F_GETFL/F_SETFL、F_GETPIPE_SZ/F_SETPIPE_SZ，以及 POSIX 记录锁（F_GETLK/F_SETLK/F_SETLKW，归属线程组，关闭同文件任一 FD 或进程退出自动释放）、OFD 记录锁（F_OFD_GETLK/F_OFD_SETLK/F_OFD_SETLKW，归属打开文件描述，最后引用关闭释放）与 BSD `flock(32)`（LOCK_SH/LOCK_EX/LOCK_UN/LOCK_NB，归属打开文件描述）；区间支持拆分与合并，阻塞冲突经调度器等待唤醒；从下界选最低空闲 FD，受进程 RLIMIT_NOFILE（默认软 1024 / 硬 4096）约束；cloexec 属于描述符，偏移与状态由 dup/fork 共享；F_SETPIPE_SZ 按页向上对齐并限 4 KiB..1 MiB，低于已缓冲字节数返回 EBUSY，非管道返回 EINVAL | F_SETFL 仅修改 O_APPEND/O_NONBLOCK，访问模式、创建与同步标志不变；请求 O_ASYNC/O_DIRECT/O_NOATIME 返回 EOPNOTSUPP 且不修改状态；未知命令返回 EINVAL；尚未实现死锁环检测（EDEADLK）、强制锁、F_SETLEASE 与异步通知 | 未实现：死锁环检测、强制锁、异步通知 |
 | pipe | 默认容量 64 KiB（可经 F_SETPIPE_SZ 在 4 KiB..1 MiB 调整）；遵循 POSIX PIPE_BUF（4096 字节）原子写语义，超过 4096 字节的写请求在缓冲有余量时允许部分写入；读路径通过 `VecDeque::as_slices` 批量切片拷贝；读空或无空间时按实例定向等待，O_NONBLOCK 返回 EAGAIN；总长不超过 4 KiB 的 writev 合并后写入，空间不足不写入前缀；无读者返回 EPIPE | SIGPIPE 与 -EPIPE 并行产生同 Linux（§4.5，默认处置下写者死于信号、见不到 EPIPE）；运行期 VecDeque 扩容的不可失败分配仍待处理；复制失败只消费已交付数据 | 缺陷 6；欠账：扩容的不可失败分配 |
 | wait4 | pid>0 指定孩子，-1 等任意孩子，0 等本进程组的孩子，<-1 等进程组 -pid 的孩子（pid==INT_MIN 返回 ESRCH）；无僵尸则阻塞，无孩子 ECHILD；WNOHANG 支持；status 按 ExitInfo：正常 `(code&255)<<8`、死于信号 `sig` | 语义接近；忽略 rusage；无 core 位 | 缺陷 4；未实现：core 位 |
@@ -313,7 +315,7 @@ try_lock 失败即报告“持锁跨调度”。
 | 身份查询 | getpid 返回线程组号（tgid），同线程组内各线程一致；gettid 返回线程号；getuid、geteuid、getgid、getegid 取自进程记录里的凭证；getresuid 与 getresgid 写出真实、有效、保存的号；getgroups 返回补充组。`/proc/<pid>/stat` 的 pgrp 与 session、`/proc/<pid>/status` 的 Uid 与 Gid 取自同一来源，exec 的 AT_UID 等四项也取自凭证 | 语义兼容 | 无偏差 |
 | 凭证切换 | setuid、setgid、setreuid、setregid、setresuid、setresgid、setfsuid、setfsgid、setgroups 按 Linux 6.12 的 `kernel/sys.c` 实现；凭证、补充组与能力集（effective/permitted/inheritable）经 fork 继承、跨 exec 保留；capget(90)/capset(91) 维护真实进程能力集并按 `cap_emulate_setxuid` 随 UID 切换联动（支持 PR_SET_KEEPCAPS），sethostname/setdomainname、settimeofday/clock_settime、prlimit64 与 PR_CAPBSET_DROP/PR_SET_SECUREBITS 按对应能力位鉴权 | 不按凭证做文件访问、kill 等权限检查；带 setuid 位或 setgid 位的可执行文件不会在 exec 时改变凭证，AT_SECURE 恒为 0；无文件能力扩展属性与用户命名空间 | 未实现：文件/信号权限检查、setuid 位、文件能力与用户命名空间 |
 | clone | 进程 fork：退出信号必须 SIGCHLD，另接受 CLONE_CHILD_CLEARTID 与 CLONE_CHILD_SETTID；线程：退出信号必须为 0，必须同时带 CLONE_THREAD、CLONE_SIGHAND 与 CLONE_VM，另接受 CLONE_FS、CLONE_FILES、CLONE_SYSVSEM、CLONE_SETTLS 与三个 tid 标志，CLONE_DETACHED 按 Linux 忽略，其余组合返回 EINVAL；非零 stack 设置子 SP，CLONE_SETTLS 设置 TP | 不支持只共享部分资源的组合，例如共享文件表但不共享地址空间空间；无 CLONE_PARENT_SETTID | 未实现：部分共享组合、进程创建时的 CLONE_PARENT_SETTID |
-| execve | argv/envp 各 ≤256 项、单串 ≤4095 字节；字符串总计最多 32 KiB；auxv 提供 AT_PHDR/PHENT/PHNUM、AT_BASE、AT_ENTRY、AT_PAGESZ、AT_RANDOM、AT_EXECFN、AT_UID/EUID/GID/EGID、AT_SECURE、AT_CLKTCK、AT_HWCAP、AT_FLAGS；ELF 支持 ET_EXEC 与 ET_DYN（装载基址固定 1 MiB，见 ELF 行）；PT_INTERP 请求的解释器缺失返回 ENOENT 并保留旧现场；`#!` 脚本按 binfmt_script 转交解释器（嵌套 ≤4 层，超限 ELOOP）；执行位统一校验（任一执行位缺失返回 EACCES，execve(2)；官方盘 basic/run-all.sh 为 0644，由用户态启动器按授权清单在运行副本 fchmodat 0755 并记录，见 §6.3 环境准备）；整镜像读入内核堆，镜像放不进内核堆时 ENOMEM | 无 shebang 的非 ELF 返回 ENOEXEC，动态库由用户态解释器加载，AT_EXECFN 为调用时给出的路径，三点与 Linux 一致 | 取舍，理由待补：镜像整体读入内核堆 |
+| execve / execveat | 支持按路径或 `dirfd` 配合 `AT_EMPTY_PATH`/`AT_SYMLINK_NOFOLLOW` 装载；argv/envp 各 ≤256 项、单串 ≤4095 字节、总计 ≤32 KiB；auxv 提供 AT_PHDR/PHENT/PHNUM/BASE/ENTRY/PAGESZ/RANDOM/EXECFN/UID/EUID/GID/EGID/SECURE/CLKTCK/HWCAP/FLAGS；ELF 支持 ET_EXEC 与 ET_DYN（装载基址 1 MiB）；PT_INTERP 缺失返回 ENOENT 并保留旧现场；`#!` 脚本按 binfmt_script 转交解释器（嵌套 ≤4 层，超限 ELOOP）；执行位统一校验；经 `ExecutableFile` / `ElfSource` 流式按段读取，不再将整镜像一次性读入内核堆 | 无 shebang 的非 ELF 返回 ENOEXEC，动态库由用户态解释器加载，AT_EXECFN 为调用路径，与 Linux 一致 | 设计：装载基址取 1 MiB、流式按段装载；实现范围见左栏 |
 | nanosleep | 到期返回 0；被打断返回 EINTR 并回写 rem；期限相对单调时钟 | 语义兼容 | 无偏差 |
 | clock_gettime | 支持 CLOCK_REALTIME、MONOTONIC、BOOTTIME、MONOTONIC_RAW、两个 COARSE 时钟、TAI、进程与线程的 CPU 时间；未知或负的 clockid 返回 EINVAL | 闹钟类时钟未实现 | 未实现：闹钟类时钟 |
 | clock_settime | 仅支持特权进程（euid==0）设置 CLOCK_REALTIME(0)；其余时钟或非法时间（负秒、越界纳秒或超过 MAX_SETTOD_SEC）返回 EINVAL；不修改单调时钟 | 不回溯重排已在 CLOCK_REALTIME 上挂起的绝对睡眠；不回写 RTC 硬件 | 未实现：绝对睡眠动态重算、RTC 同步 |
@@ -342,7 +344,7 @@ try_lock 失败即报告“持锁跨调度”。
 | mmap | 匿名映射、普通文件和 /dev/zero 均支持 PRIVATE/SHARED；非匿名映射先检查 FD 有效性及 O_PATH，再检查长度。/dev/zero 按需提供零页，共享写权限由打开模式决定；文件整页在 EOF 外允许建图，直接访问按 SIGBUS 终止；MAP_FIXED 事务替换 | 最后不足一页的尾部补零且不回写；MAP_FIXED 可覆盖用户栈；flags 白名单，MAP_DENYWRITE、MAP_EXECUTABLE 与 MAP_STACK 按 Linux 忽略 | 无偏差 |
 | memfd_create / fallocate / fcntl(SEALS) | `memfd_create(279)` 创建匿名内存文件虚拟 inode（`0x3000_0000..=0x3FFF_FFFF`，单文件上限 8 MiB），支持 `MFD_CLOEXEC`/`MFD_ALLOW_SEALING`/`MFD_NOEXEC_SEAL`/`MFD_EXEC`、名称长度上限 249（超长返 `EINVAL`）、`/proc/self/fd/<n>` 重开、常规文件读写/截断/fstat/fchmod/`mmap(MAP_SHARED/MAP_PRIVATE)`；`fallocate(47)` 支持默认扩展、`FALLOC_FL_KEEP_SIZE`、`FALLOC_FL_PUNCH_HOLE\|KEEP_SIZE` 与 `FALLOC_FL_ZERO_RANGE`（同时覆盖 Ext4 普通文件与 memfd，并对盘上卷执行空闲块 `ENOSPC` 检查）；`fcntl` 支持 `F_ADD_SEALS(1033)`/`F_GET_SEALS(1034)` 及 `F_SEAL_SEAL`/`F_SEAL_SHRINK`/`F_SEAL_GROW`/`F_SEAL_WRITE`（活跃可写共享映射时返 `EBUSY`）/`F_SEAL_FUTURE_WRITE`/`F_SEAL_EXEC` 强制拦截 | 不支持 `MFD_HUGETLB` 大页（无 hugetlbfs，合法大页标志返 `ENODEV`，非法标志返 `EINVAL`）、`FALLOC_FL_COLLAPSE_RANGE`/`INSERT_RANGE`/`UNSHARE_RANGE`；单 memfd 受 32 MiB 固定内核堆约束限 8 MiB | 未实现：MFD_HUGETLB、fallocate 区间折叠/插入 |
 | mprotect | 支持 PROT_NONE 和 R/W/X 组合；W 隐含 R，只读 FD 建立的共享映射禁止提升写权限（EACCES） | 两架构无 NX；VMA 记录请求权限，页表执行写保护，可访问页实际带 X | 取舍，理由待补：没有执行权限保护 |
-| brk/munmap | brk 失败返回原 break；munmap 起址页对齐、长度向上取整、允许空洞 | 均无按需分页；brk 立即分配/释放物理页 | 取舍，理由待补：brk 立即分配 |
+| brk/munmap | brk 按需分配物理页，增长失败返回原 break；munmap 起址页对齐、长度向上取整、允许空洞 | 与 §1.1.1 按需分配一致 | 无偏差 |
 | ELF | ET_EXEC 固定地址与 ET_DYN（装载基址 0x10_0000：官方 basic 是 intptr_t 为 32 位 int 的无重定位 PIE，Linux 高位 ELF_ET_DYN_BASE 布局下其 brk 断言同样无法通过；低位基址同时保持空指针缺页）；段相位要求 p_vaddr 与 p_offset 按页同余且按 p_align 同余（不要求各自页对齐，busybox 第二段 offset/vaddr 均非对齐但同余）；PT_INTERP 支持；不同 PT_LOAD 落到同一用户页仍拒绝 | 无 NX，PT_GNU_* 忽略；AT_PHDR 要求程序头表在首个可读 PT_LOAD 内 | 设计：装载基址取 1 MiB，理由见左栏；取舍，理由待补：程序头表位置与同页段限制 |
 | truncate/ftruncate | 支持 Ext4 普通文件缩短、稀疏扩展与清零；路径形式跟随符号链接，FD 形式要求可写并支持已删名的打开 inode，长度操作不改共享偏移；O_TRUNC 复用同一 FS 接口。扩展区读零，缩短清空尾块剩余字节，回收含 unwritten 的尾部 extent 及多余索引块，更新长度、块计数与 mtime/ctime，并沿用后端清除 set-ID 位 | 负长度 EINVAL，超出 u32::MAX 个 4 KiB 逻辑块 EFBIG；无效 FD EBADF，只读 FD 和非普通 FD EINVAL，O_PATH FD EBADF。长度改变且存在存活共享页时 EOPNOTSUPP，包括子进程仍保留映射的情况；同长度允许，避免未实现的映射失效和旧共享页写回。FAT 仅沿用清零，非零长度 EOPNOTSUPP；旧式映射仅支持直接块清零，外部 xattr 与 HUGE_FILE 编码暂不支持。尚无完整身份权限、文件锁、执行文件占用保护及 immutable/append-only 校验；MAP_PRIVATE 截断后越过 EOF 的 SIGBUS 仍未实现，掉电/OOM/全部设备失败未验证 | 设计：存活共享页时拒绝改长，理由见左栏；未实现：权限检查、文件锁与截断后的 SIGBUS |
 | renameat/renameat2 | Ext4 支持同卷普通重命名、目标替换及 RENAME_NOREPLACE；按父目录 inode 更新目录项，末项链接自身被移动，中间链接跟随；跨挂载 EXDEV，目标非空目录 ENOTEMPTY，类型冲突分别 EISDIR/ENOTDIR；被替换但仍由 FD/映射引用的 inode 延迟回收 | EXCHANGE、WHITEOUT 和未知标志 EINVAL；FAT 卷内 EOPNOTSUPP；仍由任一进程 cwd、目录 FD 或挂载点引用的目录及其祖先返回 EBUSY，保护现有路径字符串身份。单核内核态串行化与根卷锁保证操作期间无其他任务观察中间状态；保存目录块及 inode 用于失败回滚，不保证掉电原子性，设备/回滚错误后拒绝继续访问卷；身份权限及 sticky/immutable/append-only 检查未实现；复杂分配失败回收及掉电恢复未验证。目标含外部 xattr 或有块的旧式映射暂不支持替换 | 设计：被引用的目录返回 EBUSY，理由见左栏；未实现：EXCHANGE、WHITEOUT 与权限检查 |
@@ -350,7 +352,13 @@ try_lock 失败即报告“持锁跨调度”。
 | linkat | Ext4 可为普通文件、符号链接、FIFO、设备和套接字节点增加名称。默认链接到源路径末项本身，AT_SYMLINK_FOLLOW 跟随末项。按 fsuid、fsgid 和补充组检查沿途目录搜索权限，以及目标父目录的写入与搜索权限，不足时返回 EACCES。源和新名称共享 inode，目标已存在返回 EEXIST，跨挂载返回 EXDEV，目录或不支持硬链接的文件系统返回 EPERM，只读根卷返回 EROFS，达到 65000 个链接返回 EMLINK。 | 相对路径从 cwd 或目录 FD 指向的目录开始检查，符号链接跟随时检查实际路径。fsuid 为 0 沿用特权绕过规则。按父 inode 插入目录项，更新源链接数及 ctime。失败回滚，回滚失败后拒绝继续访问卷。 | 支持 AT_EMPTY_PATH 按 FD 查询源 inode；ACL、细分能力模型和 protected_hardlinks 尚未接入，未验证掉电恢复。 |
 | unlink/unlinkat | Ext4 普通文件、符号链接与特殊节点按末项自身删名。文件有其他链接时保留 inode，链接数为零时等待最后一个打开引用释放。AT_REMOVEDIR 移除空目录名并清零链接数，工作目录和目录 FD 保留原 inode，最后一个引用释放后回收。已删目录的 getcwd 返回 ENOENT，已有 FD 可查询原 inode，getdents64 返回 EOF。 | 非空 ENOTEMPTY、非目录 ENOTDIR、根与挂载点 EBUSY。已删目录的相对路径解析及路径型 fchmod 暂不支持。FAT 有句柄时 unlink 返回 EBUSY，目录删除返回 ENOTSUP。 | 未实现：FAT 上的删除语义 |
 | getdents64 | fs 层提供目录项与续读位置，EXT4 后端按块解析，syscall 层打包 Linux dirent；单次最多 4KiB；FAT 返回 ENOTSUP | 后端目录块使用可失败堆分配；Linux 目录项打包的 4 KiB 栈缓冲区限制在不内联的 getdents64 函数内，避免普通文件 I/O 承担该栈帧；失败不推进文件偏移 | 无偏差；未实现：FAT |
-| 套接字（AF_INET 回环与 AF_UNIX） | 支持 AF_INET 的 SOCK_STREAM（TCP）与 SOCK_DGRAM（UDP），`socket(AF_UNIX, SOCK_STREAM\|SOCK_DGRAM, 0)` 未连接套接字，以及 `socketpair(199)` 创建的 AF_UNIX 匿名 SOCK_STREAM/SOCK_DGRAM 互连对（对齐 Linux 类型与协议错误码顺序：非法 type 返回 EINVAL，协议不匹配返回 EPROTONOSUPPORT）；支持 SOCK_NONBLOCK/SOCK_CLOEXEC、bind（含端口 0 临时端口分配与 UDP SO_REUSEADDR 共享端口）、listen、accept/accept4、connect（非阻塞 TCP 返回 EINPROGRESS 且立即入监听队列；UDP 按精确对端优先解复用）、getsockname/getpeername（AF_UNIX 写回 2 字节地址族）、sendto/recvfrom（含 MSG_PEEK/MSG_DONTWAIT/MSG_NOSIGNAL 与 SIGPIPE；阻塞流式小包整块写入防短写）、read/write/ppoll/pselect6/close/fstat（S_IFSOCK）、shutdown，以及 SOL_SOCKET（SO_REUSEADDR/SO_REUSEPORT/SO_KEEPALIVE/SO_DONTROUTE/SO_LINGER/SO_RCVLOWAT/SO_SNDLOWAT/SO_TYPE/SO_ERROR/SO_SNDBUF/SO_RCVBUF/SO_RCVTIMEO/SO_SNDTIMEO）、IPPROTO_IP（IP_TOS/IP_TTL/IP_MTU_DISCOVER/IP_RECVERR）与 IPPROTO_TCP（TCP_NODELAY/TCP_MAXSEG/TCP_CORK/TCP_KEEPIDLE/TCP_KEEPINTVL/TCP_KEEPCNT/TCP_INFO/TCP_CONGESTION）；单 FD 套接字阻塞等待按套接字唯一唤醒键走调度器定向唤醒（64 槽位，满时退回广播） | AF_INET 仅支持本地回环（0.0.0.0 与 127.x.x.x）；AF_UNIX 仅支持匿名 socketpair 与基础未连接创建，不支持命名路径/抽象名绑定、listen/accept/connect 与 SCM_RIGHTS 辅助消息；无外部物理网卡、AF_INET6、sendmsg/recvmsg 与完整 TCP 拥塞/重传状态机 | 未实现：外部网卡、命名 AF_UNIX、AF_INET6、sendmsg/recvmsg |
+| 套接字（AF_INET 回环与 AF_UNIX） | 支持 AF_INET 的 TCP/UDP、AF_UNIX 匿名 `socketpair` 及路径名/抽象命名空间 `bind`/`listen`/`accept`/`accept4`/`connect`；支持 `sendto`/`recvfrom`、`sendmsg`/`recvmsg`/`sendmmsg`/`recvmmsg`（含 `msghdr`/`mmsghdr`/`cmsghdr`、`iovec` 分散聚集、`MSG_TRUNC`/`MSG_OOB`/`MSG_ERRQUEUE`/`MSG_WAITFORONE`/`MSG_CMSG_CLOEXEC`、`recvmmsg` 超时与 `SCM_RIGHTS` 文件描述符传递）；支持常用 `SOL_SOCKET`/`IPPROTO_IP`/`IPPROTO_TCP` 选项与单 FD 定向唤醒（64 槽，满退广播） | AF_INET 仅本地回环（0.0.0.0 与 127.x.x.x）；无外部物理网卡、AF_INET6 与完整 TCP 拥塞/重传状态机 | 未实现：外部网卡、AF_INET6、完整 TCP 状态机 |
+| POSIX 定时器（timer_*） | 实现 `timer_create`/`timer_gettime`/`timer_getoverrun`/`timer_settime`/`timer_delete`（每进程上限 256，不跨 fork 继承，exec/exit 清空），支持 `REALTIME`/`MONOTONIC`/`BOOTTIME`/`TAI`/`ALARM`/`CPUTIME` 时钟、`SIGEV_NONE`/`SIGEV_SIGNAL`/`SIGEV_THREAD_ID` 与 `SI_TIMER` 溢出计数 | 与现有硬件定时唤醒通道统一驱动，墙钟修改后即时重算 | 无偏差 |
+| POSIX 消息队列（mq_*） | 实现 `mq_open`/`mq_unlink`/`mq_timedsend`/`mq_timedreceive`/`mq_notify`/`mq_getsetattr`，支持优先级降序加同级 FIFO、绝对墙钟超时阻塞、`RLIMIT_MSGQUEUE` 与 `/proc/sys/fs/mqueue/*` 限额、`SIGEV_NONE`/`SIGEV_SIGNAL`/`SIGEV_THREAD`（极简 `AF_NETLINK` 通知套接字） | 与 Linux 语义兼容；未挂载独立 mqueue 虚拟文件系统 | 未实现：mqueuefs 挂载视图 |
+| signalfd4 / vmsplice | `signalfd4` 支持创建与更新信号掩码、`SFD_CLOEXEC`/`SFD_NONBLOCK`、128 字节 `signalfd_siginfo` 读取及 `poll`/`pselect6`/`epoll_wait` 唤醒；`vmsplice` 支持 `iovec` 向量读写管道、`SPLICE_F_NONBLOCK` 与 `EPIPE`/`SIGPIPE` | 不支持 `SPLICE_F_GIFT` 零拷贝页赠送 | 未实现：SPLICE_F_GIFT |
+| 跨进程内存、调度属性与进程杂项 | 实现 `process_vm_readv`/`process_vm_writev`、`sched_setattr`/`sched_getattr`、`rt_tgsigqueueinfo`、`ioprio_set`/`ioprio_get`、`personality`、`openat2`、`clone3` 与 `membarrier` | `openat2` 解析 `RESOLVE_*` 标志；`clone3` 复用 `clone` 约束；`membarrier` 单核下执行内存栅栏 | 未实现：多核远程 IPI membarrier 与非支持 `clone3` 命名空间标志 |
+| 扩展属性（xattr）与文件标志 | 实现 12 项 `setxattr`/`getxattr`/`listxattr`/`removexattr`（路径/不跟随/FD 三类）与 `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS`；未启用时走原子布尔零锁快路径，校验 `user.*`/`trusted.*`/`security.*` 命名空间与不可变/仅追加写保护 | 扩展属性当前驻留内核内存索引，不持久化至 Ext4 磁盘外部块 | 未实现：Ext4 盘上 xattr 持久化 |
+| inotify 与 Linux AIO | `inotify_init1`/`inotify_add_watch`/`inotify_rm_watch` 接入 VFS 事件钩子、`/proc/sys/fs/inotify/*`、`/proc/<pid>/fdinfo/<fd>`、`FIONREAD` 与 `poll`/`epoll`；`io_setup`/`io_destroy`/`io_submit`/`io_cancel`/`io_getevents`/`io_pgetevents` 与 `/proc/sys/fs/aio-{nr,max-nr}`、`/boot/config-6.1.0-OuroOS` | AIO 请求在 `io_submit` 内同步执行并压入完成队列，满足 libaio 与同步测例契约 | 设计：单核同步块设备下 AIO 同步落完成队列以避开额外异步线程池开销 |
 | pselect6 / getitimer / setitimer | pselect6 支持最多 1024 个 FD 的 read/write/except 位图、可选相对超时与临时信号掩码（被打断返回 EINTR，不走 SA_RESTART）；getitimer/setitimer 支持 ITIMER_REAL 单次与周期触发 SIGALRM（fork 清零、exec 保留、退出清理） | ITIMER_VIRTUAL 与 ITIMER_PROF 返回 EOPNOTSUPP；超过 1024 FD 的位图返回 EINVAL | 未实现：ITIMER_VIRTUAL、ITIMER_PROF |
 | eventfd2 / timerfd_* / epoll_* | `eventfd2` 支持 64 位计数、`EFD_SEMAPHORE`/`EFD_NONBLOCK`/`EFD_CLOEXEC` 与定向唤醒；`timerfd_{create,settime,gettime}` 支持 `CLOCK_REALTIME`/`MONOTONIC`/`BOOTTIME`、单次与周期到期累加、`TFD_TIMER_ABSTIME` 及硬件定时器唤醒（不忙等）；`epoll_{create1,ctl,pwait,pwait2}` 按 rv64/la64 16 字节非紧凑 `epoll_event` 编码，支持 `ADD`/`MOD`/`DEL`、普通文件拒加（`EPERM`）、嵌套深度与环检测（`ELOOP`）、`EPOLLET`/`EPOLLONESHOT`/`EPOLLEXCLUSIVE`、临时信号屏蔽字与已关闭对象自动清理 | 暂不支持 `TFD_TIMER_CANCEL_ON_SET` 的墙钟跳变 `ECANCELED` 通知与 `CLOCK_REALTIME_ALARM`/`BOOTTIME_ALARM` | 未实现：闹钟时钟与墙钟跳变取消 |
 | pidfd_open / pidfd_send_signal / pidfd_getfd / kcmp / waitid(P_PIDFD) | `pidfd_open(434)` 为线程组 leader 创建带 `FD_CLOEXEC` 的进程描述符（支持 `PIDFD_NONBLOCK`，拒绝非 leader 线程返 `EINVAL`，进程实例经 `Arc<PidFdState>` 绑定以防 PID 复用，退出时立即可 `poll`/`epoll` 读就绪）；`pidfd_send_signal(424)` 支持 `pidfd_open` 与 `/proc/<pid>`（含 `/proc/self`）目录 FD、可选 `siginfo_t`（校验 `si_signo`、保留 `si_code` 与凭证权限，非 pidfd 返回 `EBADF`）；`pidfd_getfd(438)` 按凭证鉴权并跨进程复制打开文件描述（置位 `FD_CLOEXEC`）；`kcmp(272)` 支持 `KCMP_FILE` 与线程组级资源比较；`waitid(95)` 扩展支持 `P_PIDFD(3)` 与 `PIDFD_NONBLOCK` 返 `EAGAIN` | 暂不支持 `PIDFD_THREAD`、`CLONE_PIDFD`、`KCMP_EPOLL_TFD` 与 `/proc/<pid>/fdinfo/<fd>` 导出 | 未实现：PIDFD_THREAD、CLONE_PIDFD、KCMP_EPOLL_TFD 与 fdinfo |
@@ -383,16 +391,17 @@ FS 通过 `fs::mapping` 注册 MM 映射钩子：注册后，长度改变先由 
 
 文件状态查询依据：[stat(2)](https://man7.org/linux/man-pages/man2/stat.2.html)、[statx(2)](https://man7.org/linux/man-pages/man2/statx.2.html) 与 [Linux asm-generic stat UAPI](https://github.com/torvalds/linux/blob/v6.12/include/uapi/asm-generic/stat.h)。按公开 ABI 独立编码，未复制 Linux 实现代码。
 
-### 4.4 下一里程碑缺口
+### 4.4 下一里程碑缺口与设计决策
 
+**未实现缺口**：
 
 | 类别 | 缺口 |
 |---|---|
-| 基础调用 | fcntl 文件锁和异步通知尚未实现；ioctl 仅支持 RTC_RD_TIME，TCGETS/TCWINSZ 等终端命令返回 ENOTTY |
+| 基础调用 | 终端 `ioctl`（`TCGETS`/`TCWINSZ` 等）返回 `ENOTTY`；文件锁死锁环检测（`EDEADLK`）与异步通知未实现 |
 | 信号残余 | 停止/继续状态机、RT 排队、core 位等偏差与欠账集中登记 §4.5 |
-| ELF（动态库） | 内核不加载 DT_NEEDED 库（由用户态解释器完成）；libc-test 的 dlopen 等场景待验证 |
-| mm | SIGBUS 用户投递；文件映射扩展；用户页执行禁止（NX） |
-| fs | FAT getdents、句柄缓存与重命名；link/symlink；EXT4 日志重放 |
+| ELF（动态库） | 内核不加载 DT_NEEDED 库（由用户态解释器完成）；`dlopen` 复杂场景待进一步覆盖 |
+| mm | 用户可捕获的 `SIGBUS` 文件后备故障信号处理器；用户页执行禁止（NX）；通用读写页缓存与换出 |
+| fs | FAT `getdents`/重命名/符号链接；Ext4 外部 xattr 持久化与异常断电后自动日志重放 |
 
 **待修缺陷**：行为与 Linux 不同，并经手册页或 Linux 6.12 源码确认属于错误。
 只登记，暂不修复。一条修掉后从本表删除，并去掉对应条目“性质”栏里的标注。
@@ -411,22 +420,22 @@ FS 通过 `fs::mapping` 注册 MM 映射钩子：注册后，长度改变先由 
 | 缺陷 12 | §4.5 sigaltstack | 备用栈不分线程；不检查 MINSIGSTKSZ；rt_sigreturn 不恢复登记 | sigaltstack(2)：备用栈属于线程；启用时 ss_size 小于 MINSIGSTKSZ 报 ENOMEM |
 | 缺陷 13 | §4.2 vfork | 子进程不与父进程共享地址空间 | vfork(2)：子进程与父进程共享全部内存，父进程挂起到子进程 exec 或退出 |
 
-**取舍与理由**：有意选择的做法。理由写不出的列为“待补”，补上之前不算
-成立的设计。
+**设计决策（为什么这样选）**：仅收录有明确理由的架构取舍；每条回答“为什么”与对应代价。没有正当理由的限制归入欠账或缺陷，不称作设计。
 
-| 项 | 现状 | 代价 | 理由 |
-|---|---|---|---|
-| 内核不可抢占 | §3.2 | 内核路径执行期间不投递信号，也不处理到期的等待 | 待补 |
-| 没有执行权限保护 | §1.2、§2.2 | 可访问的页都可以执行 | 待补，原文只写了“团队决定不实现” |
-| loongarch64 空闲时自旋等时钟 | §3.8 | 空闲时占满宿主 CPU | 待补 |
-| 等待表满时挂起退化为就绪让出 | §3.5 | 该任务反复重查条件，占用时间片 | 待补 |
-| 任务互等时永久等待 | §3.5 | 死锁不会被检测，靠 QEMU 超时结束 | 待补 |
-| 设备节点只存在于内核注册表 | §4.3 | 重启后丢失，每次由启动器重建 | 待补 |
-| 根卷按扫描顺序选择 | §6.3 | 有多块可挂载的卷时，取到哪块取决于枚举顺序 | 待补 |
-| 路径必须是合法 UTF-8 | §4.3 | 非 UTF-8 的文件名不可访问 | 待补 |
-| brk 立即分配物理页 | §4.3 | 申请后没有触碰的堆也占物理内存 | 待补 |
-| execve 把整个镜像读入内核堆 | §4.3、§6.5 | 镜像放不进剩余堆空间时 exec 报 ENOMEM | 待补 |
-| 进程间输出交错 | §3.8 | basic 的 test_pipe 偶发少 3 分 | 2026-11-25 决定暂不处理 |
+| 设计项 | 为什么这样选 | 代价 |
+|---|---|---|
+| 单核、内核态关中断且不可抢占 | 消除内核路径与中断/跨核并发竞争，简化 `user_access`、页表与锁模型，确保 OSTD 不变量可完整推理 | 内核长耗时路径期间延迟信号与定时唤醒；扩展 SMP 需整体重审 |
+| 位图物理帧分配器 | 避免 buddy 空闲链表对内核堆的循环依赖，保证物理页分配在 OOM 注入下零堆分配 | 连续多页分配需线性扫描位图 |
+| 两遍式用户拷贝且不造引用 | 避免中途缺页导致部分写入与裸指针别名 UB，统一把页错误收口为确定性 `EFAULT` | 长传输在栈缓存溢出时需额外一次遍历 |
+| ELF `ET_DYN` 固定装载于 1 MiB | 兼容无重定位 32 位 `intptr_t` PIE 测例的 `brk` 断言，同时保留低位空指针保护区 | 不支持随机化地址空间布局（ASLR） |
+| `getrandom` 绝不伪造熵 | 无设备树可信种子时宁可返回 `EAGAIN` 或拒绝启动，防止以弱时钟伪造密码学随机数 | 缺少 `rng-seed` 的环境无法完成随机化初始化 |
+| 路径限定合法 UTF-8 | 直接复用 Rust `&str` 避免路径编码转换复杂性，覆盖全部标准 POSIX 与评测路径 | 含非 UTF-8 字节的文件名不可访问 |
+| 暂不实现页级执行禁止（NX） | PolyHAL 0.4.0 在 LoongArch64 未表达撤 X，且当前单核评测聚焦功能与内存安全而非防代码注入 | 可读用户页实际具备可执行权限 |
+| 设备节点存于内核注册表 | 评测盘不包含动态 devtmpfs 节点，注册表与 `mknodat` 结合即可按主次设备号无硬编码解析挂载 | 重启后内存注册表丢失，依赖启动器按需重建 |
+| 根卷按总线枚举顺序扫描 | 不写死块设备名或路径，同一内核二进制可同时适配无盘冒烟、自建盘与官方双盘布局 | 挂载多块可识别 Ext4 盘时由枚举次序决定根卷 |
+| 等待表满退化为就绪让出、互等不检死锁 | 调度器保持零动态分配与固定 O(1) 唤醒开销，符合 Mesa 风格条件重查语义 | 极端满表时轮询占时间片；用户态互锁依赖外部超时终止 |
+| LoongArch64 空闲循环自旋等钟 | PolyHAL 0.4.0 未封装可验证的 LA64 `idle` 唤醒原语，自旋保证定时唤醒确定性（属 HAL 欠账） | 空闲期间占满单核宿主 CPU |
+| 进程间 `write` 交错暂不额外串行化 | `write(1)` 按标准本身不保证跨多次调用的整行原子性，不为单测例添加跨调用全局行锁 | 极少数分多次 `write` 的输出偶发交错 |
 
 ### 4.5 信号契约
 
@@ -463,8 +472,7 @@ IGN 或 DFL 且默认动作属 Ign/Cont 静默丢弃。同步（硬件）信号�
 
 **欠账**（下一里程碑）：停止/继续状态机（SIGSTOP/SIGTSTP/SIGCONT、
 Stopped 态、wait4 WUNTRACED/WCONTINUED）；控制终端与作业控制信号；RT 信号排队；ITIMER_VIRTUAL/ITIMER_PROF；
-signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综合
-自测（两架构，不入库）；libctest 信号用例已在双架构通过。
+restart_syscall(219) 精确重启。
 
 ## 5. sync 锁模型
 
@@ -600,8 +608,8 @@ signalfd4；restart_syscall(219) 精确重启。验证方式：本地 21 项综�
 
 | 项 | 现状 | 处理 |
 |---|---|---|
-| `println!` | main/task/lang_items 用 `println!` 输出验收行，与 AGENTS §6 的 log 规则冲突 | 契约声明例外，或改 log 并在 Makefile 固定 LOG |
 | README | “演示视频”“团队成员”为空 | 补内容或删除空节 |
+| 物理 `ostd` crate 拆分 | 当前通过 52/68 文件 `#![forbid(unsafe_code)]` 在单 crate 内逻辑隔离 | 后续评估将 `hal`/`mm` 底层/`drivers`/`sync` 抽为独立 `ostd` crate |
 
 ### 存储调用链栈预算
 
@@ -645,16 +653,8 @@ exec/spawn 从设备树启动熵派生独立的 16 字节，AT_RANDOM 指向新�
 
 固定地址映射支持 MAP_FIXED_NOREPLACE（重叠返回 EEXIST，原数据保留）。MAP_LOCKED 使用与 mlockall 相同的限额，在建立映射后尽力预取，不改变未来映射的锁策略；没有交换空间预留账本，MAP_NORESERVE 不额外预留。MAP_POPULATE 在 VMA 建立后尽力预取；与 MAP_NONBLOCK 同用时不预取。未锁定的私有匿名 mremap 扩展只增加虚拟区间。MADV_DONTFORK/DOFORK 控制子进程是否继承该区间；WIPEONFORK/KEEPONFORK 控制私有匿名、堆、栈页在子进程内是否重新取零页。父进程内容不变。共享匿名扩展仅增加虚拟页描述，物理数据页按需分配；fork 时私有匿名、堆和栈驻留页按写时复制共享。ELF 页和已驻留的私有文件页仍在 fork 时复制；尚无换出。
 
-/proc/meminfo 每次打开保存一次帧分配器统计；Cached 只计文件页缓存的数据帧。MemTotal 为已登记的可分配物理内存；MemAvailable 为 MemFree 的保守估计；交换为零。sysinfo(179) 提供同口径的总量和空闲量，单位 1024 字节；尚未统计负载均值和共享内存用量。procfs 另提供根目录、`/proc/<pid>/`（stat/cmdline/status）、`/proc/self/maps`（按 Linux `%08lx-%08lx` 导出当前进程 VMA 快照）、`/proc/self/fd`（导出打开时刻存活 FD 列表目录快照）、`/proc/version`、`/proc/sys/kernel/pid_max`、`/proc/sys/kernel/tainted`、`/proc/sys/fs/pipe-max-size` 与设备节点，枚举来自 Task 维护的独立快照表（§4.3"其他"行）；/proc/mounts 报告根卷与 FAT 挂载。 /proc/cpuinfo 报告单核处理器编号与目标架构；挂载列表同时包含 Ext2 辅助卷。
+/proc/meminfo 每次打开保存一次帧分配器统计；Cached 只计文件页缓存的数据帧。MemTotal 为已登记的可分配物理内存；MemAvailable 为 MemFree 的保守估计；交换为零。sysinfo(179) 提供同口径的总量和空闲量，单位 1024 字节；尚未统计负载均值和共享内存用量。procfs 另提供根目录、`/proc/<pid>/`（stat/cmdline/status/fdinfo）、`/proc/self/{maps,fd,exe,cwd,root,mounts}`、`/proc/version`、`/proc/cpuinfo`、`/proc/sys/kernel/{pid_max,tainted,msgmni,msgmax,msgmnb,sem}`、`/proc/sys/fs/{pipe-max-size,mqueue/*,inotify/*,aio-nr,aio-max-nr}`、`/proc/sysvipc/{msg,sem}`、`/boot/config-6.1.0-OuroOS` 与设备节点；`/proc/mounts` 报告根 Ext4、FAT 与 Ext2 挂载。
 
-LTP 组由启动器逐例驱动，不执行盘上的 ltp_testcode.sh：按名字排序遍历 ltp/testcases/bin 的普通文件，每例在独立会话里执行并套用 2 秒逐例时限，超时按会话逐进程 SIGKILL，回收等待上限 30 秒；用例超时或 /tmp 空闲低于 256 MiB 时清空 /tmp，单次最多两万次删除尝试。组结束后列出用例自建会话留下的进程，对它们发 SIGKILL 并等待退出，上限同样是 30 秒。截止时刻取启动器开始后 3400 秒，到点后不再启动新用例；该组只在 loongarch64 上启用，riscv64 上截止时刻已过、不启动任何用例并打印空的组标记，判分按两架构相加，所以该组分数只来自 loongarch64。glibc 组当前零分，调用位置保留但未启用。原版脚本无逐例时限，镜像中第一个不退出的用例是 cgroup_fj_proc，先 sigsuspend 等待信号，因此原版脚本在任何内核上都跑不到第 107 例之后；脚本也无超时保护，第 184 例 connect01 会 kill(0, SIGKILL) 终止同进程组的脚本 shell。
-
-启动器在建立根目录布局时创建 /etc，写入 /etc/passwd 与 /etc/group，各含 root 与 nobody 两个条目，nobody 的 UID 与 GID 都是 65534。镜像不带这两个文件，按用户名查 UID/GID 的程序在其中找不到 nobody，会在准备阶段以 TBROK 结束，例如 access01、setreuid 族、setfsgid 族与 chown03。写入失败时启动器在串口打印 write FAILED 行，不影响后续测例启动。
-
-loongarch64 实测，2026-11-26，内核含属主修改、rmdir 延迟回收、/dev/zero、capget、致命信号结束整个线程组与本次的账户数据库：musl 组 2820 例全部执行后来宾自行关机，组内约 772 秒，其中 261 例超时被杀；通过断言 1412 条，分布在 329 例，按判分公式折算的单架构组分约 178.1。另一轮相同代码上 clock_nanosleep01 的 11 条断言在 2 秒时限内完成，该轮为 1423 条、330 例、约 179.0，两轮差额只来自这一例。同一内核不写账户数据库时为 1102 条、288 例、约 149.6，组内 763 秒；差额来自 access01 的 147 条与 setreuid、setregid、setresuid、setfsgid、stat、chmod 等按用户名取凭证的用例。逐例时限取 2 秒而不是 5 秒：5 秒时限下正常结束的用例里只有 alarm05 到 alarm07 需要超过 2 秒，估计共少 3 条断言，换来组内时间少约 830 秒。退出状态为 TCONF 的 795 例与 TBROK 的 613 例不计分。glibc 组前 220 例零通过断言，未启用。
-
-本地 pre-2025 的 ltp_testcode.sh 会枚举镜像实际安装的二进制。启动器逐例驱动下，mlock01 通过 4 条，brk01 通过 1 条，mmap17 通过 1 条；该次全量运行的 mprotect01 在第 3 条断言的 mmap 处中断；mincore01 与 msync01 打印了通过断言，但属旧接口用例，不打印 Summary，不计分。判分器只汇总 Summary 段的 passed 计数，不数 TPASS 行；本镜像全量里打印 TPASS 却没有 Summary 的用例有 109 例、693 行，其中 91 例没有任何 TFAIL，这些断言不进分数。TCONF、TBROK 均不计为通过；未修改测例、脚本或 uname 来绕过前置条件。
-
-2026-11-26 单例复测：使用 pre-20250615 镜像中的原版 musl mprotect01，riscv64 和 loongarch64 均通过 3 条断言并退出 0。只读 FD 建立的 /dev/zero 共享映射在请求增加写权限时返回 EACCES。未重跑全量 LTP。
+官方盘启动器（`user/src/bin/official_init.rs`）在双架构上按顺序驱动 `basic`、`busybox`、`lua`、`libcbench`、`libctest-musl`、`iperf`、`netperf`、`iozone`、`cyclictest`、双库全量 `ltp` 与 `lmbench`，创建最小 `/etc/passwd` 与 `/etc/group`（含 `root` 与 `nobody`），并通过通用系统调用安装动态链接库和按目录逐例套用 2 秒超时与会话级回收，不感知用例内容。
 
 信号与 MM 联合路径：MM 先尝试修复用户缺页，再向信号模块交付未映射、权限不足或文件后备错误；内核代表 syscall 复制用户指针失败继续返回 EFAULT。

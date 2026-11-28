@@ -69,7 +69,6 @@ int main(void) {
     const char *qname = "ouro_mq_test";
     sys_mq_unlink(qname);
 
-    /* 1. Error paths */
     check_cond(sys_mq_open("", O_RDONLY, 0600, NULL) == -1 && errno == ENOENT, "empty name ENOENT");
     check_cond(sys_mq_open("a/b", O_RDONLY | O_CREAT, 0600, NULL) == -1 && errno == EACCES, "slash name EACCES");
     check_cond(sys_mq_open(qname, O_RDONLY, 0600, NULL) == -1 && errno == ENOENT, "nonexistent ENOENT");
@@ -78,23 +77,19 @@ int main(void) {
     struct kernel_mq_attr bad = {0, 0, 16, 0, {0}};
     check_cond(sys_mq_open(qname, O_RDWR | O_CREAT, 0600, &bad) == -1 && errno == EINVAL, "maxmsg 0 EINVAL");
 
-    /* 2. Create with custom attrs & O_EXCL */
     struct kernel_mq_attr attr = {0, 4, 64, 0, {0}};
     int mqd = (int)sys_mq_open(qname, O_RDWR | O_CREAT | O_EXCL | O_NONBLOCK, 0644, &attr);
     check_cond(mqd >= 0, "mq_open create");
     check_cond(sys_mq_open(qname, O_RDWR | O_CREAT | O_EXCL, 0644, &attr) == -1 && errno == EEXIST, "O_EXCL EEXIST");
 
-    /* Check FD_CLOEXEC auto-set */
     int fdflags = fcntl(mqd, F_GETFD);
     check_cond((fdflags & FD_CLOEXEC) != 0, "FD_CLOEXEC auto-set");
 
-    /* 3. getsetattr */
     struct kernel_mq_attr olda;
     memset(&olda, 0, sizeof(olda));
     check_cond(sys_mq_getsetattr(mqd, NULL, &olda) == 0, "getsetattr query");
     check_cond(olda.mq_maxmsg == 4 && olda.mq_msgsize == 64 && olda.mq_curmsgs == 0 && (olda.mq_flags & O_NONBLOCK), "attr values");
 
-    /* 4. Priority ordering + FIFO + EMSGSIZE + EAGAIN */
     check_cond(sys_mq_timedsend(mqd, "lo", 2, 1, NULL) == 0, "send prio 1");
     check_cond(sys_mq_timedsend(mqd, "hi1", 3, 10, NULL) == 0, "send prio 10 #1");
     check_cond(sys_mq_timedsend(mqd, "hi2", 3, 10, NULL) == 0, "send prio 10 #2");
@@ -105,7 +100,6 @@ int main(void) {
     memset(big, 'x', sizeof(big));
     check_cond(sys_mq_timedsend(mqd, big, 65, 1, NULL) == -1 && errno == EMSGSIZE, "send > msgsize EMSGSIZE");
 
-    /* poll sees readable */
     struct pollfd pfd = {mqd, POLLIN | POLLOUT, 0};
     check_cond(poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLIN) && !(pfd.revents & POLLOUT), "poll full -> POLLIN only");
 
@@ -119,7 +113,6 @@ int main(void) {
     check_cond(sys_mq_timedreceive(mqd, buf, 64, &prio, NULL) == 2 && memcmp(buf, "lo", 2) == 0 && prio == 1, "recv lo");
     check_cond(sys_mq_timedreceive(mqd, buf, 64, &prio, NULL) == -1 && errno == EAGAIN, "empty EAGAIN");
 
-    /* 5. mq_notify (SIGEV_SIGNAL + EBUSY + one-shot + SI_MESGQ) */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_flags = SA_SIGINFO;
@@ -139,7 +132,6 @@ int main(void) {
     check_cond(got_sig == SIGUSR2 && got_code == SI_MESGQ && got_val == 0x777, "received SI_MESGQ");
     check_cond(sys_mq_timedreceive(mqd, buf, 64, &prio, NULL) == 4, "drain ping");
 
-    /* 6. Blocking receive with timeout -> ETIMEDOUT, and cross-process blocking wake */
     struct kernel_mq_attr blk = {0, 0, 0, 0, {0}};
     check_cond(sys_mq_getsetattr(mqd, &blk, NULL) == 0, "clear O_NONBLOCK");
     struct timespec ts;

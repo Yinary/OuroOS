@@ -250,7 +250,7 @@ pub enum CStrError {
     InvalidUtf8,
 }
 
-/// 按页扫描用户内存中的 NUL 结尾 UTF-8 字符串，避免逐字节页表翻译与过量堆分配。
+/// 按页分块经直映拷贝扫描用户内存中的 NUL 结尾 UTF-8 字符串，不构造用户页引用。
 pub fn read_cstr(
     space: &UserAddressSpace,
     vaddr: usize,
@@ -260,6 +260,7 @@ pub fn read_cstr(
         return Err(CStrError::Fault);
     }
     let mut stack = [0u8; 256];
+    let mut chunk_buf = [0u8; 256];
     let mut heap: Option<Vec<u8>> = None;
     let mut done = 0usize;
     let mut va = vaddr;
@@ -270,43 +271,55 @@ pub fn read_cstr(
         let paddr = space
             .ensure_and_translate(va, MappingFlags::U | MappingFlags::R)
             .map_err(|_| CStrError::Fault)?;
-        let avail = (PAGE_SIZE - (va % PAGE_SIZE))
+        let page_avail = (PAGE_SIZE - (va % PAGE_SIZE))
             .min(max_len - done)
             .min(USER_TOP - va);
-        // SAFETY: ensure_and_translate 已确认本页在用户地址空间内可读且不跨页边界，
-        // phys_to_kernel_vaddr 为有效直映别名，单核内核态无并发修改。
-        let slice =
-            unsafe { core::slice::from_raw_parts(phys_to_kernel_vaddr(paddr) as *const u8, avail) };
-        let (take, finished) = match slice.iter().position(|&b| b == 0) {
-            Some(pos) => (pos, true),
-            None => (avail, false),
-        };
-        if let Some(buf) = heap.as_mut() {
-            buf.try_reserve(take).map_err(|_| CStrError::NoMem)?;
-            buf.extend_from_slice(&slice[..take]);
-        } else if done + take <= stack.len() {
-            stack[done..done + take].copy_from_slice(&slice[..take]);
-        } else {
-            let mut buf = Vec::new();
-            buf.try_reserve(done + take).map_err(|_| CStrError::NoMem)?;
-            buf.extend_from_slice(&stack[..done]);
-            buf.extend_from_slice(&slice[..take]);
-            heap = Some(buf);
-        }
-        done += take;
-        if finished {
-            return if let Some(buf) = heap {
-                String::from_utf8(buf).map_err(|_| CStrError::InvalidUtf8)
-            } else {
-                let s = core::str::from_utf8(&stack[..done]).map_err(|_| CStrError::InvalidUtf8)?;
-                let mut out = String::new();
-                out.try_reserve_exact(s.len())
-                    .map_err(|_| CStrError::NoMem)?;
-                out.push_str(s);
-                Ok(out)
+        let mut page_off = 0usize;
+        while page_off < page_avail {
+            let chunk = (page_avail - page_off).min(chunk_buf.len());
+            // SAFETY: ensure_and_translate 已确认本页在用户地址空间内可读，
+            // `page_off + chunk <= page_avail` 不跨页边界，源直映地址与内核栈缓冲不重叠。
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (phys_to_kernel_vaddr(paddr) + page_off) as *const u8,
+                    chunk_buf.as_mut_ptr(),
+                    chunk,
+                );
+            }
+            let slice = &chunk_buf[..chunk];
+            let (take, finished) = match slice.iter().position(|&b| b == 0) {
+                Some(pos) => (pos, true),
+                None => (chunk, false),
             };
+            if let Some(buf) = heap.as_mut() {
+                buf.try_reserve(take).map_err(|_| CStrError::NoMem)?;
+                buf.extend_from_slice(&slice[..take]);
+            } else if done + take <= stack.len() {
+                stack[done..done + take].copy_from_slice(&slice[..take]);
+            } else {
+                let mut buf = Vec::new();
+                buf.try_reserve(done + take).map_err(|_| CStrError::NoMem)?;
+                buf.extend_from_slice(&stack[..done]);
+                buf.extend_from_slice(&slice[..take]);
+                heap = Some(buf);
+            }
+            done += take;
+            if finished {
+                return if let Some(buf) = heap {
+                    String::from_utf8(buf).map_err(|_| CStrError::InvalidUtf8)
+                } else {
+                    let s =
+                        core::str::from_utf8(&stack[..done]).map_err(|_| CStrError::InvalidUtf8)?;
+                    let mut out = String::new();
+                    out.try_reserve_exact(s.len())
+                        .map_err(|_| CStrError::NoMem)?;
+                    out.push_str(s);
+                    Ok(out)
+                };
+            }
+            page_off += chunk;
         }
-        va = va.checked_add(avail).ok_or(CStrError::Fault)?;
+        va = va.checked_add(page_avail).ok_or(CStrError::Fault)?;
     }
     Err(CStrError::TooLong)
 }

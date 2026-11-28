@@ -127,7 +127,6 @@ extern "C" fn ouro_main() -> ! {
     ck!(syscall3(64, w, b"x".as_ptr() as usize, 1) == 1);
     close(r);
     close(w);
-    // 成功 exec 后由第二个 ELF 检查描述符及管道末端是否真正关闭。
     ck!(ctl(fd, 1030, 100) == 100 && ctl(fd, 0, 101) == 101);
     ck!(ctl(fd, 0, 102) == 102 && ctl(102, 2, 1) == 0);
     ck!(ctl(fd, 1030, 103) == 103 && ctl(103, 2, 0) == 0);

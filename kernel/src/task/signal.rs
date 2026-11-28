@@ -346,6 +346,7 @@ impl SignalGroup {
 
     /// 返回最低的可投递信号与信息槽拷贝，不清除 pending 位；
     /// 无信号返回 None。
+    #[allow(dead_code)]
     pub fn peek_deliverable(&self, blocked: SignalSet) -> Option<(u8, SigInfoSlot)> {
         let sig = (self.pending & !blocked).lowest()?;
         Some((sig, self.info[sig as usize]))
@@ -353,6 +354,7 @@ impl SignalGroup {
 
     /// 取出最低的可投递信号：清除 pending 位并返回信号号与信息槽；
     /// 无信号返回 None。
+    #[allow(dead_code)]
     pub fn take_deliverable(&mut self, blocked: SignalSet) -> Option<(u8, SigInfoSlot)> {
         let sig = (self.pending & !blocked).lowest()?;
         let slot = self.info[sig as usize];
@@ -422,6 +424,7 @@ impl ThreadSig {
     }
 
     /// 清除信号 sig 的挂起位与信息槽。
+    #[allow(dead_code)]
     pub fn flush(&mut self, sig: u8) {
         if (1..=64).contains(&sig) {
             self.pending.del(sig);
@@ -435,12 +438,14 @@ impl ThreadSig {
     }
 
     /// 返回最低的可投递信号与信息槽拷贝；mask 为不予投递的集合。
+    #[allow(dead_code)]
     pub fn peek_deliverable(&self, mask: SignalSet) -> Option<(u8, SigInfoSlot)> {
         let sig = (self.pending & !mask).lowest()?;
         Some((sig, self.info[sig as usize]))
     }
 
     /// 取出最低的可投递信号并清除挂起位。
+    #[allow(dead_code)]
     pub fn take_deliverable(&mut self, mask: SignalSet) -> Option<(u8, SigInfoSlot)> {
         let sig = (self.pending & !mask).lowest()?;
         let slot = self.info[sig as usize];

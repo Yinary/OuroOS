@@ -13,7 +13,6 @@ int main(void) {
     char path[] = "/msync-XXXXXX";
     int fd = mkstemp(path);
     CHECK(fd >= 0);
-    /* 普通写入建立文件，两个描述符的打开权限不同。 */
     static unsigned char zeros[4096 * 2];
     CHECK(write(fd, zeros, sizeof zeros) == sizeof zeros);
     int ro = open(path, O_RDONLY);

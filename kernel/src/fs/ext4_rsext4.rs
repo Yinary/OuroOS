@@ -1,5 +1,7 @@
 //! rsext4 根卷和有界分区块设备适配。
 //! 使用 rsext4 0.8.1（Apache-2.0），来源见 docs/third-party.md。
+#![forbid(unsafe_code)]
+
 use super::block_cache::BlockCache;
 use crate::{drivers, syscall::Errno};
 use alloc::{string::String, vec::Vec};

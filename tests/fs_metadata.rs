@@ -196,7 +196,6 @@ fn timestamps(readonly: bool, small: bool) {
     let area = syscall6(222, [0, 8192, 3, 0x22, usize::MAX, 0]);
     ck!(area > 0);
     let area = area as usize;
-    // SAFETY: mmap 成功建立两页可写内存，32 字节目的区间完全位于其中，与栈上源不重叠。
     unsafe {
         core::ptr::copy_nonoverlapping(
             specified.as_ptr() as *const u8,

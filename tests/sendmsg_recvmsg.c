@@ -33,7 +33,6 @@ static void check_udp_sendmsg_mmsg(void) {
     if (getsockname(srv, (struct sockaddr *)&addr, &alen) != 0)
         die("getsockname");
 
-    /* Scatter/gather sendmsg + recvmsg with MSG_TRUNC */
     char p1[] = "hello ";
     char p2[] = "sendmsg!";
     struct iovec siov[2] = {
@@ -63,7 +62,6 @@ static void check_udp_sendmsg_mmsg(void) {
     if (rn != sn || memcmp(rbuf, "hello", 5) != 0 || !(rmsg.msg_flags & MSG_TRUNC))
         die("recvmsg MSG_TRUNC");
 
-    /* sendmmsg + recvmmsg */
     char m1[] = "pkt-one";
     char m2[] = "pkt-two";
     struct iovec miov1 = { .iov_base = m1, .iov_len = strlen(m1) };
@@ -99,7 +97,6 @@ static void check_udp_sendmsg_mmsg(void) {
         rm[1].msg_len != strlen(m2) || strcmp(rb2, "pkt-two") != 0)
         die("recvmmsg");
 
-    /* Timeout expiry on empty socket -> 0 */
     struct timespec short_ts = { .tv_sec = 0, .tv_nsec = 20000000 };
     rc = recvmmsg(srv, rm, 1, 0, &short_ts);
     if (rc != 0)

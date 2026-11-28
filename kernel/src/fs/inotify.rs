@@ -91,20 +91,24 @@ fn has_excl_unlink_watches() -> bool {
     ACTIVE_EXCL_UNLINK.load(Ordering::Relaxed) != 0
 }
 
+/// 返回单实例允许排队的最大 inotify 事件数。
 pub fn max_queued_events() -> usize {
     MAX_QUEUED_EVENTS.load(Ordering::Relaxed)
 }
 
+/// 返回允许创建的最大 inotify 实例数。
 pub fn max_user_instances() -> usize {
     MAX_USER_INSTANCES.load(Ordering::Relaxed)
 }
 
+/// 返回允许注册的最大 inotify 监视项总数。
 pub fn max_user_watches() -> usize {
     MAX_USER_WATCHES.load(Ordering::Relaxed)
 }
 
 /// `/proc/sys/fs/inotify/*` 可读写配置项。
 #[derive(Clone, Copy)]
+#[allow(clippy::enum_variant_names)]
 pub enum SysctlKind {
     MaxQueuedEvents,
     MaxUserInstances,
@@ -112,6 +116,7 @@ pub enum SysctlKind {
 }
 
 impl SysctlKind {
+    /// 将 `/proc/sys/fs/inotify/*` 路径解析为配置项枚举。
     pub fn from_path(path: &str) -> Option<Self> {
         match path {
             "/proc/sys/fs/inotify/max_queued_events" => Some(Self::MaxQueuedEvents),
@@ -121,6 +126,7 @@ impl SysctlKind {
         }
     }
 
+    /// 读取该 inotify sysctl 配置项当前值。
     pub fn get(self) -> usize {
         match self {
             Self::MaxQueuedEvents => max_queued_events(),
@@ -129,6 +135,7 @@ impl SysctlKind {
         }
     }
 
+    /// 将该 inotify sysctl 配置项格式化为带换行字符串。
     pub fn format(self) -> Result<String, Errno> {
         use core::fmt::Write;
         let mut out = String::new();
@@ -137,6 +144,7 @@ impl SysctlKind {
         Ok(out)
     }
 
+    /// 解析用户写入的十进制文本并更新对应 inotify sysctl 上限。
     pub fn parse_and_set(self, data: &[u8]) -> Result<(), Errno> {
         let s = core::str::from_utf8(data).map_err(|_| Errno::Invalid)?;
         let trimmed = s.trim();
@@ -269,14 +277,17 @@ impl InotifyInstance {
         Ok(inst)
     }
 
+    /// 返回该 inotify 实例事件队列是否为空。
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
 
+    /// 返回队列中待读取事件的总字节数。
     pub fn queued_bytes(&self) -> usize {
         self.queued_bytes
     }
 
+    /// 返回该 inotify 实例的事件变化版本号。
     pub fn event_gen(&self) -> u64 {
         self.event_gen
     }

@@ -1,5 +1,7 @@
 //! Ext2 普通文件和目录项更新。每次操作暂存完整块，失败时恢复旧内容。
 
+#![forbid(unsafe_code)]
+
 use super::{
     directory, le16, le32, put16, put32, Device, Error, Group, Inode, Result, Volume, BLOCK_SIZE,
     GROUP_DESC_SIZE, INODE_SIZE, REGULAR, TYPE_MASK,

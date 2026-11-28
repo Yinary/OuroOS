@@ -1,6 +1,8 @@
 //! DebugMutex 的持锁深度与调度切换检查；lock_debug 额外记录获取点。
 //! 模型与锁序见 docs/ostd-contracts.md §5。
 
+#![forbid(unsafe_code)]
+
 use core::{
     cell::Cell,
     fmt,

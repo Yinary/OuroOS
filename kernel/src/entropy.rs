@@ -1,6 +1,8 @@
 //! QEMU /chosen/rng-seed 提供启动熵。每次请求使用不同的 ChaCha20 块；
 //! 块函数按 RFC 8439 §2.3 实现。无种子时本模块进入 NotReady 状态：
 //! getrandom(2) 按 flags 返回 EAGAIN/EINVAL，绝不以时间或常量伪造熵。
+#![forbid(unsafe_code)]
+
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
@@ -13,6 +15,7 @@ pub(crate) fn ready() -> bool {
     READY.load(Ordering::Relaxed)
 }
 
+/// 从设备树 `rng-seed` 初始化内核熵流。
 pub(crate) fn init() {
     let Ok(dt) = polyhal::mem::get_fdt() else {
         return;
@@ -49,6 +52,7 @@ pub(crate) fn fill_random(out: &mut [u8]) -> bool {
     true
 }
 
+/// 为 `execve` 的 `AT_RANDOM` 派生 16 字节随机种子。
 pub(crate) fn exec_random() -> Option<[u8; 16]> {
     let mut stream = STREAM.lock();
     let (key, counter) = stream.as_mut()?;

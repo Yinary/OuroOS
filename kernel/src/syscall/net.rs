@@ -727,6 +727,7 @@ fn parse_cmsg_rights(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 对应 Linux `sendmsg(2)`，支持向量缓冲与 `SCM_RIGHTS` 文件描述符传递。
 fn do_sendmsg(
     space: &UserAddressSpace,
     fs: &Context,
@@ -789,6 +790,7 @@ fn do_sendmsg(
     res
 }
 
+/// 对应 Linux `recvmsg(2)`，支持分散接收、对端地址回写与 `SCM_RIGHTS` 控制消息。
 fn do_recvmsg(
     space: &UserAddressSpace,
     fs: &mut Context,
@@ -925,6 +927,7 @@ fn do_recvmsg(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 对应 Linux `sendmmsg(2)`，批量发送多条套接字消息并回写实际发送字节数。
 fn do_sendmmsg(
     space: &UserAddressSpace,
     fs: &Context,
@@ -976,6 +979,7 @@ fn do_sendmmsg(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 对应 Linux `recvmmsg(2)`，批量接收消息并支持 `MSG_WAITFORONE` 与超时控制。
 fn do_recvmmsg(
     space: &UserAddressSpace,
     fs: &mut Context,

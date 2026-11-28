@@ -29,7 +29,6 @@ int main(void) {
     const char *path = "/tmp/aio_test_file";
     unlink(path);
 
-    /* 1. io_setup error paths */
     aio_context_t ctx = 123;
     if (syscall(SYS_io_setup, 8, &ctx) != -1 || errno != EINVAL)
         die("io_setup nonzero ctx");
@@ -41,10 +40,8 @@ int main(void) {
     if (syscall(SYS_io_setup, 100000, &ctx) != -1 || errno != EAGAIN)
         die("io_setup over aio-max-nr");
 
-    /* 2. io_setup success & /proc/sys/fs/aio-nr */
     if (syscall(SYS_io_setup, 8, &ctx) != 0 || ctx == 0)
         die("io_setup success");
-    /* Verify libaio ring magic read does not fault */
     uint32_t magic = *(volatile uint32_t *)(uintptr_t)(ctx + 12);
     if (magic != 0)
         die("ring magic nonzero");
@@ -56,7 +53,6 @@ int main(void) {
     if (efd < 0)
         die("eventfd");
 
-    /* 3. io_submit PWRITE + IOCB_FLAG_RESFD */
     char wbuf[16] = "hello-linux-aio";
     struct iocb cb;
     memset(&cb, 0, sizeof(cb));
@@ -82,7 +78,6 @@ int main(void) {
     if (got != 1 || evs[0].data != 0x11223344ULL || evs[0].obj != (uintptr_t)&cb || evs[0].res != 15)
         die("io_getevents pwrite");
 
-    /* 4. io_submit PREADV + io_pgetevents */
     char r1[6] = {0}, r2[10] = {0};
     struct iovec iov[2] = {{r1, 5}, {r2, 10}};
     memset(&cb, 0, sizeof(cb));
@@ -102,7 +97,6 @@ int main(void) {
     if (got != 1 || evs[0].res != 15 || memcmp(r1, "hello", 5) != 0 || memcmp(r2, "-linux-aio", 10) != 0)
         die("io_pgetevents preadv");
 
-    /* 5. io_cancel & invalid submit/destroy */
     struct io_event cres;
     if (syscall(SYS_io_cancel, ctx, &cb, &cres) != -1 || errno != EAGAIN)
         die("io_cancel EAGAIN");

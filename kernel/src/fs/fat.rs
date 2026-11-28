@@ -1,4 +1,6 @@
 //! FAT 挂载卷与按路径访问；使用锁定的 rust-fatfs（MIT）。
+#![forbid(unsafe_code)]
+
 use crate::{drivers, syscall::Errno};
 use alloc::{string::String, vec::Vec};
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -242,6 +244,7 @@ fn access<T>(ino: u32, f: impl FnOnce(&mut Mount, usize) -> Result<T, Errno>) ->
     }
     Err(Errno::NoEntry)
 }
+/// 查询 FAT 虚拟节点模式、字节长度、链接数与块计数。
 pub fn stat(ino: u32) -> Result<(u16, u64, u16, u64), Errno> {
     access(ino, |m, i| {
         let path = &m.nodes[i].path;
@@ -267,6 +270,7 @@ pub(super) fn metadata(ino: u32) -> Result<super::Metadata, Errno> {
         ..Default::default()
     })
 }
+/// 从 FAT 虚拟节点指定偏移读取字节到内核缓冲。
 pub fn read(ino: u32, offset: usize, out: &mut [u8]) -> Result<usize, Errno> {
     access(ino, |m, i| {
         let mut file = m.fs.root_dir().open_file(&m.nodes[i].path).map_err(error)?;
@@ -292,6 +296,7 @@ pub(super) fn filesystem_stats(ino: u32) -> Result<super::FileSystemStats, Errno
         })
     })
 }
+/// 向 FAT 虚拟节点指定偏移写入数据。
 pub fn write(ino: u32, offset: usize, data: &[u8]) -> Result<usize, Errno> {
     access(ino, |m, i| {
         let mut file = m.fs.root_dir().open_file(&m.nodes[i].path).map_err(error)?;
@@ -301,6 +306,7 @@ pub fn write(ino: u32, offset: usize, data: &[u8]) -> Result<usize, Errno> {
         Ok(n)
     })
 }
+/// 在 FAT 目录节点下创建普通文件并返回虚拟 inode。
 pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
     access(parent, |m, i| {
         let mut path = string(&m.nodes[i].path)?;
@@ -317,24 +323,28 @@ pub fn create(parent: u32, name: &str, mode: u16) -> Result<u32, Errno> {
         node(m, &path)
     })
 }
+/// 将 FAT 文件截断为零长度。
 pub fn truncate(ino: u32) -> Result<(), Errno> {
     access(ino, |m, i| {
         let mut file = m.fs.root_dir().open_file(&m.nodes[i].path).map_err(error)?;
         file.truncate().map_err(error)
     })
 }
+/// 递增 FAT 虚拟节点的打开引用计数。
 pub fn retain(ino: u32) -> Result<(), Errno> {
     access(ino, |m, i| {
         m.nodes[i].opens += 1;
         Ok(())
     })
 }
+/// 递减 FAT 虚拟节点的打开引用计数。
 pub fn release(ino: u32) {
     let _ = access(ino, |m, i| {
         m.nodes[i].opens = m.nodes[i].opens.saturating_sub(1);
         Ok(())
     });
 }
+/// 删除未被引用的 FAT 文件目录项。
 pub fn unlink(ino: u32) -> Result<(), Errno> {
     access(ino, |m, i| {
         if m.nodes[i].opens != 0 {

@@ -2,6 +2,8 @@
 //! 调用号与寄存器约定按 riscv64/loongarch64 通用 UAPI（a7=调用号、
 //! a0..=a5=参数、a0=返回值），支持范围与偏差见 docs/ostd-contracts.md §4。
 
+#![forbid(unsafe_code)]
+
 pub(crate) mod fs;
 mod memory;
 pub(crate) mod net;
@@ -9,6 +11,7 @@ pub(crate) mod net;
 pub(crate) mod signal;
 
 #[cfg(debug_assertions)]
+/// 自检：转调内存系统调用自检。
 pub(crate) fn memory_self_test() {
     memory::self_test();
 }
@@ -343,6 +346,7 @@ pub enum Errno {
     /// EMSGSIZE: 消息过长。
     MsgSize,
     /// EPROTOTYPE: 套接字类型与协议不匹配。
+    #[allow(dead_code)]
     ProtoType,
     /// ENOPROTOOPT: 不支持的套接字选项。
     NoProtoOpt,

@@ -2,6 +2,8 @@
 //! 用户态陷阱由任务运行循环按完整 TrapType 处置。
 //! 职责划分依据见 docs/ostd-contracts.md §2/§3。
 
+#![forbid(unsafe_code)]
+
 use core::sync::atomic::Ordering;
 
 use polyhal_trap::{

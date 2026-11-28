@@ -59,7 +59,6 @@ static long sys_timer_delete(int tid) {
 int main(void) {
     int tid = -1;
 
-    /* 1. Error paths on timer_create / delete / gettime / settime / getoverrun */
     check_cond(sys_timer_create(-1, NULL, &tid) == -1 && errno == EINVAL, "invalid clockid -1");
     check_cond(sys_timer_create(16, NULL, &tid) == -1 && errno == EINVAL, "invalid clockid 16");
     check_cond(sys_timer_create(CLOCK_MONOTONIC_RAW, NULL, &tid) == -1 && errno == EOPNOTSUPP, "MONOTONIC_RAW EOPNOTSUPP");
@@ -70,7 +69,6 @@ int main(void) {
     check_cond(sys_timer_gettime(999, &its) == -1 && errno == EINVAL, "gettime nonexistent");
     check_cond(sys_timer_settime(999, 0, NULL, NULL) == -1 && errno == EINVAL, "settime NULL new_value");
 
-    /* 2. SIGEV_SIGNAL + SI_TIMER + sigval + old_value */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_flags = SA_SIGINFO;
@@ -84,12 +82,10 @@ int main(void) {
     sev.sigev_value.sival_int = 0x1234;
     check_cond(sys_timer_create(CLOCK_MONOTONIC, &sev, &tid) == 0, "create MONOTONIC");
 
-    /* Check bad timespec */
     memset(&its, 0, sizeof(its));
     its.it_value.tv_nsec = 1000000000L;
     check_cond(sys_timer_settime(tid, 0, &its, NULL) == -1 && errno == EINVAL, "bad nsec EINVAL");
 
-    /* Arm one-shot 30ms */
     memset(&its, 0, sizeof(its));
     its.it_value.tv_nsec = 30 * 1000 * 1000;
     struct itimerspec oldv;
@@ -97,12 +93,10 @@ int main(void) {
     check_cond(sys_timer_settime(tid, 0, &its, &oldv) == 0, "arm 30ms");
     check_cond(oldv.it_value.tv_sec == 0 && oldv.it_value.tv_nsec == 0, "old_value initially zero");
 
-    /* Query remaining */
     struct itimerspec cur;
     check_cond(sys_timer_gettime(tid, &cur) == 0, "gettime armed");
     check_cond(cur.it_value.tv_sec == 0 && cur.it_value.tv_nsec > 0 && cur.it_value.tv_nsec <= 30000000L, "remaining in range");
 
-    /* Sleep 80ms to let it fire */
     struct timespec slp = {0, 80 * 1000 * 1000};
     nanosleep(&slp, NULL);
     check_cond(got_sig == SIGUSR1, "received SIGUSR1");
@@ -112,7 +106,6 @@ int main(void) {
     check_cond(got_overrun == 0, "one-shot overrun 0");
     check_cond(sys_timer_getoverrun(tid) == 0, "timer_getoverrun 0");
 
-    /* 3. Periodic timer overrun while signal blocked */
     sigset_t mask, oldmask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGUSR1);
@@ -129,19 +122,16 @@ int main(void) {
     nanosleep(&slp2, NULL);
     check_cond(got_sig == 0, "signal held while blocked");
 
-    /* Unblock -> deliver with overrun >= 2 */
     check_cond(sigprocmask(SIG_SETMASK, &oldmask, NULL) == 0, "unblock SIGUSR1");
     check_cond(got_sig == SIGUSR1, "delivered after unblock");
     long ov = sys_timer_getoverrun(tid);
     check_cond(ov >= 1 && got_overrun == ov, "overrun >= 1 and matches si_overrun");
 
-    /* Disarm */
     memset(&its, 0, sizeof(its));
     check_cond(sys_timer_settime(tid, 0, &its, &oldv) == 0, "disarm");
     check_cond(oldv.it_interval.tv_nsec == 10000000L, "old_value interval preserved");
     check_cond(sys_timer_gettime(tid, &cur) == 0 && cur.it_value.tv_nsec == 0 && cur.it_interval.tv_nsec == 0, "disarmed zero");
 
-    /* 4. Large ktime tv_sec (overflow guard, like timer_settime03) must not fire immediately */
     got_sig = 0;
     memset(&its, 0, sizeof(its));
     its.it_value.tv_sec = 0x7fffffffLL;
@@ -150,7 +140,6 @@ int main(void) {
     nanosleep(&slp3, NULL);
     check_cond(got_sig == 0, "large tv_sec did not fire prematurely");
 
-    /* 5. Fork does not inherit timers */
     pid_t child = fork();
     check_cond(child >= 0, "fork");
     if (child == 0) {
@@ -163,7 +152,6 @@ int main(void) {
     check_cond(sys_timer_delete(tid) == 0, "delete timer");
     check_cond(sys_timer_delete(tid) == -1 && errno == EINVAL, "double delete EINVAL");
 
-    /* 6. SIGEV_NONE + CLOCK_REALTIME + TIMER_ABSTIME + CPU clocks */
     int tid_rt = -1, tid_cpu = -1;
     sev.sigev_notify = SIGEV_NONE;
     check_cond(sys_timer_create(CLOCK_REALTIME, &sev, &tid_rt) == 0, "create REALTIME SIGEV_NONE");
@@ -179,7 +167,6 @@ int main(void) {
     check_cond(sys_timer_create(CLOCK_PROCESS_CPUTIME_ID, &sev, &tid_cpu) == 0, "create PROCESS_CPUTIME");
     check_cond(sys_timer_delete(tid_cpu) == 0, "delete PROCESS_CPUTIME");
 
-    /* 7. SIGEV_THREAD_ID to self */
     sev.sigev_notify = SIGEV_THREAD_ID;
     sev.sigev_signo = SIGUSR1;
     sev.sigev_tid = (int)syscall(SYS_gettid);

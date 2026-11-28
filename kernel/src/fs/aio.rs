@@ -23,10 +23,12 @@ pub const DEFAULT_AIO_MAX_NR: usize = 65536;
 static AIO_NR: AtomicUsize = AtomicUsize::new(0);
 static AIO_MAX_NR: AtomicUsize = AtomicUsize::new(DEFAULT_AIO_MAX_NR);
 
+/// 返回全局当前活跃异步 I/O 请求槽总数。
 pub fn aio_nr() -> usize {
     AIO_NR.load(Ordering::Relaxed)
 }
 
+/// 返回全局异步 I/O 请求槽上限。
 pub fn aio_max_nr() -> usize {
     AIO_MAX_NR.load(Ordering::Relaxed)
 }
@@ -57,6 +59,7 @@ pub struct IoEvent {
 }
 
 impl IoEvent {
+    /// 按 Linux `io_event` ABI 编码为 32 字节小端缓冲。
     pub fn encode(self) -> [u8; 32] {
         let mut raw = [0u8; 32];
         raw[0..8].copy_from_slice(&self.data.to_ne_bytes());
@@ -83,6 +86,7 @@ pub struct Iocb {
 }
 
 impl Iocb {
+    /// 从 64 字节用户态 `iocb` 结构解码异步 I/O 控制块。
     pub fn decode(raw: &[u8; 64]) -> Self {
         Self {
             aio_data: u64::from_ne_bytes([
@@ -128,12 +132,14 @@ impl Drop for AioTable {
 }
 
 impl AioTable {
+    /// 创建空的进程级异步 I/O 上下文表。
     pub const fn new() -> Self {
         Self {
             contexts: Vec::new(),
         }
     }
 
+    /// 释放进程所有异步 I/O 上下文并归还全局槽计数。
     pub fn clear(&mut self) {
         let mut released = 0usize;
         for ctx in self.contexts.drain(..) {
@@ -232,10 +238,12 @@ impl AioTable {
         Ok(0)
     }
 
+    /// 检查指定 `ctx_id` 是否属于当前进程。
     pub fn contains(&self, ctx_id: u64) -> bool {
         ctx_id != 0 && self.contexts.iter().any(|c| c.id == ctx_id)
     }
 
+    /// 检查目标异步上下文完成队列是否仍有空槽。
     pub fn has_space(&self, ctx_id: u64) -> Result<bool, Errno> {
         let ctx = self
             .contexts
@@ -245,6 +253,7 @@ impl AioTable {
         Ok(ctx.events.len() < ctx.max_events)
     }
 
+    /// 向目标异步上下文完成队列压入一条完成事件。
     pub fn push_event(&mut self, ctx_id: u64, ev: IoEvent) -> Result<(), Errno> {
         let ctx = self
             .contexts
@@ -259,6 +268,7 @@ impl AioTable {
         Ok(())
     }
 
+    /// 返回目标异步上下文当前可读取的完成事件数。
     pub fn available_events(&self, ctx_id: u64) -> Result<usize, Errno> {
         let ctx = self
             .contexts

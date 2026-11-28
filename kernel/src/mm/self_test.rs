@@ -1,9 +1,7 @@
 //! 启动期内存不变量自检，不依赖用户程序名/测例参数。
 //! 覆盖页所有权、区间分裂、权限、边界及释放守恒；debug 内核额外逐点注入 OOM。
 use super::{
-    address_space::{
-        phys_to_kernel_vaddr, AreaKind, MapError, UserAddressSpace, USER_STACK_TOP, USER_TOP,
-    },
+    address_space::{AreaKind, MapError, UserAddressSpace, USER_STACK_TOP, USER_TOP},
     frame,
     kstack::WINDOW_ROOT_START,
     user_access::{copy_from_user, copy_to_user},
@@ -293,12 +291,12 @@ pub(super) fn run() {
         );
         assert!(space.translate(USER_TOP).is_none());
         assert_eq!(frame::stats(), mapped);
-        let pa = space.translate(0x20_0000).expect("mapped translation").0;
-        // SAFETY: pa 是本空间持有的完整数据页，未进入用户态，无并发访问。
-        let bytes = unsafe {
-            core::slice::from_raw_parts(phys_to_kernel_vaddr(pa) as *const u8, PAGE_SIZE)
-        };
-        assert!(bytes.iter().all(|b| *b == 0));
+        assert!(space.translate(0x20_0000).is_some());
+        let mut zero_buf = [0xffu8; 256];
+        for off in (0..PAGE_SIZE).step_by(zero_buf.len()) {
+            copy_from_user(&space, 0x20_0000 + off, &mut zero_buf).expect("read zeroed page");
+            assert!(zero_buf.iter().all(|b| *b == 0));
+        }
         space
             .protect(0x20_1000, 1, F::U | F::R)
             .expect("mprotect R");
@@ -348,12 +346,11 @@ pub(super) fn run() {
             .map_alloc(0x10_0000, F::URW)
             .expect("second private page");
         assert_ne!(a.raw(), b.raw());
-        // SAFETY: 两个空间独占各自数据页，未进入用户态；单字节访问不越界。
-        unsafe {
-            (phys_to_kernel_vaddr(a) as *mut u8).write_volatile(0x31);
-            (phys_to_kernel_vaddr(b) as *mut u8).write_volatile(0x72);
-            assert_eq!((phys_to_kernel_vaddr(a) as *const u8).read_volatile(), 0x31);
-        }
+        copy_to_user(&first, 0x10_0000, &[0x31]).expect("write first private page");
+        copy_to_user(&second, 0x10_0000, &[0x72]).expect("write second private page");
+        let mut byte = [0u8; 1];
+        copy_from_user(&first, 0x10_0000, &mut byte).expect("read first private page");
+        assert_eq!(byte[0], 0x31);
         drop(first);
         assert_eq!(
             second
@@ -363,20 +360,15 @@ pub(super) fn run() {
                 .raw(),
             b.raw()
         );
-        // SAFETY: second 仍持有 b；释放 first 不得改变该页内容或生命周期。
-        unsafe {
-            assert_eq!((phys_to_kernel_vaddr(b) as *const u8).read_volatile(), 0x72);
-        }
+        copy_from_user(&second, 0x10_0000, &mut byte).expect("read surviving private page");
+        assert_eq!(byte[0], 0x72);
     }
     assert_eq!(frame::stats(), baseline);
     #[cfg(debug_assertions)]
     {
         let mut space = UserAddressSpace::new().expect("fixed test root");
         let pa = space.map_alloc(0x20_0000, F::URW).expect("fixed original");
-        // SAFETY: 测试持有数据页，尚无用户并发访问，字节访问在页内。
-        unsafe {
-            (phys_to_kernel_vaddr(pa) as *mut u8).write_volatile(93);
-        }
+        copy_to_user(&space, 0x20_0000, &[93]).expect("write fixed original");
         let before = frame::stats();
         space.activate();
         // 两个新数据页、根页和两级中间表，共五次帧分配；逐次失败都须回滚。
@@ -389,23 +381,18 @@ pub(super) fn run() {
             frame::set_test_budget(None);
             assert_eq!(frame::stats(), before);
             assert_eq!(space.translate(0x20_0000).unwrap().0.raw(), pa.raw());
-            // SAFETY: 失败后原页仍归该测试空间所有。
-            unsafe {
-                assert_eq!((phys_to_kernel_vaddr(pa) as *const u8).read_volatile(), 93);
-            }
+            let mut byte = [0u8; 1];
+            copy_from_user(&space, 0x20_0000, &mut byte).expect("read preserved original");
+            assert_eq!(byte[0], 93);
         }
         space
             .replace_region(0x20_0000, 2, F::URW)
             .expect("fixed commit");
         let fresh = space.translate(0x20_0000).unwrap().0;
         assert_ne!(fresh.raw(), pa.raw());
-        // SAFETY: 新匿名页在当前空间内，成功替换后仍持有其所有权。
-        unsafe {
-            assert_eq!(
-                (phys_to_kernel_vaddr(fresh) as *const u8).read_volatile(),
-                0
-            );
-        }
+        let mut byte = [0xffu8; 1];
+        copy_from_user(&space, 0x20_0000, &mut byte).expect("read fresh replaced page");
+        assert_eq!(byte[0], 0);
         drop(space);
         assert_eq!(frame::stats(), baseline);
         log::info!("mm self-test: fixed replacement rollback passed");

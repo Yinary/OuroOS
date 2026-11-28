@@ -59,18 +59,15 @@ static void check_rlimits(void) {
     CHECK(syscall(SYS_prlimit64, 0, RLIMIT_CORE, NULL, &core_cur) == 0);
     CHECK(core_cur.rlim_cur == 4096 && core_cur.rlim_max == 8192);
 
-    /* old_limit 指针非法时不得修改目标限额（原子回滚） */
     struct rlimit core_try = { .rlim_cur = 1024, .rlim_max = 2048 };
     CHECK(syscall(SYS_prlimit64, 0, RLIMIT_CORE, &core_try, (void *)0x1000) == -1 &&
           errno == EFAULT);
     CHECK(syscall(SYS_prlimit64, 0, RLIMIT_CORE, NULL, &core_cur) == 0);
     CHECK(core_cur.rlim_cur == 4096 && core_cur.rlim_max == 8192);
 
-    /* 负 pid 与不存在的 pid 返回 ESRCH */
     CHECK(syscall(SYS_prlimit64, -1, RLIMIT_CORE, NULL, &core_cur) == -1 && errno == ESRCH);
     CHECK(syscall(SYS_prlimit64, 999999, RLIMIT_CORE, NULL, &core_cur) == -1 && errno == ESRCH);
 
-    /* 跨进程 prlimit64 + 非特权抬高硬限额 EPERM */
     int p2c[2], c2p[2];
     CHECK(pipe(p2c) == 0 && pipe(c2p) == 0);
     pid_t parent_pid = getpid();
@@ -89,7 +86,6 @@ static void check_rlimits(void) {
         close(p2c[0]);
         CHECK(syscall(SYS_prlimit64, 0, RLIMIT_CORE, NULL, &inherited) == 0);
         CHECK(inherited.rlim_cur == 2048 && inherited.rlim_max == 4096);
-        /* 降权后不得抬高硬限额，也不得读取 root 父进程限额 */
         CHECK(setresuid(1000, 1000, 1000) == 0);
         struct rlimit raise = { .rlim_cur = 2048, .rlim_max = 8192 };
         CHECK(syscall(SYS_prlimit64, 0, RLIMIT_CORE, &raise, NULL) == -1 && errno == EPERM);
@@ -114,7 +110,6 @@ static void check_rlimits(void) {
 }
 
 static void check_prctl(void) {
-    /* NAME + /proc/self/stat 同步 */
     char name[16] = { 0 };
     CHECK(prctl(PR_SET_NAME, "ouro-test-123456789", 0, 0, 0) == 0);
     CHECK(prctl(PR_GET_NAME, name, 0, 0, 0) == 0);
@@ -128,7 +123,6 @@ static void check_prctl(void) {
     close(sfd);
     CHECK(sn > 0 && strstr(statbuf, "(ouro-test-12345)") != NULL);
 
-    /* DUMPABLE / KEEPCAPS / TIMING / ENDIAN / SECCOMP / THP_DISABLE / TIMERSLACK */
     CHECK(prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) == 1);
     CHECK(prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) == 0);
     CHECK(prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) == 0);
@@ -152,7 +146,6 @@ static void check_prctl(void) {
     CHECK(prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0) == 50000);
     CHECK(prctl(PR_SET_TIMERSLACK, 70000, 0, 0, 0) == 0);
     CHECK(prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0) == 70000);
-    /* fork 后子进程 default_timer_slack_ns 继承父当前值（70000），重置为 0 时回到 70000 */
     pid_t slack_child = fork();
     CHECK(slack_child >= 0);
     if (slack_child == 0) {
@@ -167,7 +160,6 @@ static void check_prctl(void) {
     CHECK(prctl(PR_SET_TIMERSLACK, 0, 0, 0, 0) == 0);
     CHECK(prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0) == 50000);
 
-    /* /proc/self/comm 与 /proc/self/timerslack_ns */
     int cfd = open("/proc/self/comm", O_RDONLY);
     CHECK(cfd >= 0);
     char commbuf[64] = { 0 };
@@ -180,7 +172,6 @@ static void check_prctl(void) {
     CHECK(prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0) == 1);
     CHECK(prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0) == 0);
 
-    /* CAPBSET & SECUREBITS */
     CHECK(prctl(PR_CAPBSET_READ, 0, 0, 0, 0) == 1);
     CHECK(prctl(PR_CAPBSET_READ, 99, 0, 0, 0) == -1 && errno == EINVAL);
     pid_t cap_child = fork();
@@ -192,7 +183,6 @@ static void check_prctl(void) {
         CHECK(prctl(PR_GET_SECUREBITS, 0, 0, 0, 0) == 0x3);
         CHECK(prctl(PR_SET_SECUREBITS, 0x0, 0, 0, 0) == -1 && errno == EPERM);
         CHECK(prctl(PR_SET_SECUREBITS, 0x100, 0, 0, 0) == -1 && errno == EINVAL);
-        /* capset(91) 撤掉 CAP_SYS_TIME 后 settimeofday 必须返回 EPERM */
         struct {
             uint32_t version;
             int pid;
@@ -211,7 +201,6 @@ static void check_prctl(void) {
     }
     CHECK(waitpid(cap_child, &st, 0) == cap_child && WIFEXITED(st) && WEXITSTATUS(st) == 0);
 
-    /* PDEATHSIG：父进程退出时向子进程投递 SIGUSR1，且 fork 清零 */
     int pdeath_pipe[2], ready_pipe[2];
     CHECK(pipe(pdeath_pipe) == 0 && pipe(ready_pipe) == 0);
     pid_t mid = fork();
@@ -245,7 +234,6 @@ static void check_prctl(void) {
         char rch = 0;
         CHECK(read(ready_pipe[0], &rch, 1) == 1 && rch == 'r');
         close(ready_pipe[0]);
-        /* 孙子已装好 PDEATHSIG，父进程立即退出触发投递 */
         _exit(0);
     }
     close(pdeath_pipe[1]);
@@ -256,7 +244,6 @@ static void check_prctl(void) {
     CHECK(read(pdeath_pipe[0], &res_ch, 1) == 1 && res_ch == 'Y');
     close(pdeath_pipe[0]);
 
-    /* CHILD_SUBREAPER：祖父接管孙子并可 waitpid 收割 */
     pid_t sub_root = fork();
     CHECK(sub_root >= 0);
     if (sub_root == 0) {
@@ -270,13 +257,11 @@ static void check_prctl(void) {
         CHECK(p1 >= 0);
         if (p1 == 0) {
             close(sp[0]);
-            /* fork 必须清零 child_subreaper */
             int child_sr = 1;
             CHECK(prctl(PR_GET_CHILD_SUBREAPER, &child_sr, 0, 0, 0) == 0 && child_sr == 0);
             pid_t p2 = fork();
             CHECK(p2 >= 0);
             if (p2 == 0) {
-                /* 等 p1 退出，确认被 sub_root 接管 */
                 for (int i = 0; i < 200 && getppid() != me; i++) {
                     struct timespec ts = { .tv_sec = 0, .tv_nsec = 5000000 };
                     nanosleep(&ts, NULL);
@@ -299,7 +284,6 @@ static void check_prctl(void) {
     }
     CHECK(waitpid(sub_root, &st, 0) == sub_root && WIFEXITED(st) && WEXITSTATUS(st) == 0);
 
-    /* NO_NEW_PRIVS + /proc/self/status */
     pid_t nnp = fork();
     CHECK(nnp >= 0);
     if (nnp == 0) {
@@ -353,7 +337,6 @@ static void check_getcpu_uts_time(void) {
     CHECK(syscall(SYS_sethostname, orig.nodename, strlen(orig.nodename)) == 0);
     CHECK(syscall(SYS_setdomainname, orig.domainname, strlen(orig.domainname)) == 0);
 
-    /* settimeofday & clock_settime */
     struct timespec saved_real = { 0 }, mono_before = { 0 }, mono_after = { 0 };
     CHECK(clock_gettime(CLOCK_REALTIME, &saved_real) == 0);
     CHECK(clock_gettime(CLOCK_MONOTONIC, &mono_before) == 0);
@@ -380,7 +363,6 @@ static void check_getcpu_uts_time(void) {
     CHECK(clock_gettime(CLOCK_REALTIME, &got_ts) == 0);
     CHECK(got_ts.tv_sec >= 1740000000 && got_ts.tv_sec <= 1740000005);
 
-    /* 恢复墙钟并确认单调时钟未回退 */
     CHECK(syscall(SYS_clock_settime, CLOCK_REALTIME, &saved_real) == 0);
     CHECK(clock_gettime(CLOCK_MONOTONIC, &mono_after) == 0);
     CHECK(mono_after.tv_sec > mono_before.tv_sec ||

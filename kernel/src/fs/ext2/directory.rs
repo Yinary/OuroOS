@@ -1,4 +1,6 @@
 //! Ext2 线性目录的按块解析和路径分量查找。
+#![forbid(unsafe_code)]
+
 use super::{le16, le32, Device, Error, Inode, Result, Volume, BLOCK_SIZE};
 use alloc::vec::Vec;
 

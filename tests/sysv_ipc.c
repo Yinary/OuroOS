@@ -79,36 +79,29 @@ static void test_msg_basic(void) {
     CHECK(msgsnd(q, &m2, strlen(m2.mtext) + 1, 0) == 0);
     CHECK(msgsnd(q, &m3, strlen(m3.mtext) + 1, 0) == 0);
 
-    /* Invalid mtype */
     struct test_msg bad = { .mtype = 0, .mtext = "x" };
     CHECK(msgsnd(q, &bad, 1, 0) == -1 && errno == EINVAL);
 
-    /* MSG_COPY non-destructive peek */
     struct test_msg r;
     memset(&r, 0, sizeof(r));
     ssize_t n = msgrcv(q, &r, sizeof(r.mtext), 1, MSG_COPY | IPC_NOWAIT);
     CHECK(n == (ssize_t)(strlen("five") + 1) && r.mtype == 5 && strcmp(r.mtext, "five") == 0);
 
-    /* E2BIG without MSG_NOERROR, truncation with MSG_NOERROR */
     CHECK(msgrcv(q, &r, 4, 20, IPC_NOWAIT) == -1 && errno == E2BIG);
     memset(&r, 0, sizeof(r));
     n = msgrcv(q, &r, 6, 20, IPC_NOWAIT | MSG_NOERROR);
     CHECK(n == 6 && r.mtype == 20 && memcmp(r.mtext, "twenty", 6) == 0);
 
-    /* msgtyp < 0: smallest type <= 10 -> type 5 first */
     memset(&r, 0, sizeof(r));
     n = msgrcv(q, &r, sizeof(r.mtext), -10, IPC_NOWAIT);
     CHECK(n == (ssize_t)(strlen("five") + 1) && r.mtype == 5 && strcmp(r.mtext, "five") == 0);
 
-    /* MSG_EXCEPT: type != 99 -> gets type 10 */
     memset(&r, 0, sizeof(r));
     n = msgrcv(q, &r, sizeof(r.mtext), 99, IPC_NOWAIT | MSG_EXCEPT);
     CHECK(n == (ssize_t)(strlen("ten") + 1) && r.mtype == 10 && strcmp(r.mtext, "ten") == 0);
 
-    /* Now empty -> ENOMSG */
     CHECK(msgrcv(q, &r, sizeof(r.mtext), 0, IPC_NOWAIT) == -1 && errno == ENOMSG);
 
-    /* IPC_SET lower qbytes, verify full -> EAGAIN */
     CHECK(msgctl(q, IPC_STAT, &ds) == 0);
     ds.msg_qbytes = 16;
     CHECK(msgctl(q, IPC_SET, &ds) == 0);
@@ -123,7 +116,6 @@ static void test_msg_blocking_and_rmid(void) {
     int q = msgget(IPC_PRIVATE, 0600);
     CHECK(q >= 0);
 
-    /* Blocking msgrcv woken by parent msgsnd */
     pid_t pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
@@ -139,7 +131,6 @@ static void test_msg_blocking_and_rmid(void) {
     int st = 0;
     CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
 
-    /* Blocking msgrcv interrupted by signal -> EINTR even with SA_RESTART */
     pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
@@ -157,7 +148,6 @@ static void test_msg_blocking_and_rmid(void) {
     CHECK(kill(pid, SIGUSR1) == 0);
     CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
 
-    /* Blocking msgrcv woken by IPC_RMID -> EIDRM */
     pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
@@ -196,27 +186,23 @@ static void test_sem_basic_and_atomic(void) {
     arg.val = 40000;
     CHECK(semctl(s, 0, SETVAL, arg) == -1 && errno == ERANGE);
 
-    /* Atomic multi-op: op 0 (-1 on sem 0) would succeed, op 1 (-1 on sem 1) fails EAGAIN */
     struct sembuf ops[2] = {
         { .sem_num = 0, .sem_op = -1, .sem_flg = 0 },
         { .sem_num = 1, .sem_op = -1, .sem_flg = IPC_NOWAIT },
     };
     CHECK(semop(s, ops, 2) == -1 && errno == EAGAIN);
-    CHECK(semctl(s, 0, GETVAL) == 2); /* unchanged! */
+    CHECK(semctl(s, 0, GETVAL) == 2);
 
-    /* Out-of-range sem_num -> EFBIG */
     struct sembuf badop = { .sem_num = 3, .sem_op = 1, .sem_flg = 0 };
     CHECK(semop(s, &badop, 1) == -1 && errno == EFBIG);
 
-    /* semtimedop timeout */
     struct sembuf waitop = { .sem_num = 1, .sem_op = -1, .sem_flg = 0 };
-    struct timespec ts = { 0, 50 * 1000 * 1000 }; /* 50 ms */
+    struct timespec ts = { 0, 50 * 1000 * 1000 };
     uint64_t t0 = mono_ms();
     CHECK(semtimedop(s, &waitop, 1, &ts) == -1 && errno == EAGAIN);
     uint64_t dt = mono_ms() - t0;
     CHECK(dt >= 35);
 
-    /* GETNCNT / GETZCNT while children block */
     pid_t p_ncnt = fork();
     CHECK(p_ncnt >= 0);
     if (p_ncnt == 0) {
@@ -235,7 +221,6 @@ static void test_sem_basic_and_atomic(void) {
     CHECK(semctl(s, 1, GETNCNT) == 1);
     CHECK(semctl(s, 0, GETZCNT) == 1);
 
-    /* Wake both children */
     struct sembuf wake[2] = {
         { .sem_num = 1, .sem_op = 1, .sem_flg = 0 },
         { .sem_num = 0, .sem_op = -2, .sem_flg = 0 },
@@ -247,7 +232,6 @@ static void test_sem_basic_and_atomic(void) {
     CHECK(semctl(s, 1, GETNCNT) == 0);
     CHECK(semctl(s, 0, GETZCNT) == 0);
 
-    /* SEM_UNDO rollback on child exit wakes blocked parent/sibling */
     arg.val = 3;
     CHECK(semctl(s, 2, SETVAL, arg) == 0);
     pid_t p_undo = fork();
@@ -256,7 +240,7 @@ static void test_sem_basic_and_atomic(void) {
         struct sembuf op = { .sem_num = 2, .sem_op = -3, .sem_flg = SEM_UNDO };
         if (semop(s, &op, 1) != 0) _exit(4);
         sleep_ms(40);
-        _exit(0); /* exiting should restore sem 2 by +3 */
+        _exit(0);
     }
     sleep_ms(15);
     CHECK(semctl(s, 2, GETVAL) == 0);
@@ -265,7 +249,6 @@ static void test_sem_basic_and_atomic(void) {
     CHECK(semctl(s, 2, GETVAL) == 1);
     CHECK(waitpid(p_undo, &st, 0) == p_undo && WIFEXITED(st) && WEXITSTATUS(st) == 0);
 
-    /* IPC_RMID wakes blocked semop with EIDRM */
     pid_t p_rm = fork();
     CHECK(p_rm >= 0);
     if (p_rm == 0) {

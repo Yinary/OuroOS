@@ -1,5 +1,7 @@
 //! 内核 panic 处理：打印信息后走 QEMU 关机，让 QEMU 自行退出。
 
+#![forbid(unsafe_code)]
+
 use core::panic::PanicInfo;
 
 use polyhal::println;

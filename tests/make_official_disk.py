@@ -13,7 +13,6 @@ import struct
 import subprocess
 import tempfile
 
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=pathlib.Path)
@@ -21,8 +20,8 @@ def main():
     args = parser.parse_args()
 
     total = args.size_mib * 1024 * 1024
-    p1_start, p1_count = 2048, 2048          # 1 MiB 占位分区
-    p2_start = p1_start + p1_count           # FAT32 到盘尾
+    p1_start, p1_count = 2048, 2048
+    p2_start = p1_start + p1_count
     p2_count = total // 512 - p2_start
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -33,7 +32,6 @@ def main():
         subprocess.run(["mkfs.vfat", "-F", "32", str(fat)], check=True)
 
         mbr = bytearray(total)
-        # MBR 分区表：分区 1 占位（0x83），分区 2 FAT32 LBA（0x0c）
         for index, (boot, count, ptype) in enumerate(
             [(p1_start, p1_count, 0x83), (p2_start, p2_count, 0x0C)]
         ):
@@ -47,7 +45,6 @@ def main():
         args.output.write_bytes(mbr)
     print(f"disk image written: {args.output} ({total // 1024 // 1024} MiB, "
           f"p2 FAT32 at sector {p2_start})")
-
 
 if __name__ == "__main__":
     main()

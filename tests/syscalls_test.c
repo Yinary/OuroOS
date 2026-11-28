@@ -56,7 +56,6 @@ int main(void) {
     mkdir("/tmp", 0777);
     mkdir("/tmp/o2dir", 0755);
 
-    /* 1. membarrier */
     long mask = syscall(SYS_membarrier, 0, 0);
     if (mask <= 0 || !(mask & (1 << 3)))
         die("membarrier query");
@@ -69,7 +68,6 @@ int main(void) {
     if (syscall(SYS_membarrier, 0, 1) != -1 || errno != EINVAL)
         die("membarrier bad flags");
 
-    /* 2. openat2 */
     int dfd = open("/tmp/o2dir", O_RDONLY | O_DIRECTORY);
     if (dfd < 0)
         die("open /tmp/o2dir");
@@ -77,27 +75,22 @@ int main(void) {
     int f1 = syscall(SYS_openat2, dfd, "hello.txt", &how, sizeof(how));
     if (f1 < 0)
         die("openat2 create beneath");
-    /* Escape attempt with RESOLVE_BENEATH => EXDEV */
     how.flags = O_RDONLY;
     how.mode = 0;
     if (syscall(SYS_openat2, dfd, "../o2dir/hello.txt", &how, sizeof(how)) != -1 || errno != EXDEV)
         die("openat2 RESOLVE_BENEATH escape");
-    /* RESOLVE_IN_ROOT clamps .. at dirfd */
     how.resolve = 0x10;
     int f2 = syscall(SYS_openat2, dfd, "/../../hello.txt", &how, sizeof(how));
     if (f2 < 0)
         die("openat2 RESOLVE_IN_ROOT");
-    /* Nonzero mode without O_CREAT => EINVAL */
     how.mode = 0644;
     how.resolve = 0;
     if (syscall(SYS_openat2, dfd, "hello.txt", &how, sizeof(how)) != -1 || errno != EINVAL)
         die("openat2 nonzero mode without O_CREAT");
-    /* Bad size => EINVAL */
     how.mode = 0;
     if (syscall(SYS_openat2, dfd, "hello.txt", &how, 8) != -1 || errno != EINVAL)
         die("openat2 small size");
 
-    /* 3. kcmp */
     int f1_dup = dup(f1);
     if (f1_dup < 0)
         die("dup f1");
@@ -112,14 +105,11 @@ int main(void) {
     if (syscall(SYS_kcmp, me, me, 99, 0, 0) != -1 || errno != EINVAL)
         die("kcmp bad type");
 
-    /* 4. clone3 */
     struct clone_args_u ca;
     memset(&ca, 0, sizeof(ca));
     ca.exit_signal = SIGCHLD;
-    /* Invalid size => EINVAL */
     if (syscall(SYS_clone3, &ca, 16) != -1 || errno != EINVAL)
         die("clone3 small size");
-    /* stack without stack_size => EINVAL */
     ca.stack = 0x1000;
     ca.stack_size = 0;
     if (syscall(SYS_clone3, &ca, sizeof(ca)) != -1 || errno != EINVAL)
@@ -134,7 +124,6 @@ int main(void) {
     if (waitpid(cpid, &st, 0) != cpid || !WIFEXITED(st) || WEXITSTATUS(st) != 42)
         die("clone3 waitpid");
 
-    /* 5. execveat error paths */
     char *const argv[] = {"test", NULL};
     char *const envp[] = {NULL};
     if (syscall(SYS_execveat, dfd, "", argv, envp, 0x1000) != -1 || errno != EACCES)

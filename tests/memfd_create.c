@@ -38,7 +38,6 @@ static void die(const char *msg) {
 }
 
 int main(void) {
-    /* 1. Validation: NULL name, >249 name, invalid flags */
     if (syscall(SYS_memfd_create, NULL, 0) != -1 || errno != EFAULT)
         die("NULL name EFAULT");
     char long_name[256];
@@ -50,7 +49,6 @@ int main(void) {
     int fd249 = (int)syscall(SYS_memfd_create, long_name, MFD_CLOEXEC);
     if (fd249 < 0) die("249-byte name ok");
     if ((fcntl(fd249, F_GETFD) & FD_CLOEXEC) == 0) die("MFD_CLOEXEC not set");
-    /* Without MFD_ALLOW_SEALING, initial seals == F_SEAL_SEAL */
     if (fcntl(fd249, F_GET_SEALS) != F_SEAL_SEAL) die("default F_SEAL_SEAL");
     if (fcntl(fd249, F_ADD_SEALS, F_SEAL_WRITE) != -1 || errno != EPERM)
         die("add seal without MFD_ALLOW_SEALING EPERM");
@@ -59,7 +57,6 @@ int main(void) {
     if (syscall(SYS_memfd_create, "bad", 0x1000) != -1 || errno != EINVAL)
         die("bad flags EINVAL");
 
-    /* 2. Basic read/write/ftruncate/fstat/mmap + seals */
     int fd = (int)syscall(SYS_memfd_create, "test", MFD_ALLOW_SEALING);
     if (fd < 0) die("memfd_create MFD_ALLOW_SEALING");
     if (fcntl(fd, F_GET_SEALS) != 0) die("initial seals 0");
@@ -70,7 +67,6 @@ int main(void) {
     struct stat st;
     if (fstat(fd, &st) != 0 || st.st_size != 4096) die("fstat size");
 
-    /* MAP_SHARED writable blocks F_SEAL_WRITE with EBUSY */
     char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (p == MAP_FAILED) die("mmap MAP_SHARED RW");
     if (memcmp(p, "hello", 5) != 0) die("mmap sees write");
@@ -85,7 +81,6 @@ int main(void) {
     if (pread(fd, buf, 10, 0) != 10 || memcmp(buf, "helloworld", 10) != 0)
         die("pread sees mmap write");
 
-    /* Now F_SEAL_SHRINK & F_SEAL_GROW & F_SEAL_WRITE */
     if (fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK) != 0) die("add F_SEAL_SHRINK");
     if (ftruncate(fd, 2048) != -1 || errno != EPERM) die("shrink blocked EPERM");
     if (ftruncate(fd, 8192) != 0) die("grow still allowed");
@@ -99,13 +94,11 @@ int main(void) {
     if (mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) != MAP_FAILED || errno != EPERM)
         die("mmap RW blocked EPERM");
 
-    /* Read-only MAP_SHARED still allowed */
     char *ro = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
     if (ro == MAP_FAILED) die("mmap RO after F_SEAL_WRITE");
     if (memcmp(ro, "helloworld", 10) != 0) die("RO mmap data");
     munmap(ro, 4096);
 
-    /* F_SEAL_SEAL locks seals */
     if (fcntl(fd, F_ADD_SEALS, F_SEAL_SEAL) != 0) die("add F_SEAL_SEAL");
     if (fcntl(fd, F_ADD_SEALS, F_SEAL_EXEC) != -1 || errno != EPERM)
         die("sealed F_ADD_SEALS EPERM");

@@ -176,7 +176,6 @@ fn mappings() {
     let addr = syscall6(222, [0, 8192, 3, 1, fd, 0]);
     ck!(addr >= 0);
     let addr = addr as usize;
-    // SAFETY: mmap 成功建立可写的两页映射，偏移 100 在映射范围内，当前任务持有它。
     unsafe {
         core::ptr::write_volatile((addr + 100) as *mut u8, 0x7f);
     }

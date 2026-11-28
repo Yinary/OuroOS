@@ -35,6 +35,7 @@ const GIB: usize = 1 << 30;
 /// 替换启动页表。须在帧分配器初始化之后、第一个用户地址空间创建之前调用。
 pub fn init() {
     #[cfg(target_arch = "riscv64")]
+    // SAFETY: 仅在启动单核阶段调用，此时旧启动页表仍活跃，帧分配器已就绪。
     unsafe {
         init_rv();
     }
