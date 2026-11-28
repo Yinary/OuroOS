@@ -49,4 +49,4 @@ Cargo 清单移除了随上游测试程序提供的目标。内核默认启用�
 - 哈希树目录查找、位图连续分配与大块缓冲补丁：
   1. `hashtree/lookup.rs` 与 `loopfile.rs` 在有效单层哈希树目录（`EXT4_INDEX_FL`、`indirect_levels == 0` 且受支持哈希版本）下直接处理 `"."`/`".."` 与哈希冲突续链块（`hash & 1 != 0`），把权威未命中（`HashTreeError::EntryNotFound`）直接返回 `Ok(None)`，消除每次 `ENOENT` 的两次全目录线性扫描、冗余 CRC32C 校验与 `warn!` 刷屏；
   2. `bmalloc/block.rs` 与 `ext4/alloc.rs` 新增字节级快跳只读探查 `find_contiguous_in_slice`，连续块分配先只读探查再修改位图，避免碎片探测把未修改位图块标脏并仅在单块分配失败时记 `warn!`；
-  3. `file/io.rs` 与 `cache/data_block.rs` 将连续块读写暂存缓冲上限收紧至 64 KiB（16 块）并改用可失败 `try_reserve_exact`（返回 `ENOMEM`），修复原 `MAX_RUN_IO_BYTES = 1 MiB` 不可失败堆分配及 `write_dirty_runs` 块数上限单位误用问题。
+  3. `file/io.rs` 与 `cache/data_block.rs` 将连续块读写暂存缓冲上限收紧至 64 KiB（16 块）并改用可失败 `try_reserve_exact`（返回 `ENOMEM`），块对齐整段读取直接经 `read_run` 写入调用方缓冲免去临时分配、清零与二次拷贝，并修复 `write_dirty_runs` 块数上限单位误用问题。

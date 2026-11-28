@@ -66,4 +66,4 @@ LoongArch 关机使用 PolyHAL 0.4.0（MIT）中 QEMU virt GED 的寄存器地�
 - `third_party/rsext4`（Apache-2.0，rsext4 0.8.1）新增补丁（均标注 `// OuroOS patch:`，明细见 `third_party/rsext4/README.md`）：
   - `hashtree/lookup.rs` 与 `loopfile.rs` 补齐有效单层哈希树目录的 `"."`/`".."` 查找与哈希冲突续链扫描，权威 `EntryNotFound` 直接返回未命中，消除每次 `ENOENT` 的双重全目录线性扫描与告警刷屏；
   - `bmalloc/block.rs` 与 `ext4/alloc.rs` 改为字节级快跳只读探查连续空闲块，消除无效位图标脏与多块碎片误报；
-  - `file/io.rs` 与 `cache/data_block.rs` 收紧连续块读写暂存缓冲为 64 KiB 并改为可失败预留，消除不可失败 1 MiB 堆分配导致的内核 OOM panic。
+  - `file/io.rs` 与 `cache/data_block.rs` 收紧连续块读写暂存缓冲为 64 KiB 并改为可失败预留，块对齐整段读取直写调用方缓冲免除二次拷贝，消除不可失败 1 MiB 堆分配导致的内核 OOM panic。

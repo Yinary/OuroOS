@@ -1489,6 +1489,47 @@ impl OpenFile {
         }
     }
 
+    /// 预分配文件空间（fallocate(2)，当前支持默认模式与 FALLOC_FL_KEEP_SIZE 稀疏预留）。
+    pub(crate) fn fallocate(&self, mode: i32, offset: i64, len: i64) -> Result<(), Errno> {
+        const FALLOC_FL_KEEP_SIZE: i32 = 0x01;
+        if self.flags & 0x200000 != 0 || self.flags & 3 == 0 {
+            return Err(Errno::BadF);
+        }
+        if offset < 0 || len <= 0 {
+            return Err(Errno::Invalid);
+        }
+        let end = offset.checked_add(len).ok_or(Errno::FileTooBig)?;
+        if mode & !FALLOC_FL_KEEP_SIZE != 0 {
+            return Err(Errno::NotSupported);
+        }
+        match self.kind {
+            Kind::Pipe { .. } => Err(Errno::SeekPipe),
+            Kind::Inode { ino, .. } => {
+                let (file_mode, old_size, _, _) = fs::stat(ino)?;
+                if file_mode & 0xf000 != 0x8000 {
+                    return Err(Errno::NoDevice);
+                }
+                let stats = fs::filesystem_stats(ino)?;
+                let bs = u64::from(stats.block_size).max(4096);
+                let end_u64 = end as u64;
+                let extra_bytes = if end_u64 > old_size {
+                    end_u64 - old_size
+                } else {
+                    0
+                };
+                let needed_blocks = extra_bytes.div_ceil(bs);
+                if needed_blocks > stats.available_blocks {
+                    return Err(Errno::NoSpace);
+                }
+                if mode & FALLOC_FL_KEEP_SIZE == 0 && end_u64 > old_size {
+                    fs::truncate(ino, end_u64)?;
+                }
+                Ok(())
+            }
+            _ => Err(Errno::NoDevice),
+        }
+    }
+
     /// 查询共享的访问模式和文件状态标志。
     pub(crate) fn status_flags(&self) -> usize {
         self.flags

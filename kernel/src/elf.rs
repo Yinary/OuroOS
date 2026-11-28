@@ -506,7 +506,13 @@ fn load_segment_source(
             let chunk_len = end - begin;
             let file_off = p_offset + (begin - vaddr);
             if file_off < buf_off || file_off + chunk_len > buf_off + buf_len {
-                let read_len = (file_end - file_off).min(chunk_buf.len());
+                let mut read_len = (file_end - file_off).min(chunk_buf.len());
+                if file_off % PAGE_SIZE == 0
+                    && file_off + read_len < file_end
+                    && read_len >= PAGE_SIZE
+                {
+                    read_len &= !(PAGE_SIZE - 1);
+                }
                 src.read_exact_at(file_off, &mut chunk_buf[..read_len])?;
                 buf_off = file_off;
                 buf_len = read_len;

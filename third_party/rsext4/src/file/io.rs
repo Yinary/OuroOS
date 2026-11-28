@@ -387,7 +387,22 @@ pub fn read_inode_data_into<B: BlockDevice>(
                 let run_bytes = BLOCK_SIZE
                     .checked_mul(part_blocks as usize)
                     .ok_or_else(|| Ext4Error::from(Errno::EOVERFLOW))?;
-                // OuroOS patch: 连续块读缓冲走可失败预留，内存不足时返回 ENOMEM 而非内核 OOM panic。
+                let run_start_lbn = run_lbn + u64::from(run_block_offset);
+                let run_start_byte = run_start_lbn * block_bytes;
+                // OuroOS patch: 块对齐的整段读取直接写入调用方缓冲 dst，免除临时堆分配、清零与二次拷贝。
+                if offset <= run_start_byte && run_start_byte + run_bytes as u64 <= end {
+                    fs.datablock_cache.read_run(
+                        device,
+                        phys,
+                        part_blocks,
+                        &mut dst[copied..copied + run_bytes],
+                    )?;
+                    copied += run_bytes;
+                    lbn = run_start_lbn + u64::from(part_blocks);
+                    run_block_offset += part_blocks;
+                    continue;
+                }
+                // OuroOS patch: 非对齐连续块读缓冲走可失败预留，内存不足时返回 ENOMEM 而非内核 OOM panic。
                 let mut run_buf = Vec::new();
                 run_buf
                     .try_reserve_exact(run_bytes)

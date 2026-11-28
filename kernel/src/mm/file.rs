@@ -82,12 +82,22 @@ pub(super) fn install_hooks() {
 
 /// 清理目标 inode 的空登记组，避免每次解除映射都扫描全部 inode。
 pub(crate) fn compact_ino(ino: u32) {
+    compact_inos(&[ino]);
+}
+
+/// 在单次 RESIDENT 锁内批量压缩一组 inode 的弱引用登记组，避免地址空间析构时逐页重复加锁扫描。
+pub(crate) fn compact_inos(inos: &[u32]) {
+    if inos.is_empty() {
+        return;
+    }
     let mut groups = RESIDENT.lock();
-    if let Ok(index) = groups.binary_search_by_key(&ino, |group| group.ino) {
-        let group = &mut groups[index];
-        group.pages.retain(|p| p.strong_count() != 0);
-        if group.pages.is_empty() {
-            groups.remove(index);
+    for &ino in inos {
+        if let Ok(index) = groups.binary_search_by_key(&ino, |group| group.ino) {
+            let group = &mut groups[index];
+            group.pages.retain(|p| p.strong_count() != 0);
+            if group.pages.is_empty() {
+                groups.remove(index);
+            }
         }
     }
 }
@@ -211,15 +221,21 @@ impl FilePage {
                 || matches!(&p.data, Data::Shared(page) if !page.is_valid())
         })
     }
-    pub(super) fn discard(&self) {
+    /// 释放驻留页引用并回收空闲共享页，但延迟 `RESIDENT` 压缩，供地址空间析构按 inode 批量执行。
+    pub(super) fn release_deferred(&self) -> Option<u32> {
         if self.data.borrow_mut().take().is_none() {
-            return;
+            return None;
         }
         let ino = self.file.ino;
         if matches!(self.mode, Mode::Shared { .. }) {
             crate::fs::cache::release_idle(ino, self.offset);
         }
-        compact_ino(ino);
+        Some(ino)
+    }
+    pub(super) fn discard(&self) {
+        if let Some(ino) = self.release_deferred() {
+            compact_ino(ino);
+        }
     }
     pub(super) fn addr(&self) -> Option<PhysAddr> {
         self.data.borrow().as_ref().map(|p| p.data.addr())

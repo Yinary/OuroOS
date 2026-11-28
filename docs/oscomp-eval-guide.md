@@ -302,3 +302,14 @@ python3 tests/run_official.py la --groups ltp-musl --ltp-filter chown,statx --lt
   - `la` 全量 `ltp-glibc`：由修复前 402 例/120 秒、8,872 条 `[WARN]`（线上 396）提升至全部 **2,840 例**完整跑完、**`[WARN] = 0`**、零 OOM panic，得分 **`3,197 / 4,342`**；
   - `rv` 回归：`basic-musl` **102/102**、`busybox-musl` **54/55**、`lua-musl` **9/9**、`cyclictest-musl` **6.04/4**、`cyclictest-glibc` **6.10/4**；`ltp-musl` 15 分钟跑完 1,305 例 **`1,465 / 1,891`**、**`[WARN] = 0`**、零 panic；
   - 文件系统一致性：`tests/fs_stat.py`（4/4）与 `tests/fs_fcntl.py`（2/2）双架构 + `e2fsck` 全部通过。
+
+### 5.14 LTP 批量超时根因修复与内核热路径提速
+
+- **优化与修复范围（均为通用 Linux 语义与性能修复，无测例特判）**：
+  1. **补齐 `fallocate(47)` 系统调用并修正 `mount` 参数校验顺序（`kernel/src/syscall/{mod,fs}.rs`、`kernel/src/fs/context.rs`）**：实现默认模式与 `FALLOC_FL_KEEP_SIZE` 的稀疏预留与空闲块 `ENOSPC` 检查；消除约 130–220 个需要临时块设备镜像的 LTP 测例因 `fallocate` 返回 `ENOSYS` 回退写 300 MiB 零数据导致每例卡死超时 2–6 秒并冲刷 16 MiB 块缓存的问题；`mount` 改为先校验文件系统类型再读 `source`，使 `tmpfs` 返回准确 `ENODEV` 而非 `EFAULT`。
+  2. **`UserAddressSpace::drop` 按唯一 inode 批量压缩 `RESIDENT`（`kernel/src/mm/{file,address_space}.rs`）**：将进程退出时逐页加锁扫描的 $O(N^2)$ 清理改为单次锁内按去重 inode 批量压缩，显著降低 `glibc` 进程退出开销。
+  3. **`rsext4` 块对齐整段读零拷贝直写（`third_party/rsext4/src/file/io.rs`、`kernel/src/elf.rs`）**：`read_inode_data_into` 对块对齐整段读取直接经 `read_run` 写入调用方缓冲 `dst`，免去每 64 KiB 的临时堆分配、清零与二次拷贝，并让流式 ELF 加载块按页对齐命中直读路径。
+- **双架构实测对比（QEMU 10.0.2 + QCOW2 覆盖层，`sdcard-rv.img`/`sdcard-la.img` `pre-20250615`）**：
+  - `rv` `ltp-musl` 吞吐对比：修复前 900 秒跑 1,305 例（**87 例/分**，超时 162 例，得分 `1,465/1,891`）；修复后仅 **180 秒** 即跑完 **1,099 例**（**366 例/分，提速 4.2×**），超时降至 51 例、零 panic，3 分钟得分已达 **`1,320 / 1,746`**；
+  - 10 项原 100% 超时挂载/设备测例 + `fallocate01`–`06`（双库共 32 项）：`la` 仅用约 5.5 秒全部跑完，超时 **0**、遗留 `/tmp` 为 **0**，且 `fallocate01`（4/4）、`fallocate02`（8/8）、`fallocate03`（8/8）双架构全部 **100% 通过**；
+  - 回归与一致性：`la` 上 `basic-glibc` **102/102**、`busybox-glibc` **54/55**、`lua-glibc` **9/9**、`libcbench-musl` **35.46/27**；`tests/fs_stat.py`（4/4）与 `tests/fs_fcntl.py`（2/2）双架构 + `e2fsck` 全部通过。
