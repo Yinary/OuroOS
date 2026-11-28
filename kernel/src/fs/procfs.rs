@@ -1,5 +1,7 @@
 //! 只读虚拟文件：每次 open 捕获一次快照；dup/fork 共享快照和读偏移。
 //! 覆盖 /proc/{cpuinfo,meminfo,mounts}、进程信息与基本 /dev 设备节点。
+#![forbid(unsafe_code)]
+
 use crate::syscall::Errno;
 use alloc::string::String;
 use core::fmt::Write;
@@ -305,9 +307,7 @@ pub(super) fn mounts() -> Result<String, Errno> {
     Ok(out)
 }
 
-/// /proc/<pid>/stat 快照（proc(5) 编号 1..=53 全字段；busybox ps 按下标解析
-/// utime/ starttime 等字段，缺字段会导致进程行被跳过）。状态、父 pid、进程组与
-/// 会话取自 Task 快照表；CPU 记账与内存尺寸字段置 0（未导出，登记契约欠账）。
+/// 生成 `/proc/<pid>/stat` 快照（`proc(5)` 编号 1..=53 字段）；详见 `docs/ostd-contracts.md` §4.3。
 pub(super) fn pid_stat(pid: u32) -> Result<String, Errno> {
     let Some((name, state, ppid, _)) = crate::task::proc_table_lookup(pid) else {
         return Err(Errno::NoEntry);

@@ -196,6 +196,7 @@ pub struct PidFdState {
 }
 
 impl PidFdState {
+    /// 创建指定进程的 `PidFdState` 状态。
     pub fn new(pid: Pid, exited: bool) -> Self {
         Self {
             pid,
@@ -204,18 +205,22 @@ impl PidFdState {
         }
     }
 
+    /// 返回该进程句柄绑定的进程号。
     pub fn pid(&self) -> Pid {
         self.pid
     }
 
+    /// 返回绑定进程是否已退出。
     pub fn is_exited(&self) -> bool {
         self.exited.load(Ordering::Acquire)
     }
 
+    /// 返回退出事件边沿版本号，供 `epoll` 边沿触发判定。
     pub fn event_gen(&self) -> u64 {
         self.event_gen.load(Ordering::Acquire)
     }
 
+    /// 标记进程已退出并递增事件版本号。
     pub fn mark_exited(&self) {
         self.exited.store(true, Ordering::Release);
         self.event_gen.fetch_add(1, Ordering::AcqRel);
@@ -1157,6 +1162,7 @@ mod exec;
 mod posix_timer;
 
 #[cfg(debug_assertions)]
+/// 自检：转调 `exec::self_test`。
 pub(crate) fn exec_self_test() {
     exec::self_test();
 }

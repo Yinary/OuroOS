@@ -376,6 +376,7 @@ fn require_random(random: Option<[u8; 16]>) -> Result<[u8; 16], Errno> {
 }
 
 #[cfg(debug_assertions)]
+/// 自检：验证 `exec` 装载失败保留原空间与参数打包边界。
 pub(crate) fn self_test() {
     assert_eq!(require_random(None), Err(Errno::Io));
     assert!(require_random(Some([0; 16])).is_ok());

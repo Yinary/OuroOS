@@ -1176,6 +1176,7 @@ impl UserAddressSpace {
     ) -> Result<usize, MapError> {
         self.remap_mode(start, old_count, new_count, may_move, fixed, false)
     }
+    /// 校验并转换 `mremap` 标志组合。
     pub(crate) fn remap_mode(
         &mut self,
         start: usize,
@@ -1989,16 +1990,10 @@ pub fn phys_to_kernel_vaddr(pa: PhysAddr) -> usize {
     pa.raw() | VIRT_ADDR_START
 }
 
-/// 地址空间的单核使用凭证：让 !Send 的 [`UserAddressSpace`] 能进入
-/// 静态容器（进程注册表）。
-///
-/// SAFETY（unsafe impl Send 的全部依据）：内核当前单核（-smp 1，构建
-/// 与运行均不含多核机制），地址空间只在创建核被创建/激活/销毁，
-/// 不存在跨核移动。SMP 化时本类型必须先于 TLB shootdown 实现移除
-/// 或重构（见 docs/ostd-contracts.md mm 欠账）。不变量的归属在 mm，
-/// 因此 unsafe 断言写在这里而不在使用方。
+/// 地址空间的单核使用凭证：让 `!Send` 的 [`UserAddressSpace`] 进入静态进程注册表。
+/// 约束详见 `docs/ostd-contracts.md` §1.2 与 §3.8。
 pub struct LocalSpace(pub(crate) UserAddressSpace);
-// SAFETY: 见类型文档；单核内不存在跨线程移动。
+// SAFETY: 内核仅支持单核执行，地址空间只在创建核创建、激活与销毁，无跨核并发移动。
 unsafe impl Send for LocalSpace {}
 
 impl LocalSpace {

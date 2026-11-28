@@ -48,6 +48,7 @@ pub struct MemorySnapshot {
     pub free_kib: usize,
 }
 
+/// 读取已登记与空闲物理内存快照，单位 KiB。
 pub fn memory_snapshot() -> MemorySnapshot {
     let (total, free) = stats();
     MemorySnapshot {
@@ -197,6 +198,7 @@ impl OwnedFrame {
         Ok(())
     }
     /// 从内核缓冲区写入所拥有的页；越过页边界返回 InvalidRange。
+    /// 单核非抢占路径经裸指针直映写入，不构造共享页 Rust 引用；调用方须避免覆写 COW 只读共享页。
     pub fn write(&self, offset: usize, data: &[u8]) -> Result<(), FrameError> {
         if offset > PAGE_SIZE || data.len() > PAGE_SIZE - offset {
             return Err(FrameError::InvalidRange);
@@ -213,15 +215,17 @@ impl OwnedFrame {
         Ok(())
     }
     /// 将页内指定范围经内核直映可变切片交给回调填充，避免经临时栈缓冲二次拷贝。
+    /// 要求 `&mut self` 以禁止经共享 `FrameRef` 产生可变引用别名。
     pub(crate) fn fill_range_with<E>(
-        &self,
+        &mut self,
         offset: usize,
         len: usize,
         f: impl FnOnce(&mut [u8]) -> Result<usize, E>,
     ) -> Result<usize, E> {
         let end = offset.saturating_add(len).min(PAGE_SIZE);
         let slice_len = end.saturating_sub(offset);
-        // SAFETY: self 独占持有该物理页帧，offset..end 位于单页内，单核内核态无并发别名。
+        // SAFETY: `&mut self` 保证独占持有该物理页帧且无 `FrameRef` 共享别名，
+        // `offset..end` 位于单页内，单核内核态无并发访问。
         let dst = unsafe {
             core::slice::from_raw_parts_mut(
                 (direct_map_addr(self.pa) + offset) as *mut u8,
@@ -231,6 +235,7 @@ impl OwnedFrame {
         f(dst)
     }
     /// 清零页内半开区间；边界裁剪到本页，空区间无副作用。
+    /// 单核非抢占路径经裸指针写入，不构造 Rust 引用；调用方须避免覆写 COW 只读共享页。
     pub(crate) fn clear_range(&self, start: usize, end: usize) {
         let end = end.min(PAGE_SIZE);
         if start < end {

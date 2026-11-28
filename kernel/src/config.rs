@@ -1,5 +1,7 @@
 //! 内核全局配置常量
 
+#![forbid(unsafe_code)]
+
 /// 内核名（对外标识，改名请同时改 Cargo.toml 与本处）
 pub const KERNEL_NAME: &str = "OuroOS";
 

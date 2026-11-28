@@ -44,7 +44,6 @@ static void on_signal(int sig) {
     interrupted = (sig == SIGUSR1);
 }
 
-/* REQUEUE 的返回值确认子进程已经入队，消除对父子运行顺序的假设。 */
 static void shared_queue(int *child_words, int *parent_words, enum completion how) {
     pid_t pid = fork();
     CHECK(pid >= 0);

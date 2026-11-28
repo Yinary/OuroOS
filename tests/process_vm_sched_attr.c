@@ -56,7 +56,6 @@ static void check_process_vm(void) {
     if (n != 5 || memcmp(src, "PATCH", 5) != 0)
         die("process_vm_writev self");
 
-    /* Cross-process read from child */
     int p[2];
     if (pipe(p) != 0)
         die("pipe");
@@ -100,7 +99,7 @@ static void check_sched_attr(void) {
     if (attr.size < 48 || attr.sched_policy != 0)
         die("sched_getattr initial");
 
-    attr.sched_policy = 1; /* SCHED_FIFO */
+    attr.sched_policy = 1;
     attr.sched_priority = 10;
     if (syscall(SYS_sched_setattr, 0, &attr, 0) != 0)
         die("sched_setattr FIFO");
@@ -141,14 +140,12 @@ static void check_tgsigqueue_ioprio_personality(void) {
     if (got_sig != SIGUSR1 || got_code != SI_QUEUE)
         die("rt_tgsigqueueinfo delivery");
 
-    /* ioprio_set / ioprio_get */
     int be3 = (2 << 13) | 3;
     if (syscall(SYS_ioprio_set, 1, 0, be3) != 0)
         die("ioprio_set");
     if (syscall(SYS_ioprio_get, 1, 0) != be3)
         die("ioprio_get");
 
-    /* personality */
     long orig = personality(0xffffffffUL);
     if (orig < 0)
         die("personality query");

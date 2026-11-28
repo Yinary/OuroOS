@@ -191,7 +191,6 @@ extern "C" fn ouro_main() -> ! {
     );
     let iov_area = syscall6(222, [0, 16384, 3, 0x22, usize::MAX, 0]);
     ck!(iov_area > 0);
-    // SAFETY: mmap 成功提供对齐的 16384 字节可写区，恰好容纳 1024 项 IoVec。
     let vectors = unsafe { core::slice::from_raw_parts_mut(iov_area as *mut IoVec, 1024) };
     vectors.fill(input(b"z"));
     seek(fd, 0);
@@ -223,7 +222,6 @@ extern "C" fn ouro_main() -> ! {
     let area = syscall6(222, [0, 73728, 3, 0x22, usize::MAX, 0]);
     ck!(area > 0);
     let area = area as usize;
-    // SAFETY: mmap 已成功提供 73728 字节可写用户内存；切片长度在映射范围内。
     let data = unsafe { core::slice::from_raw_parts_mut(area as *mut u8, 65536) };
     for (i, byte) in data.iter_mut().enumerate() {
         *byte = (i % 251) as u8;
@@ -251,20 +249,15 @@ extern "C" fn ouro_main() -> ! {
         .iter()
         .enumerate()
         .all(|(i, b)| *b == (i % 251) as u8));
-    // 描述符数组跨入未映射页时，应在开始 I/O 前失败。
     ck!(syscall3(215, area + 69632, 4096, 0) == 0);
-    // SAFETY: 地址位于仍有效映射内且按 IoVec 对齐；仅写一项。
     unsafe {
         core::ptr::write((area + 69616) as *mut IoVec, input(b"x"));
     }
     seek(fd, 7);
     ck!(syscall6(66, [fd, area + 69616, 2, 0, 0, 0]) == -14 && offset(fd) == 7);
-    // 数据跨入未映射页时，只报告实际搬运的前缀。
     ck!(syscall6(68, [fd, area + 69630, 4, 0, 0, 0]) == 2 && offset(fd) == 7);
     ck!(syscall6(67, [fd, area + 69630, 4, 0, 0, 0]) == 2 && offset(fd) == 7);
-    // 首个输出缓冲区覆盖描述符数组，后续描述符应仍使用内核快照。
     let descriptor = area + 65536;
-    // SAFETY: 两项描述符及输出目标都在仍有效的 mmap 中，地址对齐。
     unsafe {
         core::ptr::write(
             descriptor as *mut IoVec,

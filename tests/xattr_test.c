@@ -24,7 +24,6 @@ int main(void) {
     if (fd < 0)
         die("open");
 
-    /* setxattr + XATTR_CREATE / XATTR_REPLACE */
     if (setxattr(path, "user.alpha", "hello", 5, XATTR_CREATE) != 0)
         die("setxattr create");
     errno = 0;
@@ -35,7 +34,6 @@ int main(void) {
     if (fsetxattr(fd, "trusted.k", "v", 1, 0) != 0)
         die("fsetxattr trusted");
 
-    /* getxattr / fgetxattr size query + ERANGE + value read */
     ssize_t sz = getxattr(path, "user.alpha", NULL, 0);
     if (sz != 6)
         die("getxattr size query");
@@ -47,7 +45,6 @@ int main(void) {
     if (fgetxattr(fd, "user.alpha", buf, sizeof(buf)) != 6 || strcmp(buf, "world!") != 0)
         die("fgetxattr value");
 
-    /* listxattr / flistxattr */
     ssize_t lsz = listxattr(path, NULL, 0);
     if (lsz != (ssize_t)(strlen("trusted.k") + 1 + strlen("user.alpha") + 1))
         die("listxattr size");
@@ -55,7 +52,6 @@ int main(void) {
     if (flistxattr(fd, lbuf, sizeof(lbuf)) != lsz)
         die("flistxattr read");
 
-    /* lsetxattr / lgetxattr on symlink: user.* forbidden (EPERM / ENODATA), trusted.* allowed */
     if (symlink(path, linkp) != 0)
         die("symlink");
     errno = 0;
@@ -72,14 +68,12 @@ int main(void) {
     if (lremovexattr(linkp, "trusted.sym") != 0)
         die("lremovexattr");
 
-    /* removexattr / fremovexattr */
     if (fremovexattr(fd, "user.alpha") != 0)
         die("fremovexattr");
     errno = 0;
     if (removexattr(path, "user.alpha") != -1 || errno != ENODATA)
         die("removexattr ENODATA");
 
-    /* Invalid prefix -> EOPNOTSUPP, empty name -> ERANGE */
     errno = 0;
     if (setxattr(path, "bogus.x", "1", 1, 0) != -1 || errno != EOPNOTSUPP)
         die("setxattr bad prefix");

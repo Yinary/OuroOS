@@ -55,6 +55,7 @@ pub(crate) struct EventFd {
 }
 
 impl EventFd {
+    /// 创建 `eventfd` 实例，指定初始计数与信号量模式。
     pub fn new(id: u64, initval: u32, semaphore: bool) -> Self {
         Self {
             id,
@@ -64,10 +65,12 @@ impl EventFd {
         }
     }
 
+    /// 返回 `eventfd` 状态变化版本号。
     pub fn event_gen(&self) -> u64 {
         self.event_gen
     }
 
+    /// 查询 `eventfd` 当前满足的 `poll` 就绪掩码。
     pub fn poll_events(&self, requested: u16) -> u16 {
         let mut ev = 0u16;
         if self.count > 0 {
@@ -142,6 +145,7 @@ pub(crate) struct TimerFd {
 }
 
 impl TimerFd {
+    /// 按指定时钟源创建 `timerfd` 实例。
     pub fn new(id: u64, clockid: i32) -> Result<Self, Errno> {
         if !matches!(clockid, CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME) {
             return Err(Errno::Invalid);
@@ -156,6 +160,7 @@ impl TimerFd {
         })
     }
 
+    /// 推进到期计数并返回 `timerfd` 状态版本号。
     pub fn event_gen(&mut self) -> u64 {
         let now = crate::time::monotonic();
         self.refresh(now);
@@ -252,6 +257,7 @@ impl TimerFd {
         Ok(old)
     }
 
+    /// 推进到期计数并查询 `timerfd` 的 `poll` 就绪掩码。
     pub fn poll_events(&mut self, requested: u16) -> u16 {
         let now = crate::time::monotonic();
         self.refresh(now);
@@ -262,6 +268,7 @@ impl TimerFd {
         }
     }
 
+    /// 读取并清零 `timerfd` 累计到期次数。
     pub fn read(
         &mut self,
         nonblock: bool,
@@ -306,6 +313,7 @@ pub(crate) struct EpollInstance {
 }
 
 impl EpollInstance {
+    /// 创建空的 `epoll` 监控实例。
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
@@ -413,6 +421,7 @@ impl EpollInstance {
         Ok(())
     }
 
+    /// 对应 `EPOLL_CTL_ADD`，向 `epoll` 实例注册监控项。
     pub fn add(
         &mut self,
         parent: &Arc<Mutex<EpollInstance>>,
@@ -447,6 +456,7 @@ impl EpollInstance {
         Ok(())
     }
 
+    /// 对应 `EPOLL_CTL_MOD`，更新已注册监控项的事件掩码。
     pub fn modify(
         &mut self,
         fd: usize,
@@ -472,6 +482,7 @@ impl EpollInstance {
         Ok(())
     }
 
+    /// 对应 `EPOLL_CTL_DEL`，从 `epoll` 实例移除监控项。
     pub fn delete(
         &mut self,
         parent_ptr: usize,

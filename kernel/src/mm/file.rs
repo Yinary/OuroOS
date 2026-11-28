@@ -1,4 +1,6 @@
 //! 文件映射持有 inode 和文件偏移。驻留页按需读入，截断使同一 inode 的所有旧页失效。
+#![forbid(unsafe_code)]
+
 use super::{address_space::MapError, frame::OwnedFrame};
 use crate::{fs, syscall::Errno};
 use alloc::{
@@ -108,6 +110,7 @@ pub(crate) struct MappingFile {
     writable_shared: bool,
 }
 impl MappingFile {
+    /// 为文件映射建立 inode 引用句柄，并记录共享可写状态。
     pub(crate) fn new_for_map(ino: u32, writable_shared: bool) -> Result<Arc<Self>, Errno> {
         fs::retain(ino)?;
         if writable_shared && fs::memfd::is_memfd_ino(ino) {
@@ -209,6 +212,7 @@ pub(crate) struct FilePage {
     data: RefCell<Option<Arc<Resident>>>,
 }
 impl FilePage {
+    /// 构造指向指定文件偏移与映射模式的页描述。
     pub(crate) fn new(file: Arc<MappingFile>, offset: usize, mode: Mode) -> Self {
         Self {
             file,
@@ -242,9 +246,7 @@ impl FilePage {
     }
     /// 释放驻留页引用并回收空闲共享页，返回待压缩的 inode 号。
     pub(super) fn release_deferred(&self) -> Option<u32> {
-        if self.data.borrow_mut().take().is_none() {
-            return None;
-        }
+        self.data.borrow_mut().take()?;
         let ino = self.file.ino;
         if matches!(self.mode, Mode::Shared { .. }) {
             crate::fs::cache::release_idle(ino, self.offset);
@@ -270,7 +272,7 @@ impl FilePage {
         }
         let data = match self.mode {
             Mode::Private => {
-                let frame = OwnedFrame::new()?;
+                let mut frame = OwnedFrame::new()?;
                 let count = (length - self.offset as u64).min(PAGE_SIZE as u64) as usize;
                 let mut i = 0;
                 while i < count {

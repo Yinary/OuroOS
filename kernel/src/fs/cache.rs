@@ -103,6 +103,7 @@ impl SharedPage {
         Ok(())
     }
 
+    /// 返回缓存页是否仍有效（未被截断作废）。
     pub fn is_valid(&self) -> bool {
         self.valid.load(Ordering::Acquire)
     }

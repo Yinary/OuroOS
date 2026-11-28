@@ -844,7 +844,7 @@ fn fallocate_call(ctx: &Context, a: [usize; 6]) -> Result<usize, Errno> {
     let keep = mode & FALLOC_FL_KEEP_SIZE != 0;
     if mode & FALLOC_FL_PUNCH_HOLE == 0 && end > cur {
         let stats = fs::filesystem_stats(ino)?;
-        let bs = u64::from(stats.block_size).max(4096);
+        let bs = stats.block_size.max(4096);
         let needed_blocks = (end - cur).div_ceil(bs);
         if needed_blocks > stats.available_blocks {
             return Err(Errno::NoSpace);
@@ -1475,23 +1475,27 @@ fn fcntl(
             };
 
             let origin = base.checked_add(l_start).ok_or(Errno::Invalid)?;
-            let (start, end) = if l_len == 0 {
-                if origin < 0 {
-                    return Err(Errno::Invalid);
+            let (start, end) = match l_len.cmp(&0) {
+                core::cmp::Ordering::Equal => {
+                    if origin < 0 {
+                        return Err(Errno::Invalid);
+                    }
+                    (origin as u64, u64::MAX)
                 }
-                (origin as u64, u64::MAX)
-            } else if l_len > 0 {
-                if origin < 0 {
-                    return Err(Errno::Invalid);
+                core::cmp::Ordering::Greater => {
+                    if origin < 0 {
+                        return Err(Errno::Invalid);
+                    }
+                    let hi = origin.checked_add(l_len - 1).ok_or(Errno::Invalid)?;
+                    (origin as u64, hi as u64)
                 }
-                let hi = origin.checked_add(l_len - 1).ok_or(Errno::Invalid)?;
-                (origin as u64, hi as u64)
-            } else {
-                let lo = origin.checked_add(l_len).ok_or(Errno::Invalid)?;
-                if lo < 0 || origin <= 0 {
-                    return Err(Errno::Invalid);
+                core::cmp::Ordering::Less => {
+                    let lo = origin.checked_add(l_len).ok_or(Errno::Invalid)?;
+                    if lo < 0 || origin <= 0 {
+                        return Err(Errno::Invalid);
+                    }
+                    (lo as u64, (origin - 1) as u64)
                 }
-                (lo as u64, (origin - 1) as u64)
             };
 
             let owner = if ofd_cmd {
@@ -1689,12 +1693,10 @@ fn rw(nr: usize, a: [usize; 6], space: &UserAddressSpace, ctx: &Context) -> Resu
         }
         sysnr::PREADV2 | sysnr::PWRITEV2 => {
             let pos = a[3] as i64;
-            if pos == -1 {
-                None
-            } else if pos < -1 {
-                return Err(Errno::Invalid);
-            } else {
-                Some(pos as usize)
+            match pos.cmp(&-1) {
+                core::cmp::Ordering::Equal => None,
+                core::cmp::Ordering::Less => return Err(Errno::Invalid),
+                core::cmp::Ordering::Greater => Some(pos as usize),
             }
         }
         _ => None,
@@ -2868,6 +2870,7 @@ fn check_xattr_perm(
     }
 }
 
+/// 对应 Linux `setxattr(2)`/`lsetxattr(2)`/`fsetxattr(2)`，设置节点扩展属性。
 fn setxattr_call(
     nr: usize,
     ctx: &Context,
@@ -2918,6 +2921,7 @@ fn setxattr_call(
     Ok(0)
 }
 
+/// 对应 Linux `getxattr(2)`/`lgetxattr(2)`/`fgetxattr(2)`，读取节点扩展属性。
 fn getxattr_call(
     nr: usize,
     ctx: &Context,
@@ -2948,6 +2952,7 @@ fn getxattr_call(
     })
 }
 
+/// 对应 Linux `listxattr(2)`/`llistxattr(2)`/`flistxattr(2)`，列举节点扩展属性名。
 fn listxattr_call(
     nr: usize,
     ctx: &Context,
@@ -2976,6 +2981,7 @@ fn listxattr_call(
     })
 }
 
+/// 对应 Linux `removexattr(2)`/`lremovexattr(2)`/`fremovexattr(2)`，移除节点扩展属性。
 fn removexattr_call(
     nr: usize,
     ctx: &Context,

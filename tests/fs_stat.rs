@@ -394,7 +394,6 @@ extern "C" fn ouro_main() -> ! {
         && u32at(&x, 132) == 3);
     close(dir);
     close(fd);
-    // 小 inode 镜像不提供 FAT 分区，其他镜像验证挂载后的查询。
     if !small {
         let root_capacity = capacity(b"/\0");
         ck!(syscall6(

@@ -27,7 +27,6 @@ int main(void) {
     if (mkdir(dir, 0755) != 0)
         die("mkdir dir");
 
-    /* 1. Invalid flags */
     if (inotify_init1(0x1234) != -1 || errno != EINVAL)
         die("invalid init1 flags");
 
@@ -35,14 +34,12 @@ int main(void) {
     if (ifd < 0)
         die("inotify_init1");
 
-    /* 2. Empty nonblock read => EAGAIN, write => EBADF */
     char buf[4096];
     if (read(ifd, buf, sizeof(buf)) != -1 || errno != EAGAIN)
         die("empty nonblock read");
     if (write(ifd, "x", 1) != -1 || errno != EBADF)
         die("write to inotify fd");
 
-    /* 3. Invalid mask / bad fd / bad wd */
     if (inotify_add_watch(ifd, dir, 0) != -1 || errno != EINVAL)
         die("zero mask");
     if (inotify_add_watch(ifd, dir, IN_OPEN | IN_MASK_ADD | IN_MASK_CREATE) != -1 ||
@@ -51,14 +48,12 @@ int main(void) {
     if (inotify_rm_watch(ifd, 999) != -1 || errno != EINVAL)
         die("rm invalid wd");
 
-    /* 4. Watch directory + IN_MASK_CREATE */
     int wd_dir = inotify_add_watch(ifd, dir, IN_ALL_EVENTS | IN_MASK_CREATE);
     if (wd_dir <= 0)
         die("add_watch dir");
     if (inotify_add_watch(ifd, dir, IN_OPEN | IN_MASK_CREATE) != -1 || errno != EEXIST)
         die("IN_MASK_CREATE duplicate");
 
-    /* 5. Create, write, read, close, rename, unlink inside watched dir */
     int fd = open(f1, O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0)
         die("open create f1");
@@ -76,7 +71,6 @@ int main(void) {
     if (unlink(f2) != 0)
         die("unlink f2");
 
-    /* 6. FIONREAD & poll */
     int avail = 0;
     if (ioctl(ifd, FIONREAD, &avail) != 0 || avail <= 0)
         die("ioctl FIONREAD");
@@ -84,11 +78,9 @@ int main(void) {
     if (poll(&pfd, 1, 0) != 1 || !(pfd.revents & POLLIN))
         die("poll POLLIN");
 
-    /* 7. Small buffer => EINVAL */
     if (read(ifd, buf, 8) != -1 || errno != EINVAL)
         die("small buf EINVAL");
 
-    /* 8. Drain and verify expected masks & rename cookie */
     ssize_t n = read(ifd, buf, sizeof(buf));
     if (n <= 0)
         die("read events");
@@ -110,7 +102,6 @@ int main(void) {
     if (cookie_from == 0 || cookie_from != cookie_to)
         die("rename cookie mismatch");
 
-    /* 9. IN_ONESHOT + IN_IGNORED + IN_ONLYDIR */
     fd = open(f1, O_CREAT | O_RDWR, 0644);
     if (fd < 0)
         die("recreate f1");
@@ -120,7 +111,6 @@ int main(void) {
     int wd_f = inotify_add_watch(ifd, f1, IN_OPEN | IN_ONESHOT);
     if (wd_f <= 0)
         die("add_watch oneshot");
-    /* Drain earlier dir events first */
     while (read(ifd, buf, sizeof(buf)) > 0) {
     }
     fd = open(f1, O_RDONLY);
@@ -140,7 +130,6 @@ int main(void) {
     if (!got_open || !got_ignored)
         die("oneshot did not fire OPEN + IGNORED");
 
-    /* 10. rm_watch + procfs limits */
     if (inotify_rm_watch(ifd, wd_dir) != 0)
         die("rm_watch dir");
     n = read(ifd, buf, sizeof(buf));

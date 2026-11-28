@@ -80,6 +80,7 @@ pub(crate) struct IpcPerm {
 }
 
 impl IpcPerm {
+    /// 按创建者凭证与权限位构造 System V IPC 权限头。
     pub fn new(key: i32, mode: i32, seq: u16, creds: &Credentials) -> Self {
         Self {
             key,
@@ -162,6 +163,7 @@ pub(crate) const fn sem_wake_key(id: usize) -> u64 {
 }
 
 #[inline]
+/// 返回当前墙上时钟秒数，供 IPC 时间戳字段记录。
 pub(crate) fn now_secs() -> i64 {
     crate::time::realtime().as_secs() as i64
 }

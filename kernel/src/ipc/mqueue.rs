@@ -38,6 +38,7 @@ static SYSCTL_MSGSIZE_MAX: AtomicUsize = AtomicUsize::new(DFLT_MSGSIZEMAX);
 
 /// /proc/sys/fs/mqueue/* 参数项枚举。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum MqSysctl {
     QueuesMax,
     MsgMax,
@@ -290,6 +291,7 @@ fn realtime_to_mono_deadline(abs_rt: Option<Duration>) -> Result<Option<Duration
 }
 
 /// mq_open(2)：打开或创建 POSIX 消息队列，返回带 FD_CLOEXEC 的描述符。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn open(
     space: &UserAddressSpace,
     fs: &mut crate::fs::context::Context,

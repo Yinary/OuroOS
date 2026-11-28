@@ -27,7 +27,6 @@ static void check_signalfd(void) {
     if (sigprocmask(SIG_BLOCK, &mask, NULL) != 0)
         die("sigprocmask");
 
-    /* Invalid flags / sizemask checks */
     errno = 0;
     if (syscall(SYS_signalfd4, -1, &mask, 4, 0) != -1 || errno != EINVAL)
         die("signalfd4 bad sizemask");
@@ -46,18 +45,15 @@ static void check_signalfd(void) {
     if ((st & O_NONBLOCK) == 0)
         die("signalfd nonblock");
 
-    /* Nonblocking read with no pending signals -> EAGAIN */
     struct signalfd_siginfo info;
     errno = 0;
     if (read(sfd, &info, sizeof(info)) != -1 || errno != EAGAIN)
         die("signalfd empty EAGAIN");
 
-    /* Too-small buffer -> EINVAL */
     errno = 0;
     if (read(sfd, &info, 64) != -1 || errno != EINVAL)
         die("signalfd short read EINVAL");
 
-    /* Send SIGUSR1 and check poll + epoll + read */
     if (kill(getpid(), SIGUSR1) != 0)
         die("kill SIGUSR1");
 
@@ -81,7 +77,6 @@ static void check_signalfd(void) {
     if (n != (ssize_t)sizeof(info) || info.ssi_signo != SIGUSR1 || info.ssi_pid != (uint32_t)getpid())
         die("signalfd read SIGUSR1");
 
-    /* Update existing signalfd mask to only SIGUSR2, clear NONBLOCK, test blocking wake from child */
     sigset_t mask2;
     sigemptyset(&mask2);
     sigaddset(&mask2, SIGUSR2);
@@ -136,17 +131,14 @@ static void check_vmsplice(void) {
     if (rn != wn || memcmp(buf1, "hello ", 6) != 0 || strcmp(buf2, "vmsplice!") != 0)
         die("vmsplice read");
 
-    /* Empty pipe + SPLICE_F_NONBLOCK -> EAGAIN */
     errno = 0;
     if (vmsplice(p[0], riov, 1, SPLICE_F_NONBLOCK) != -1 || errno != EAGAIN)
         die("vmsplice nonblock EAGAIN");
 
-    /* Non-pipe FD -> EBADF */
     errno = 0;
     if (vmsplice(STDOUT_FILENO, wiov, 1, 0) != -1 || errno != EBADF)
         die("vmsplice non-pipe EBADF");
 
-    /* Closed read end -> EPIPE + SIGPIPE */
     signal(SIGPIPE, SIG_IGN);
     close(p[0]);
     errno = 0;

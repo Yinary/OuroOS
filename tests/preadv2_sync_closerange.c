@@ -57,7 +57,6 @@ int main(void) {
     int pfd[2];
     if (pipe(pfd) != 0) die("pipe");
 
-    /* 1. preadv2 / pwritev2 on pipe with offset=-1, positioned ESPIPE, invalid flags EOPNOTSUPP */
     const char *msg = "hello";
     struct iovec wv = { .iov_base = (void *)msg, .iov_len = 5 };
     if (sys_pwritev2(pfd[1], &wv, 1, 0, 0) != -1 || errno != ESPIPE)
@@ -82,7 +81,6 @@ int main(void) {
     if (sys_preadv2(pfd[0], &rv, 1, -1, 0) != 5 || memcmp(rbuf, "hello", 5) != 0)
         die("preadv2 pipe offset=-1");
 
-    /* 2. fdatasync / syncfs / sync_file_range error paths on pipe & bad fd */
     if (syscall(SYS_fdatasync, -1) != -1 || errno != EBADF)
         die("fdatasync bad fd EBADF");
     if (syscall(SYS_fdatasync, pfd[0]) != -1 || errno != EINVAL)
@@ -102,7 +100,6 @@ int main(void) {
     if (syscall(SYS_sync_file_range, 999, 0, 0, 0) != -1 || errno != EBADF)
         die("sync_file_range bad fd EBADF");
 
-    /* 3. close_range: validation, CLOEXEC, range close */
     int d1 = dup(pfd[0]);
     int d2 = dup(pfd[0]);
     int d3 = dup(pfd[0]);
@@ -126,7 +123,6 @@ int main(void) {
     if (fcntl(d3, F_GETFD) != -1 || errno != EBADF) die("d3 not closed");
     if (fcntl(pfd[0], F_GETFD) < 0) die("pfd[0] unexpectedly closed");
 
-    /* Empty/out-of-range close_range succeeds as no-op */
     if (syscall(SYS_close_range, 500, 1000, 0) != 0)
         die("close_range high empty range");
 

@@ -721,6 +721,7 @@ enum ProcessResult {
     /// rt_sigreturn：SEPC 已从信号帧恢复为真实返回点，不再推进。
     Restored,
 }
+#[allow(clippy::too_many_arguments)]
 fn process_call(
     parent: Pid,
     frame: &mut TrapFrame,
@@ -1036,7 +1037,7 @@ fn process_call(
         sysnr::GETITIMER => {
             // getitimer(2)：查询 ITIMER_REAL 当前剩余时间与周期。
             let which = args[0] as u32 as i32;
-            if which < 0 || which > 2 {
+            if !(0..=2).contains(&which) {
                 Err(Errno::Invalid)
             } else if which != 0 {
                 Err(Errno::NotSupported)
@@ -1066,7 +1067,7 @@ fn process_call(
         sysnr::SETITIMER => {
             // setitimer(2)：设置或关闭 ITIMER_REAL，到期产生 SIGALRM。
             let which = args[0] as u32 as i32;
-            let res = if which < 0 || which > 2 {
+            let res = if !(0..=2).contains(&which) {
                 Err(Errno::Invalid)
             } else if which != 0 {
                 Err(Errno::NotSupported)
@@ -2793,12 +2794,10 @@ fn kcmp_call(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
         return Err(Errno::Perm);
     }
     let cmp_order = |a: usize, b: usize| -> usize {
-        if a == b {
-            0
-        } else if a < b {
-            1
-        } else {
-            2
+        match a.cmp(&b) {
+            core::cmp::Ordering::Equal => 0,
+            core::cmp::Ordering::Less => 1,
+            core::cmp::Ordering::Greater => 2,
         }
     };
     if kind == KCMP_FILE {
@@ -4805,7 +4804,7 @@ fn sched_getattr(parent: Pid, args: [usize; 6]) -> Result<usize, Errno> {
     let attr_ptr = args[1];
     let size = args[2] as u32;
     let flags = args[3] as u32;
-    if attr_ptr == 0 || pid < 0 || size < SCHED_ATTR_SIZE_VER0 || size > 4096 || flags != 0 {
+    if attr_ptr == 0 || pid < 0 || !(SCHED_ATTR_SIZE_VER0..=4096).contains(&size) || flags != 0 {
         return Err(Errno::Invalid);
     }
     let target = if pid == 0 { parent } else { pid as usize };

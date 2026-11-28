@@ -45,21 +45,17 @@ static void test_eventfd(void) {
     CHECK((fcntl(efd, F_GETFD) & FD_CLOEXEC) != 0);
     CHECK((fcntl(efd, F_GETFL) & O_NONBLOCK) != 0);
 
-    /* Short read/write -> EINVAL */
     uint32_t small = 0;
     CHECK(read(efd, &small, sizeof(small)) == -1 && errno == EINVAL);
     CHECK(write(efd, &small, sizeof(small)) == -1 && errno == EINVAL);
 
-    /* Read consumes full counter */
     uint64_t v = 0;
     CHECK(read(efd, &v, sizeof(v)) == 8 && v == 3);
     CHECK(read(efd, &v, sizeof(v)) == -1 && errno == EAGAIN);
 
-    /* Write UINT64_MAX -> EINVAL */
     v = UINT64_MAX;
     CHECK(write(efd, &v, sizeof(v)) == -1 && errno == EINVAL);
 
-    /* Write & read */
     v = 10;
     CHECK(write(efd, &v, sizeof(v)) == 8);
     v = 5;
@@ -67,7 +63,6 @@ static void test_eventfd(void) {
     CHECK(read(efd, &v, sizeof(v)) == 8 && v == 15);
     close(efd);
 
-    /* EFD_SEMAPHORE decrements by 1 */
     int sfd = eventfd(2, EFD_SEMAPHORE | EFD_NONBLOCK);
     CHECK(sfd >= 0);
     CHECK(read(sfd, &v, sizeof(v)) == 8 && v == 1);
@@ -75,7 +70,6 @@ static void test_eventfd(void) {
     CHECK(read(sfd, &v, sizeof(v)) == -1 && errno == EAGAIN);
     close(sfd);
 
-    /* Blocking eventfd woken by child */
     int bfd = eventfd(0, 0);
     CHECK(bfd >= 0);
     pid_t pid = fork();
@@ -99,7 +93,6 @@ static void test_timerfd(void) {
     int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
     CHECK(tfd >= 0);
 
-    /* One-shot 40ms timer + periodic 25ms */
     struct itimerspec its;
     memset(&its, 0, sizeof(its));
     its.it_value.tv_nsec = 40 * 1000 * 1000;
@@ -111,24 +104,20 @@ static void test_timerfd(void) {
     CHECK(timerfd_gettime(tfd, &cur) == 0);
     CHECK(cur.it_interval.tv_nsec == 25 * 1000 * 1000);
 
-    /* Blocking read wakes on hardware timer */
     uint64_t exp = 0;
     CHECK(read(tfd, &exp, 8) == 8 && exp >= 1);
     uint64_t dt = mono_ms() - t0;
     CHECK(dt >= 30);
 
-    /* Wait for periodic tick via poll() */
     struct pollfd pfd = { .fd = tfd, .events = POLLIN, .revents = 0 };
     CHECK(poll(&pfd, 1, 200) == 1 && (pfd.revents & POLLIN));
     CHECK(read(tfd, &exp, 8) == 8 && exp >= 1);
 
-    /* Disarm returns previous timer */
     struct itimerspec zero, old;
     memset(&zero, 0, sizeof(zero));
     CHECK(timerfd_settime(tfd, 0, &zero, &old) == 0);
     CHECK(old.it_interval.tv_nsec == 25 * 1000 * 1000);
 
-    /* Write on timerfd -> EINVAL */
     CHECK(write(tfd, &exp, 8) == -1 && errno == EINVAL);
     close(tfd);
 }
@@ -141,26 +130,21 @@ static void test_epoll(void) {
     int p[2];
     CHECK(pipe(p) == 0);
 
-    /* Self-add -> EINVAL */
     struct epoll_event ev;
     memset(&ev, 0, sizeof(ev));
     ev.events = EPOLLIN;
     ev.data.u64 = 0x1122334455667788ULL;
     CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, ep, &ev) == -1 && errno == EINVAL);
 
-    /* Add pipe read end */
     CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, p[0], &ev) == 0);
     CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, p[0], &ev) == -1 && errno == EEXIST);
 
-    /* Timeout 0 when empty -> 0 */
     struct epoll_event out[4];
     CHECK(epoll_pwait(ep, out, 4, 0, NULL) == 0);
 
-    /* Invalid maxevents / bad ptr */
     CHECK(epoll_pwait(ep, out, 0, 0, NULL) == -1 && errno == EINVAL);
     CHECK(epoll_pwait(ep, NULL, 1, 0, NULL) == -1 && errno == EFAULT);
 
-    /* Blocking epoll_pwait woken by child writing to pipe */
     pid_t pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
@@ -173,7 +157,6 @@ static void test_epoll(void) {
     int st = 0;
     CHECK(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
 
-    /* EPOLLET edge-triggered: second wait without new write returns 0 */
     ev.events = EPOLLIN | EPOLLET;
     ev.data.u64 = 42;
     CHECK(epoll_ctl(ep, EPOLL_CTL_MOD, p[0], &ev) == 0);
@@ -185,7 +168,6 @@ static void test_epoll(void) {
     CHECK(epoll_pwait(ep, out, 4, 0, NULL) == 1);
     CHECK(read(p[0], buf, 2) == 2);
 
-    /* EPOLLONESHOT fires once then stays disabled until MOD */
     ev.events = EPOLLIN | EPOLLONESHOT;
     ev.data.u64 = 99;
     CHECK(epoll_ctl(ep, EPOLL_CTL_MOD, p[0], &ev) == 0);
@@ -196,7 +178,6 @@ static void test_epoll(void) {
     CHECK(epoll_pwait(ep, out, 4, 0, NULL) == 1 && out[0].data.u64 == 99);
     CHECK(read(p[0], buf, 1) == 1);
 
-    /* epoll watching timerfd + epoll_pwait2 */
     int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     CHECK(tfd >= 0);
     ev.events = EPOLLIN;
@@ -212,7 +193,6 @@ static void test_epoll(void) {
     uint64_t exp = 0;
     CHECK(read(tfd, &exp, 8) == 8 && exp >= 1);
 
-    /* Nested epoll + cycle detection ELOOP */
     int ep2 = epoll_create1(0);
     CHECK(ep2 >= 0);
     ev.events = EPOLLIN;
@@ -220,7 +200,6 @@ static void test_epoll(void) {
     CHECK(epoll_ctl(ep2, EPOLL_CTL_ADD, ep, &ev) == 0);
     CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, ep2, &ev) == -1 && errno == ELOOP);
 
-    /* DEL */
     CHECK(epoll_ctl(ep, EPOLL_CTL_DEL, p[0], NULL) == 0);
     CHECK(epoll_ctl(ep, EPOLL_CTL_DEL, p[0], NULL) == -1 && errno == ENOENT);
 

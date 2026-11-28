@@ -18,12 +18,10 @@ GROUP_END = re.compile(r"#### OS COMP TEST GROUP END ([a-zA-Z0-9-]+) ####")
 QEMU_VERSION = re.compile(r"version 10\.0\.2\b")
 TARGET_GROUPS = ("basic-musl", "basic-glibc", "busybox-musl", "busybox-glibc")
 IMAGES_DIR_DEFAULT = pathlib.Path("sdcard") / "pre-20250615"
-# judge 目录搜索链（--judge-dir 显式指定优先；末项为本机历史位置，向后兼容）
 JUDGE_DIR_CANDIDATES = (
     pathlib.Path(".cache/autotest-for-oskernel/kernel/judge"),
     pathlib.Path.home() / "os-contest-ref/autotest-for-oskernel/kernel/judge",
 )
-
 
 def resolve_judge_dir(explicit):
     """定位官方 judge 目录，找不到时给出 make test-setup 指引并退出。"""
@@ -40,7 +38,6 @@ def resolve_judge_dir(explicit):
         "  或 --judge-dir 指向已有的 judge 目录"
     )
 
-
 def qemu_binary(arch, override):
     """按架构取 QEMU：PATH 查找 + 官方版本校验（10.0.2，见团队环境约定）。"""
     name = f"qemu-system-{'riscv64' if arch == 'rv' else 'loongarch64'}"
@@ -54,7 +51,6 @@ def qemu_binary(arch, override):
                  f"实际输出：{version.stdout.strip().splitlines()[:1]}）")
     return str(qemu)
 
-
 def qemu_img_binary(qemu_path):
     """定位 qemu-img：优先取与 qemu 同目录或真实构建目录，再回退 PATH。"""
     q = pathlib.Path(qemu_path)
@@ -67,7 +63,6 @@ def qemu_img_binary(qemu_path):
         sys.exit("错误：未找到 qemu-img（无法创建 QCOW2 写时复制覆盖层；可传 --raw-copy 回退整盘复制）")
     return found
 
-
 def create_qcow2_overlay(qemu_img, backing_path, overlay_path):
     """基于只读 raw 原盘秒级创建 QCOW2 写时复制覆盖层，避免整盘拷贝。"""
     backing = backing_path.resolve()
@@ -79,7 +74,6 @@ def create_qcow2_overlay(qemu_img, backing_path, overlay_path):
     )
     if res.returncode != 0:
         sys.exit(f"错误：创建 QCOW2 覆盖层失败：{res.stderr.strip() or res.stdout.strip()}")
-
 
 def qemu_command(qemu, arch, kernel, disk, extra_disk=None,
                  disk_format="raw", extra_format="raw"):
@@ -104,7 +98,6 @@ def qemu_command(qemu, arch, kernel, disk, extra_disk=None,
         cmd += ["-drive", f"file={extra_disk},if=none,format={extra_format},id=x1",
                 "-device", "virtio-blk-pci,drive=x1"]
     return cmd
-
 
 def build_split_kernel(arch, out_dir, groups, ltp_filter, ltp_timeout):
     """按本地拆组/拆例参数编译临时测试内核，绝不覆盖根目录交付产物 kernel-rv/la。"""
@@ -134,7 +127,6 @@ def build_split_kernel(arch, out_dir, groups, ltp_filter, ltp_timeout):
     shutil.copyfile(built, dst)
     return dst
 
-
 def sha256_of(path):
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -142,24 +134,21 @@ def sha256_of(path):
             digest.update(chunk)
     return digest.hexdigest()
 
-
 def judge_groups(judge_dir):
     """judge_<组>.py 清单，命名规则与 run.py::_get_name/_get_exec 相同。"""
     return {path.name[len("judge_"):-len(path.suffix)]: [sys.executable, str(path)]
             for path in judge_dir.glob("judge_*")
             if path.suffix == ".py" and path.name != "judge_config.py"}
 
-
 def collect_group(judge, group):
     """收尾 judge 子进程：非 JSON 输出或非零退出码都抛异常判失败。"""
     judge.stdin.close()
     raw = judge.stdout.read().decode()
-    result = json.loads(raw)  # 非 JSON 直接抛
+    result = json.loads(raw)
     judge.wait(5)
     if judge.returncode != 0:
         raise RuntimeError(f"judge exited {judge.returncode}")
     return result
-
 
 def score_serial(judge_dir, serial_path):
     """按组标记状态机拆分串口并喂 judge，返回 (分数表, 诊断信息)。"""
@@ -174,7 +163,6 @@ def score_serial(judge_dir, serial_path):
             is_start = GROUP_START.findall(line)
             is_end = GROUP_END.findall(line)
             if is_end or is_start:
-                # END 必须与当前活跃组名一致；嵌套/无配对/错名都判失败
                 if is_end and judge is None:
                     notes["anomalies"].append(f"END {is_end[0]} without active group")
                 elif is_end and judge is not None and is_end[0] != group:
@@ -186,7 +174,7 @@ def score_serial(judge_dir, serial_path):
                 if judge:
                     try:
                         results[group] = collect_group(judge, group)
-                    except Exception as error:  # judge 崩溃/非 JSON/非零退出
+                    except Exception as error:
                         notes["judge_errors"].append(f"{group}: {error}")
                     judge = group = None
             elif judge is not None:
@@ -200,14 +188,13 @@ def score_serial(judge_dir, serial_path):
                     judge = subprocess.Popen(judges[group], stdin=subprocess.PIPE,
                                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 elif group not in notes.get("missing_judges", []):
-                    pass  # 无该组 judge：串口照常走，判分阶段按缺组处理
-    if judge:  # 串口在最后一组 END 前结束
+                    pass
+    if judge:
         notes["truncated"] = True
         try:
             results[group] = collect_group(judge, group)
         except Exception as error:
             notes["judge_errors"].append(f"{group}: {error}")
-    # 从未启动的组同样以空输入判分（官方行为，计 0 分）
     for name, command in judges.items():
         if name not in notes["groups_seen"]:
             probe = subprocess.Popen(command, stdin=subprocess.PIPE,
@@ -217,7 +204,6 @@ def score_serial(judge_dir, serial_path):
             except Exception as error:
                 notes["judge_errors"].append(f"{name}: {error}")
     return results, notes
-
 
 def group_score(result):
     """单组总分：judge 输出的明细列表求和（兼容 all/total/性能组）。"""
@@ -230,12 +216,10 @@ def group_score(result):
         total_all = len(result)
     return (total_score, total_all)
 
-
 def format_score(val):
     if isinstance(val, float):
         return f"{val:.2f}"
     return str(val)
-
 
 def run_arch(arch, args):
     """运行单架构验收，返回汇总行。"""
@@ -303,7 +287,6 @@ def run_arch(arch, args):
             print(f"[{arch}] 警告：QEMU 到达超时 {args.timeout}s 被 kill",
                   flush=True)
         serial_text = (out / "serial.txt").read_text(errors="ignore")
-        # 内核 panic / rust 运行时崩溃无论组标记是否齐全都判运行不完整
         panicked = "[panic]" in serial_text or "panicked at" in serial_text
 
         results, notes = score_serial(args.judge_dir, out / "serial.txt")
@@ -340,14 +323,12 @@ def run_arch(arch, args):
         print(f"[{arch}] 串口：{out / 'serial.txt'}  判分明细：{out / 'result.json'}",
               flush=True)
     finally:
-        # 运行盘覆盖层与临时拆组内核用完即清，异常路径同样
         run_disk.unlink(missing_ok=True)
         if extra_overlay is not None:
             extra_overlay.unlink(missing_ok=True)
         if temp_kernel is not None:
             temp_kernel.unlink(missing_ok=True)
     return summary
-
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -385,7 +366,6 @@ def main():
                  "请省略 --kernel（默认取 kernel-rv / kernel-la）或分架构单独运行")
     statuses = []
     for arch in archs:
-        # both 模式强制按架构取内核（禁止污染）；单架构尊重 --kernel
         kernel = pathlib.Path(f"kernel-{arch}") if len(archs) > 1 else (
             args.kernel or pathlib.Path(f"kernel-{arch}")
         )
@@ -394,7 +374,6 @@ def main():
         args.kernel = kernel
         statuses.append(run_arch(arch, args))
 
-    # 退出码只反映运行完整性，不把分数当门禁：0 完整、1 运行不完整、2 judge 失败
     expected_groups = tuple(args.requested_groups) if args.requested_groups else TARGET_GROUPS
     exit_code = 0
     for status in statuses:
@@ -417,7 +396,6 @@ def main():
     import subprocess as _sp
     print(_sp.run(["du", "-sh", "target"], capture_output=True, text=True).stdout.strip())
     sys.exit(exit_code)
-
 
 if __name__ == "__main__":
     main()

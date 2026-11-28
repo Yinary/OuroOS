@@ -216,7 +216,6 @@ fn child_cwd() {
         close(pipe[0] as usize);
         chdir(b"/busy-parent/child\0");
         ck!(syscall3(64, pipe[1] as usize, b"x".as_ptr() as usize, 1) == 1);
-        // 等待父进程关闭其读取端，确认期间 cwd 一直存活。
         loop {
             let ret = syscall3(64, pipe[1] as usize, b"x".as_ptr() as usize, 1);
             if ret == -32 {

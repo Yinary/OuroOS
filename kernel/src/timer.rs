@@ -1,5 +1,7 @@
 //! 定时器：维护周期性的拍，并在当前任务的时间片终点与等待表最早的到期时刻触发时钟中断。
 
+#![forbid(unsafe_code)]
+
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 

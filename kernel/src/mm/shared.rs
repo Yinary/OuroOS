@@ -1,4 +1,6 @@
 //! 共享匿名对象由映射持有；相同对象的相同页号在各地址空间引用同一帧。
+#![forbid(unsafe_code)]
+
 use super::{address_space::MapError, frame::OwnedFrame};
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -15,6 +17,7 @@ struct SharedObject {
 }
 
 #[derive(Clone)]
+/// 共享匿名对象的单页句柄，跨 `fork` 与别名映射共享同一物理帧。
 pub(crate) struct SharedPage {
     object: Arc<SharedObject>,
     index: usize,

@@ -1,4 +1,6 @@
 //! 启动物理内存账本：FDT RAM 与 HAL 剩余区求交、扣除保留区后登记给帧分配器。
+#![forbid(unsafe_code)]
+
 use super::frame::{self, FrameError};
 use alloc::vec::Vec;
 use polyhal::{

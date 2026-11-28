@@ -124,7 +124,6 @@ fn page_cache_roundtrip() {
     let _guard = TEST_LOCK.lock().unwrap();
     DISK.lock().data = vec![11; 4100];
     let page = cache::page(1, 0).unwrap();
-    // SAFETY: page 拥有整页，单线程测试独占。
     unsafe {
         (page.addr() as *mut u8).write(97);
     }
@@ -143,7 +142,6 @@ fn resize_zeroes_tail_and_expands() {
     let _guard = TEST_LOCK.lock().unwrap();
     DISK.lock().data = vec![11; 8];
     let page = cache::page(1, 0).unwrap();
-    // SAFETY: page 拥有整页，单线程测试独占。
     unsafe {
         (page.addr() as *mut u8).write(33);
     }
@@ -156,7 +154,6 @@ fn resize_zeroes_tail_and_expands() {
     let page = cache::page(1, 0).unwrap();
     DISK.lock().data.resize(8, 0);
     cache::resize_inode(1, 4, 8);
-    // SAFETY: page 拥有整页，单线程测试独占。
     unsafe {
         assert_eq!((page.addr() as *const u8).add(6).read(), 0);
     }
@@ -171,7 +168,6 @@ fn flush_retries_after_writeback_failure() {
     let _guard = TEST_LOCK.lock().unwrap();
     DISK.lock().data = vec![0; 4096];
     let page = cache::page(1, 0).unwrap();
-    // SAFETY: page 拥有整页，单线程测试独占。
     unsafe {
         (page.addr() as *mut u8).write(42);
     }

@@ -10,12 +10,10 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 
-
 def run(args, log, **kwargs):
     with log.open("wb") as stream:
         subprocess.run(args, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT,
                        check=True, timeout=240, **kwargs)
-
 
 def verify_metadata(image, out, stem, small, readonly):
     log = out / f"{stem}-persisted-times.log"
@@ -41,7 +39,6 @@ def verify_metadata(image, out, stem, small, readonly):
             if not match or int(match[1], 8) != mode:
                 raise RuntimeError(f"落盘权限不符: {name}")
 
-
 def verify_truncate(image, out, stem, readonly):
     expected = {"/meta/data": b"testing"} if readonly else {
         "/meta/data": b"", "/prealloc": b"", "/prealloc-zero": b"",
@@ -55,7 +52,6 @@ def verify_truncate(image, out, stem, readonly):
         run(["debugfs", "-R", f'dump {path} "{dumped}"', str(image)], log)
         if not dumped.exists() or dumped.read_bytes() != content:
             raise RuntimeError(f"截断落盘内容不符: {path}")
-
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -148,7 +144,6 @@ def main():
             script = out / f"{stem}-populate"
             script.write_text("\n".join(commands) + "\n")
             run(["debugfs", "-w", "-f", str(script), str(ext)], out / f"{stem}-populate.log")
-            # 预分配后写入快照，避免保存期望值本身改变空闲计数。
             run(["debugfs", "-R", "bmap /fs-expected 0", str(ext)], out / f"{stem}-expected-block.log")
             block = int((out / f"{stem}-expected-block.log").read_text().splitlines()[-1])
             if block <= 0 or (block + 1) * 4096 > ext.stat().st_size:
@@ -267,7 +262,6 @@ def main():
                      else "rmdir" if args.rmdir else "devzero" if args.devzero
                      else "status queries")
             print(f"{stem}: PASS ({suite} and e2fsck)", flush=True)
-
 
 if __name__ == "__main__":
     main()

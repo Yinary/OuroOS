@@ -1,4 +1,6 @@
 //! 文件系统入口，按路径和 inode 将操作转交对应的卷。
+#![forbid(unsafe_code)]
+
 use crate::syscall::Errno;
 use alloc::sync::Arc;
 

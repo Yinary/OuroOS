@@ -1,6 +1,8 @@
 //! 内核日志环：收集启动报告、任务终态与 panic 行，供 syslog(2)/klogctl
 //! 读取；log 分级宏的串口输出不经过这里。
 
+#![forbid(unsafe_code)]
+
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
