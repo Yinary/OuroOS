@@ -498,6 +498,7 @@ impl EpollInstance {
         &mut self,
         maxevents: usize,
         depth: usize,
+        pending_signals: u64,
     ) -> Result<(Vec<u8>, usize, Option<Duration>), Errno> {
         self.prune();
         let mut out = Vec::new();
@@ -515,7 +516,7 @@ impl EpollInstance {
                 let mut f = handle.lock();
                 let req = ((entry.events & 0x3fff) | EPOLL_ALWAYS) as u16;
                 let rev = if depth <= EPOLL_MAX_NESTS {
-                    fd_poll_events(&mut f, req, depth + 1) as u32
+                    fd_poll_events(&mut f, req, depth + 1, pending_signals) as u32
                 } else {
                     0
                 };
@@ -568,7 +569,7 @@ impl EpollInstance {
     }
 
     /// 非破坏性检测该 epoll 实例是否已有就绪事件（供 poll/select/嵌套 epoll 查询）。
-    pub fn has_ready(&mut self, depth: usize) -> bool {
+    pub fn has_ready(&mut self, depth: usize, pending_signals: u64) -> bool {
         if depth > EPOLL_MAX_NESTS + 1 {
             return false;
         }
@@ -582,7 +583,7 @@ impl EpollInstance {
             };
             let mut f = handle.lock();
             let req = ((entry.events & 0x3fff) | EPOLL_ALWAYS) as u16;
-            let rev = fd_poll_events(&mut f, req, depth + 1) as u32;
+            let rev = fd_poll_events(&mut f, req, depth + 1, pending_signals) as u32;
             if rev != 0 && (entry.events & EPOLLET == 0 || (rev & !entry.last_ready) != 0) {
                 return true;
             }

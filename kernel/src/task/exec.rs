@@ -166,8 +166,26 @@ fn parse_shebang(image: &[u8]) -> Option<(alloc::string::String, Option<alloc::s
     Some((interp_path, arg))
 }
 
+impl elf::ElfSource for context::ExecutableFile {
+    fn size(&self) -> usize {
+        context::ExecutableFile::size(self)
+    }
+
+    fn read_exact_at(&self, offset: usize, dst: &mut [u8]) -> Result<(), elf::ElfError> {
+        context::ExecutableFile::read_exact_at(self, offset, dst).map_err(|e| match e {
+            Errno::NoMem => elf::ElfError::OutOfMemory,
+            _ => elf::ElfError::Io,
+        })
+    }
+}
+
 /// 全部准备成功才替换旧地址空间，失败保留原程序和现场。
 pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Errno> {
+    let load_error = |e: elf::ElfError| match e {
+        elf::ElfError::OutOfMemory => Errno::NoMem,
+        elf::ElfError::Io => Errno::Io,
+        _ => Errno::ExecFormat,
+    };
     let (image, interp_image, argv, envp, path) = {
         let reg = REGISTRY.lock();
         let rec = reg.group(pid).ok_or(Errno::Invalid)?;
@@ -176,13 +194,19 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
         let mut argv = strings(space, args[1])?;
         let envp = strings(space, args[2])?;
         let fs = rec.fs.as_ref().ok_or(Errno::Invalid)?;
-        let mut image = context::executable(fs, &path)?;
+        let mut image = context::open_executable(fs, &path)?;
         let mut depth = 0;
-        // #! 脚本转交解释器（binfmt_script；嵌套上限对齐 Linux 的 4 层）。
+        // #! 脚本转交解释器（binfmt_script；嵌套上限对齐 Linux 的 4 层，首行扫描上限 256 字节）。
         // argv[0] 被替换为解释器，脚本路径作为解释器的首个操作数。
         let mut script_path = path.clone();
+        let mut head = [0u8; 256];
         loop {
-            let Some((interp_path, script_arg)) = parse_shebang(&image) else {
+            let probe_len = image.size().min(head.len());
+            if probe_len < 2 {
+                break;
+            }
+            image.read_exact_at(0, &mut head[..probe_len])?;
+            let Some((interp_path, script_arg)) = parse_shebang(&head[..probe_len]) else {
                 break;
             };
             depth += 1;
@@ -202,16 +226,21 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
             if let Some(arg) = script_arg {
                 next_argv.push(arg);
             }
-            next_argv.push(alloc::string::String::from(&script_path[..]));
+            let mut script_arg0 = alloc::string::String::new();
+            script_arg0
+                .try_reserve(script_path.len())
+                .map_err(|_| Errno::NoMem)?;
+            script_arg0.push_str(&script_path);
+            next_argv.push(script_arg0);
             next_argv.extend(argv.into_iter().skip(1));
             argv = next_argv;
             script_path = interp_path;
-            image = context::executable(fs, &script_path)?;
+            image = context::open_executable(fs, &script_path)?;
         }
         // PT_INTERP 请求的解释器：缺失按 Linux 返回 ENOENT，旧进程保留
-        let interp_image = elf::interp_path(&image)
-            .map_err(|_| Errno::ExecFormat)?
-            .map(|p| context::executable(fs, &p))
+        let interp_image = elf::interp_path_source(&image)
+            .map_err(load_error)?
+            .map(|p| context::open_executable(fs, &p))
             .transpose()?;
         (image, interp_image, argv, envp, path)
     };
@@ -223,19 +252,14 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
         let c = &current.creds;
         [c.ruid, c.euid, c.rgid, c.egid]
     };
-    let load_error = |e: elf::ElfError| {
-        if matches!(e, elf::ElfError::OutOfMemory) {
-            Errno::NoMem
-        } else {
-            Errno::ExecFormat
-        }
-    };
-    let main = elf::load_elf(&mut space, &image).map_err(load_error)?;
+    let main = elf::load_elf_source(&mut space, &image).map_err(load_error)?;
     // 堆起点只跟主映像（Linux mm->brk 语义），必须先于解释器装载计算
     space.init_heap();
     // 解释器与主映像共置同一临时地址空间，两个映像及栈全部就绪才发布
     let interp = match (&interp_image, &main.interp) {
-        (Some(bytes), Some(_)) => Some(elf::load_interp(&mut space, bytes).map_err(load_error)?),
+        (Some(file), Some(_)) => {
+            Some(elf::load_interp_source(&mut space, file).map_err(load_error)?)
+        }
         (None, None) => None,
         // 头部声明 PT_INTERP 但文件未读到（前一步已报 ENOENT），不可达
         _ => return Err(Errno::ExecFormat),
@@ -288,6 +312,8 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
     // —— 提交段：发布备齐对象，无分配、无失败路径 ——
     rec.space = Some(LocalSpace(space));
     rec.signal.reset_for_exec();
+    let had_posix_timers = !rec.posix_timers.is_empty();
+    rec.posix_timers.clear();
     rec.dumpable = 1;
     rec.keepcaps = false;
     let new_comm = crate::task::comm_from_path(&path);
@@ -305,6 +331,9 @@ pub fn exec(pid: Pid, args: [usize; 3], frame: &mut TrapFrame) -> Result<(), Err
         context::close_exec(ctx);
         // /proc/self/exe 记录（proc(5)）；值为空串时退化为 ENOENT
         ctx.set_exe_path_owned(exe_value);
+    }
+    if had_posix_timers {
+        super::recompute_next_itimer(reg);
     }
     *frame = next;
     drop(locked);

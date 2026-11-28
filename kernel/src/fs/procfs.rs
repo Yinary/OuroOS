@@ -1,5 +1,5 @@
 //! 只读虚拟文件：每次 open 捕获一次快照；dup/fork 共享快照和读偏移。
-//! 覆盖 /proc/meminfo、/proc/mounts、/proc/<pid>/{stat,cmdline} 与基本 /dev 设备节点。
+//! 覆盖 /proc/{cpuinfo,meminfo,mounts}、进程信息与基本 /dev 设备节点。
 use crate::syscall::Errno;
 use alloc::string::String;
 use core::fmt::Write;
@@ -13,6 +13,7 @@ pub(super) const DEVZERO: u32 = u32::MAX - 8;
 /// /dev/urandom 与 /dev/random 的虚拟 inode。
 pub(super) const DEVURANDOM: u32 = u32::MAX - 9;
 pub(super) const DEVRANDOM: u32 = u32::MAX - 10;
+pub(super) const CPUINFO: u32 = u32::MAX - 28;
 
 pub(super) fn null_metadata() -> super::Metadata {
     super::Metadata {
@@ -69,7 +70,7 @@ pub(super) const SELF_DIR: u32 = u32::MAX - 15;
 /// /proc/self/maps
 pub(super) const SELF_MAPS: u32 = u32::MAX - 16;
 /// /proc/self/fd 目录
-pub(super) const SELF_FD_DIR: u32 = u32::MAX - 17;
+pub(crate) const SELF_FD_DIR: u32 = u32::MAX - 17;
 /// /proc/sys/kernel/tainted 文件
 pub(super) const TAINTED: u32 = u32::MAX - 18;
 /// /proc/sys/fs 目录
@@ -84,11 +85,16 @@ pub(super) const SYS_SEM: u32 = u32::MAX - 24;
 pub(super) const SYSVIPC_DIR: u32 = u32::MAX - 25;
 pub(super) const SYSVIPC_MSG: u32 = u32::MAX - 26;
 pub(super) const SYSVIPC_SEM: u32 = u32::MAX - 27;
+/// /proc/sys/fs/mqueue 目录与参数节点（queues_max / msg_max / msgsize_max）。
+pub(super) const SYS_FS_MQUEUE_DIR: u32 = u32::MAX - 29;
+pub(super) const SYS_FS_MQUEUE_QUEUES_MAX: u32 = u32::MAX - 30;
+pub(super) const SYS_FS_MQUEUE_MSG_MAX: u32 = u32::MAX - 31;
+pub(super) const SYS_FS_MQUEUE_MSGSIZE_MAX: u32 = u32::MAX - 32;
 /// /proc/sys/fs/inotify 目录及其三个限额只读节点。
-pub(super) const SYS_INOTIFY_DIR: u32 = u32::MAX - 28;
-pub(super) const INOTIFY_MAX_QUEUED: u32 = u32::MAX - 29;
-pub(super) const INOTIFY_MAX_INSTANCES: u32 = u32::MAX - 30;
-pub(super) const INOTIFY_MAX_WATCHES: u32 = u32::MAX - 31;
+pub(super) const SYS_INOTIFY_DIR: u32 = u32::MAX - 33;
+pub(super) const INOTIFY_MAX_QUEUED: u32 = u32::MAX - 34;
+pub(super) const INOTIFY_MAX_INSTANCES: u32 = u32::MAX - 35;
+pub(super) const INOTIFY_MAX_WATCHES: u32 = u32::MAX - 36;
 
 /// 判断 inode 是否属于虚拟节点区间（固定虚拟节点或 /proc/<pid> 派生节点）。
 pub(crate) fn is_virtual_ino(ino: u32) -> bool {
@@ -226,7 +232,20 @@ pub(super) fn meminfo() -> Result<String, Errno> {
     Ok(out)
 }
 
-/// /proc/mounts 快照：根卷一条 + FAT 追加挂载记录（字段见 mounts(5)）。
+/// 生成当前内核可用的逻辑处理器记录。
+pub(super) fn cpuinfo() -> Result<String, Errno> {
+    let mut out = String::new();
+    out.try_reserve(64).map_err(|_| Errno::NoMem)?;
+    writeln!(
+        out,
+        "processor\t: 0\narchitecture\t: {}",
+        crate::config::ARCH_NAME
+    )
+    .map_err(|_| Errno::Io)?;
+    Ok(out)
+}
+
+/// 生成根卷和辅助卷的挂载记录快照。
 pub(super) fn mounts() -> Result<String, Errno> {
     let mut out = String::new();
     out.try_reserve(128).map_err(|_| Errno::NoMem)?;
@@ -239,6 +258,12 @@ pub(super) fn mounts() -> Result<String, Errno> {
     let _ = writeln!(out, "/dev/{} / ext4 {} 0 0", root_disk, mode);
     for (source, target) in super::fat::mount_list() {
         let _ = writeln!(out, "{} {} vfat rw 0 0", source, target);
+    }
+    for (source, target, readonly) in super::ext2_mount::mount_list()? {
+        let mode = if readonly { "ro" } else { "rw" };
+        out.try_reserve(source.len() + target.len() + 16)
+            .map_err(|_| Errno::NoMem)?;
+        writeln!(out, "{} {} ext2 {} 0 0", source, target, mode).map_err(|_| Errno::Io)?;
     }
     Ok(out)
 }
