@@ -109,6 +109,7 @@ pub mod sysnr {
     pub const PWRITEV2: usize = 287;
     pub const STATX: usize = 291;
     pub const CLOSE_RANGE: usize = 436;
+    pub const OPENAT2: usize = 437;
     pub const EPOLL_PWAIT2: usize = 441;
     // 进程
     pub const EXIT: usize = 93;
@@ -215,6 +216,9 @@ pub mod sysnr {
     pub const EXECVE: usize = 221;
     pub const WAIT4: usize = 260;
     pub const KCMP: usize = 272;
+    pub const EXECVEAT: usize = 281;
+    pub const MEMBARRIER: usize = 283;
+    pub const CLONE3: usize = 435;
     pub const PIDFD_SEND_SIGNAL: usize = 424;
     pub const PIDFD_OPEN: usize = 434;
     pub const PIDFD_GETFD: usize = 438;
@@ -503,6 +507,7 @@ pub fn dispatch(
         | sysnr::CHDIR
         | sysnr::FCHDIR
         | sysnr::OPENAT
+        | sysnr::OPENAT2
         | sysnr::MEMFD_CREATE
         | sysnr::CLOSE
         | sysnr::CLOSE_RANGE
@@ -837,9 +842,12 @@ pub fn dispatch(
         | sysnr::GETEGID
         | sysnr::GETTID
         | sysnr::CLONE
+        | sysnr::CLONE3
         | sysnr::FUTEX
         | sysnr::GET_ROBUST_LIST
         | sysnr::EXECVE
+        | sysnr::EXECVEAT
+        | sysnr::MEMBARRIER
         | sysnr::WAIT4
         | sysnr::WAITID
         | sysnr::KCMP

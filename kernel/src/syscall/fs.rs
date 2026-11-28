@@ -195,167 +195,11 @@ pub fn dispatch(
             Ok(0)
         }
         sysnr::OPENAT => {
-            const O_NOFOLLOW: usize = 0x20000;
-            const O_PATH: usize = 0x200000;
-            let path_only = a[2] & O_PATH != 0;
-            let flags = if path_only {
-                a[2] & (O_PATH | O_NOFOLLOW | 0x10000 | 0x80000)
-            } else {
-                a[2]
-            };
-            let create = flags & 64 != 0;
-            let exclusive = create && flags & 0x80 != 0;
-            let nofollow = flags & O_NOFOLLOW != 0;
-            if flags & 3 == 3 || flags & 0x10000 != 0 && create {
-                return Err(Errno::Invalid);
-            }
-            let dir = a[0] as u32 as i32 as isize as usize;
-            let input = user_string(space, a[1])?;
-            let (path, entry) = match ctx.open_path(dir, &input, !(nofollow || exclusive), create) {
-                Ok((path, entry)) => (path, Some(entry)),
-                Err(Errno::NoDevice) if !fs::mounted() => (ctx.path(dir, &input)?, None),
-                Err(e) => return Err(e),
-            };
-            if let Some(fs::ResolvedEntry::Existing(ref info)) = entry {
-                if exclusive {
-                    return Err(Errno::Exists);
-                }
-                if info.mode & 0xf000 == 0xa000 && nofollow && !path_only {
-                    return Err(Errno::Loop);
-                }
-                if flags & 0x10000 != 0 && info.mode & 0xf000 != 0x4000 {
-                    return Err(Errno::NotDir);
-                }
-            }
-            if path == "/proc/meminfo" {
-                return ctx.open_meminfo(flags, flags & 0x80000 != 0);
-            }
-            if path == "/proc/self/fd" {
-                return ctx.open_proc_fd_dir(flags, flags & 0x80000 != 0);
-            }
-            if let Some(kind) = fs::inotify::SysctlKind::from_path(&path) {
-                return ctx.open_proc_sysctl(kind, flags, flags & 0x80000 != 0);
-            }
-            if let Some(fd_str) = parse_proc_fdinfo_path(&path, tgid) {
-                let target_fd: usize = fd_str.parse().map_err(|_| Errno::NoEntry)?;
-                let text = ctx.format_fdinfo(target_fd)?;
-                return ctx.open_proc_text(
-                    fs::procfs::SELF_FD_DIR,
-                    text,
-                    flags,
-                    flags & 0x80000 != 0,
-                );
-            }
-            if let Some(fd_str) = path.strip_prefix("/proc/self/fd/") {
-                if !fd_str.is_empty() && fd_str.bytes().all(|b| b.is_ascii_digit()) {
-                    let src_fd: usize = fd_str.parse().map_err(|_| Errno::NoEntry)?;
-                    return ctx.reopen_fd(src_fd, flags, flags & 0x80000 != 0);
-                }
-                return Err(Errno::NoEntry);
-            }
-            if path == "/proc/self/maps" {
-                let ino = fs::lookup(&path)?;
-                let text = fs::procfs_maps(space)?;
-                return ctx.open_proc_text(ino, text, flags, flags & 0x80000 != 0);
-            }
-            if let Some(field) = match path.as_str() {
-                "/proc/sys/fs/mqueue/queues_max" => Some(crate::ipc::mqueue::MqSysctl::QueuesMax),
-                "/proc/sys/fs/mqueue/msg_max" => Some(crate::ipc::mqueue::MqSysctl::MsgMax),
-                "/proc/sys/fs/mqueue/msgsize_max" => Some(crate::ipc::mqueue::MqSysctl::MsgSizeMax),
-                _ => None,
-            } {
-                return ctx.open_proc_mq_sysctl(field, flags, flags & 0x80000 != 0);
-            }
-            if fs::is_procfs_text(&path) {
-                let ino = fs::lookup(&path)?;
-                let text = fs::procfs_text(&path)?;
-                return ctx.open_proc_text(ino, text, flags, flags & 0x80000 != 0);
-            }
-            if let Some(rest) = path.strip_prefix("/proc/") {
-                if matches!(rest, "cpuinfo" | "mounts")
-                    || rest
-                        .split_once('/')
-                        .is_some_and(|(_, f)| matches!(f, "stat" | "cmdline" | "status"))
-                {
-                    let ino = fs::lookup(&path)?;
-                    let text = fs::procfs_text(&path)?;
-                    return ctx.open_proc_text(ino, text, flags, flags & 0x80000 != 0);
-                }
-            }
-            if path == "/dev/null" {
-                return ctx.open_devnull(flags, flags & 0x80000 != 0);
-            }
-            if path == "/dev/zero" {
-                return ctx.open_devzero(flags, flags & 0x80000 != 0);
-            }
-            if path == "/dev/urandom" {
-                return ctx.open_devrandom(true, flags, flags & 0x80000 != 0);
-            }
-            if path == "/dev/random" {
-                return ctx.open_devrandom(false, flags, flags & 0x80000 != 0);
-            }
-            if path == "/dev/misc/rtc" {
-                return ctx.open_rtc(flags, flags & 0x80000 != 0);
-            }
-            if let Some((disk, part)) = fs::lookup_blk_node(&path) {
-                if credentials.euid != 0 && !path_only {
-                    return Err(Errno::Access);
-                }
-                if let Ok((start, len)) = crate::drivers::partition(disk, part) {
-                    return ctx.open_devblk(
-                        disk,
-                        part,
-                        start,
-                        len as u64,
-                        flags,
-                        flags & 0x80000 != 0,
-                    );
-                }
-                return Err(Errno::NoDevice);
-            }
-            let (ino, mode) = match entry.ok_or(Errno::NoDevice)? {
-                fs::ResolvedEntry::Existing(info) => (info.inode_handle(), info.mode),
-                fs::ResolvedEntry::Missing { parent } => {
-                    let name = path.rsplit('/').next().ok_or(Errno::NoEntry)?;
-                    let mode = 0x8000 | ctx.creation_mode(a[3]);
-                    let owner = (credentials.fsuid, credentials.fsgid);
-                    (fs::create_regular(parent, name, mode, owner)?, mode)
-                }
-            };
-            if mode & 0xf000 == 0x4000 && (flags & 3 != 0 || create) {
-                return Err(Errno::IsDir);
-            }
-            if flags & 3 != 0 {
-                fs::check_write_open(ino)?;
-            }
-            if mode & 0xf000 == 0x1000 && !path_only {
-                return ctx.open_fifo(ino, flags, flags & 0x80000 != 0, tgid);
-            }
-            if mode & 0xf000 == 0x2000 && !path_only {
-                let rdev = fs::metadata(ino)?.rdev;
-                let cloexec = flags & 0x80000 != 0;
-                return match rdev {
-                    0x0103 => ctx.open_devnull(flags, cloexec),
-                    0x0105 => ctx.open_devzero(flags, cloexec),
-                    0x0108 => ctx.open_devrandom(false, flags, cloexec),
-                    0x0109 => ctx.open_devrandom(true, flags, cloexec),
-                    _ => Err(Errno::NxIo),
-                };
-            }
-            if matches!(mode & 0xf000, 0x6000 | 0xc000) && !path_only {
-                return Err(Errno::NxIo);
-            }
-            if flags & 0x200 != 0 && flags & 3 != 0 {
-                fs::truncate(ino, 0)?;
-            }
-            ctx.open_inode(
-                ino,
-                path,
-                flags,
-                flags & 0x80000 != 0,
-                mode & 0xf000 == 0x4000,
-            )
+            let raw_input = user_string(space, a[1])?;
+            let dirfd = a[0] as u32 as i32 as isize as usize;
+            openat_common(ctx, space, dirfd, &raw_input, a[2], a[3], tgid, credentials)
         }
+        sysnr::OPENAT2 => openat2(ctx, space, a, tgid, credentials),
         sysnr::SYNC => {
             let _ = fs::sync();
             Ok(0)
@@ -459,6 +303,491 @@ pub fn dispatch(
         sysnr::MEMFD_CREATE => memfd_create(ctx, space, a, credentials),
         _ => Err(Errno::NoSys),
     }
+}
+
+/// openat(2) 与 openat2(2) 共享的核心打开逻辑。
+#[allow(clippy::too_many_arguments)]
+fn openat_common(
+    ctx: &mut Context,
+    space: &UserAddressSpace,
+    dirfd: usize,
+    raw_input: &str,
+    open_flags: usize,
+    open_mode: usize,
+    tgid: u32,
+    credentials: &Credentials,
+) -> Result<usize, Errno> {
+    const O_NOFOLLOW: usize = 0x20000;
+    const O_PATH: usize = 0x200000;
+    let path_only = open_flags & O_PATH != 0;
+    let flags = if path_only {
+        open_flags & (O_PATH | O_NOFOLLOW | 0x10000 | 0x80000)
+    } else {
+        open_flags
+    };
+    let create = flags & 64 != 0;
+    let exclusive = create && flags & 0x80 != 0;
+    let nofollow = flags & O_NOFOLLOW != 0;
+    if flags & 3 == 3 || flags & 0x10000 != 0 && create {
+        return Err(Errno::Invalid);
+    }
+    let (path, entry) = match ctx.open_path(dirfd, raw_input, !(nofollow || exclusive), create) {
+        Ok((path, entry)) => (path, Some(entry)),
+        Err(Errno::NoDevice) if !fs::mounted() => (ctx.path(dirfd, raw_input)?, None),
+        Err(e) => return Err(e),
+    };
+    if let Some(fs::ResolvedEntry::Existing(ref info)) = entry {
+        if exclusive {
+            return Err(Errno::Exists);
+        }
+        if info.mode & 0xf000 == 0xa000 && nofollow && !path_only {
+            return Err(Errno::Loop);
+        }
+        if flags & 0x10000 != 0 && info.mode & 0xf000 != 0x4000 {
+            return Err(Errno::NotDir);
+        }
+    }
+    if path == "/proc/meminfo" {
+        return ctx.open_meminfo(flags, flags & 0x80000 != 0);
+    }
+    if path == "/proc/self/fd" {
+        return ctx.open_proc_fd_dir(flags, flags & 0x80000 != 0);
+    }
+    if path == "/proc/self/exe" {
+        let target = {
+            let s = ctx.exe_path()?;
+            let mut owned = String::new();
+            owned.try_reserve(s.len()).map_err(|_| Errno::NoMem)?;
+            owned.push_str(s);
+            owned
+        };
+        return openat_common(
+            ctx,
+            space,
+            (-100isize) as usize,
+            &target,
+            open_flags,
+            open_mode,
+            tgid,
+            credentials,
+        );
+    }
+    if path == "/proc/self/root" {
+        return openat_common(
+            ctx,
+            space,
+            (-100isize) as usize,
+            "/",
+            open_flags,
+            open_mode,
+            tgid,
+            credentials,
+        );
+    }
+    if path == "/proc/self/cwd" {
+        let target = ctx.cwd()?;
+        return openat_common(
+            ctx,
+            space,
+            (-100isize) as usize,
+            &target,
+            open_flags,
+            open_mode,
+            tgid,
+            credentials,
+        );
+    }
+    if let Some(kind) = fs::inotify::SysctlKind::from_path(&path) {
+        return ctx.open_proc_sysctl(kind, flags, flags & 0x80000 != 0);
+    }
+    if let Some(fd_str) = parse_proc_fdinfo_path(&path, tgid) {
+        let target_fd: usize = fd_str.parse().map_err(|_| Errno::NoEntry)?;
+        let text = ctx.format_fdinfo(target_fd)?;
+        return ctx.open_proc_text(fs::procfs::SELF_FD_DIR, text, flags, flags & 0x80000 != 0);
+    }
+    if let Some(fd_str) = path.strip_prefix("/proc/self/fd/") {
+        if !fd_str.is_empty() && fd_str.bytes().all(|b| b.is_ascii_digit()) {
+            let src_fd: usize = fd_str.parse().map_err(|_| Errno::NoEntry)?;
+            return ctx.reopen_fd(src_fd, flags, flags & 0x80000 != 0);
+        }
+        return Err(Errno::NoEntry);
+    }
+    if path == "/proc/self/maps" {
+        let ino = fs::lookup(&path)?;
+        let text = fs::procfs_maps(space)?;
+        return ctx.open_proc_text(ino, text, flags, flags & 0x80000 != 0);
+    }
+    if let Some(field) = match path.as_str() {
+        "/proc/sys/fs/mqueue/queues_max" => Some(crate::ipc::mqueue::MqSysctl::QueuesMax),
+        "/proc/sys/fs/mqueue/msg_max" => Some(crate::ipc::mqueue::MqSysctl::MsgMax),
+        "/proc/sys/fs/mqueue/msgsize_max" => Some(crate::ipc::mqueue::MqSysctl::MsgSizeMax),
+        _ => None,
+    } {
+        return ctx.open_proc_mq_sysctl(field, flags, flags & 0x80000 != 0);
+    }
+    if fs::is_procfs_text(&path) {
+        let ino = fs::lookup(&path)?;
+        let text = fs::procfs_text(&path)?;
+        return ctx.open_proc_text(ino, text, flags, flags & 0x80000 != 0);
+    }
+    if let Some(rest) = path.strip_prefix("/proc/") {
+        if matches!(rest, "cpuinfo" | "mounts")
+            || rest
+                .split_once('/')
+                .is_some_and(|(_, f)| matches!(f, "stat" | "cmdline" | "status"))
+        {
+            let ino = fs::lookup(&path)?;
+            let text = fs::procfs_text(&path)?;
+            return ctx.open_proc_text(ino, text, flags, flags & 0x80000 != 0);
+        }
+    }
+    if path == "/dev/null" {
+        return ctx.open_devnull(flags, flags & 0x80000 != 0);
+    }
+    if path == "/dev/zero" {
+        return ctx.open_devzero(flags, flags & 0x80000 != 0);
+    }
+    if path == "/dev/urandom" {
+        return ctx.open_devrandom(true, flags, flags & 0x80000 != 0);
+    }
+    if path == "/dev/random" {
+        return ctx.open_devrandom(false, flags, flags & 0x80000 != 0);
+    }
+    if path == "/dev/misc/rtc" {
+        return ctx.open_rtc(flags, flags & 0x80000 != 0);
+    }
+    if let Some((disk, part)) = fs::lookup_blk_node(&path) {
+        if credentials.euid != 0 && !path_only {
+            return Err(Errno::Access);
+        }
+        if let Ok((start, len)) = crate::drivers::partition(disk, part) {
+            return ctx.open_devblk(disk, part, start, len as u64, flags, flags & 0x80000 != 0);
+        }
+        return Err(Errno::NoDevice);
+    }
+    let (ino, mode) = match entry.ok_or(Errno::NoDevice)? {
+        fs::ResolvedEntry::Existing(info) => (info.inode_handle(), info.mode),
+        fs::ResolvedEntry::Missing { parent } => {
+            let name = path.rsplit('/').next().ok_or(Errno::NoEntry)?;
+            let mode = 0x8000 | ctx.creation_mode(open_mode);
+            let owner = (credentials.fsuid, credentials.fsgid);
+            (fs::create_regular(parent, name, mode, owner)?, mode)
+        }
+    };
+    if mode & 0xf000 == 0x4000 && (flags & 3 != 0 || create) {
+        return Err(Errno::IsDir);
+    }
+    if flags & 3 != 0 {
+        fs::check_write_open(ino)?;
+    }
+    if mode & 0xf000 == 0x1000 && !path_only {
+        return ctx.open_fifo(ino, flags, flags & 0x80000 != 0, tgid);
+    }
+    if mode & 0xf000 == 0x2000 && !path_only {
+        let rdev = fs::metadata(ino)?.rdev;
+        let cloexec = flags & 0x80000 != 0;
+        return match rdev {
+            0x0103 => ctx.open_devnull(flags, cloexec),
+            0x0105 => ctx.open_devzero(flags, cloexec),
+            0x0108 => ctx.open_devrandom(false, flags, cloexec),
+            0x0109 => ctx.open_devrandom(true, flags, cloexec),
+            _ => Err(Errno::NxIo),
+        };
+    }
+    if matches!(mode & 0xf000, 0x6000 | 0xc000) && !path_only {
+        return Err(Errno::NxIo);
+    }
+    if flags & 0x200 != 0 && flags & 3 != 0 {
+        fs::truncate(ino, 0)?;
+    }
+    ctx.open_inode(
+        ino,
+        path,
+        flags,
+        flags & 0x80000 != 0,
+        mode & 0xf000 == 0x4000,
+    )
+}
+
+/// Linux `openat2(2)`：严格校验 `struct open_how`（含扩展尾零校验）并支持 `RESOLVE_*` 路径约束。
+fn openat2(
+    ctx: &mut Context,
+    space: &UserAddressSpace,
+    a: [usize; 6],
+    tgid: u32,
+    credentials: &Credentials,
+) -> Result<usize, Errno> {
+    const OPEN_HOW_SIZE_VER0: usize = 24;
+    const O_CREAT: u64 = 0x40;
+    const O_EXCL: u64 = 0x80;
+    const O_NOCTTY: u64 = 0x100;
+    const O_TRUNC: u64 = 0x200;
+    const O_APPEND: u64 = 0x400;
+    const O_NONBLOCK: u64 = 0x800;
+    const O_DSYNC: u64 = 0x1000;
+    const FASYNC: u64 = 0x2000;
+    const O_DIRECT: u64 = 0x4000;
+    const O_LARGEFILE: u64 = 0x8000;
+    const O_DIRECTORY: u64 = 0x10000;
+    const O_NOFOLLOW: u64 = 0x20000;
+    const O_NOATIME: u64 = 0x40000;
+    const O_CLOEXEC: u64 = 0x80000;
+    const O_SYNC: u64 = 0x101000;
+    const O_PATH: u64 = 0x200000;
+    const O_TMPFILE: u64 = 0x410000;
+    const VALID_FLAGS: u64 = 3
+        | O_CREAT
+        | O_EXCL
+        | O_NOCTTY
+        | O_TRUNC
+        | O_APPEND
+        | O_NONBLOCK
+        | O_DSYNC
+        | FASYNC
+        | O_DIRECT
+        | O_LARGEFILE
+        | O_DIRECTORY
+        | O_NOFOLLOW
+        | O_NOATIME
+        | O_CLOEXEC
+        | O_SYNC
+        | O_PATH
+        | O_TMPFILE;
+
+    const RESOLVE_NO_XDEV: u64 = 0x01;
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const RESOLVE_BENEATH: u64 = 0x08;
+    const RESOLVE_IN_ROOT: u64 = 0x10;
+    const RESOLVE_CACHED: u64 = 0x20;
+
+    let size = a[3];
+    if size < OPEN_HOW_SIZE_VER0 {
+        return Err(Errno::Invalid);
+    }
+    if size > 4096 {
+        return Err(Errno::TooBig);
+    }
+    let mut raw = [0u8; OPEN_HOW_SIZE_VER0];
+    user_access::copy_from_user(space, a[2], &mut raw).map_err(|_| Errno::Fault)?;
+    if size > OPEN_HOW_SIZE_VER0 {
+        let mut tail = [0u8; 256];
+        let mut off = OPEN_HOW_SIZE_VER0;
+        while off < size {
+            let n = (size - off).min(tail.len());
+            let ptr = a[2].checked_add(off).ok_or(Errno::Fault)?;
+            user_access::copy_from_user(space, ptr, &mut tail[..n]).map_err(|_| Errno::Fault)?;
+            if tail[..n].iter().any(|&b| b != 0) {
+                return Err(Errno::TooBig);
+            }
+            off += n;
+        }
+    }
+
+    let flags = u64::from_ne_bytes([
+        raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+    ]);
+    let mode = u64::from_ne_bytes([
+        raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
+    ]);
+    let resolve = u64::from_ne_bytes([
+        raw[16], raw[17], raw[18], raw[19], raw[20], raw[21], raw[22], raw[23],
+    ]);
+
+    if flags & !VALID_FLAGS != 0 || flags & 3 == 3 {
+        return Err(Errno::Invalid);
+    }
+    if (flags & 0x400000 != 0) && (flags & O_DIRECTORY == 0) {
+        return Err(Errno::Invalid);
+    }
+    let has_create = (flags & O_CREAT != 0) || (flags & O_TMPFILE == O_TMPFILE);
+    if has_create {
+        if mode & !0o7777 != 0 {
+            return Err(Errno::Invalid);
+        }
+    } else if mode != 0 {
+        return Err(Errno::Invalid);
+    }
+    if flags & O_PATH != 0
+        && (flags & !(O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_LARGEFILE) != 0)
+    {
+        return Err(Errno::Invalid);
+    }
+    if resolve
+        & !(RESOLVE_NO_XDEV
+            | RESOLVE_NO_MAGICLINKS
+            | RESOLVE_NO_SYMLINKS
+            | RESOLVE_BENEATH
+            | RESOLVE_IN_ROOT
+            | RESOLVE_CACHED)
+        != 0
+    {
+        return Err(Errno::Invalid);
+    }
+    if (resolve & RESOLVE_BENEATH != 0) && (resolve & RESOLVE_IN_ROOT != 0) {
+        return Err(Errno::Invalid);
+    }
+    if flags & O_TMPFILE == O_TMPFILE {
+        return Err(Errno::NotSupported);
+    }
+
+    let raw_input = user_string(space, a[1])?;
+    if raw_input.is_empty() {
+        return Err(Errno::NoEntry);
+    }
+    let dirfd = a[0] as u32 as i32 as isize as usize;
+    if resolve == 0 {
+        return openat_common(
+            ctx,
+            space,
+            dirfd,
+            &raw_input,
+            flags as usize,
+            mode as usize,
+            tgid,
+            credentials,
+        );
+    }
+
+    let base_dir = ctx.directory_fd_path(dirfd)?;
+    let base_dev = fs::query(&base_dir, true)?.dev;
+    let beneath = resolve & RESOLVE_BENEATH != 0;
+    let in_root = resolve & RESOLVE_IN_ROOT != 0;
+    let no_symlinks = resolve & RESOLVE_NO_SYMLINKS != 0;
+    let no_magiclinks = resolve & RESOLVE_NO_MAGICLINKS != 0;
+    let no_xdev = resolve & RESOLVE_NO_XDEV != 0;
+
+    if beneath && raw_input.starts_with('/') {
+        return Err(Errno::CrossDevice);
+    }
+
+    let trailing_slash = raw_input.ends_with('/');
+    let mut cur = if in_root || !raw_input.starts_with('/') {
+        base_dir.clone()
+    } else {
+        let mut root = String::new();
+        root.try_reserve(1).map_err(|_| Errno::NoMem)?;
+        root.push('/');
+        root
+    };
+    let mut queue: Vec<String> = Vec::new();
+    for seg in raw_input.split('/').rev() {
+        if !seg.is_empty() {
+            let mut s = String::new();
+            s.try_reserve(seg.len()).map_err(|_| Errno::NoMem)?;
+            s.push_str(seg);
+            queue.try_reserve(1).map_err(|_| Errno::NoMem)?;
+            queue.push(s);
+        }
+    }
+    let mut depth = 0usize;
+    while let Some(comp) = queue.pop() {
+        let is_last = queue.is_empty();
+        if comp == "." {
+            if fs::query(&cur, true)?.mode & 0xf000 != 0x4000 {
+                return Err(Errno::NotDir);
+            }
+            continue;
+        }
+        if comp == ".." {
+            if fs::query(&cur, true)?.mode & 0xf000 != 0x4000 {
+                return Err(Errno::NotDir);
+            }
+            if beneath && cur == base_dir {
+                return Err(Errno::CrossDevice);
+            }
+            if in_root && cur == base_dir {
+                continue;
+            }
+            if let Some(i) = cur.rfind('/') {
+                cur.truncate(i.max(1));
+            }
+            continue;
+        }
+        if comp.len() > 255 {
+            return Err(Errno::NameTooLong);
+        }
+        if no_magiclinks
+            && (cur == "/proc/self" || cur.starts_with("/proc/"))
+            && matches!(comp.as_str(), "exe" | "fd" | "root" | "cwd")
+        {
+            return Err(Errno::Loop);
+        }
+        let mut next_path = String::new();
+        next_path
+            .try_reserve(cur.len() + comp.len() + 1)
+            .map_err(|_| Errno::NoMem)?;
+        next_path.push_str(&cur);
+        if cur != "/" {
+            next_path.push('/');
+        }
+        next_path.push_str(&comp);
+
+        let check_final_nofollow = is_last
+            && !trailing_slash
+            && ((flags & O_NOFOLLOW != 0) || (flags & (O_CREAT | O_EXCL) == (O_CREAT | O_EXCL)));
+        match fs::query(&next_path, false) {
+            Ok(info) => {
+                if no_xdev && info.dev != base_dev {
+                    return Err(Errno::CrossDevice);
+                }
+                if info.mode & 0xf000 == 0xa000 {
+                    if no_symlinks {
+                        return Err(Errno::Loop);
+                    }
+                    if check_final_nofollow {
+                        cur = next_path;
+                        continue;
+                    }
+                    depth += 1;
+                    if depth > 40 {
+                        return Err(Errno::Loop);
+                    }
+                    let target = fs::read_link(info.inode_handle())?;
+                    if target.starts_with('/') {
+                        if beneath {
+                            return Err(Errno::CrossDevice);
+                        }
+                        if in_root {
+                            cur = base_dir.clone();
+                        } else {
+                            cur.clear();
+                            cur.push('/');
+                        }
+                    }
+                    for seg in target.split('/').rev() {
+                        if !seg.is_empty() {
+                            let mut s = String::new();
+                            s.try_reserve(seg.len()).map_err(|_| Errno::NoMem)?;
+                            s.push_str(seg);
+                            queue.try_reserve(1).map_err(|_| Errno::NoMem)?;
+                            queue.push(s);
+                        }
+                    }
+                } else {
+                    cur = next_path;
+                }
+            }
+            Err(Errno::NoEntry) if is_last && (flags & O_CREAT != 0) => {
+                cur = next_path;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if trailing_slash && cur != "/" {
+        cur.try_reserve(1).map_err(|_| Errno::NoMem)?;
+        cur.push('/');
+    }
+    openat_common(
+        ctx,
+        space,
+        (-100isize) as usize,
+        &cur,
+        flags as usize,
+        mode as usize,
+        tgid,
+        credentials,
+    )
 }
 
 /// fallocate(2)：支持默认预分配扩展、FALLOC_FL_KEEP_SIZE、FALLOC_FL_PUNCH_HOLE|KEEP_SIZE 与 FALLOC_FL_ZERO_RANGE。
@@ -1006,6 +1335,37 @@ fn readlinkat(ctx: &Context, space: &UserAddressSpace, a: [usize; 6]) -> Result<
     }
     let path = user_string(space, a[1])?;
     let dir = a[0] as u32 as i32 as isize as usize;
+    if let Ok(resolved) = ctx.path(dir, &path) {
+        let magic_target: Option<String> = if resolved == "/proc/self/exe" {
+            let s = ctx.exe_path()?;
+            let mut out = String::new();
+            out.try_reserve(s.len()).map_err(|_| Errno::NoMem)?;
+            out.push_str(s);
+            Some(out)
+        } else if resolved == "/proc/self/cwd" {
+            Some(ctx.cwd()?)
+        } else if resolved == "/proc/self/root" {
+            let mut out = String::new();
+            out.try_reserve(1).map_err(|_| Errno::NoMem)?;
+            out.push('/');
+            Some(out)
+        } else if let Some(fd_str) = resolved.strip_prefix("/proc/self/fd/") {
+            if !fd_str.is_empty() && fd_str.bytes().all(|b| b.is_ascii_digit()) {
+                let target_fd: usize = fd_str.parse().map_err(|_| Errno::NoEntry)?;
+                Some(ctx.fd_path(target_fd)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(target) = magic_target {
+            let n = target.len().min(capacity as usize);
+            user_access::copy_to_user(space, a[2], &target.as_bytes()[..n])
+                .map_err(|_| Errno::Fault)?;
+            return Ok(n);
+        }
+    }
     let info = ctx.query(dir, &path, true, false)?;
     if info.mode & 0xf000 != 0xa000 {
         return Err(if path.is_empty() {

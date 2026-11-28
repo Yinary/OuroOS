@@ -345,7 +345,7 @@ pub fn lookup(path: &str) -> Result<u32, Errno> {
     if path == "/proc/cpuinfo" {
         return Ok(procfs::CPUINFO);
     }
-    if path == "/proc/mounts" {
+    if path == "/proc/mounts" || path == "/proc/self/mounts" {
         return Ok(procfs::MOUNTS);
     }
     if path == "/proc/version" {
@@ -1126,6 +1126,7 @@ pub fn is_procfs_text(path: &str) -> bool {
     if matches!(
         path,
         "/proc/mounts"
+            | "/proc/self/mounts"
             | "/proc/sys/kernel/pid_max"
             | "/proc/sys/kernel/tainted"
             | "/proc/sys/kernel/msgmni"
@@ -1159,7 +1160,7 @@ pub fn procfs_text(path: &str) -> Result<alloc::string::String, Errno> {
     if path == "/proc/cpuinfo" {
         return procfs::cpuinfo();
     }
-    if path == "/proc/mounts" {
+    if path == "/proc/mounts" || path == "/proc/self/mounts" {
         return procfs::mounts();
     }
     if path == "/proc/sys/kernel/pid_max" {

@@ -416,6 +416,23 @@ impl Context {
     pub(crate) fn set_exe_path_owned(&mut self, value: String) {
         self.exe_path = value;
     }
+    /// 查询 `/proc/self/exe` 对应的绝对路径。
+    pub(crate) fn exe_path(&self) -> Result<&str, Errno> {
+        if self.exe_path.is_empty() {
+            Err(Errno::NoEntry)
+        } else {
+            Ok(&self.exe_path)
+        }
+    }
+    /// 查询打开 FD 对应的路径（供 `/proc/self/fd/<N>` 解析）。
+    pub(crate) fn fd_path(&self, fd: usize) -> Result<String, Errno> {
+        let handle = self.get(fd).map_err(|_| Errno::NoEntry)?;
+        let f = handle.lock();
+        match &f.kind {
+            Kind::Inode { path, .. } => string(path),
+            _ => Err(Errno::NoEntry),
+        }
+    }
     /// 设置创建权限掩码，仅保存权限位并返回旧值。
     pub(crate) fn set_umask(&mut self, mask: usize) -> usize {
         let previous = self.umask;
@@ -431,6 +448,23 @@ impl Context {
     /// 对新建文件和目录的请求权限应用当前进程掩码（保留特殊权限位 0o7000）。
     pub(crate) fn creation_mode(&self, mode: usize) -> u16 {
         mode as u16 & 0o7777 & !self.umask
+    }
+
+    /// 查询目录 FD 对应的规范路径（AT_FDCWD 返回当前工作目录）；无效 FD 返回 EBADF，非目录返回 ENOTDIR。
+    pub(crate) fn directory_fd_path(&self, dirfd: usize) -> Result<String, Errno> {
+        if dirfd as isize == -100 {
+            self.cwd()
+        } else {
+            self.get(dirfd)?.lock().directory_path()
+        }
+    }
+
+    /// 查询 FD 的 FD_CLOEXEC 标志（内部辅助）。
+    pub(crate) fn is_cloexec(&self, fd: usize) -> bool {
+        self.fds
+            .get(fd)
+            .and_then(Option::as_ref)
+            .is_some_and(|d| d.cloexec)
     }
 
     /// 取得打开文件引用，无效 FD 返回 EBADF。
@@ -3244,27 +3278,12 @@ impl Drop for ExecutableFile {
     }
 }
 
-/// 校验并打开可执行文件，返回持有 inode 引用的句柄。
-pub fn open_executable(ctx: &Context, path: &str) -> Result<ExecutableFile, Errno> {
-    // /proc/self/exe 指向当前进程的可执行文件（proc(5)）；execve 与
-    // open 共用该重写。没有盘上可执行路径（内核内嵌程序）时按 ENOENT。
-    let redirected;
-    let path = if path == "/proc/self/exe" {
-        if ctx.exe_path.is_empty() {
-            return Err(Errno::NoEntry);
-        }
-        redirected = ctx.exe_path.clone();
-        &redirected
-    } else {
-        path
-    };
-    let ino = fs::lookup(&ctx.path((-100isize) as usize, path)?)?;
+/// 校验普通可执行文件并保留 inode 引用，返回流式句柄。
+fn open_executable_inode(ino: u32) -> Result<ExecutableFile, Errno> {
     let (mode, len, _, _) = fs::stat(ino)?;
     if mode & 0xf000 != 0x8000 {
-        return Err(Errno::Invalid);
+        return Err(Errno::Access);
     }
-    // execve(2)：任一执行位为 1 才可执行（无凭证模型等同 root，root 同样
-    // 要求 x 位）；ELF、#! 脚本与其解释器统一走本入口
     if mode & 0o111 == 0 {
         return Err(Errno::Access);
     }
@@ -3273,7 +3292,71 @@ pub fn open_executable(ctx: &Context, path: &str) -> Result<ExecutableFile, Errn
     Ok(ExecutableFile { ino, len })
 }
 
+/// 校验并打开可执行文件，返回持有 inode 引用的句柄。
+pub fn open_executable(ctx: &Context, path: &str) -> Result<ExecutableFile, Errno> {
+    open_executable_at(ctx, (-100isize) as usize, path, 0).map(|(file, _)| file)
+}
+
+/// execveat(2) 流式可执行句柄加载：支持 dirfd、AT_EMPTY_PATH 与 AT_SYMLINK_NOFOLLOW。
+pub fn open_executable_at(
+    ctx: &Context,
+    dirfd: usize,
+    path: &str,
+    flags: u32,
+) -> Result<(ExecutableFile, String), Errno> {
+    const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+    const AT_EMPTY_PATH: u32 = 0x1000;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(Errno::Invalid);
+    }
+    if path.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(Errno::NoEntry);
+        }
+        if dirfd as isize == -100 {
+            return Err(Errno::Access);
+        }
+        let handle = ctx.get(dirfd)?;
+        let (ino, resolved_path) = {
+            let f = handle.lock();
+            match &f.kind {
+                Kind::Inode {
+                    ino,
+                    path: saved,
+                    directory: None,
+                } => (*ino, string(saved)?),
+                Kind::Inode {
+                    directory: Some(_), ..
+                } => return Err(Errno::Access),
+                _ => return Err(Errno::Access),
+            }
+        };
+        let file = open_executable_inode(ino)?;
+        return Ok((file, resolved_path));
+    }
+    // /proc/self/exe 指向当前进程的可执行文件（proc(5)）。
+    let redirected;
+    let effective = if path == "/proc/self/exe" {
+        if ctx.exe_path.is_empty() {
+            return Err(Errno::NoEntry);
+        }
+        redirected = ctx.exe_path.clone();
+        &redirected
+    } else {
+        path
+    };
+    let joined = ctx.join_raw(dirfd, effective)?;
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let (resolved, info) = fs::resolve(&joined, follow)?;
+    if info.mode & 0xf000 == 0xa000 {
+        return Err(Errno::Loop);
+    }
+    let file = open_executable_inode(info.inode_handle())?;
+    Ok((file, resolved))
+}
+
 /// 读取可执行文件完整字节内容。
+#[allow(dead_code)]
 pub fn executable(ctx: &Context, path: &str) -> Result<Vec<u8>, Errno> {
     let file = open_executable(ctx, path)?;
     let len = file.size();
