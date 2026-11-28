@@ -1622,7 +1622,15 @@ fn process_call(
         sysnr::GETSID => get_pg_or_sid(parent, args[0], true),
         sysnr::SETSID => set_sid(parent),
         sysnr::KILL | sysnr::TKILL | sysnr::TGKILL => kill_or_tgkill(parent, nr, args),
-        sysnr::ACCEPT | sysnr::ACCEPT4 | sysnr::CONNECT | sysnr::SENDTO | sysnr::RECVFROM => {
+        sysnr::ACCEPT
+        | sysnr::ACCEPT4
+        | sysnr::CONNECT
+        | sysnr::SENDTO
+        | sysnr::RECVFROM
+        | sysnr::SENDMSG
+        | sysnr::RECVMSG
+        | sysnr::SENDMMSG
+        | sysnr::RECVMMSG => {
             let flow = {
                 let mut locked = REGISTRY.lock();
                 let reg = &mut *locked;

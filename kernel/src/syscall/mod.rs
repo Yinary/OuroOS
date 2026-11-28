@@ -209,7 +209,11 @@ pub mod sysnr {
     pub const SETSOCKOPT: usize = 208;
     pub const GETSOCKOPT: usize = 209;
     pub const SHUTDOWN: usize = 210;
+    pub const SENDMSG: usize = 211;
+    pub const RECVMSG: usize = 212;
     pub const ACCEPT4: usize = 242;
+    pub const RECVMMSG: usize = 243;
+    pub const SENDMMSG: usize = 269;
     // 内存
     pub const READAHEAD: usize = 213;
     pub const BRK: usize = 214;
@@ -755,6 +759,10 @@ pub fn dispatch(
         | sysnr::CONNECT
         | sysnr::SENDTO
         | sysnr::RECVFROM
+        | sysnr::SENDMSG
+        | sysnr::RECVMSG
+        | sysnr::SENDMMSG
+        | sysnr::RECVMMSG
         | sysnr::MQ_OPEN
         | sysnr::MQ_UNLINK
         | sysnr::MQ_TIMEDSEND
