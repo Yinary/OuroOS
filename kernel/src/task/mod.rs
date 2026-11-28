@@ -10,7 +10,8 @@ pub mod signal;
 mod task;
 pub mod user_task;
 
-use alloc::vec::Vec;
+use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use polyhal::{irq::IRQ, println};
 
@@ -187,6 +188,40 @@ pub fn comm_from_path(path: &str) -> [u8; 16] {
     comm_from_bytes(base.as_bytes())
 }
 
+/// pidfd(2) 共享进程实例状态：锁外供 poll/epoll 查询退出状态与边沿版本，防止 PID 复用误判。
+pub struct PidFdState {
+    pid: Pid,
+    exited: AtomicBool,
+    event_gen: AtomicU64,
+}
+
+impl PidFdState {
+    pub fn new(pid: Pid, exited: bool) -> Self {
+        Self {
+            pid,
+            exited: AtomicBool::new(exited),
+            event_gen: AtomicU64::new(1),
+        }
+    }
+
+    pub fn pid(&self) -> Pid {
+        self.pid
+    }
+
+    pub fn is_exited(&self) -> bool {
+        self.exited.load(Ordering::Acquire)
+    }
+
+    pub fn event_gen(&self) -> u64 {
+        self.event_gen.load(Ordering::Acquire)
+    }
+
+    pub fn mark_exited(&self) {
+        self.exited.store(true, Ordering::Release);
+        self.event_gen.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// 进程注册表条目：Task 之外的全部资源与终态。
 /// 生命周期：wait 成功收割即删除；孤儿过继 init，运行时间累归丢弃。
 /// 表内只存活跃进程与未被收割的僵尸。
@@ -215,6 +250,10 @@ pub struct ProcessRecord {
     pub creds: Credentials,
     /// ITIMER_REAL 定时器：(下次单调触发时刻, 重复周期)；fork 清零，exec 保留。
     pub itimer_real: Option<(core::time::Duration, core::time::Duration)>,
+    /// POSIX 进程定时器（timer_create）；不跨 fork 继承，exec/exit 时清空。
+    pub posix_timers: Vec<posix_timer::PosixTimer>,
+    /// 下一个待分配的 POSIX 定时器 ID（timer_t，非负递增）。
+    pub next_timer_id: i32,
     /// 16 项 POSIX 资源限额（DATA/STACK/MEMLOCK/AS 与 space 同步，NOFILE 与 fs 同步）。
     pub rlimits: [[u64; 2]; RLIM_NLIMITS],
     /// PR_SET_DUMPABLE / PR_GET_DUMPABLE（0=不可转储，1=可转储；fork 继承，exec 重置为 1）。
@@ -233,6 +272,8 @@ pub struct ProcessRecord {
     pub ioprio: u16,
     /// personality(2) 执行域标志（默认 0 即 PER_LINUX；fork 继承，exec 保留）。
     pub personality: u32,
+    /// pidfd_open(2) 按需创建的进程实例句柄，退出时置位并唤醒 poll/epoll。
+    pub pidfd_state: Option<Arc<PidFdState>>,
 }
 
 /// 线程记录：线程私有的信号状态与 prctl 属性。地址空间等组级资源在 ProcessRecord。
@@ -315,10 +356,25 @@ impl Registry {
     }
 }
 
+/// `EXIT_REPORTS` 环形缓冲容量上限。
+const MAX_EXIT_REPORTS: usize = 512;
+
 /// 终态行积攒表：收割即删后注册表不留历史，输出推迟到时代结束，
 /// 避免混入用户程序的测试输出块（官方 oracle 按 START/END 判定）。
-static EXIT_REPORTS: DebugMutex<Vec<(Pid, &'static str, ExitInfo)>> =
-    DebugMutex::new("EXIT_REPORTS", Vec::new());
+static EXIT_REPORTS: DebugMutex<VecDeque<(Pid, &'static str, ExitInfo)>> =
+    DebugMutex::new("EXIT_REPORTS", VecDeque::new());
+
+/// 元素数远小于容量时缩容，分配失败则保留原缓冲。
+fn maybe_shrink_vec<T>(v: &mut Vec<T>, min_cap: usize) {
+    if v.capacity() > min_cap * 2 && v.len() * 4 <= v.capacity() {
+        let target = v.len().max(min_cap);
+        let mut compact = Vec::new();
+        if compact.try_reserve_exact(target).is_ok() {
+            compact.append(v);
+            *v = compact;
+        }
+    }
+}
 
 /// procfs 的独立进程快照表：Task 在注册/退出/收割的提交点同步维护，
 /// FS 读路径只取本表（不回调 REGISTRY——syscall 分发已持有该锁，
@@ -474,7 +530,9 @@ pub(crate) fn proc_table_set_state(pid: Pid, state: u8) {
 
 /// 收割时移除快照（wait 收割 / 孤儿即收 / 父退出清理，均在 REGISTRY 段）。
 pub(crate) fn proc_table_remove_all<F: Fn(u32) -> bool>(pred: F) {
-    PROC_TABLE.lock().retain(|e| !pred(e.pid));
+    let mut table = PROC_TABLE.lock();
+    table.retain(|e| !pred(e.pid));
+    maybe_shrink_vec(&mut table, 32);
 }
 
 /// procfs 快照条目：(pid, 登记名, 状态字符, 父 pid, exec 后 argv)
@@ -505,74 +563,83 @@ pub fn proc_table_lookup(pid: u32) -> Option<(&'static str, u8, u32, Option<allo
 /// 最早到期的 ITIMER_REAL 单调时刻（纳秒；u64::MAX 表示当前无活动定时器）。
 static NEXT_ITIMER_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
 
-/// 在持 REGISTRY 锁下重算全局最早 ITIMER_REAL 触发时刻。
+/// 在持 REGISTRY 锁下重算全局最早 ITIMER_REAL / POSIX 定时器触发时刻。
 fn recompute_next_itimer(reg: &Registry) {
-    let min_ns = reg
-        .records
-        .iter()
-        .filter(|r| r.exit.is_none())
-        .filter_map(|r| {
-            r.itimer_real
-                .map(|(d, _)| d.as_nanos().min(u64::MAX as u128) as u64)
-        })
-        .min()
-        .unwrap_or(u64::MAX);
+    let now_mono = crate::time::monotonic();
+    let now_real = crate::time::realtime();
+    let mut min_ns = u64::MAX;
+    for r in reg.records.iter().filter(|r| r.exit.is_none()) {
+        if let Some((d, _)) = r.itimer_real {
+            min_ns = min_ns.min(d.as_nanos().min(u64::MAX as u128) as u64);
+        }
+        if !r.posix_timers.is_empty() {
+            let cpu_ns = r.user_ns.saturating_add(r.system_ns);
+            for t in &r.posix_timers {
+                if let Some(d) = t.monotonic_wakeup(now_mono, now_real, cpu_ns) {
+                    min_ns = min_ns.min(d.as_nanos().min(u64::MAX as u128) as u64);
+                }
+            }
+        }
+    }
     NEXT_ITIMER_NS.store(min_ns, core::sync::atomic::Ordering::Release);
 }
 
-/// 返回全局最早的 ITIMER_REAL 触发时刻（无活动定时器时返回 None）。
+/// 返回全局最早的 ITIMER_REAL / POSIX 定时器触发时刻（无活动定时器时返回 None）。
 pub(super) fn next_itimer_deadline() -> Option<core::time::Duration> {
     let ns = NEXT_ITIMER_NS.load(core::sync::atomic::Ordering::Acquire);
     (ns != u64::MAX).then(|| core::time::Duration::from_nanos(ns))
 }
 
-/// 检查并触发所有已到期的 ITIMER_REAL 定时器，投递 SIGALRM。
+/// 检查并触发所有已到期的 ITIMER_REAL 与 POSIX 定时器。
 /// 仅在已到最早触发时刻时才加 REGISTRY 锁（调用方持有 SCHED 锁，满足 SCHED→REGISTRY 锁序）。
 pub(super) fn fire_expired_itimers(now: core::time::Duration) -> bool {
     let now_ns = now.as_nanos().min(u64::MAX as u128) as u64;
     if now_ns < NEXT_ITIMER_NS.load(core::sync::atomic::Ordering::Acquire) {
         return false;
     }
+    let now_real = crate::time::realtime();
     let mut reg = REGISTRY.lock();
     let mut fired = false;
     let sig_bit: signal::SignalSet = 1u64 << (signal::SIGALRM - 1);
     for idx in 0..reg.records.len() {
-        let Some((deadline, interval)) = reg.records[idx].itimer_real else {
-            continue;
-        };
         if reg.records[idx].exit.is_some() {
             reg.records[idx].itimer_real = None;
+            reg.records[idx].posix_timers.clear();
             continue;
         }
-        if now < deadline {
-            continue;
-        }
-        let tgid = reg.records[idx].pid;
-        let all_blocked = reg
-            .threads
-            .iter()
-            .filter(|t| t.tgid == tgid)
-            .all(|t| t.signal.blocked() & sig_bit != 0);
-        let blocked = if all_blocked { sig_bit } else { 0 };
-        let next = if !interval.is_zero() {
-            let mut d = deadline.saturating_add(interval);
-            if d <= now {
-                d = now.saturating_add(interval);
+        if let Some((deadline, interval)) = reg.records[idx].itimer_real {
+            if now >= deadline {
+                let tgid = reg.records[idx].pid;
+                let all_blocked = reg
+                    .threads
+                    .iter()
+                    .filter(|t| t.tgid == tgid)
+                    .all(|t| t.signal.blocked() & sig_bit != 0);
+                let blocked = if all_blocked { sig_bit } else { 0 };
+                let next = if !interval.is_zero() {
+                    let mut d = deadline.saturating_add(interval);
+                    if d <= now {
+                        d = now.saturating_add(interval);
+                    }
+                    Some((d, interval))
+                } else {
+                    None
+                };
+                reg.records[idx].itimer_real = next;
+                reg.records[idx].signal.generate(
+                    signal::SIGALRM,
+                    SigInfoSlot {
+                        code: 0x80, // SI_KERNEL
+                        ..Default::default()
+                    },
+                    blocked,
+                );
+                fired = true;
             }
-            Some((d, interval))
-        } else {
-            None
-        };
-        reg.records[idx].itimer_real = next;
-        reg.records[idx].signal.generate(
-            signal::SIGALRM,
-            SigInfoSlot {
-                code: 0x80, // SI_KERNEL
-                ..Default::default()
-            },
-            blocked,
-        );
-        fired = true;
+        }
+        if posix_timer::fire_process_timers(&mut reg, idx, now, now_real) {
+            fired = true;
+        }
     }
     recompute_next_itimer(&reg);
     fired
@@ -615,6 +682,8 @@ mod registry {
             did_exec: false,
             creds: Credentials::root(),
             itimer_real: None,
+            posix_timers: Vec::new(),
+            next_timer_id: 0,
             rlimits: default_rlimits(),
             dumpable: 1,
             keepcaps: false,
@@ -624,6 +693,7 @@ mod registry {
             securebits: 0,
             ioprio: 0,
             personality: 0,
+            pidfd_state: None,
             user_ns: 0,
             system_ns: 0,
             child_user_ns: 0,
@@ -693,14 +763,22 @@ mod registry {
             let mut reg = REGISTRY.lock();
             let rec = reg.group_mut(pid).expect("exiting task is not registered");
             rec.exit = Some(exit);
-            let had_itimer = rec.itimer_real.take().is_some();
+            if let Some(ref state) = rec.pidfd_state {
+                state.mark_exited();
+                sched::request_pipe_wake();
+            }
+            let had_itimer = rec.itimer_real.take().is_some() || !rec.posix_timers.is_empty();
+            rec.posix_timers.clear();
             // 快照置僵尸（procfs 可见的存活规则与注册表一致）
             proc_table_mark_zombie(pid);
-            // 积攒终态行；容量不足时丢弃（打印非关键路径）
+            // 积攒终态行；满容淘汰最旧条目，分配失败则丢弃。
             {
                 let mut reports = EXIT_REPORTS.lock();
-                if reports.try_reserve(1).is_ok() {
-                    reports.push((pid, rec.name, exit));
+                if reports.len() >= MAX_EXIT_REPORTS {
+                    reports.pop_front();
+                }
+                if reports.len() < MAX_EXIT_REPORTS && reports.try_reserve(1).is_ok() {
+                    reports.push_back((pid, rec.name, exit));
                 }
             }
             if let Some(local) = rec.space.as_ref() {
@@ -836,6 +914,8 @@ mod registry {
             for pid in &removed {
                 reg.remove_thread(*pid as Pid);
             }
+            maybe_shrink_vec(&mut reg.records, 32);
+            maybe_shrink_vec(&mut reg.threads, 32);
             proc_table_remove_all(|p| removed.contains(&p));
             let mut adopted_zombie: Option<(Pid, ExitInfo)> = None;
             for child in reg.records.iter_mut().filter(|r| r.parent == pid) {
@@ -885,8 +965,9 @@ mod registry {
             debug_assert!(!orphan || reg.records.iter().all(|r| r.pid != pid));
             taken
         };
-        // 锁外释放该进程持有的全部 POSIX 记录锁，再 Drop 地址空间与 FD 表。
+        // 锁外释放该进程持有的全部 POSIX 记录锁与 POSIX 消息队列通知，再 Drop 地址空间与 FD 表。
         crate::fs::locks::release_process_locks(pid as u32);
+        crate::ipc::mqueue::on_process_exit(pid);
         drop(taken);
     }
 
@@ -900,6 +981,8 @@ mod registry {
             .position(|r| r.pid == target && r.parent == parent && r.exit.is_some())?;
         let rec = reg.records.remove(i);
         reg.remove_thread(target);
+        maybe_shrink_vec(&mut reg.records, 32);
+        maybe_shrink_vec(&mut reg.threads, 32);
         proc_table_remove_all(|p| p == target as u32);
         Some((
             rec.user_ns.saturating_add(rec.child_user_ns),
@@ -1048,6 +1131,8 @@ pub fn run(baseline: (usize, usize)) {
     if let Err(e) = crate::fs::cache::flush(None) {
         log::error!("shared page writeback pending at task exit: {:?}", e);
     }
+    // 回收关机时仍驻留的 System V 共享内存段。
+    mm::shm::clear_all();
     let (total, free) = mm::frame::stats();
     assert_eq!(
         (total, free + crate::fs::retained_frames()),
@@ -1060,6 +1145,7 @@ pub fn run(baseline: (usize, usize)) {
 }
 
 mod exec;
+mod posix_timer;
 
 #[cfg(debug_assertions)]
 pub(crate) fn exec_self_test() {
