@@ -250,6 +250,8 @@ pub struct Context {
     /// 本进程最近一次 execve 的绝对路径（/proc/self/exe 的目标，proc(5)）。
     /// 内核内嵌启动的程序没有盘上路径，保持为空串。
     exe_path: String,
+    /// 本进程拥有的 Linux AIO 上下文表（不跨 fork 继承，exec 时清理）。
+    aio: super::aio::AioTable,
 }
 fn string(s: &str) -> Result<String, Errno> {
     let mut result = String::new();
@@ -279,9 +281,10 @@ impl Context {
             nofile_limit: [FD_DEFAULT_SOFT, FD_DEFAULT_HARD],
             umask: 0o022,
             exe_path: String::new(),
+            aio: super::aio::AioTable::new(),
         })
     }
-    /// fork 复制描述符表，保留共享偏移。
+    /// fork 复制描述符表，保留共享偏移；AIO 上下文表不跨 fork 继承。
     pub fn fork(&self) -> Result<Self, Errno> {
         let mut fds = Vec::new();
         fds.try_reserve(self.fds.len()).map_err(|_| Errno::NoMem)?;
@@ -292,7 +295,33 @@ impl Context {
             nofile_limit: self.nofile_limit,
             umask: self.umask,
             exe_path: self.exe_path.clone(),
+            aio: super::aio::AioTable::new(),
         })
+    }
+    pub(crate) fn aio(&self) -> &super::aio::AioTable {
+        &self.aio
+    }
+    pub(crate) fn aio_mut(&mut self) -> &mut super::aio::AioTable {
+        &mut self.aio
+    }
+    /// 校验 `fd` 是否指向有效 eventfd（供 AIO `IOCB_FLAG_RESFD` 使用）。
+    pub(crate) fn check_eventfd(&self, fd: usize) -> Result<(), Errno> {
+        let handle = self.get(fd).map_err(|_| Errno::Invalid)?;
+        let f = handle.lock();
+        if matches!(f.kind, Kind::EventFd { .. }) {
+            Ok(())
+        } else {
+            Err(Errno::Invalid)
+        }
+    }
+    /// 向 eventfd 累加 1（供 AIO `IOCB_FLAG_RESFD` 完成通知）。
+    pub(crate) fn signal_eventfd(&self, fd: usize) {
+        if let Ok(handle) = self.get(fd) {
+            let f = handle.lock();
+            if let Kind::EventFd { efd, .. } = &f.kind {
+                let _ = efd.lock().write(&1u64.to_ne_bytes(), true);
+            }
+        }
     }
     /// 查询本进程 RLIMIT_NOFILE 的软硬限额。
     pub(crate) fn nofile_limit(&self) -> [usize; 2] {
@@ -2500,8 +2529,9 @@ pub fn mapping(ctx: &Context, fd: usize, write: bool) -> Result<(u32, bool), Err
     Err(Errno::NoDevice)
 }
 
-/// exec 成功提交后关闭 CLOEXEC 描述符，标志不与 dup 的源 fd 共享。
+/// exec 成功提交后关闭 CLOEXEC 描述符并清空本进程 AIO 上下文。
 pub fn close_exec(ctx: &mut Context) {
+    ctx.aio.clear();
     for fd in &mut ctx.fds {
         if fd.as_ref().is_some_and(|d| d.cloexec) {
             *fd = None;

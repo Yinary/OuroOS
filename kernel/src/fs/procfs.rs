@@ -84,10 +84,47 @@ pub(super) const SYS_SEM: u32 = u32::MAX - 24;
 pub(super) const SYSVIPC_DIR: u32 = u32::MAX - 25;
 pub(super) const SYSVIPC_MSG: u32 = u32::MAX - 26;
 pub(super) const SYSVIPC_SEM: u32 = u32::MAX - 27;
+/// /proc/sys/fs/aio-max-nr 与 /proc/sys/fs/aio-nr 只读节点。
+pub(super) const AIO_MAX_NR: u32 = u32::MAX - 28;
+pub(super) const AIO_NR: u32 = u32::MAX - 29;
+/// /boot 与 /boot/config-<KERNEL_RELEASE> 内核配置只读节点（供 LTP tst_kconfig 等工具读取）。
+pub(super) const BOOT_DIR: u32 = u32::MAX - 30;
+pub(super) const BOOT_CONFIG: u32 = u32::MAX - 31;
 
 /// 判断 inode 是否属于虚拟节点区间（固定虚拟节点或 /proc/<pid> 派生节点）。
 pub(super) fn is_virtual_ino(ino: u32) -> bool {
-    ino >= SYSVIPC_SEM || pid_ino_parts(ino).is_some()
+    ino >= BOOT_CONFIG || pid_ino_parts(ino).is_some()
+}
+
+/// `/boot/config-6.1.0-OuroOS`：如实声明本内核已启用的能力项。
+pub(super) fn kernel_config() -> &'static str {
+    "CONFIG_64BIT=y\n\
+     CONFIG_MMU=y\n\
+     CONFIG_AIO=y\n\
+     CONFIG_EPOLL=y\n\
+     CONFIG_EVENTFD=y\n\
+     CONFIG_TIMERFD=y\n\
+     CONFIG_POSIX_TIMERS=y\n\
+     CONFIG_SYSVIPC=y\n\
+     CONFIG_FUTEX=y\n\
+     CONFIG_SHMEM=y\n\
+     CONFIG_EXT4_FS=y\n\
+     CONFIG_PROC_FS=y\n\
+     CONFIG_UNIX=y\n\
+     CONFIG_INET=y\n"
+}
+
+/// `/proc/sys/fs/aio-{max-nr,nr}` 只读快照。
+pub(super) fn sys_fs_aio(name: &str) -> Result<String, Errno> {
+    let val = match name {
+        "aio-max-nr" => super::aio::aio_max_nr(),
+        "aio-nr" => super::aio::aio_nr(),
+        _ => return Err(Errno::NoEntry),
+    };
+    let mut out = String::new();
+    out.try_reserve(24).map_err(|_| Errno::NoMem)?;
+    let _ = writeln!(out, "{}", val);
+    Ok(out)
 }
 
 /// /proc/sys/kernel/{msgmni,msgmax,msgmnb,sem} 只读快照（与 ipc 模块限额常量同源）。

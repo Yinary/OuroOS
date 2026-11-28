@@ -218,7 +218,10 @@ pub fn dispatch(
             let raw_input = user_string(space, a[1])?;
             let dirfd = a[0] as u32 as i32 as isize as usize;
             let joined = ctx.join_raw(dirfd, &raw_input)?;
-            if joined.starts_with("/proc") || joined.starts_with("/dev") {
+            if joined.starts_with("/proc")
+                || joined.starts_with("/dev")
+                || joined.starts_with("/boot")
+            {
                 if let Ok(path) = ctx.path(dirfd, &raw_input) {
                     if path == "/proc/meminfo" {
                         return ctx.open_meminfo(a[2], a[2] & O_CLOEXEC != 0);
@@ -1252,6 +1255,136 @@ fn transfer_with_buf(
         }
     }
     Ok(done)
+}
+
+/// Linux `io_submit(2)`：按序解析 iocb 数组，复用 `transfer` 缓冲池执行 I/O 并入队完成事件。
+pub(crate) fn io_submit(
+    space: &UserAddressSpace,
+    ctx: &mut Context,
+    ctx_id: u64,
+    nr_raw: usize,
+    iocbpp: usize,
+) -> Result<usize, Errno> {
+    use fs::aio::{
+        validate_iocb, IoEvent, Iocb, IOCB_CMD_FDSYNC, IOCB_CMD_FSYNC, IOCB_CMD_PREAD,
+        IOCB_CMD_PREADV, IOCB_CMD_PWRITE, IOCB_CMD_PWRITEV, IOCB_FLAG_RESFD, RWF_APPEND,
+    };
+    if !ctx.aio().contains(ctx_id) {
+        return Err(Errno::Invalid);
+    }
+    let nr = nr_raw as isize;
+    if nr < 0 {
+        return Err(Errno::Invalid);
+    }
+    let nr = nr as usize;
+    if nr == 0 {
+        return Ok(0);
+    }
+
+    let mut submitted = 0usize;
+    for i in 0..nr {
+        let step: Result<(), Errno> = (|| {
+            let ptr_addr = iocbpp.checked_add(i * 8).ok_or(Errno::Fault)?;
+            let mut ptr_raw = [0u8; 8];
+            user_access::copy_from_user(space, ptr_addr, &mut ptr_raw).map_err(|_| Errno::Fault)?;
+            let iocb_ptr = usize::from_ne_bytes(ptr_raw);
+            let mut cb_raw = [0u8; 64];
+            user_access::copy_from_user(space, iocb_ptr, &mut cb_raw).map_err(|_| Errno::Fault)?;
+            let cb = Iocb::decode(&cb_raw);
+            validate_iocb(&cb)?;
+            if cb.aio_flags & IOCB_FLAG_RESFD != 0 {
+                ctx.check_eventfd(cb.aio_resfd as usize)?;
+            }
+            if !ctx.aio().has_space(ctx_id)? {
+                return Err(Errno::Again);
+            }
+            let handle = ctx.get(cb.aio_fildes as usize)?;
+            let io_res: Result<usize, Errno> = match cb.aio_lio_opcode {
+                IOCB_CMD_PREAD | IOCB_CMD_PWRITE => {
+                    let reading = cb.aio_lio_opcode == IOCB_CMD_PREAD;
+                    let len = usize::try_from(cb.aio_nbytes).map_err(|_| Errno::Invalid)?;
+                    if len > isize::MAX as usize {
+                        return Err(Errno::Invalid);
+                    }
+                    let b = buffer(cb.aio_buf as usize, len)?;
+                    let mut file = handle.lock();
+                    file.check_access(reading)?;
+                    file.check_positioned()?;
+                    let offset = if !reading && cb.aio_rw_flags & RWF_APPEND != 0 {
+                        file.lock_file_size()? as usize
+                    } else {
+                        cb.aio_offset as usize
+                    };
+                    transfer(space, &mut file, &[b], reading, Some(offset))
+                }
+                IOCB_CMD_PREADV | IOCB_CMD_PWRITEV => {
+                    let reading = cb.aio_lio_opcode == IOCB_CMD_PREADV;
+                    let iovcnt = usize::try_from(cb.aio_nbytes).map_err(|_| Errno::Invalid)?;
+                    let mut file = handle.lock();
+                    file.check_access(reading)?;
+                    file.check_positioned()?;
+                    let buffers = import_iov(space, cb.aio_buf as usize, iovcnt)?;
+                    let offset = if !reading && cb.aio_rw_flags & RWF_APPEND != 0 {
+                        file.lock_file_size()? as usize
+                    } else {
+                        cb.aio_offset as usize
+                    };
+                    transfer(space, &mut file, &buffers, reading, Some(offset))
+                }
+                IOCB_CMD_FSYNC | IOCB_CMD_FDSYNC => {
+                    let ino = handle.lock().inode()?;
+                    #[cfg(not(feature = "rsext4-readonly"))]
+                    {
+                        fs::sync_inode(ino)?;
+                    }
+                    #[cfg(feature = "rsext4-readonly")]
+                    let _ = ino;
+                    Ok(0)
+                }
+                _ => Err(Errno::Invalid),
+            };
+            let res_code: i64 = match io_res {
+                Ok(n) => n as i64,
+                Err(Errno::Fault) => return Err(Errno::Fault),
+                Err(e) => -e.as_errno() as i64,
+            };
+            ctx.aio_mut().push_event(
+                ctx_id,
+                IoEvent {
+                    data: cb.aio_data,
+                    obj: iocb_ptr as u64,
+                    res: res_code,
+                    res2: 0,
+                },
+            )?;
+            if cb.aio_flags & IOCB_FLAG_RESFD != 0 {
+                ctx.signal_eventfd(cb.aio_resfd as usize);
+            }
+            Ok(())
+        })();
+        match step {
+            Ok(()) => submitted += 1,
+            Err(e) => return if submitted > 0 { Ok(submitted) } else { Err(e) },
+        }
+    }
+    Ok(submitted)
+}
+
+/// Linux `io_cancel(2)`：按 Linux `fs/aio.c` 顺序先校验 `iocb` 可读，再校验 `ctx_id`，无在途请求返回 EAGAIN。
+pub(crate) fn io_cancel(
+    space: &UserAddressSpace,
+    ctx: &Context,
+    ctx_id: u64,
+    iocb_ptr: usize,
+    _result_ptr: usize,
+) -> Result<usize, Errno> {
+    let mut key_raw = [0u8; 4];
+    let key_addr = iocb_ptr.checked_add(8).ok_or(Errno::Fault)?;
+    user_access::copy_from_user(space, key_addr, &mut key_raw).map_err(|_| Errno::Fault)?;
+    if !ctx.aio().contains(ctx_id) {
+        return Err(Errno::Invalid);
+    }
+    Err(Errno::Again)
 }
 
 /// 编码 rv64/la64 共用的 asm-generic 128 字节 stat 布局。

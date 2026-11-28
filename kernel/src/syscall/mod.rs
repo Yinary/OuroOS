@@ -23,6 +23,13 @@ use crate::task::WaitReason;
 /// 少数未实现项一并列入（目录性质，接入时直接引用）。
 #[allow(dead_code)]
 pub mod sysnr {
+    // Linux AIO
+    pub const IO_SETUP: usize = 0;
+    pub const IO_DESTROY: usize = 1;
+    pub const IO_SUBMIT: usize = 2;
+    pub const IO_CANCEL: usize = 3;
+    pub const IO_GETEVENTS: usize = 4;
+    pub const IO_PGETEVENTS: usize = 292;
     // 文件
     pub const GETCWD: usize = 17;
     pub const EVENTFD2: usize = 19;
@@ -400,6 +407,16 @@ pub fn dispatch(
     let args = cx.args();
     let (a0, a1, a2) = (args[0], args[1], args[2]);
     match nr {
+        sysnr::IO_SETUP | sysnr::IO_DESTROY | sysnr::IO_SUBMIT | sysnr::IO_CANCEL => {
+            let ret = match nr {
+                sysnr::IO_SETUP => fs.aio_mut().setup(space, a0 as u32, a1),
+                sysnr::IO_DESTROY => fs.aio_mut().destroy(space, a0 as u64),
+                sysnr::IO_SUBMIT => self::fs::io_submit(space, fs, a0 as u64, a1, a2),
+                _ => self::fs::io_cancel(space, fs, a0 as u64, a1, a2),
+            };
+            cx[TrapFrameArgs::RET] = to_abi(ret);
+            Flow::Continue
+        }
         sysnr::GETCWD
         | sysnr::EVENTFD2
         | sysnr::EPOLL_CREATE1
@@ -676,6 +693,8 @@ pub fn dispatch(
         | sysnr::PPOLL
         | sysnr::EPOLL_PWAIT
         | sysnr::EPOLL_PWAIT2
+        | sysnr::IO_GETEVENTS
+        | sysnr::IO_PGETEVENTS
         | sysnr::NANOSLEEP
         | sysnr::GETITIMER
         | sysnr::SETITIMER

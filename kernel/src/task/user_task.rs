@@ -673,7 +673,9 @@ fn park_check_signals(
                     && frame[TrapFrameArgs::SYSCALL] != sysnr::PPOLL
                     && frame[TrapFrameArgs::SYSCALL] != sysnr::PSELECT6
                     && frame[TrapFrameArgs::SYSCALL] != sysnr::EPOLL_PWAIT
-                    && frame[TrapFrameArgs::SYSCALL] != sysnr::EPOLL_PWAIT2 =>
+                    && frame[TrapFrameArgs::SYSCALL] != sysnr::EPOLL_PWAIT2
+                    && frame[TrapFrameArgs::SYSCALL] != sysnr::IO_GETEVENTS
+                    && frame[TrapFrameArgs::SYSCALL] != sysnr::IO_PGETEVENTS =>
             {
                 ParkOutcome::Incomplete
             }
@@ -1167,6 +1169,120 @@ fn process_call(
                 Err(e) => {
                     *sleep_deadline = None;
                     Err(e)
+                }
+            }
+        }
+        sysnr::IO_GETEVENTS | sysnr::IO_PGETEVENTS => {
+            enum AioStep {
+                Done(Result<usize, Errno>),
+                Wait(WaitReason),
+            }
+            let step = {
+                let mut locked = REGISTRY.lock();
+                let reg = &mut *locked;
+                let res: Result<AioStep, Errno> = (|| {
+                    let ctx_id = args[0] as u64;
+                    let min_nr = args[1] as isize;
+                    let max_nr = args[2] as isize;
+                    let events_ptr = args[3];
+                    let timeout_ptr = args[4];
+                    if min_nr < 0 || max_nr < 0 || min_nr > max_nr {
+                        return Err(Errno::Invalid);
+                    }
+                    let min_nr = min_nr as usize;
+                    let max_nr = max_nr as usize;
+                    if max_nr > 0 {
+                        let byte_len = max_nr.checked_mul(32).ok_or(Errno::Invalid)?;
+                        user_access::check_user_range(events_ptr, byte_len)
+                            .map_err(|_| Errno::Fault)?;
+                    }
+
+                    let index = reg.group_index(parent).ok_or(Errno::NoProcess)?;
+                    let space = reg.records[index]
+                        .space
+                        .as_ref()
+                        .ok_or(Errno::Invalid)?
+                        .as_space();
+
+                    if !reg.records[index]
+                        .fs
+                        .as_ref()
+                        .ok_or(Errno::Invalid)?
+                        .aio()
+                        .contains(ctx_id)
+                    {
+                        return Err(Errno::Invalid);
+                    }
+
+                    if nr == sysnr::IO_PGETEVENTS && args[5] != 0 && sigsuspend_saved.is_none() {
+                        let mut usig = [0u8; 16];
+                        user_access::copy_from_user(space, args[5], &mut usig)
+                            .map_err(|_| Errno::Fault)?;
+                        let sigmask_ptr =
+                            usize::from_ne_bytes(usig[0..8].try_into().unwrap_or([0; 8]));
+                        let sigsetsize =
+                            usize::from_ne_bytes(usig[8..16].try_into().unwrap_or([0; 8]));
+                        if sigmask_ptr != 0 {
+                            if sigsetsize != SIGSETSIZE {
+                                return Err(Errno::Invalid);
+                            }
+                            let mut raw_mask = [0u8; SIGSETSIZE];
+                            user_access::copy_from_user(space, sigmask_ptr, &mut raw_mask)
+                                .map_err(|_| Errno::Fault)?;
+                            let mut new_mask = SignalSet::from_ne_bytes(raw_mask);
+                            new_mask.del(SIGKILL);
+                            new_mask.del(SIGSTOP);
+                            if let Some(thread) = reg.threads.iter_mut().find(|t| t.tid == parent) {
+                                *sigsuspend_saved = Some(thread.signal.blocked());
+                                thread.signal.setmask(new_mask);
+                            }
+                        }
+                    }
+
+                    if timeout_ptr != 0 && sleep_deadline.is_none() {
+                        let mut ts = [0u8; 16];
+                        user_access::copy_from_user(space, timeout_ptr, &mut ts)
+                            .map_err(|_| Errno::Fault)?;
+                        let sec = i64::from_ne_bytes(ts[0..8].try_into().unwrap_or([0; 8]));
+                        let nsec = i64::from_ne_bytes(ts[8..16].try_into().unwrap_or([0; 8]));
+                        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+                            return Err(Errno::Invalid);
+                        }
+                        *sleep_deadline = Some(
+                            crate::time::monotonic()
+                                .checked_add(core::time::Duration::new(sec as u64, nsec as u32))
+                                .ok_or(Errno::Invalid)?,
+                        );
+                    }
+
+                    let rec = &mut reg.records[index];
+                    let space = rec.space.as_ref().ok_or(Errno::Invalid)?.as_space();
+                    let fs = rec.fs.as_mut().ok_or(Errno::Invalid)?;
+                    let avail = fs.aio().available_events(ctx_id)?;
+                    let expired = sleep_deadline.is_some_and(|d| crate::time::monotonic() >= d);
+                    if avail >= min_nr || expired {
+                        let got = fs
+                            .aio_mut()
+                            .pop_events_to_user(space, ctx_id, max_nr, events_ptr)?;
+                        return Ok(AioStep::Done(Ok(got)));
+                    }
+                    Ok(AioStep::Wait(match *sleep_deadline {
+                        Some(d) => WaitReason::PollUntil(d),
+                        None => WaitReason::Pipe,
+                    }))
+                })();
+                match res {
+                    Ok(AioStep::Wait(reason)) => AioStep::Wait(reason),
+                    Ok(AioStep::Done(r)) => AioStep::Done(r),
+                    Err(e) => AioStep::Done(Err(e)),
+                }
+            };
+            match step {
+                AioStep::Wait(reason) => return ProcessResult::Wait(reason),
+                AioStep::Done(r) => {
+                    *sleep_deadline = None;
+                    *wait_uncompleted = false;
+                    r
                 }
             }
         }
