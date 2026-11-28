@@ -1942,6 +1942,35 @@ impl Drop for UserAddressSpace {
         if self.pt.borrow_mut().is_active() {
             self.pt.borrow_mut().deactivate();
         }
+        // 按去重后的 inode 批量压缩 RESIDENT 弱引用表。
+        let mut dirty_inos = [0u32; 32];
+        let mut dirty_len = 0usize;
+        let mut record_ino = |ino: u32| {
+            if dirty_inos[..dirty_len].contains(&ino) {
+                return;
+            }
+            if dirty_len == dirty_inos.len() {
+                file::compact_inos(&dirty_inos[..dirty_len]);
+                dirty_len = 0;
+            }
+            dirty_inos[dirty_len] = ino;
+            dirty_len += 1;
+        };
+        for page in &self.pages {
+            if let Backing::File(f) = &*page.frame.borrow() {
+                if let Some(ino) = f.release_deferred() {
+                    record_ino(ino);
+                }
+            }
+        }
+        for page in self.pending.get_mut().iter() {
+            if let Backing::File(f) = &*page.frame.borrow() {
+                if let Some(ino) = f.release_deferred() {
+                    record_ino(ino);
+                }
+            }
+        }
+        file::compact_inos(&dirty_inos[..dirty_len]);
     }
 }
 /// 物理 RAM 的内核直映别名，仅用于拥有/验证过的物理页。
