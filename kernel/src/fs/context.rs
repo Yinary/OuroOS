@@ -990,6 +990,37 @@ impl Context {
         Ok(())
     }
 
+    /// close_range(2)：关闭 `[first, last]` 内全部已打开 FD，或为它们批量置位 FD_CLOEXEC。
+    pub(crate) fn close_range(
+        &mut self,
+        first: usize,
+        last: usize,
+        cloexec_only: bool,
+        tgid: u32,
+    ) -> Result<usize, Errno> {
+        if first > last {
+            return Err(Errno::Invalid);
+        }
+        if first >= self.fds.len() {
+            return Ok(0);
+        }
+        let end = last.min(self.fds.len() - 1);
+        if cloexec_only {
+            for slot in &mut self.fds[first..=end] {
+                if let Some(desc) = slot.as_mut() {
+                    desc.cloexec = true;
+                }
+            }
+        } else {
+            for fd in first..=end {
+                if self.fds[fd].is_some() {
+                    let _ = self.close(fd, tgid);
+                }
+            }
+        }
+        Ok(0)
+    }
+
     /// 当进程关闭指向同一 POSIX 消息队列的最后一个描述符时，撤销该进程登记的 mq_notify。
     fn clear_mqueue_notify_if_last(
         &self,
@@ -1850,6 +1881,66 @@ impl OpenFile {
         Ok(0)
     }
 
+    /// 同步普通文件/目录对应的底层 inode；O_PATH 返回 EBADF，管道/FIFO/套接字/虚拟节点返回 EINVAL。
+    pub(crate) fn sync_inode(&self) -> Result<(), Errno> {
+        if self.flags & 0x200000 != 0 {
+            return Err(Errno::BadF);
+        }
+        match self.kind {
+            Kind::Inode { ino, .. } if !super::procfs::is_virtual_ino(ino) => {
+                #[cfg(not(feature = "rsext4-readonly"))]
+                {
+                    fs::sync_inode(ino)?;
+                }
+                Ok(())
+            }
+            _ => Err(Errno::Invalid),
+        }
+    }
+
+    /// sync_file_range(2) 校验并按需同步底层 inode；管道/FIFO/套接字/字符设备返回 ESPIPE。
+    pub(crate) fn sync_file_range(&self, do_sync: bool) -> Result<(), Errno> {
+        if self.flags & 0x200000 != 0 {
+            return Err(Errno::BadF);
+        }
+        match self.kind {
+            Kind::Inode { ino, .. } if !super::procfs::is_virtual_ino(ino) => {
+                if do_sync {
+                    #[cfg(not(feature = "rsext4-readonly"))]
+                    {
+                        let _ = fs::sync_inode(ino);
+                    }
+                }
+                Ok(())
+            }
+            Kind::DevBlk { .. } => Ok(()),
+            _ => Err(Errno::SeekPipe),
+        }
+    }
+
+    /// 是否支持 preadv2/pwritev2 的 RWF_NOWAIT（对应 Linux FMODE_NOWAIT：普通文件与块设备支持，管道/套接字不支持）。
+    pub(crate) fn supports_nowait(&self) -> bool {
+        matches!(
+            self.kind,
+            Kind::Inode {
+                directory: None,
+                ..
+            } | Kind::DevBlk { .. }
+        )
+    }
+
+    /// 是否指向普通文件 inode 且需要落盘（供 pwritev2 RWF_DSYNC/RWF_SYNC 使用）。
+    pub(crate) fn sync_if_inode(&self) {
+        if let Kind::Inode { ino, .. } = self.kind {
+            if !super::procfs::is_virtual_ino(ino) {
+                #[cfg(not(feature = "rsext4-readonly"))]
+                {
+                    let _ = fs::sync_inode(ino);
+                }
+            }
+        }
+    }
+
     /// 获取 inode；没有后端 inode 的对象返回 EINVAL。
     pub(crate) fn inode(&self) -> Result<u32, Errno> {
         match self.kind {
@@ -2574,6 +2665,35 @@ impl OpenFile {
             offset
         };
         fs::write(ino, offset, data)
+    }
+
+    /// 强制以追加模式写入文件末尾，不修改共享偏移（供 pwritev2 带显式偏移的 RWF_APPEND 使用）。
+    pub(crate) fn write_append_at(&self, data: &[u8], first: bool) -> Result<usize, Errno> {
+        self.check_type(first)?;
+        if matches!(
+            self.kind,
+            Kind::DevNull | Kind::DevZero | Kind::DevRandom { .. } | Kind::Rtc
+        ) {
+            return Ok(data.len());
+        }
+        let ino = match self.kind {
+            Kind::Inode { ino, .. } => ino,
+            _ => return Err(Errno::SeekPipe),
+        };
+        let end = fs::stat(ino)?.1 as usize;
+        fs::write(ino, end, data)
+    }
+
+    /// 强制以追加模式写入文件末尾并推进共享偏移（供 pwritev2 offset=-1 的 RWF_APPEND 使用）。
+    pub(crate) fn write_append_chunk(&mut self, data: &[u8], first: bool) -> Result<usize, Errno> {
+        self.check_type(first)?;
+        if let Kind::Inode { ino, .. } = self.kind {
+            let end = fs::stat(ino)?.1 as usize;
+            let count = fs::write(ino, end, data)?;
+            self.offset = end.checked_add(count).ok_or(Errno::Invalid)?;
+            return Ok(count);
+        }
+        self.write_chunk(data, first)
     }
 }
 

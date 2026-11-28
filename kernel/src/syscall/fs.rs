@@ -314,16 +314,32 @@ pub fn dispatch(
             let _ = fs::sync();
             Ok(0)
         }
-        #[cfg(not(feature = "rsext4-readonly"))]
-        sysnr::FSYNC => {
+        sysnr::FSYNC | sysnr::FDATASYNC => {
             let handle = ctx.get(a[0])?;
-            let ino = handle.lock().inode()?;
-            fs::sync_inode(ino)?;
+            let result = handle.lock().sync_inode();
+            result?;
             Ok(0)
         }
+        sysnr::SYNCFS => {
+            let _ = ctx.get(a[0])?;
+            let _ = fs::sync();
+            Ok(0)
+        }
+        sysnr::SYNC_FILE_RANGE => sync_file_range(ctx, a),
         sysnr::CLOSE => {
             ctx.close(a[0], tgid)?;
             Ok(0)
+        }
+        sysnr::CLOSE_RANGE => {
+            const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
+            const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+            let first = a[0] as u32 as usize;
+            let last = a[1] as u32 as usize;
+            let flags = a[2] as u32;
+            if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
+                return Err(Errno::Invalid);
+            }
+            ctx.close_range(first, last, flags & CLOSE_RANGE_CLOEXEC != 0, tgid)
         }
         sysnr::LSEEK => {
             let handle = ctx.get(a[0])?;
@@ -337,7 +353,9 @@ pub fn dispatch(
         | sysnr::PREAD64
         | sysnr::PWRITE64
         | sysnr::PREADV
-        | sysnr::PWRITEV => rw(nr, a, space, ctx),
+        | sysnr::PWRITEV
+        | sysnr::PREADV2
+        | sysnr::PWRITEV2 => rw(nr, a, space, ctx),
         sysnr::READLINKAT => readlinkat(ctx, space, a),
         sysnr::FSTATAT | sysnr::STATX => {
             let extended = nr == sysnr::STATX;
@@ -1046,42 +1064,100 @@ impl UserIo<'_> {
     }
 }
 
+/// sync_file_range(2)：校验 flags、负偏移/长度、溢出与文件类型后同步对应范围。
+fn sync_file_range(ctx: &Context, a: [usize; 6]) -> Result<usize, Errno> {
+    let flags = a[3] as u32;
+    if flags & !7 != 0 {
+        return Err(Errno::Invalid);
+    }
+    let offset = a[1] as i64;
+    let nbytes = a[2] as i64;
+    if offset < 0 || nbytes < 0 {
+        return Err(Errno::Invalid);
+    }
+    if nbytes > 0
+        && (offset as u64)
+            .checked_add(nbytes as u64)
+            .is_none_or(|end| end > i64::MAX as u64)
+    {
+        return Err(Errno::Invalid);
+    }
+    let handle = ctx.get(a[0])?;
+    handle.lock().sync_file_range(flags != 0)?;
+    Ok(0)
+}
+
 /// 普通与定位、单缓冲区与向量 I/O 共用搬运流程；定位偏移不写入打开文件对象。
 fn rw(nr: usize, a: [usize; 6], space: &UserAddressSpace, ctx: &Context) -> Result<usize, Errno> {
+    const RWF_HIPRI: u32 = 0x01;
+    const RWF_DSYNC: u32 = 0x02;
+    const RWF_SYNC: u32 = 0x04;
+    const RWF_NOWAIT: u32 = 0x08;
+    const RWF_APPEND: u32 = 0x10;
+    const RWF_SUPPORTED: u32 = RWF_HIPRI | RWF_DSYNC | RWF_SYNC | RWF_NOWAIT | RWF_APPEND;
+
     let reading = matches!(
         nr,
-        sysnr::READ | sysnr::READV | sysnr::PREAD64 | sysnr::PREADV
+        sysnr::READ | sysnr::READV | sysnr::PREAD64 | sysnr::PREADV | sysnr::PREADV2
     );
     let vector = matches!(
         nr,
-        sysnr::READV | sysnr::WRITEV | sysnr::PREADV | sysnr::PWRITEV
+        sysnr::READV
+            | sysnr::WRITEV
+            | sysnr::PREADV
+            | sysnr::PWRITEV
+            | sysnr::PREADV2
+            | sysnr::PWRITEV2
     );
-    let positioned = matches!(
-        nr,
-        sysnr::PREAD64 | sysnr::PWRITE64 | sysnr::PREADV | sysnr::PWRITEV
-    );
-    // rv64/la64 的 pos_l 已容纳完整 64 位偏移，原始 preadv/pwritev 的 pos_h 不参与取值。
-    let offset = if positioned {
-        if (a[3] as isize) < 0 {
-            return Err(Errno::Invalid);
+    let v2 = matches!(nr, sysnr::PREADV2 | sysnr::PWRITEV2);
+    let rwf_flags = if v2 { a[5] as u32 } else { 0 };
+    if v2 && rwf_flags & !RWF_SUPPORTED != 0 {
+        return Err(Errno::NotSupported);
+    }
+
+    // rv64/la64 的 pos_l 已容纳完整 64 位偏移；preadv2/pwritev2 允许 pos == -1 表示使用并更新当前文件偏移。
+    let offset = match nr {
+        sysnr::PREAD64 | sysnr::PWRITE64 | sysnr::PREADV | sysnr::PWRITEV => {
+            if (a[3] as isize) < 0 {
+                return Err(Errno::Invalid);
+            }
+            Some(a[3])
         }
-        Some(a[3])
-    } else {
-        None
+        sysnr::PREADV2 | sysnr::PWRITEV2 => {
+            let pos = a[3] as i64;
+            if pos == -1 {
+                None
+            } else if pos < -1 {
+                return Err(Errno::Invalid);
+            } else {
+                Some(pos as usize)
+            }
+        }
+        _ => None,
     };
     let handle = ctx.get(a[0])?;
     let mut file = handle.lock();
-    if positioned {
+    if offset.is_some() {
         file.check_positioned()?;
     }
     file.check_access(reading)?;
-    if vector {
+    if v2 && rwf_flags & RWF_NOWAIT != 0 && !file.supports_nowait() {
+        return Err(Errno::NotSupported);
+    }
+    let force_append = !reading && v2 && (rwf_flags & RWF_APPEND != 0);
+    let res = if vector {
         let buffers = import_iov(space, a[1], a[2])?;
-        transfer(space, &mut file, &buffers, reading, offset)
+        transfer(space, &mut file, &buffers, reading, offset, force_append)
     } else {
         let b = buffer(a[1], a[2])?;
-        transfer(space, &mut file, &[b], reading, offset)
+        transfer(space, &mut file, &[b], reading, offset, force_append)
+    };
+    if let Ok(done) = res {
+        if !reading && done > 0 && (rwf_flags & (RWF_DSYNC | RWF_SYNC) != 0) {
+            file.sync_if_inode();
+        }
     }
+    res
 }
 
 /// 小读写直接走栈上 256 字节缓冲，避免自旋锁与堆池开销。
@@ -1132,6 +1208,7 @@ fn transfer(
     buffers: &[UserBuffer],
     reading: bool,
     position: Option<usize>,
+    force_append: bool,
 ) -> Result<usize, Errno> {
     let total = buffers
         .iter()
@@ -1149,6 +1226,7 @@ fn transfer(
             total,
             reading,
             position,
+            force_append,
             &mut stack_buf[..total],
         );
     }
@@ -1161,10 +1239,12 @@ fn transfer(
         total,
         reading,
         position,
+        force_append,
         &mut scratch.0[..cap],
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transfer_with_buf(
     space: &UserAddressSpace,
     file: &mut fs::context::OpenFile,
@@ -1172,6 +1252,7 @@ fn transfer_with_buf(
     total: usize,
     reading: bool,
     mut position: Option<usize>,
+    force_append: bool,
     chunk: &mut [u8],
 ) -> Result<usize, Errno> {
     let mut user = UserIo {
@@ -1200,7 +1281,13 @@ fn transfer_with_buf(
                     user_access::copy_from_user(space, address, &mut chunk[start..start + len])
                         .map_err(|_| Errno::Fault)
                 })?;
-                if let Some(pos) = position {
+                if force_append {
+                    if position.is_some() {
+                        file.write_append_at(&chunk[..copied], done == 0)
+                    } else {
+                        file.write_append_chunk(&chunk[..copied], done == 0)
+                    }
+                } else if let Some(pos) = position {
                     file.write_at(pos, &chunk[..copied], done == 0)
                 } else {
                     file.write_chunk(&chunk[..copied], done == 0)
