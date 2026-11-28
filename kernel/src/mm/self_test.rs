@@ -148,7 +148,7 @@ pub(super) fn run() {
         copy_from_user(&child, 0x120000, &mut byte).expect("child private data");
         assert_eq!(byte, [81]);
         space
-            .map_shared_anonymous(0x130000, 1, F::URW, false)
+            .map_shared_anonymous(0x130000, 1, F::URW, false, true)
             .expect("shared advice");
         copy_to_user(&space, 0x130000, &[17]).expect("shared sentinel");
         space
@@ -162,7 +162,7 @@ pub(super) fn run() {
         let baseline = frame::stats();
         let mut parent = UserAddressSpace::new().expect("shared root");
         parent
-            .map_shared_anonymous(0x90000, 2, F::URW, false)
+            .map_shared_anonymous(0x90000, 2, F::URW, false, true)
             .expect("shared map");
         copy_to_user(&parent, 0x90000, &[7]).expect("shared initial");
         #[cfg(debug_assertions)]

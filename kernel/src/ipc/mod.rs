@@ -3,6 +3,7 @@
 //! 契约与锁序见 docs/ostd-contracts.md §4 与 §5。
 #![deny(unsafe_code)]
 
+pub mod mqueue;
 pub mod msg;
 pub mod sem;
 

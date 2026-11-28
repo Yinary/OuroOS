@@ -122,6 +122,7 @@ fn create_test_fs() -> Ext4FileSystem {
         mounted: true,
         readonly: false,
         journal_sb_block_start: None,
+        directory_index: None,
     }
 }
 
